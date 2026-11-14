@@ -77,6 +77,7 @@ const ROWS = [
   ['10 Trap recovery (sandbox, both ADR-003 modes)', 'node', [join(ROOT, 'js', 'tools', 'trap-sim.mjs')], true],
   ['11 Act layer (sandbox, act-test build)', 'node', [join(ROOT, 'js', 'tools', 'act-sim.mjs')], true],
   ['12 Profiler (sandbox, profiler build)', 'node', [join(ROOT, 'js', 'tools', 'profiler-sim.mjs')], true],
+  ['13 Persistence (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'persist-sim.mjs')], true],
 ];
 
 function main() {

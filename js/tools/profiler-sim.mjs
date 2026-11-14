@@ -10,12 +10,15 @@
 //   layer's `issued`) even though the game refuses one of them;
 // - each failure the binding guards against (no RawMemory, a segments value that is not an object, a set
 //   that throws, a set the object refuses) costs one log line, never a trap, and leaves the segment as it was;
-// - rustedscreep.profiler() reports the cold loop, the open window, the say, and the writes.
+// - rustedscreep.profiler() reports the cold loop, the open window, the say, and the writes;
+// - in a second run (keySim, P1.9) the profiler and the segment manager share the 10-key save cap: with 9
+//   segments activated from the console, the manager keeps the closing tick's last key for segment 99 and
+//   its write waits a tick; with 10, the profiler skips its write and the manager re-issues its set.
 // npm run check runs it; standalone: node js/tools/profiler-sim.mjs.
 import { join } from 'node:path';
 import { build } from './build.mjs';
 import { ROOT, fail, isMain } from './lib/common.mjs';
-import { checkResults, simulate } from './smoke.mjs';
+import { checkResults, commandResults, driverRawMemory, simulate } from './smoke.mjs';
 import { sceneAt } from './lib/world.mjs';
 
 /** PROFILER_MMO (config.rs): window length, kept windows and segment id. */
@@ -44,10 +47,10 @@ const FAILURES = [
   { window: 6, why: 'RawMemory.segments refused the write', raw: () => ({ segments: Object.freeze({}) }) },
 ];
 
-/** The RawMemory global at `offset`: each failure applies to every tick of its window. */
-function rawMemoryAt(offset) {
+/** The RawMemory global at `offset`: each failure applies to every tick of its window; otherwise the driver model. */
+function rawMemoryAt(offset, world) {
   const f = FAILURES.find((x) => offset > closeAt(x.window - 1) && offset <= closeAt(x.window));
-  return f ? f.raw() : { segments: {} };
+  return f ? f.raw() : driverRawMemory(offset, world);
 }
 
 /** What rustedscreep.profiler() must show at these offsets. */
@@ -112,6 +115,49 @@ function checkSegment(seg, problems) {
   });
 }
 
+/**
+ * A second run of the profiler build (P1.9): the segment manager and the profiler share the driver's
+ * 10-key save cap (V119). After the loop before window 1 closes, the console activates 9 segments and
+ * asks for a self-test: on the closing tick the manager keeps the last key for segment 99 and its write
+ * waits a tick. After the loop before window 2 closes, the console activates 10 segments: the profiler
+ * skips its write (no free key) and the manager re-issues its active set on the next tick. No tick saves
+ * more than 10 keys.
+ */
+function keySim(dist, problems) {
+  const reserveAt = closeAt(1);
+  const refuseAt = closeAt(2);
+  const summaryAt = refuseAt + 2;
+  const world = simulate(dist, {
+    ticks: summaryAt + 1,
+    command: (w) => {
+      if (w.ticksRun === reserveAt - 1) return 'RawMemory.setActiveSegments([0, 1, 2, 3, 4, 5, 6, 7, 8]); rustedscreep.persistTest(10)';
+      if (w.ticksRun === refuseAt - 1) return 'RawMemory.setActiveSegments([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])';
+      return w.ticksRun === summaryAt ? 'rustedscreep.persist()' : null;
+    },
+  });
+  const p = (m) => problems.push(`key sim: ${m}`);
+  if (world.segmentErrors.length) p(`save errors: ${world.segmentErrors.join(' / ')}`);
+  const saved = (offset) => world.segmentSaves.find((x) => x.offset === offset)?.keys ?? [];
+  const nine = ['0', '1', '2', '3', '4', '5', '6', '7', '8'];
+  if (JSON.stringify(saved(reserveAt)) !== JSON.stringify([...nine, SEGMENT])) p(`closing tick saved ${JSON.stringify(saved(reserveAt))}: the nine loaded keys and 99 expected`);
+  if (!saved(reserveAt + 1).includes('98')) p(`the waiting self-test write is not saved a tick later: ${JSON.stringify(saved(reserveAt + 1))}`);
+  const ok = `rustedscreep persist self-test: round trip ok: 10 B in 39 units, written at ${T0 + reserveAt + 1}, read at ${T0 + reserveAt + 2}`;
+  if (!world.logs.some((l) => l.startsWith(ok))) p(`no verdict "${ok}"`);
+  if (JSON.stringify(saved(refuseAt)) !== JSON.stringify([...nine, '9'])) p(`refusing tick saved ${JSON.stringify(saved(refuseAt))}: the ten loaded keys expected`);
+  const refusals = world.logs.filter((l) => l.startsWith('rustedscreep profiler: writing stats segment'));
+  const want = `rustedscreep profiler: writing stats segment 99 failed at tick ${T0 + refuseAt}: no free save key`;
+  if (refusals.length !== 1 || !refusals[0].startsWith(want)) p(`profiler refusals: ${refusals.join(' / ') || 'none'}`);
+  const reissue = world.loopCalls[refuseAt + 1]?.setActive ?? [];
+  if (JSON.stringify(reissue) !== '[[]]') p(`the manager's set after the refusal: ${JSON.stringify(reissue)}, expected [[]]`);
+  if (world.activeSegments.length) p(`segments left active: ${world.activeSegments.join(',')}`);
+  const summary = commandResults(world, 'rustedscreep.persist()')[0] ?? '';
+  for (const part of ['| writes 1 (0 failed, 0 rejected, 1 ticks short of a key) |', '| JS failures 0 |']) {
+    if (!summary.includes(part)) p(`summary lacks "${part}": ${summary}`);
+  }
+  const bad = world.logs.filter((l) => /incident|loader error|\[error\]|rustedscreep fault/.test(l));
+  if (bad.length || world.halts) p(`unexpected trouble: ${bad.join(' / ')} (halts ${world.halts})`);
+}
+
 export function profilerSim() {
   const dist = join(ROOT, 'target', 'profiler');
   build({ features: ['profiler'], dist });
@@ -159,6 +205,7 @@ export function profilerSim() {
     problems.push(`segment 99 is not JSON: ${e.message}`);
   }
   if (seg) checkSegment(seg, problems);
+  keySim(dist, problems);
   const bad = world.logs.filter((l) => /incident|loader error|\[error\]|rustedscreep fault/.test(l));
   if (bad.length || world.halts || world.globals !== 1) problems.push(`unexpected trouble: ${bad.join(' / ')} (halts ${world.halts}, globals ${world.globals})`);
   if (problems.length) throw new Error(`${problems.join('\n')}\nlast logs:\n${world.logs.slice(-12).join('\n')}`);
@@ -168,7 +215,7 @@ export function profilerSim() {
 if (isMain(import.meta.url)) {
   try {
     const r = profilerSim();
-    console.log(`profiler: ${r.ticks} ticks, ${WINDOWS} windows, segment ${SEGMENT} ${r.bytes} characters, ${r.failures} guarded write failures`);
+    console.log(`profiler: ${r.ticks} ticks, ${WINDOWS} windows, segment ${SEGMENT} ${r.bytes} characters, ${r.failures} guarded write failures; the save-key run passed`);
   } catch (e) {
     fail(`profiler test failed: ${e.message}`);
   }

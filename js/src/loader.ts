@@ -47,6 +47,10 @@ export interface Glue {
   profilerSummary?: () => string;
   /** Asks every own creep to say `text` on the next tick (P1 module 7); returns a confirmation line. */
   queueSay?: (text: string) => string;
+  /** One line about the segment manager: active set, wanted loads, dirty records, counts, self-test (P1 module 9). */
+  persistSummary?: () => string;
+  /** Starts the persistence self-test with `bytes` payload bytes, the largest that fits when undefined (P1 module 9). */
+  persistTest?: (bytes?: number) => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -473,8 +477,29 @@ export class Loader {
     return this.guarded('queueSay', 'say', () => call(text));
   }
 
+  /** Console command: the wasm's segment-manager summary (active set, loads, writes, the self-test). */
+  persist(): string {
+    return this.summary('persistSummary', 'persist summary');
+  }
+
+  /**
+   * Console command: a storage round trip through the segment manager (the P1 gate's live check). `bytes`
+   * is the payload size, or undefined for the largest that fits one segment; the wasm clamps larger sizes.
+   */
+  persistTest(bytes: unknown): string {
+    const call = this.glue.persistTest;
+    if (!call) return 'rustedscreep: this build has no persistTest export';
+    if (bytes !== undefined && !(typeof bytes === 'number' && Number.isInteger(bytes) && bytes >= 0 && bytes <= 0xffffffff)) {
+      return 'rustedscreep: give the payload size as a whole number of bytes, or nothing for a full segment, for example rustedscreep.persistTest(1000)';
+    }
+    return this.guarded('persistTest', 'persist test', () => call(bytes));
+  }
+
   /** Calls a wasm summary export for a console command (see `guarded`). */
-  private summary(name: 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary', noun: string): string {
+  private summary(
+    name: 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary' | 'persistSummary',
+    noun: string,
+  ): string {
     const call = this.glue[name];
     if (!call) return `rustedscreep: this build has no ${name} export`;
     return this.guarded(name, noun, call);

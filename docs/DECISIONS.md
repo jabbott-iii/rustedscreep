@@ -62,16 +62,34 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
 - Decision: (c), the hybrid, as recommended; the user accepted it on 2026-11-13 ("Accept all four", covering ADR-001, 003, 005 and 006 as recommended).
 - Consequences: the P1 loader ships the halt-based recovery (a) first. Re-instantiating from the cached Module (b) goes behind a config flag, off by default, and becomes the default only if `trap-test` shows it correct over 10 consecutive traps and cheaper than a halt plus recompile. The measured numbers and the final default are recorded here in P1. Backoff and one notification per incident apply in both modes.
 
-## ADR-004 Persistence encoding: Proposed (P1)
+## ADR-004 Persistence encoding: Accepted (2026-11-14)
 - Context: RawMemory segments are strings. Persist only data that must survive a reset, in a compact, versioned form, written only when dirty.
 - Options: (a) base64 of a binary layout, (b) a denser UTF-16 packing scheme, (c) a hand-rolled varint layout with either of those.
 - Decide by: bytes per segment, encode and decode CPU (bench plus in-game), and robustness against corruption (checksum).
-- Evidence (VERIFICATION_LOG section F):
+- Evidence (VERIFICATION_LOG sections F and G):
   - RawMemory has 100 segments (ids 0-99), at most 10 active at once, and 100 KB per segment. Requested segments appear on the next tick, and the driver rejects oversize writes at end of tick (V41). Memory itself is capped at 2 MB (V40).
   - The segment and Memory limits are checks on JS string `.length`, so they count UTF-16 code units, not bytes (V40, V41, read verbatim in the driver).
-  - Every segment present in `RawMemory.segments` at end of tick is re-saved and counts toward the 10-segment cap. Exceeding the cap throws after the loop and likely loses the tick (V41, inferred), so the segment manager must unload segments it no longer needs.
-- Recommendation: decide in P1 by benchmark, as planned. Because the limit counts code units, (b) a dense UTF-16 packing (for example 15 bits per code unit, which avoids lone surrogates) holds about 2.5 times what base64 holds per segment (6 bits per code unit). Lean towards (b) with a versioned header and checksum, provided a live round-trip test on the MMO shows the storage path preserves every code unit. Otherwise use (a).
-- Decision: _pending (P1)_
+  - Every segment present in `RawMemory.segments` at end of tick is re-saved and counts toward the 10-segment cap. Exceeding the cap throws after the loop and likely loses the tick (V41, inferred; V119), so the segment manager must unload segments it no longer needs.
+  - Capacity per segment: base64 carries 76797 bytes in 102400 units (76781 of payload after the 16-byte header); a 15-bit packing carries 192000.
+  - The string crossing decides the CPU, not the encoding's density (V123). The wasm-bindgen glue copies ASCII text into wasm in a JS loop and sends everything else through the TextEncoder/TextDecoder polyfill (the MMO has neither, V72), which converts a 15-bit unit to 3 UTF-8 bytes per code point in JS. Measured locally on one full segment (Node 18.19.1, a copy of the glue's loop and the repo's polyfill, the codec compiled to wasm; relative numbers only, the MMO runs a newer Node):
+
+    | Path | Write (encode + CRC-32 + crossing) | Read (crossing + decode + CRC-32) |
+    |---|---|---|
+    | (a) base64, stock glue | 124 + 196 + 632 µs = 12.7 µs/KiB | 134 + 121 + 196 µs = 6.0 µs/KiB |
+    | (b) 15-bit, stock glue | 617 + 429 + 1577 µs = 14.0 µs/KiB | 706 + 755 + 429 µs = 10.1 µs/KiB |
+    | (b) 15-bit, inline-JS crossing (a build change) | 617 + 429 + 388 µs = 7.6 µs/KiB | 135 + 755 + 429 µs = 7.0 µs/KiB |
+
+    CRC-32 costs about 2.3 to 2.6 µs/KiB in wasm (Adler-32 0.5, FNV-1a 1.0, both weaker on short records). At the volumes the bot will persist (a few KB per write), the difference between the paths is well under 0.01 CPU per write.
+  - Storage fidelity: the driver stores the string as given (V121); the open-source storage path is JSON over UTF-8 (inferred lossless on Node 12 or later); the MMO's storage is closed source, so whether non-ASCII code units survive there is unverified (V121). A bulk UTF-16 crossing needs inline JS (V125).
+  - In the sandbox the plain build's self-test (`node js/tools/persist-sim.mjs`, the bundle in a Node vm context with the polyfill) measured a full segment at about 0.33 to 0.6 ms to encode, 0.23 to 0.29 ms to read and 0.46 to 0.7 ms to decode and compare. The JS write took 8 to 13 ms on the first large crossing of a global (the polyfill's decoder is not optimized yet) and 0.8 to 1.9 ms on later runs; the cold read took 2.4 to 3.1 ms (2026-11-14).
+- Recommendation: (a) with CRC-32. Through the stock glue it is cheaper than (b) per payload byte in both directions, its ASCII text survives any storage, and it needs no custom JS. (b) is faster only with an inline-JS crossing, which needs a build change, and it is safe only after a live round trip proves the MMO keeps every code unit; neither is worth it at the expected volumes. A tag in the frame names the encoding, so (b) can be added later without breaking stored data.
+- Decision: (a) base64 with CRC-32, as recommended. The user chose "base64 + CRC-32 (Recommended)" on 2026-11-14 (P1.9).
+- Consequences:
+  - Frame (container format 1, `rustedscreep_core::persist::frame`): `"rs1b"` (magic `rs`, version `1`, encoding `b`), then base64 (RFC 4648 section 4 alphabet, no padding, strict decoding) of a 16-byte little-endian header (owner kind u16, schema u16, write tick u32, payload length u32, CRC-32/ISO-HDLC u32 over the first 12 header bytes and the payload) followed by the payload. Every decode failure (empty, foreign, unknown version or encoding, bad base64, short, length or CRC mismatch, another owner's kind or schema) is an error the owner answers by rebuilding from game state.
+  - The CRC is the one the loader and tools already use (js/src/crc32.ts, js/tools/lib/crc32.mjs), so a JS tool can check a frame.
+  - Payload layouts belong to their owners and are versioned by `schema`; option (c), a shared varint writer, waits for the first owner that needs one.
+  - The 15-bit option stays open: a new encoding letter, the inline-JS crossing, and a live round trip of every code unit on the MMO first.
+  - The live round trip on the MMO (the P1 gate) is `rustedscreep.persistTest()` (TEST_PLAN §8).
 
 ## ADR-005 Constants source for native tests: Accepted (2026-11-13)
 - Context: pure crates must test natively, and constants should come from the API (SPEC §0).

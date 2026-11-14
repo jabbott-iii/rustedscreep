@@ -462,7 +462,11 @@ test('the say command passes a string to the wasm only while it is ready, and re
 test('every console command refuses while the wasm is running, without calling it', () => {
   let calls = 0;
   const count = () => { calls += 1; return 'called'; };
-  const h = harness({ glue: { snapshotSummary: count, schedulerSummary: count, actSummary: count, queueSay: count } });
+  const h = harness({
+    glue: {
+      snapshotSummary: count, schedulerSummary: count, actSummary: count, queueSay: count, persistSummary: count, persistTest: count,
+    },
+  });
   h.tick(2);
   assert.equal(h.loader.phase, 'ready');
   h.loader.running = true;
@@ -470,7 +474,53 @@ test('every console command refuses while the wasm is running, without calling i
   assert.match(h.loader.scheduler(), /no scheduler summary while the loader is ready/);
   assert.match(h.loader.act(), /no act summary while the loader is ready/);
   assert.match(h.loader.say('hi'), /no say while the loader is ready/);
+  assert.match(h.loader.persist(), /no persist summary while the loader is ready/);
+  assert.match(h.loader.persistTest(undefined), /no persist test while the loader is ready/);
   assert.equal(calls, 0);
   h.loader.running = false;
   assert.equal(h.loader.act(), 'called');
+});
+
+test('the persist command shares the guard: missing export, idle, poisoned, and a throw poisons', () => {
+  const none = harness();
+  assert.match(none.loader.persist(), /no persistSummary export/);
+  let calls = 0;
+  const h = harness({ glue: { persistSummary: () => `persist ${++calls}` } });
+  assert.match(h.loader.persist(), /no persist summary while the loader is idle/);
+  h.tick(2);
+  assert.equal(h.loader.persist(), 'persist 1');
+  h.loopThrows = true;
+  h.tick();
+  assert.match(h.loader.persist(), /no persist summary while the loader is poisoned/);
+  assert.equal(calls, 1);
+
+  const bad = harness({ glue: { persistSummary: () => { throw new Error('RuntimeError: unreachable'); } } });
+  bad.tick(2);
+  assert.match(bad.loader.persist(), /persistSummary trapped; the loader recovers on the next tick/);
+  assert.equal(bad.loader.phase, 'poisoned');
+  bad.tick();
+  assert.equal(bad.halts, 1);
+});
+
+test('the persistTest command passes a whole byte count or nothing, and refuses other values', () => {
+  const none = harness();
+  assert.match(none.loader.persistTest(undefined), /no persistTest export/);
+  const sizes = [];
+  const h = harness({ glue: { persistTest: (bytes) => { sizes.push(bytes); return `ok ${bytes}`; } } });
+  assert.match(h.loader.persistTest(10), /no persist test while the loader is idle/);
+  h.tick(2);
+  for (const bad of [-1, 1.5, Number.NaN, Infinity, 2 ** 32, '100', null, {}]) {
+    assert.match(h.loader.persistTest(bad), /give the payload size as a whole number of bytes/, String(bad));
+  }
+  assert.equal(h.loader.persistTest(undefined), 'ok undefined');
+  assert.equal(h.loader.persistTest(0), 'ok 0');
+  assert.equal(h.loader.persistTest(2 ** 32 - 1), `ok ${2 ** 32 - 1}`);
+  assert.deepEqual(sizes, [undefined, 0, 2 ** 32 - 1], 'only valid sizes reached the wasm');
+
+  const bad = harness({ glue: { persistTest: () => { throw new Error('RuntimeError: unreachable'); } } });
+  bad.tick(2);
+  assert.match(bad.loader.persistTest(undefined), /persistTest trapped; the loader recovers on the next tick/);
+  assert.equal(bad.loader.phase, 'poisoned');
+  bad.tick();
+  assert.equal(bad.halts, 1);
 });

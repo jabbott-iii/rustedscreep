@@ -150,6 +150,31 @@ pub const PROFILER_MMO: ProfilerConfig = ProfilerConfig {
     stats_segment: 99,
 };
 
+/// Segment manager settings (ROADMAP P1 module 9); `docs/TUNING.md` gives each one's rationale and
+/// safe range. Writes and loads run only while the Standard tier does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PersistConfig {
+    /// Most segments the manager keeps active at once with `setActiveSegments`; the rest of the
+    /// wanted loads follow as these complete. Unit: segments.
+    pub max_active_segments: u8,
+    /// Ticks a requested segment may be missing after its activation tick before the load fails and
+    /// its owner rebuilds. Unit: ticks.
+    pub load_retries: u8,
+    /// Most segments written per tick. Unit: segments.
+    pub max_writes_per_tick: u8,
+    /// The segment the self-test (`rustedscreep.persistTest()`) writes and reads back (0 to 99,
+    /// `rustedscreep_consts::extra::MEMORY_SEGMENT_COUNT`). Unit: segment id.
+    pub self_test_segment: u8,
+}
+
+/// Segment manager values for the official MMO (the only profile until P1 module 10).
+pub const PERSIST_MMO: PersistConfig = PersistConfig {
+    max_active_segments: 8,
+    load_retries: 3,
+    max_writes_per_tick: 2,
+    self_test_segment: 98,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +334,50 @@ mod tests {
             ("stats_segment", stats_segment.to_string()),
         ];
         assert_tuning_rows(TUNING, "ProfilerConfig", &expected);
+    }
+
+    /// Uses: rustedscreep_consts::{MEMORY_SEGMENT_ACTIVE_LIMIT, extra::MEMORY_SEGMENT_SAVE_LIMIT,
+    /// extra::MEMORY_SEGMENT_COUNT}. The active cap leaves a save key for the profiler's segment, the
+    /// manager can write, retries and writes are at least 1, and the self-test segment exists and is
+    /// not the profiler's.
+    #[test]
+    fn persist_values_are_coherent() {
+        let c = PERSIST_MMO;
+        assert!(c.max_active_segments >= 1);
+        assert!(
+            u32::from(c.max_active_segments) <= rustedscreep_consts::MEMORY_SEGMENT_ACTIVE_LIMIT
+        );
+        assert!(
+            u32::from(c.max_active_segments)
+                < rustedscreep_consts::extra::MEMORY_SEGMENT_SAVE_LIMIT,
+            "one save key stays free for the profiler's segment"
+        );
+        assert!((1..=20).contains(&c.load_retries));
+        assert!(
+            (1..=rustedscreep_consts::extra::MEMORY_SEGMENT_SAVE_LIMIT)
+                .contains(&u32::from(c.max_writes_per_tick))
+        );
+        assert!(c.self_test_segment < rustedscreep_consts::extra::MEMORY_SEGMENT_COUNT);
+        assert_ne!(c.self_test_segment, PROFILER_MMO.stats_segment);
+    }
+
+    /// docs/TUNING.md mirrors PERSIST_MMO field for field (CLAUDE.md).
+    #[test]
+    fn tuning_md_mirrors_the_persist_config() {
+        // Exhaustive: adding a field without a row here fails to compile.
+        let PersistConfig {
+            max_active_segments,
+            load_retries,
+            max_writes_per_tick,
+            self_test_segment,
+        } = PERSIST_MMO;
+        let expected = [
+            ("max_active_segments", max_active_segments.to_string()),
+            ("load_retries", load_retries.to_string()),
+            ("max_writes_per_tick", max_writes_per_tick.to_string()),
+            ("self_test_segment", self_test_segment.to_string()),
+        ];
+        assert_tuning_rows(TUNING, "PersistConfig", &expected);
     }
 
     #[test]

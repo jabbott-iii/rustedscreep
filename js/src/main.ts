@@ -4,9 +4,9 @@
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
 import { textCodecSource } from './text-polyfill.js';
 import {
-  __wbg_reset_state, actSummary as wasmActSummary, initSync, loop as wasmLoop, profilerSummary as wasmProfilerSummary,
-  queueSay as wasmQueueSay, schedulerSummary as wasmSchedulerSummary, snapshotSummary as wasmSnapshotSummary,
-  trapTest as wasmTrapTest,
+  __wbg_reset_state, actSummary as wasmActSummary, initSync, loop as wasmLoop, persistSummary as wasmPersistSummary,
+  persistTest as wasmPersistTest, profilerSummary as wasmProfilerSummary, queueSay as wasmQueueSay,
+  schedulerSummary as wasmSchedulerSummary, snapshotSummary as wasmSnapshotSummary, trapTest as wasmTrapTest,
 } from '../pkg/rustedscreep_wasm.js';
 import { type BuildInfo, type Env, type Glue, Loader, type LoaderConfig, type LoaderMemory, sanitizeLoaderMemory } from './loader.js';
 
@@ -86,6 +86,8 @@ const glue: Glue = {
   actSummary: wasmActSummary,
   profilerSummary: wasmProfilerSummary,
   queueSay: wasmQueueSay,
+  persistSummary: wasmPersistSummary,
+  persistTest: wasmPersistTest,
 };
 
 const loader = new Loader(env, glue, CONFIG, BUILD);
@@ -113,7 +115,8 @@ function routeConsole(): void {
 }
 
 // Console commands, for example `rustedscreep.trapTest(10)`, `rustedscreep.status()`, `rustedscreep.snapshot()`,
-// `rustedscreep.scheduler()`, `rustedscreep.act()`, `rustedscreep.profiler()` or `rustedscreep.say("hi")`.
+// `rustedscreep.scheduler()`, `rustedscreep.act()`, `rustedscreep.profiler()`, `rustedscreep.say("hi")`,
+// `rustedscreep.persist()` or `rustedscreep.persistTest()`.
 g.rustedscreep = {
   trapTest: (n: unknown = 1) => loader.scheduleTraps(Number(n)),
   status: () => loader.status(),
@@ -122,6 +125,8 @@ g.rustedscreep = {
   act: () => loader.act(),
   profiler: () => loader.profiler(),
   say: (text: unknown) => loader.say(text),
+  persist: () => loader.persist(),
+  persistTest: (bytes?: unknown) => loader.persistTest(bytes),
 };
 
 export function loop(): void {

@@ -14,6 +14,17 @@
 /// VERIFICATION_LOG V41 and V85. Last verified: 2026-11-13.
 pub const MEMORY_SEGMENT_COUNT: u8 = 100;
 
+/// Most keys `RawMemory.segments` may hold at the end of a tick. The driver saves every key present
+/// then, loaded active segments included even when unchanged, and throws "Cannot save more than 10
+/// memory segments on the same tick" above this count, which likely loses the tick (V41, inferred).
+/// It is the same literal as `MEMORY_SEGMENT_ACTIVE_LIMIT` but a separate rule, so a segment written
+/// without being activated counts here too.
+///
+/// Source: screeps/driver `lib/runtime/runtime.js` at cf63d8a, the end-of-tick save
+/// (<https://github.com/screeps/driver/blob/cf63d8adf902663e2ebddd7f8c5b7baa425dc928/lib/runtime/runtime.js#L250-L268>),
+/// VERIFICATION_LOG V85 and V119. Last verified: 2026-11-14.
+pub const MEMORY_SEGMENT_SAVE_LIMIT: u32 = 10;
+
 /// Offset of room coordinates in a packed room name or position: a room coordinate `c` (`W`n and
 /// `N`n are -n-1, `E`n and `S`n are n) is stored as the byte `c + HALF_WORLD_SIZE`, so room
 /// coordinates run over `-HALF_WORLD_SIZE..HALF_WORLD_SIZE`. The API keeps its own copy private.

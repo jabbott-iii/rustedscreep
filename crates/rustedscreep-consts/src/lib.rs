@@ -159,7 +159,6 @@ mod tests {
     // Invariants between constants are checked at compile time, so a balance change that breaks
     // one fails the test build.
 
-    /// Uses: MEMORY_SEGMENT_ACTIVE_LIMIT, extra::MEMORY_SEGMENT_COUNT.
     /// The packed room byte is the room coordinate plus `extra::HALF_WORLD_SIZE`, at both ends of
     /// the range (the crate's own `x_coord` and `y_coord` read it back).
     #[test]
@@ -175,10 +174,15 @@ mod tests {
         assert_eq!("W127N127".parse::<RoomName>().ok(), Some(lowest));
     }
 
+    /// Uses: MEMORY_SEGMENT_ACTIVE_LIMIT, extra::MEMORY_SEGMENT_COUNT, extra::MEMORY_SEGMENT_SAVE_LIMIT.
     #[test]
     fn segment_limits_are_consistent() {
         const { assert!(MEMORY_SEGMENT_ACTIVE_LIMIT >= 1) };
         const { assert!(MEMORY_SEGMENT_ACTIVE_LIMIT <= extra::MEMORY_SEGMENT_COUNT as u32) };
+        // Every active segment can always be saved: the save cap is at least the active cap.
+        const { assert!(extra::MEMORY_SEGMENT_SAVE_LIMIT >= MEMORY_SEGMENT_ACTIVE_LIMIT) };
+        // A segment set fits a u128 bitset (rustedscreep-core persist::SegmentSet).
+        const { assert!(extra::MEMORY_SEGMENT_COUNT <= 128) };
     }
 
     /// Uses: CPU_TICK_LIMIT_MAX, PIXEL_CPU_COST, CPU_BUCKET_MAX, INTENT_CPU_COST. A full bucket

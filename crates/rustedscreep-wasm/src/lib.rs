@@ -18,6 +18,7 @@
 mod act;
 #[cfg(feature = "act-test")]
 mod act_test;
+mod persist;
 mod profiler;
 mod scheduler;
 mod snapshot;
@@ -25,7 +26,7 @@ mod snapshot;
 use std::cell::RefCell;
 
 use rustedscreep_core::config::SCHEDULER_MMO;
-use rustedscreep_core::scheduler::Scheduler;
+use rustedscreep_core::scheduler::{Scheduler, Tier};
 use rustedscreep_core::snapshot::Snapshot;
 use wasm_bindgen::prelude::wasm_bindgen;
 
@@ -37,6 +38,7 @@ struct State {
     js: snapshot::JsWorld,
     scheduler: Scheduler,
     act: act::Act,
+    persist: persist::Persist,
     /// Zero-sized without the `profiler` feature.
     profiler: profiler::Profiler,
     #[cfg(feature = "act-test")]
@@ -56,9 +58,11 @@ fn start() {
 }
 
 /// Exported to JS as `loop`; the loader calls it once per tick: the snapshot, then the scheduler's
-/// tick (its budget from the snapshot's tick context), in which jobs queue intents (P2 onward; the
-/// console's `say` until then), then the act step, which issues them in one batch. A `profiler`
-/// build reads the CPU clock around each step (`profiler::Probe`); other builds compile it out.
+/// tick (its budget from the snapshot's tick context), in which the persistence loads run and jobs
+/// queue intents (P2 onward; the console's `say` until then), then the act step, which issues them
+/// in one batch, then the persistence writes and the active segments (`persist::Persist::flush`).
+/// A `profiler` build reads the CPU clock around each step (`profiler::Probe`); the flush falls in
+/// its `end` span with the fault log. Other builds compile the probe out.
 ///
 /// A JS exception inside the pass ends the call without unwinding, which would leave the state
 /// borrowed. The loader treats that as a trap and replaces the instance (ADR-003), so the borrow
@@ -74,6 +78,7 @@ pub fn game_loop() {
                     js,
                     scheduler: sched,
                     act,
+                    persist,
                     profiler: prof,
                     #[cfg(feature = "act-test")]
                     act_test,
@@ -84,6 +89,8 @@ pub fn game_loop() {
                 act.begin(snapshot);
                 let mut tick = sched.begin(&snapshot.tick, &SCHEDULER_MMO, scheduler::GameClock);
                 // Critical, then Standard, then Optional jobs run here and queue intents (P2 onward).
+                // The persistence loads are a Standard job; Critical jobs will run before them (P2).
+                persist.load(&mut tick, snapshot.tick.time);
                 act.queue_console_say(snapshot, tick.commit());
                 #[cfg(feature = "act-test")]
                 act_test.queue(&mut act.buffer, snapshot, tick.commit());
@@ -94,8 +101,14 @@ pub fn game_loop() {
                 // `TickCpu` held `&mut Scheduler` until `finish`, so `act::issue` cannot run earlier.
                 act::issue(act, snapshot, js, sched);
                 probe.act();
+                let standard = sched
+                    .last_tick()
+                    .is_some_and(|r| r.budget.allows(Tier::Standard));
+                persist.flush(snapshot.tick.time, standard);
                 scheduler::log_faults(sched);
-                prof.finish(probe, &snapshot.tick, act.issues());
+                if prof.finish(probe, &snapshot.tick, act.issues()) {
+                    persist.keys_short();
+                }
                 true
             }
             Err(_) => false,
@@ -153,6 +166,34 @@ pub fn profiler_summary() -> String {
             Err(_) => String::from("rustedscreep profiler: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep profiler: state unavailable"))
+}
+
+/// Exported to JS as `persistSummary`, for the `rustedscreep.persist()` console command: one line
+/// with the active set, wanted loads, dirty records, the counts since boot and the self-test.
+#[wasm_bindgen(js_name = "persistSummary")]
+pub fn persist_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state.persist.summary(),
+            Err(_) => String::from("rustedscreep persist: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep persist: state unavailable"))
+}
+
+/// Exported to JS as `persistTest`, for the `rustedscreep.persistTest(bytes)` console command:
+/// writes a test frame of `bytes` payload bytes (the largest that fits a segment when omitted) on
+/// the next tick and reads it back through the segment manager (the P1 gate's live round trip).
+#[wasm_bindgen(js_name = "persistTest")]
+pub fn persist_test(bytes: Option<u32>) -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow_mut() {
+            Ok(mut state) => {
+                let now = state.snapshot.tick.time;
+                state.persist.request_test(bytes, now)
+            }
+            Err(_) => String::from("rustedscreep persist self-test: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep persist self-test: state unavailable"))
 }
 
 /// Exported to JS as `queueSay`, for the `rustedscreep.say(text)` console command: every own creep

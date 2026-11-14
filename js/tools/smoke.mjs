@@ -2,8 +2,9 @@
 // VERIFICATION_LOG V96 records them: each tick gets a fresh console with only log and logUnsafe, Game
 // and Memory; Memory is parsed from a JSON string at the start of the tick and saved at its end; a halt
 // discards that tick's Memory and starts a new global, which evaluates main.js again; console commands
-// run after loop. RawMemory.segments starts empty each tick (nothing is ever activated) and every key in
-// it is saved at the end of the tick with the driver's checks (V41, V85). TextDecoder and TextEncoder are absent (V72), and so are fetch, URL and document
+// run after loop. RawMemory follows the driver's segment lifecycle (driverRawMemory: the active set lives
+// in the world, applies on the next tick and survives globals; V116 to V120), and every key of
+// RawMemory.segments is saved at the end of the tick with the driver's checks (V41, V85). TextDecoder and TextEncoder are absent (V72), and so are fetch, URL and document
 // (assumed, V95). npm run build runs the plain smoke test; npm run check also runs a trap-test build
 // through 10 forced traps. Standalone: node js/tools/smoke.mjs [dir].
 import { readFileSync } from 'node:fs';
@@ -47,18 +48,51 @@ export function saveSegments(segments, world, offset) {
 }
 
 /**
+ * The tick's RawMemory, following the driver at cf63d8a (V116 to V120): `segments` holds the segments of
+ * the active set stored in the world (one never written loads as '', V117); `setActiveSegments` checks
+ * like the driver (an array of at most 10 ids, each parseInt'ed into 0 to 99; a bad id throws after the
+ * ids before it are kept, V118), the last call of a tick wins, and `endTick` makes it the world's set for
+ * the next tick, across globals. Calls are recorded in `world.activeCalls` as [offset, ids].
+ */
+export function driverRawMemory(offset, world) {
+  world.activeSegments ??= [];
+  world.activeCalls ??= [];
+  const segments = Object.create(null);
+  for (const id of world.activeSegments) segments[id] = world.segments[id] ?? '';
+  let next = null;
+  return {
+    segments,
+    setActiveSegments(ids) {
+      if (!Array.isArray(ids)) throw new Error('RawMemory.setActiveSegments: argument must be an array');
+      if (ids.length > SEGMENTS_PER_TICK) throw new Error(`RawMemory.setActiveSegments: only ${SEGMENTS_PER_TICK} segments can be active`);
+      next = [];
+      for (const x of ids) {
+        const id = Number.parseInt(x, 10);
+        if (Number.isNaN(id) || id > SEGMENT_IDS - 1 || id < 0) throw new Error(`RawMemory.setActiveSegments: "${x}" is not a valid segment ID`);
+        next.push(id);
+      }
+      world.activeCalls.push([offset, [...next]]);
+    },
+    endTick() {
+      if (next !== null) world.activeSegments = next;
+    },
+  };
+}
+
+/**
  * Runs the bundle in `dir` for up to `ticks` ticks. `command(world)` may return console command source
  * to evaluate after that tick's loop, as the game does. Stops early once `until(world)` is true.
  * `scene(offset)` gives the tick's Game.creeps, Game.rooms and Game.structures (js/tools/lib/world.mjs).
- * `rawMemory(offset)` gives the tick's RawMemory global (undefined for none); by default its segments
- * object is empty. World: `segments` holds the saved segment strings by id, `segmentSaves` the ticks that
- * saved any, and `segmentErrors` the saves the driver would have thrown on. `loopCalls[offset]` counts
- * what the bundle did inside that tick's loop call (`getUsed` calls and `RawMemory.segments` reads), not
+ * `rawMemory(offset, world)` gives the tick's RawMemory global (undefined for none); by default
+ * driverRawMemory, whose optional `endTick()` runs after a tick that did not halt. World: `segments` holds
+ * the saved segment strings by id, `segmentSaves` the ticks that saved any, and `segmentErrors` the saves
+ * the driver would have thrown on. `loopCalls[offset]` counts what the bundle did inside that tick's loop
+ * call (`getUsed` calls, `RawMemory.segments` reads and the id lists passed to `setActiveSegments`), not
  * in console commands or the end-of-tick save.
  */
 export function simulate(dir, {
   ticks = 6, bucket = 10000, command = null, until = null, memoryJson = '{}', withHalt = true, wasmBytes = null,
-  scene = sceneAt, rawMemory = () => ({ segments: {} }),
+  scene = sceneAt, rawMemory = driverRawMemory,
 } = {}) {
   const code = readFileSync(join(dir, 'main.js'), 'utf8');
   const bytes = wasmBytes ?? readFileSync(join(dir, `${WASM_MODULE}.wasm`));
@@ -101,12 +135,22 @@ export function simulate(dir, {
       logUnsafe: { value: (...a) => world.logs.push(a.map(String).join(' ')), writable: true, configurable: true },
     });
     context.Memory = memory;
-    const raw = rawMemory(offset);
-    const calls = { getUsed: 0, segments: 0 };
+    const raw = rawMemory(offset, world);
+    const calls = { getUsed: 0, segments: 0, setActive: [] };
     let inLoop = false;
-    // A view of `raw` whose `segments` getter counts the bundle's reads; the save reads `raw` itself.
+    // A view of `raw` whose `segments` getter and `setActiveSegments` count the bundle's calls; the save
+    // reads `raw` itself.
     context.RawMemory = raw === undefined || raw === null ? raw : Object.create(null, {
       segments: { get: () => { if (inLoop) calls.segments += 1; return raw.segments; }, enumerable: true },
+      ...(typeof raw.setActiveSegments === 'function' ? {
+        setActiveSegments: {
+          value: (ids) => {
+            if (inLoop) calls.setActive.push(Array.isArray(ids) ? [...ids] : ids);
+            return raw.setActiveSegments(ids);
+          },
+          enumerable: true,
+        },
+      } : {}),
     });
     context.Game = {
       ...scene(offset),
@@ -145,6 +189,7 @@ export function simulate(dir, {
     } else {
       if (memory !== null) world.memoryJson = JSON.stringify(memory); // a null Memory is not saved, so the raw string stays
       saveSegments(raw?.segments, world, offset);
+      raw?.endTick?.();
     }
     if (until && until(world)) break;
   }
@@ -300,11 +345,15 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [] } = {}) {
   }
   // Readings inside loop once booted (the loader also reads the clock on the boot ticks and the first
   // loop): none without the profiler, six with it (crates/rustedscreep-wasm/src/profiler.rs), so the
-  // feature compiles out and its documented count holds. No build reads RawMemory here.
+  // feature compiles out and its documented count holds. No build reads RawMemory.segments here, and the
+  // segment manager (crates/rustedscreep-wasm/src/persist.rs) calls setActiveSegments once, with no ids,
+  // on the global's first loop (offset 1), to clear a set an earlier global left.
   const perLoop = features.includes('profiler') ? 6 : 0;
   world.loopCalls.forEach((c, offset) => {
     if (offset >= 2 && c.getUsed !== perLoop) throw new Error(`offset ${offset}: ${c.getUsed} getUsed calls in loop, expected ${perLoop}`);
     if (c.segments) throw new Error(`offset ${offset}: the loop read RawMemory.segments ${c.segments} time(s)`);
+    const wantActive = offset === 1 ? '[[]]' : '[]';
+    if (JSON.stringify(c.setActive) !== wantActive) throw new Error(`offset ${offset}: setActiveSegments calls ${JSON.stringify(c.setActive)}, expected ${wantActive}`);
   });
   // No window closes in 9 ticks, so no build writes a segment here.
   if (world.segmentSaves.length || world.segmentErrors.length) {
