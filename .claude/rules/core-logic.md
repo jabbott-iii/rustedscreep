@@ -30,7 +30,8 @@ paths:
 
 ## No panics
 - Non-test code uses `Result`/`Option`, checked or saturating arithmetic where overflow is possible, and `get()` or proven-in-bounds newtypes.
-- Crate roots set `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]`.
+- Crate roots set `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::todo, clippy::unimplemented, clippy::unreachable))]`.
+  `assert!`-family macros, division by zero and overflow are not covered by these lints, so avoid them in non-test code by hand.
 
 ## Formulas and tests
 - Every non-trivial formula has a doc comment that lists the constants it uses (`/// Uses: rustedscreep_consts::X, rustedscreep_consts::Y`) and

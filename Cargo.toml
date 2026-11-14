@@ -1,0 +1,31 @@
+[workspace]
+# A virtual manifest has no edition to infer the resolver from, so it must be set (VERIFICATION_LOG V78).
+resolver = "3"
+members = [
+    "crates/rustedscreep-consts",
+    "crates/rustedscreep-core",
+    "crates/rustedscreep-wasm",
+]
+# Plain `cargo test` / `cargo clippy` in the root skip the cdylib; `-p rustedscreep-wasm` still reaches it (V78).
+default-members = [
+    "crates/rustedscreep-consts",
+    "crates/rustedscreep-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+publish = false
+
+# Profiles apply only from this root manifest; member manifests' profiles are ignored (V79).
+# `cargo bench` inherits this profile but always unwinds; `cargo test` uses dev (V80).
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+# "debuginfo", not `true`/"symbols": stripping symbols also drops the `target_features` section, and
+# wasm-bindgen 0.2.130 then cannot detect the module's wasm features (V81, VERIFICATION_LOG D7).
+strip = "debuginfo"

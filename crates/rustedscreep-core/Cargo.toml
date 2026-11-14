@@ -1,0 +1,8 @@
+[package]
+name = "rustedscreep-core"
+description = "Pure, deterministic decision logic for the bot; native-testable, no JS dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true

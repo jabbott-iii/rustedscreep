@@ -43,7 +43,7 @@ Evidence conventions:
 ## P1 Build pipeline, loader, snapshot, scheduler, profiler, persistence, consts self-check
 Modules:
 1. Workspace: root `Cargo.toml` with members `crates/{rustedscreep-consts,rustedscreep-core,rustedscreep-wasm}`, `default-members` excluding `rustedscreep-wasm`, and the
-   release profile at the root (`opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip`, per SPEC §1 and ADR-002).
+   release profile at the root (`opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip="debuginfo"` (VERIFICATION_LOG D7), per SPEC §1 and ADR-002).
    Toolchain pinned in `rust-toolchain.toml`. Clippy no-panic denies at the crate roots.
 2. `rustedscreep-consts`: the facade over the API constants, `extra.rs` with sources and dates, and constant-derived tests.
 3. Build: wasm build (ADR-001) + `wasm-opt` (flags from ADR-002) + a Rollup bundle of the TypeScript loader compiled by `tsc` to ES2022, no Babel (ADR-008), into `dist/`. npm scripts: `build`, `check`, `stage` (runs the release build and copies `main.js` and the `.wasm` into the tracked `deploy/` folder for the GitHub link, or into `--out <dir>` for tests and dry runs; reports sizes, a `.wasm` byte hash and a build ID; ADR-012),

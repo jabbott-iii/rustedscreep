@@ -1,0 +1,10 @@
+# Pinned stable toolchain (ADR-002, VERIFICATION_LOG V13). Bump by editing this file; `rustup update` does not move it.
+# rustup itself never prompts. With its default auto-install (V82), the first cargo command run here on a machine
+# without this toolchain (a fresh clone, or right after a bump) downloads and installs it. To install it deliberately,
+# run this first (in Claude Code, `rustup *` commands ask for approval; plain cargo commands do not):
+#   rustup toolchain install 1.100.0 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

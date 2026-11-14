@@ -1,0 +1,11 @@
+[package]
+name = "rustedscreep-wasm"
+description = "WASM boundary for the bot: snapshot, act, persistence, profiler and the exported loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]

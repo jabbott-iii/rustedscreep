@@ -1,7 +1,7 @@
 # Status
 
-**Current phase:** P1, build pipeline, loader, snapshot, scheduler, profiler, persistence, consts self-check (not started). P0 passed 2026-11-13.
-**Pinned versions:** to pin in P1 (ADR-001, 002 and 006 accepted; VERIFICATION_LOG V1–V13): Rust 1.100.0, edition 2024, screeps-game-api 0.23.5, wasm-bindgen and wasm-bindgen-cli 0.2.130, binaryen version_133.
+**Current phase:** P1, build pipeline, loader, snapshot, scheduler, profiler, persistence, consts self-check (in progress: module 1 done). P0 passed 2026-11-13.
+**Pinned versions:** Rust 1.100.0 and edition 2024, pinned in `rust-toolchain.toml` and the root `Cargo.toml` (P1.1). Still to pin in P1 (ADR-001 and 006; VERIFICATION_LOG V1–V13): screeps-game-api 0.23.5, wasm-bindgen and wasm-bindgen-cli 0.2.130, binaryen version_133.
 **Target servers:** official MMO, shard3 (free tier) on the core track. Optional tracks: private server (`docs/ROADMAP_PRIVATE.md`, none running yet) and Seasonal (`docs/ROADMAP_SEASONAL.md`, after P12). See `docs/PROJECT_CONTEXT.md`.
 
 ## Blockers
@@ -44,8 +44,8 @@ Seasonal (`docs/ROADMAP_SEASONAL.md`):
 - [ ] SE2 Season profile and modules (after SE1)
 
 ## Current phase checklist (P1, `docs/ROADMAP.md`)
-Before P1 code (each install asks first): Rust 1.100.0 plus the `wasm32-unknown-unknown` target (rustup), wasm-bindgen-cli 0.2.130 (cargo install), binaryen version_133. Deploying also needs Node 22 or 24 (see Blockers).
-- [ ] 1. Workspace: root `Cargo.toml`, the three crates, `default-members` without rustedscreep-wasm, release profile, `rust-toolchain.toml`, clippy no-panic denies
+Installs (each asks first): Rust 1.100.0 with rustfmt, clippy and the `wasm32-unknown-unknown` target is installed (2026-11-13, V82). Caveat: rustup's default auto-install lets a plain cargo command install a missing pinned toolchain without asking (fresh clone or after a bump; V82). `RUSTUP_AUTO_INSTALL=0` would stop that, and setting it is the user's call. Still needed for module 3: wasm-bindgen-cli 0.2.130 (cargo install) and binaryen version_133. Deploying also needs Node 22 or 24 (see Blockers).
+- [x] 1. Workspace: root `Cargo.toml`, the three crates, `default-members` without rustedscreep-wasm, release profile, `rust-toolchain.toml`, clippy no-panic denies
 - [ ] 2. `rustedscreep-consts`: re-exports of the crate's constants and pure local types (ADR-005), `extra.rs`, constant-derived tests
 - [ ] 3. Build: cargo build, then wasm-bindgen CLI at the Cargo.lock version, then wasm-opt `-O4` (ADR-001/002); `tsc` to ES2022 plus Rollup (ADR-008); npm scripts including `stage` into the tracked `deploy/` folder (ADR-012); `.example-screeps.yaml`
 - [ ] GitHub-link deploy path verified (V77; needs the user to name `mmo` and push): wasm hash matches in game, sentinel shows deletion behavior, delay, identical re-sync (the trigger on `main` is confirmed)
@@ -57,6 +57,7 @@ Before P1 code (each install asks first): Rust 1.100.0 plus the `wasm32-unknown-
 - [ ] 9. Persistence (decides ADR-004)
 - [ ] 10. Config: `mmo` profile, runtime overrides, TUNING.md and the doc-sync test
 - [ ] 11. Constants self-check
+- [ ] Gate evidence (ROADMAP P1 gate, all live checks on the MMO): `/check` green; wasm loads; 10 forced traps in a row recover within the ADR-003 bound; cold-start cost measured and the boot gate set from it; empty-bot CPU floor measured; persistence round trip passes natively (with the corrupt-segment test) and once live; sizes recorded
 Timing for the P1 live checks: an RCL1 room with no upgrading is lost about 20000 ticks after it is claimed (V71). Run them shortly before P2 is ready, or respawn before the P2 deploy.
 
 ## Measurements (latest)
@@ -69,6 +70,8 @@ Timing for the P1 live checks: an RCL1 room with no upgrading is lost about 2000
 | Largest console probe unit | n/a | 864 JSON characters (limit 1024, V69) | 2026-11-13 | `node js/probe/check.mjs` |
 
 ## Log (newest first)
+- 2026-11-13: P1.1 workspace done. Root `Cargo.toml` (resolver 3, three members, `default-members` without rustedscreep-wasm, `[workspace.package]` edition 2024, rust-version 1.100, release profile `opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip="debuginfo"`), `rust-toolchain.toml` (1.100.0, minimal, rustfmt, clippy, wasm32), three empty crates, the wasm crate a `cdylib`. No dependencies yet. Crate roots deny unwrap_used, expect_used, panic, indexing_slicing, todo, unimplemented and unreachable outside tests (the last three added with the user's OK; core-logic.md updated). `strip="debuginfo"`, not `true`, because "symbols" drops `target_features`, which wasm-bindgen 0.2.130 needs (V81, D7). Evidence: `cargo fmt --all -- --check`, native clippy, wasm32 clippy and `cargo test -p rustedscreep-core -p rustedscreep-consts` (0 tests) all exit 0. `cargo tree` shows no dependencies for core or consts. Probes in a scratch copy: each lint fires exactly once on a planted violation in core (native) and wasm (wasm32), none fires under `cfg(test)`, an unknown lint name fails, and a bare `cargo build` skips the wasm crate. Release wasm sections per strip value: V81. Verification rows V78–V84 (4 researchers, 4 skeptics). /check rows 6–8 (tsc, `npm run build`, sizes) are n/a until modules 3–4. Independent review (3 lenses plus skeptics): 4 findings, 1 confirmed and fixed (the toolchain comment said rustup asks first, but its auto-install does not; V82 and the install caveat above), 3 refuted. V81 wording on when wasm-bindgen warns made precise.
+- 2026-11-13: P1 gate evaluated: not passed, because no P1 module exists yet. All 8 criteria fail. Evidence: no `Cargo.toml`, `crates/`, `rust-toolchain.toml`, `package.json`, `dist/` or `deploy/` in the repo; `cargo test -p rustedscreep-core -p rustedscreep-consts` reports "could not find `Cargo.toml`"; `npm run check` exits 1 ("Missing script: check", because npm resolves the prefix to the home folder). Toolchain found: rustc 1.99.0 (pin is 1.100.0), host target only (no `wasm32-unknown-unknown`), no `wasm-bindgen` or `wasm-opt`, Node 18.19.1. Added a gate-evidence checklist entry.
 - 2026-11-13: With the user's OK, hardened `.claude/hooks/guard-bash.mjs` (GitHub writes, git plumbing that publishes, quoted, wrapped, nested and eval forms) and added `ask` rules for `npm run stage` and `gh api` to `.claude/settings.json`. Evidence: `node .claude/hooks/test-guard-bash.mjs` passes 60 block and 32 allow cases; `node --check` and the JSON parse pass.
 - 2026-11-13: Independent review of the ADR-012 change: 20 findings confirmed and fixed (deploy dry run no longer writes `deploy/`; re-point order and its immediate overwrite stated; API fallback requires unlinking first; V77 test uses the first checked build with a byte hash, a sentinel module and a docs-only push; Steam mirror rule; ADR-012 Evidence field; V74/V75 repointed), 8 refuted. Hardening guard-bash.mjs and settings.json `ask` rules await the user's OK.
 - 2026-11-13: The user confirmed that every push to `main` triggers the GitHub sync and that the bot script will deploy from a `deploy/` folder. V77, ADR-012, ROADMAP P1 gate and STATUS updated; the P1 check now covers only `.wasm` handling, deletion and delay.
