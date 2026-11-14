@@ -15,10 +15,13 @@
     )
 )]
 
+mod scheduler;
 mod snapshot;
 
 use std::cell::RefCell;
 
+use rustedscreep_core::config::SCHEDULER_MMO;
+use rustedscreep_core::scheduler::Scheduler;
 use rustedscreep_core::snapshot::Snapshot;
 use wasm_bindgen::prelude::wasm_bindgen;
 
@@ -28,6 +31,7 @@ use wasm_bindgen::prelude::wasm_bindgen;
 struct State {
     snapshot: Snapshot,
     js: snapshot::JsWorld,
+    scheduler: Scheduler,
 }
 
 thread_local! {
@@ -42,8 +46,9 @@ fn start() {
     console_error_panic_hook::set_once();
 }
 
-/// Exported to JS as `loop`; the loader calls it once per tick. So far it takes the snapshot; the
-/// scheduler and act layer land in P1 modules 6 and 7.
+/// Exported to JS as `loop`; the loader calls it once per tick: the snapshot, then the scheduler's
+/// tick (its budget from the snapshot's tick context). No job runs under it until P2 adds the first
+/// subsystems; the act layer lands in P1 module 7.
 ///
 /// A JS exception inside the pass ends the call without unwinding, which would leave the state
 /// borrowed. The loader treats that as a trap and replaces the instance (ADR-003), so the borrow
@@ -54,8 +59,16 @@ pub fn game_loop() {
     let borrowed = STATE
         .try_with(|cell| match cell.try_borrow_mut() {
             Ok(mut state) => {
-                let State { snapshot, js } = &mut *state;
+                let State {
+                    snapshot,
+                    js,
+                    scheduler: sched,
+                } = &mut *state;
                 snapshot::take(snapshot, js);
+                // Critical, then Standard, then Optional jobs run on this tick (P2 onward).
+                let tick = sched.begin(&snapshot.tick, &SCHEDULER_MMO, scheduler::GameClock);
+                tick.finish();
+                scheduler::log_faults(sched);
                 true
             }
             Err(_) => false,
@@ -76,6 +89,18 @@ pub fn snapshot_summary() -> String {
             Err(_) => String::from("rustedscreep snapshot: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep snapshot: state unavailable"))
+}
+
+/// Exported to JS as `schedulerSummary`, for the `rustedscreep.scheduler()` console command: one line
+/// with the last tick's tier caps, what the scheduler did, and the fault counts.
+#[wasm_bindgen(js_name = "schedulerSummary")]
+pub fn scheduler_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => scheduler::summary(&state.scheduler, &state.snapshot.tick),
+            Err(_) => String::from("rustedscreep scheduler: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep scheduler: state unavailable"))
 }
 
 /// Debug export for the loader's trap-recovery test (ADR-003; the P1 gate forces 10 traps in a row).

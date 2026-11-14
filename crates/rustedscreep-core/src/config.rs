@@ -82,9 +82,139 @@ impl LoaderConfig {
     }
 }
 
+/// Scheduler thresholds (ROADMAP P1 module 6); `docs/TUNING.md` gives each one's rationale and safe
+/// range, and `crate::scheduler::Budget::compute` states the formula they feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchedulerConfig {
+    /// Percent of `Game.cpu.tickLimit` that no tier may spend: it is left for work after the decide
+    /// step (the act layer's calls, the flushes, the loader) and for the overshoot of the units run
+    /// since the last clock sample. Unit: percent.
+    pub tick_reserve_pct: u32,
+    /// Lowest bucket at which the Standard tier runs. Unit: CPU.
+    pub standard_bucket_min: u32,
+    /// Lowest bucket at which the Optional tier runs. Unit: CPU.
+    pub optional_bucket_min: u32,
+    /// Bucket at which the Optional tier's cap equals `Game.cpu.limit`. Unit: CPU.
+    pub bucket_target: u32,
+    /// Bucket above the target raises the Optional cap by 1 CPU per this many CPU of surplus, and a
+    /// bucket below it lowers the cap the same way, so the surplus (or deficit) closes over about
+    /// this many ticks. Unit: ticks.
+    pub surplus_spread_ticks: u32,
+    /// Loops a new global (after a global reset or a re-instantiation) runs before the Optional tier
+    /// may run. Unit: loops.
+    pub optional_warmup_loops: u32,
+    /// Most units (or steps) a time-sliced job runs between two clock samples. Unit: units.
+    pub max_units_per_sample: u32,
+    /// Bad clock readings (NaN, infinite or negative) in one tick after which the clock counts as
+    /// broken and every tier, Critical included, stops for the rest of the tick. Unit: readings.
+    pub bad_samples_to_break: u32,
+    /// Most fault reports logged per window, across all jobs; further faults are counted, and the
+    /// window's closing note names their jobs. Unit: reports.
+    pub fault_reports_per_window: u32,
+    /// Length of the fault-report window. Unit: ticks.
+    pub fault_window_ticks: u32,
+}
+
+/// Scheduler values for the official MMO (the only profile until P1 module 10).
+pub const SCHEDULER_MMO: SchedulerConfig = SchedulerConfig {
+    tick_reserve_pct: 10,
+    standard_bucket_min: 2000,
+    optional_bucket_min: 3000,
+    bucket_target: 9000,
+    surplus_spread_ticks: 100,
+    optional_warmup_loops: 1,
+    max_units_per_sample: 16,
+    bad_samples_to_break: 2,
+    fault_reports_per_window: 10,
+    fault_window_ticks: 100,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finds the rows of one config struct in TUNING.md and checks each field has exactly one row
+    /// whose default equals the value in config.rs.
+    fn assert_tuning_rows(tuning: &str, strukt: &str, expected: &[(&str, String)]) {
+        let start = format!("| `{strukt}::");
+        let rows: Vec<&str> = tuning.lines().filter(|l| l.starts_with(&start)).collect();
+        assert_eq!(rows.len(), expected.len(), "{strukt} rows in TUNING.md");
+        for (field, default) in expected {
+            let prefix = format!("| `{strukt}::{field}` | {default} |");
+            assert_eq!(
+                rows.iter().filter(|r| r.starts_with(&prefix)).count(),
+                1,
+                "TUNING.md needs one row starting {prefix}"
+            );
+        }
+    }
+
+    const TUNING: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/TUNING.md"));
+
+    /// Uses: rustedscreep_consts::{CPU_BUCKET_MAX, CPU_TICK_LIMIT_MAX}, LOADER_MMO.boot_bucket_min.
+    /// The bucket gates are ordered and reachable, and every divisor and count is at least 1.
+    ///
+    /// Standard's gate is at least the boot gate plus `CPU_TICK_LIMIT_MAX`: Standard switches on from
+    /// the bucket at the start of the tick, and one tick is billed about tickLimit at most (the
+    /// scheduler stops every tier at the ceiling and the reserve covers the rest) while it refills
+    /// `limit`, which is at least 0 (V37). So a Standard tick leaves the bucket at or above the boot
+    /// gate, and a global reset in a CPU deficit can still boot at once. At the MMO's limit of 20 the
+    /// refill also covers the up to 1 CPU of ceil billing (V106).
+    #[test]
+    fn scheduler_values_are_coherent() {
+        let c = SCHEDULER_MMO;
+        assert!((5..=50).contains(&c.tick_reserve_pct));
+        assert!(
+            c.standard_bucket_min
+                >= LOADER_MMO.boot_bucket_min + rustedscreep_consts::CPU_TICK_LIMIT_MAX,
+            "one Standard tick must not cross the loader's boot gate"
+        );
+        assert!(c.standard_bucket_min <= c.optional_bucket_min);
+        assert!(c.optional_bucket_min <= c.bucket_target);
+        assert!(c.bucket_target <= rustedscreep_consts::CPU_BUCKET_MAX);
+        assert!(c.surplus_spread_ticks >= 1);
+        assert!(
+            c.optional_warmup_loops >= 1,
+            "the first tick after a reset must not run Optional work (wasm-bot rule)"
+        );
+        assert!(c.max_units_per_sample >= 1);
+        assert!(c.bad_samples_to_break >= 1);
+        assert!(c.fault_reports_per_window >= 1 && c.fault_window_ticks >= 1);
+    }
+
+    /// docs/TUNING.md mirrors SCHEDULER_MMO field for field (CLAUDE.md).
+    #[test]
+    fn tuning_md_mirrors_the_scheduler_config() {
+        // Exhaustive: adding a field without a row here fails to compile.
+        let SchedulerConfig {
+            tick_reserve_pct,
+            standard_bucket_min,
+            optional_bucket_min,
+            bucket_target,
+            surplus_spread_ticks,
+            optional_warmup_loops,
+            max_units_per_sample,
+            bad_samples_to_break,
+            fault_reports_per_window,
+            fault_window_ticks,
+        } = SCHEDULER_MMO;
+        let expected = [
+            ("tick_reserve_pct", tick_reserve_pct.to_string()),
+            ("standard_bucket_min", standard_bucket_min.to_string()),
+            ("optional_bucket_min", optional_bucket_min.to_string()),
+            ("bucket_target", bucket_target.to_string()),
+            ("surplus_spread_ticks", surplus_spread_ticks.to_string()),
+            ("optional_warmup_loops", optional_warmup_loops.to_string()),
+            ("max_units_per_sample", max_units_per_sample.to_string()),
+            ("bad_samples_to_break", bad_samples_to_break.to_string()),
+            (
+                "fault_reports_per_window",
+                fault_reports_per_window.to_string(),
+            ),
+            ("fault_window_ticks", fault_window_ticks.to_string()),
+        ];
+        assert_tuning_rows(TUNING, "SchedulerConfig", &expected);
+    }
 
     /// Uses: rustedscreep_consts::CPU_BUCKET_MAX. A boot gate above the bucket's maximum would never open.
     #[test]
@@ -103,7 +233,6 @@ mod tests {
     /// one row whose default equals `LOADER_MMO`. P1 module 10 extends this to every config struct.
     #[test]
     fn tuning_md_mirrors_the_loader_config() {
-        let tuning = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/TUNING.md"));
         // Exhaustive: adding a field without a row here fails to compile.
         let LoaderConfig {
             boot_bucket_min,
@@ -127,19 +256,7 @@ mod tests {
             ("notify_group_minutes", notify_group_minutes.to_string()),
             ("trap_test_max", trap_test_max.to_string()),
         ];
-        let rows: Vec<&str> = tuning
-            .lines()
-            .filter(|l| l.starts_with("| `LoaderConfig::"))
-            .collect();
-        assert_eq!(rows.len(), expected.len(), "LoaderConfig rows in TUNING.md");
-        for (field, default) in expected {
-            let prefix = format!("| `LoaderConfig::{field}` | {default} |");
-            assert_eq!(
-                rows.iter().filter(|r| r.starts_with(&prefix)).count(),
-                1,
-                "TUNING.md needs one row starting {prefix}"
-            );
-        }
+        assert_tuning_rows(TUNING, "LoaderConfig", &expected);
     }
 
     #[test]

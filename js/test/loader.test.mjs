@@ -364,3 +364,30 @@ test('a snapshot command that throws poisons the instance like a trap, and the n
   h.tick();
   assert.equal(h.halts, 1, 'the next tick halts, as after a trap in loop');
 });
+
+test('the scheduler command calls the wasm only while it is ready, reports a missing export, and a throw poisons', () => {
+  const none = harness();
+  assert.match(none.loader.scheduler(), /no schedulerSummary export/);
+  let calls = 0;
+  const h = harness({ glue: { schedulerSummary: () => `scheduler ${++calls}` } });
+  assert.match(h.loader.scheduler(), /no scheduler summary while the loader is idle/);
+  assert.match(h.loader.snapshot(), /no snapshotSummary export/, 'each command checks its own export');
+  h.tick(2);
+  assert.equal(h.loader.scheduler(), 'scheduler 1');
+  assert.equal(h.loader.running, false);
+  h.loopThrows = true;
+  h.tick();
+  assert.equal(h.loader.phase, 'poisoned');
+  assert.match(h.loader.scheduler(), /no scheduler summary while the loader is poisoned/);
+  assert.equal(calls, 1, 'the wasm is not called while poisoned');
+
+  const bad = harness({ glue: { schedulerSummary: () => { throw new Error('RuntimeError: unreachable'); } } });
+  bad.tick(2);
+  assert.match(bad.loader.scheduler(), /schedulerSummary trapped; the loader recovers on the next tick/);
+  assert.equal(bad.loader.phase, 'poisoned');
+  assert.equal(bad.loader.running, false);
+  assert.equal(bad.mem.incidents.length, 1);
+  assert.ok(bad.logs.some((l) => l.includes('incident: trap at') && /schedulerSummary: Error: RuntimeError/.test(l)));
+  bad.tick();
+  assert.equal(bad.halts, 1);
+});

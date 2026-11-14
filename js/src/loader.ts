@@ -39,6 +39,8 @@ export interface Glue {
   trapTest?: () => void;
   /** One line about the wasm's latest snapshot (P1 module 5), for a console command. */
   snapshotSummary?: () => string;
+  /** One line about the wasm's scheduler: tier caps, work done, faults (P1 module 6), for a console command. */
+  schedulerSummary?: () => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -437,23 +439,34 @@ export class Loader {
     return `rustedscreep: ${n} trap(s) scheduled; each fires in the next loop after a boot`;
   }
 
-  /**
-   * Console command: the wasm's summary of this tick's snapshot. It calls into the wasm only while the
-   * instance is healthy, and a throw poisons it like a trap in loop, so the next tick recovers.
-   */
+  /** Console command: the wasm's summary of this tick's snapshot. */
   snapshot(): string {
-    if (!this.glue.snapshotSummary) return 'rustedscreep: this build has no snapshotSummary export';
-    if (this.phase !== 'ready' || this.running) return `rustedscreep: no snapshot while the loader is ${this.phase}`;
+    return this.summary('snapshotSummary', 'snapshot');
+  }
+
+  /** Console command: the wasm's summary of the scheduler's last tick. */
+  scheduler(): string {
+    return this.summary('schedulerSummary', 'scheduler summary');
+  }
+
+  /**
+   * Calls a wasm summary export for a console command, only while the instance is healthy. A throw
+   * poisons the instance like a trap in loop, so the next tick recovers.
+   */
+  private summary(name: 'snapshotSummary' | 'schedulerSummary', noun: string): string {
+    const call = this.glue[name];
+    if (!call) return `rustedscreep: this build has no ${name} export`;
+    if (this.phase !== 'ready' || this.running) return `rustedscreep: no ${noun} while the loader is ${this.phase}`;
     this.running = true;
     try {
-      const text = this.glue.snapshotSummary();
+      const text = call();
       this.running = false;
       return text;
     } catch (e) {
       this.running = false;
       this.phase = 'poisoned';
-      this.incident('trap', `snapshotSummary: ${message(e)}`);
-      return 'rustedscreep: snapshotSummary trapped; the loader recovers on the next tick';
+      this.incident('trap', `${name}: ${message(e)}`);
+      return `rustedscreep: ${name} trapped; the loader recovers on the next tick`;
     }
   }
 

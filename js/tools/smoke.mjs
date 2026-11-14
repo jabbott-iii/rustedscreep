@@ -118,23 +118,60 @@ const SNAPSHOT_EXPECTED = {
 };
 
 /**
+ * What `rustedscreep.scheduler()` must report after the loops at these offsets. The fake world has CPU limit
+ * 20, tickLimit 500 and bucket 10000, so with SCHEDULER_MMO (crates/rustedscreep-core/src/config.rs) the
+ * ceiling is 500 × (100 − 10) / 100 = 450 and the Optional cap 20 + (10000 − 9000) / 100 = 30. The first loop
+ * of a global runs no Optional work (warm-up), and no job runs yet, so the clock is never sampled.
+ */
+const SCHEDULER_EXPECTED = {
+  1: [
+    'rustedscreep scheduler at tick 50000001 (loop 0 of this global): cpu limit 20, tickLimit 500, bucket 10000',
+    'ceiling 450.0; critical on; standard on (cap 450.0); optional off (warm-up)',
+    'samples 0 (bad 0), units 0, budget stops 0, tier-off skips 0, out of order 0, faults 0',
+    'faults since boot 0 (this window 0)',
+  ],
+  4: ['(loop 3 of this global)', 'optional on (cap 30.0)', ' | clock now '],
+};
+
+/** The results of `cmd` in tick order: each command's result is logged right after it. */
+function commandResults(world, cmd) {
+  return world.logs.filter((l, i) => i > 0 && world.logs[i - 1] === `> ${cmd}`);
+}
+
+/** Checks each result of `cmd` against the parts expected at its offset. */
+function checkResults(world, cmd, expectedByOffset, label) {
+  const results = commandResults(world, cmd);
+  const expected = Object.entries(expectedByOffset);
+  if (results.length !== expected.length) throw new Error(`${results.length} ${label} summaries, expected ${expected.length}`);
+  expected.forEach(([offset, parts], i) => {
+    const missing = parts.filter((p) => !results[i].includes(p));
+    if (missing.length) throw new Error(`${label} at offset ${offset} lacks ${missing.join(' / ')}: ${results[i]}`);
+  });
+  return results;
+}
+
+/**
  * The plain smoke test npm run build runs: the bundle boots, logs a matching CRC-32, runs clean, and its
- * snapshot of the fake world matches SNAPSHOT_EXPECTED.
+ * snapshot and scheduler summaries of the fake world match SNAPSHOT_EXPECTED and SCHEDULER_EXPECTED.
  */
 export function smoke(dir = join(ROOT, 'dist')) {
   const world = simulate(dir, {
     ticks: 6,
-    command: (w) => (SNAPSHOT_EXPECTED[w.ticksRun] ? 'rustedscreep.snapshot()' : null),
+    command: (w) => {
+      if (SNAPSHOT_EXPECTED[w.ticksRun]) return 'rustedscreep.snapshot()';
+      if (SCHEDULER_EXPECTED[w.ticksRun]) return 'rustedscreep.scheduler()';
+      return null;
+    },
   });
-  // Each command's result is logged right after it, in tick order.
-  const summaries = world.logs.filter((l, i) => i > 0 && world.logs[i - 1] === '> rustedscreep.snapshot()');
-  const expected = Object.entries(SNAPSHOT_EXPECTED);
-  if (summaries.length !== expected.length) throw new Error(`${summaries.length} snapshot summaries, expected ${expected.length}`);
-  expected.forEach(([offset, parts], i) => {
-    const missing = parts.filter((p) => !summaries[i].includes(p));
-    if (missing.length) throw new Error(`snapshot at offset ${offset} lacks ${missing.join(' / ')}: ${summaries[i]}`);
-    if (summaries[i].includes('NOT aligned')) throw new Error(`snapshot at offset ${offset}: JS objects and rows differ: ${summaries[i]}`);
+  const summaries = checkResults(world, 'rustedscreep.snapshot()', SNAPSHOT_EXPECTED, 'snapshot');
+  summaries.forEach((s) => {
+    if (s.includes('NOT aligned')) throw new Error(`snapshot: JS objects and rows differ: ${s}`);
   });
+  for (const s of checkResults(world, 'rustedscreep.scheduler()', SCHEDULER_EXPECTED, 'scheduler')) {
+    // The sandbox's getUsed is real elapsed time since the tick started, so a reading of 0 or more.
+    if (!/ \| clock now \d+\.\d\d \|/.test(s)) throw new Error(`scheduler: no clock reading: ${s}`);
+  }
+  if (world.logs.some((l) => l.startsWith('rustedscreep fault'))) throw new Error('a fault was logged with no job running');
   const boot = world.logs.find((l) => l.startsWith('rustedscreep boot:'));
   if (!boot) throw new Error(`no boot log; logs: ${world.logs.join(' / ')}`);
   if (!boot.includes(': match)')) throw new Error(`the boot log does not report a matching CRC-32: ${boot}`);
