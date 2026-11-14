@@ -12,6 +12,10 @@ default-members = [
     "crates/rustedscreep-core",
 ]
 
+# Exact pins: a version bump is a deliberate edit plus re-verification (VERIFICATION_LOG V1; ADR-005, ADR-006).
+[workspace.dependencies]
+screeps-game-api = "=0.23.5"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

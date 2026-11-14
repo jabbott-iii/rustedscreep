@@ -6,3 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[dependencies]
+# Only `screeps::constants` and pure `screeps::local` types are used (ADR-005; purity hook).
+screeps-game-api.workspace = true
