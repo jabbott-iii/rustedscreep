@@ -1,0 +1,20 @@
+{
+  // Loader build (ADR-008): tsc to ES2022, the level the MMO probe accepted (VERIFICATION_LOG V72).
+  // Rollup then bundles js/build/main.js with the wasm-bindgen glue in js/pkg into dist/main.js.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    // No "DOM": TextDecoder is undefined on the MMO (V72) and fetch and document are assumed absent (V95).
+    // src/env.d.ts declares what the runtime has.
+    "lib": ["ES2022"],
+    "types": [],
+    "strict": true,
+    "noEmitOnError": true,
+    // The generated glue's .d.ts names DOM types (RequestInfo, Response) for its unused async init.
+    "skipLibCheck": true,
+    "rootDir": "src",
+    "outDir": "build"
+  },
+  "include": ["src"]
+}

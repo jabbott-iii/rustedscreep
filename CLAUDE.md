@@ -78,11 +78,13 @@ The live server's constants are the ground truth for that server. At init, the b
 | Lints, native | `cargo clippy -p rustedscreep-core -p rustedscreep-consts --all-targets -- -D warnings` |
 | Lints, wasm | `cargo clippy -p rustedscreep-wasm --target wasm32-unknown-unknown -- -D warnings` |
 | Benches (native only) | `cargo bench -p rustedscreep-core` |
+| Install the pinned wasm-opt (binaryen version_133) into `.tools/` | `npm run setup:binaryen` |
 | Release build (wasm + wasm-opt + Rollup to `dist/`) | `npm run build` |
+| Tool tests (Node) / sizes and upload budget | `npm run test` / `npm run size` |
 | Full gate (same as `/check`) | `npm run check` |
-| Stage the MMO deploy folder for the GitHub link (ask first; the user pushes) | `npm run stage` |
-| Deploy through the API (ask first; private, season, or the ADR-012 fallback) | `npm run deploy -- --server <name> [--dryrun]` |
-| Capture console / profiler stats to `logs/` | `npm run console -- --server <name>` / `npm run stats -- --server <name>` |
+| Stage the MMO deploy folder for the GitHub link (ask first; the user pushes) | `npm run stage` (`-- --out <dir>` for a dry run) |
+| Deploy through the API (ask first; private, season, or the ADR-012 fallback; not written yet, needs Node 22/24) | `npm run deploy -- --server <name> [--dryrun]` |
+| Capture console / profiler stats to `logs/` (not written yet, needs Node 22/24) | `npm run console -- --server <name>` / `npm run stats -- --server <name>` |
 
 ## Workflow
 - Start with `/kickoff` (P0). Then run `/module` repeatedly. With no argument it takes the next item in STATUS and ROADMAP. Close each phase with `/phase-gate <P#|PS#|SE#>`.

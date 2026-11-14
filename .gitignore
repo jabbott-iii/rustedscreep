@@ -2,7 +2,12 @@
 /target
 /dist
 /pkg
+/js/pkg
+/js/build
 node_modules/
+
+# Project-local tools (npm run setup:binaryen)
+/.tools
 
 # Credentials and personal settings (never commit)
 .screeps.yaml

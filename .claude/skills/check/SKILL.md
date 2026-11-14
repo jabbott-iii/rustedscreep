@@ -15,12 +15,13 @@ Run these in order. Do not stop at the first failure, because the user wants the
 | 2 | Clippy, native | `cargo clippy -p rustedscreep-core -p rustedscreep-consts --all-targets -- -D warnings` |
 | 3 | Clippy, wasm | `cargo clippy -p rustedscreep-wasm --target wasm32-unknown-unknown -- -D warnings` |
 | 4 | Native tests (includes the TUNING doc-sync test and the consts tests) | `cargo test -p rustedscreep-core -p rustedscreep-consts` |
-| 5 | Purity: no JS crates in pure crates | `cargo tree -p rustedscreep-core -e normal` must not contain `wasm-bindgen`, `js-sys`, or `web-sys`. If ADR-005 allows `screeps-game-api` in `rustedscreep-consts`, check only `rustedscreep-core`'s direct dependencies. |
-| 6 | TypeScript | `npx tsc --noEmit -p js` |
-| 7 | Release build + bundle | `npm run build` |
-| 8 | Sizes | Report the sizes of the `.wasm` and the JS bundle in `dist/` and the delta against the last value in STATUS.md |
+| 5 | Purity: no JS crates in pure crates | `cargo tree -p rustedscreep-core -e normal --prefix depth` must not contain `wasm-bindgen`, `js-sys`, or `web-sys` outside the `rustedscreep-consts` subtree, which ADR-005 allows to pull in `screeps-game-api` (guard-purity.mjs covers the facade's own boundary). |
+| 6 | Tool tests | `npm run test` |
+| 7 | Release build + bundle + smoke | `npm run build`; it ends by running `dist/main.js` in a Screeps-like sandbox for a few ticks (`js/tools/smoke.mjs`) |
+| 8 | TypeScript | `npx tsc --noEmit -p js` (after the build, which generates the glue it type-checks against) |
+| 9 | Sizes | `npm run size` prints the build ID, the `.wasm` and `main.js` sizes in `dist/`, and the upload estimate against the V76 budget. Report those plus the delta against the last values in STATUS.md, computed by hand. |
 
-If `npm run check` exists, it may run all of these at once. Still report each row separately.
+`npm run check` runs all of these at once (`js/tools/check.mjs`). Still report each row separately.
 
 ## Report
 A table: # | check | result (pass / FAIL / n/a) | key output (first relevant error lines, or the counts).

@@ -1,0 +1,22 @@
+{
+  "name": "rustedscreep",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Screeps: World bot in Rust, compiled to WebAssembly, with a thin TypeScript loader.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.19"
+  },
+  "scripts": {
+    "build": "node js/tools/build.mjs",
+    "check": "node js/tools/check.mjs",
+    "stage": "node js/tools/stage.mjs",
+    "size": "node js/tools/size.mjs",
+    "test": "node --test js/tools/lib/common.test.mjs js/tools/lib/crc32.test.mjs js/tools/lib/paths.test.mjs js/tools/lib/bundle-check.test.mjs js/tools/check.test.mjs js/tools/size.test.mjs js/tools/smoke.test.mjs",
+    "setup:binaryen": "node js/tools/setup-binaryen.mjs"
+  },
+  "devDependencies": {
+    "rollup": "4.66.0",
+    "typescript": "7.0.2"
+  }
+}

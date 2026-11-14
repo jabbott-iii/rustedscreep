@@ -14,3 +14,10 @@
         clippy::unreachable
     )
 )]
+
+use wasm_bindgen::prelude::wasm_bindgen;
+
+/// Exported to JS as `loop`; the loader calls it once per tick. It does nothing yet: it gives the
+/// build pipeline (P1 module 3) a real export until the tick path lands (P1 modules 5 to 7).
+#[wasm_bindgen(js_name = "loop")]
+pub fn game_loop() {}

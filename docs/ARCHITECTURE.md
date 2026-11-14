@@ -18,7 +18,12 @@ denies the panicking clippy lints outside tests.
 rustedscreep-consts (P1.2) re-exports the `screeps::constants` items at its root, minus the JS-carrying `find` and `look` modules and
 `FindConstant`/`LookConstant` traits (hidden by private shadows), plus the pure `screeps::local` types by name, and holds values the
 API does not export in `extra` (never glob-re-exported). Its crate docs list the JS-backed, panicking and overflowing APIs that
-rustedscreep-core must avoid. rustedscreep-core and rustedscreep-wasm have no modules or dependencies yet.
+rustedscreep-core must avoid. rustedscreep-core has no modules or dependencies yet; rustedscreep-wasm has only an empty `loop` export.
+
+js/ (P1.3): `js/src/main.ts` is a build-pipeline placeholder until the loader lands (P1 module 4). `js/tools/` holds the build
+(cargo → wasm-bindgen `--target web` → `wasm-opt -O4` → tsc → Rollup CJS into `dist/`), stage (into `deploy/` for the GitHub link),
+size, check, smoke (the bundle in a Screeps-like sandbox, run at the end of every build) and setup-binaryen. Generated files go to the git-ignored `js/pkg/`,
+`js/build/` and `dist/`.
 
 ## 3. Cache and invalidation table
 _P1 onward._ | Cache | Key | Contents | Built in tier | Invalidated by | TTL | Approx. size | Toggle (naive mode) |
