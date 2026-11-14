@@ -12,7 +12,7 @@
     "check": "node js/tools/check.mjs",
     "stage": "node js/tools/stage.mjs",
     "size": "node js/tools/size.mjs",
-    "test": "node --test js/tools/lib/common.test.mjs js/tools/lib/crc32.test.mjs js/tools/lib/paths.test.mjs js/tools/lib/bundle-check.test.mjs js/tools/check.test.mjs js/tools/size.test.mjs js/tools/smoke.test.mjs",
+    "test": "node js/tools/run-tests.mjs",
     "setup:binaryen": "node js/tools/setup-binaryen.mjs"
   },
   "devDependencies": {

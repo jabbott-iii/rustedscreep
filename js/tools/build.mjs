@@ -1,6 +1,7 @@
 // Release build (ADR-001, ADR-002, ADR-008): cargo build for wasm32, then the wasm-bindgen CLI at the
-// exact Cargo.lock version (--target web), then the pinned wasm-opt -O4, then tsc and Rollup.
-// Output: dist/main.js, dist/rustedscreep_wasm.wasm and dist/build-info.json. Usage: npm run build.
+// exact Cargo.lock version (--target web), then the pinned wasm-opt -O4, then tsc and Rollup, then a
+// smoke run in a Screeps-like sandbox. Output: dist/main.js, dist/rustedscreep_wasm.wasm and
+// dist/build-info.json. Usage: npm run build [-- --features trap-test].
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -12,6 +13,8 @@ import { crc32Hex } from './lib/crc32.mjs';
 import { smoke } from './smoke.mjs';
 
 export const DIST = join(ROOT, 'dist');
+/** Cargo features of rustedscreep-wasm that a build may enable. */
+export const KNOWN_FEATURES = ['trap-test'];
 const PKG = join(ROOT, 'js', 'pkg');
 const TS_OUT = join(ROOT, 'js', 'build');
 const BIN = join(ROOT, 'node_modules', '.bin');
@@ -59,49 +62,87 @@ function gitDescription() {
   return `${sha.stdout.trim()}${dirty ? '-dirty' : ''}`;
 }
 
+/** `--features a,b` (or repeated) from argv, checked against KNOWN_FEATURES. */
+export function parseFeatures(argv) {
+  const features = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--features' && argv[i + 1]) features.push(...argv[++i].split(',').filter(Boolean));
+    else fail(`unknown argument: ${argv[i]} (usage: [--features ${KNOWN_FEATURES.join(',')}])`);
+  }
+  const unknown = features.filter((f) => !KNOWN_FEATURES.includes(f));
+  if (unknown.length) fail(`unknown feature(s): ${unknown.join(', ')}; known: ${KNOWN_FEATURES.join(', ')}`);
+  return [...new Set(features)].sort();
+}
+
+/** The loader thresholds from rustedscreep-core's config.rs (LOADER_MMO), as printed by its example. */
+function loaderConfig() {
+  const res = mustRun('loader config', 'cargo', ['run', '--quiet', '-p', 'rustedscreep-core', '--example', 'loader_config'], { capture: true });
+  const config = JSON.parse(res.stdout);
+  const want = ['bootBucketMin', 'bootSplitTicks', 'recoveryMode', 'backoffWindowTicks', 'backoffIncidents',
+    'backoffBaseTicks', 'backoffMaxTicks', 'notifyGroupMinutes', 'trapTestMax'];
+  if (Object.keys(config).sort().join(',') !== [...want].sort().join(',')) fail(`loader config keys differ: ${res.stdout.trim()}`);
+  return config;
+}
+
 /** The wasm cargo builds, under cargo's real target directory (CARGO_TARGET_DIR and config honoured). */
 function cargoWasmPath() {
   const meta = mustRun('cargo metadata', 'cargo', ['metadata', '--format-version', '1', '--no-deps'], { capture: true });
   return join(JSON.parse(meta.stdout).target_directory, 'wasm32-unknown-unknown', 'release', `${WASM_MODULE}.wasm`);
 }
 
-export function build() {
+/**
+ * `loaderOverrides` replaces some loader values from config.rs. Only tests use it (js/tools/trap-sim.mjs runs
+ * the reinstantiate mode); the build ID and build-info.json record it.
+ */
+export function build({ features = [], dist = DIST, loaderOverrides = {} } = {}) {
   // Remove every output first, so a build that fails part way cannot leave an older build to be checked or staged.
-  for (const dir of [PKG, TS_OUT, DIST]) rmSync(dir, { recursive: true, force: true });
+  for (const dir of [PKG, TS_OUT, dist]) rmSync(dir, { recursive: true, force: true });
 
   step('tools');
   const tools = checkTools();
   console.log(`wasm-bindgen ${tools.wasmBindgen}; ${tools.wasmOptVersion} (${tools.wasmOpt})`);
 
-  step('cargo build (release, wasm32-unknown-unknown)');
-  mustRun('cargo build', 'cargo', ['build', '--release', '--target', 'wasm32-unknown-unknown', '-p', 'rustedscreep-wasm']);
+  step('loader config (rustedscreep-core config.rs)');
+  const base = loaderConfig();
+  const unknownOverrides = Object.keys(loaderOverrides).filter((k) => !(k in base));
+  if (unknownOverrides.length) fail(`unknown loader override(s): ${unknownOverrides.join(', ')}`);
+  const config = { ...base, ...loaderOverrides };
+  console.log(JSON.stringify(config));
+
+  step(`cargo build (release, wasm32-unknown-unknown${features.length ? `, features ${features.join(',')}` : ''})`);
+  const featureArgs = features.length ? ['--features', features.join(',')] : [];
+  mustRun('cargo build', 'cargo', ['build', '--release', '--target', 'wasm32-unknown-unknown', '-p', 'rustedscreep-wasm', ...featureArgs]);
   const cargoWasm = cargoWasmPath();
 
   step('wasm-bindgen --target web');
   // --omit-default-module-path drops the glue's `new URL(..., import.meta.url)` default (V90).
-  mustRun('wasm-bindgen', 'wasm-bindgen', [cargoWasm, '--target', 'web', '--out-dir', PKG, '--omit-default-module-path']);
+  // --experimental-reset-state-function exports __wbg_reset_state, ADR-003's re-instantiation path (V97).
+  mustRun('wasm-bindgen', 'wasm-bindgen', [cargoWasm, '--target', 'web', '--out-dir', PKG, '--omit-default-module-path',
+    '--experimental-reset-state-function']);
   const pkgFiles = readdirSync(PKG).sort();
   if (pkgFiles.join(',') !== [...EXPECTED_PKG_FILES].sort().join(',')) {
     fail(`unexpected wasm-bindgen output in js/pkg: ${pkgFiles.join(', ')}; expected ${EXPECTED_PKG_FILES.join(', ')}`);
   }
 
   step(`wasm-opt -O4 (binaryen ${BINARYEN_VERSION})`);
-  mkdirSync(DIST, { recursive: true });
-  const distWasm = join(DIST, `${WASM_MODULE}.wasm`);
+  mkdirSync(dist, { recursive: true });
+  const distWasm = join(dist, `${WASM_MODULE}.wasm`);
   // No --enable-* flags: wasm-opt reads the target_features section that strip="debuginfo" keeps (V81, V91).
   mustRun('wasm-opt', tools.wasmOpt, [join(PKG, `${WASM_MODULE}_bg.wasm`), '-O4', '-o', distWasm]);
   const wasmBytes = readFileSync(distWasm);
   const wasmCrc = crc32Hex(wasmBytes);
-  const buildId = `${gitDescription()}-${wasmCrc}`;
+  const overrideTag = Object.keys(loaderOverrides).length ? `+override(${Object.entries(loaderOverrides).map(([k, v]) => `${k}=${v}`).join(',')})` : '';
+  const buildId = `${gitDescription()}-${wasmCrc}${features.map((f) => `+${f}`).join('')}${overrideTag}`;
+  const buildValue = { id: buildId, wasmCrc32: wasmCrc, features };
 
   step('tsc (ES2022)');
   mustRun('tsc', join(BIN, 'tsc'), ['-p', join(ROOT, 'js')]);
 
   step('rollup (CommonJS)');
-  mustRun('rollup', join(BIN, 'rollup'), ['-c', join(ROOT, 'rollup.config.mjs')], {
-    env: { ...process.env, RUSTEDSCREEP_BUILD_ID: buildId },
+  const mainPath = join(dist, 'main.js');
+  mustRun('rollup', join(BIN, 'rollup'), ['-c', join(ROOT, 'rollup.config.mjs'), '--file', mainPath], {
+    env: { ...process.env, RUSTEDSCREEP_BUILD: JSON.stringify(buildValue), RUSTEDSCREEP_LOADER_CONFIG: JSON.stringify(config) },
   });
-  const mainPath = join(DIST, 'main.js');
   const mainText = readFileSync(mainPath, 'utf8');
   if (!/^exports\.loop = loop;$/m.test(mainText)) fail('dist/main.js does not export loop as exports.loop');
   const problems = bundleProblems(mainText, WASM_MODULE);
@@ -110,8 +151,8 @@ export function build() {
 
   step('smoke test (Screeps-like sandbox)');
   try {
-    const logs = smoke(DIST);
-    console.log(`3 ticks ran; ${logs.length} log line(s)`);
+    const result = smoke(dist);
+    console.log(`${result.ticks} ticks ran; booted on tick ${result.bootedAt}; ${result.logs.length} log line(s)`);
   } catch (e) {
     fail(`bundle smoke test failed: ${e.message}`);
   }
@@ -119,6 +160,9 @@ export function build() {
   const mainBytes = Buffer.from(mainText, 'utf8');
   const info = {
     buildId,
+    features,
+    loaderConfig: config,
+    loaderOverrides,
     tools: {
       wasmBindgen: tools.wasmBindgen,
       wasmOpt: tools.wasmOptVersion,
@@ -130,7 +174,7 @@ export function build() {
       [WASM_MODULE]: { file: `${WASM_MODULE}.wasm`, bytes: wasmBytes.length, sha256: sha256(wasmBytes), crc32: wasmCrc },
     },
   };
-  writeFileSync(join(DIST, 'build-info.json'), `${JSON.stringify(info, null, 2)}\n`);
+  writeFileSync(join(dist, 'build-info.json'), `${JSON.stringify(info, null, 2)}\n`);
 
   step('done');
   console.log(`build ${buildId}`);
@@ -139,4 +183,4 @@ export function build() {
   return info;
 }
 
-if (isMain(import.meta.url)) build();
+if (isMain(import.meta.url)) build({ features: parseFeatures(process.argv.slice(2)) });

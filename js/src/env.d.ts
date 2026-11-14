@@ -2,12 +2,29 @@
 // and TextEncoder are undefined on the MMO (VERIFICATION_LOG V72), fetch and document are assumed absent
 // (V95), and DOM types would hide that. Extend this file only with globals the runtime is known to provide.
 
-/** CommonJS require: for a binary module it returns the module's bytes (V31). */
+/** CommonJS require: for a binary module it returns the module's bytes (V31); a missing one throws (V96). */
 declare function require(module: string): unknown;
 
+/** Rebuilt before every tick, with only log among the methods the loader uses (V96). */
 declare const console: {
   log(...args: unknown[]): void;
 };
+
+declare const Game: {
+  readonly time: number;
+  readonly cpu: {
+    readonly bucket: number;
+    readonly limit: number;
+    readonly tickLimit: number;
+    getUsed(): number;
+    /** Resets the global; discards the current tick's intents and Memory writes (V96). Not on every server. */
+    halt?: () => void;
+  };
+  notify(message: string, groupInterval?: number): void;
+};
+
+/** Parsed on first access in a tick and saved at its end; mutate its fields, never reassign it (V96). */
+declare const Memory: Record<string, unknown>;
 
 type BufferSource = ArrayBufferView | ArrayBuffer;
 

@@ -20,6 +20,7 @@ Run these in order. Do not stop at the first failure, because the user wants the
 | 7 | Release build + bundle + smoke | `npm run build`; it ends by running `dist/main.js` in a Screeps-like sandbox for a few ticks (`js/tools/smoke.mjs`) |
 | 8 | TypeScript | `npx tsc --noEmit -p js` (after the build, which generates the glue it type-checks against) |
 | 9 | Sizes | `npm run size` prints the build ID, the `.wasm` and `main.js` sizes in `dist/`, and the upload estimate against the V76 budget. Report those plus the delta against the last values in STATUS.md, computed by hand. |
+| 10 | Trap recovery (sandbox) | run by `npm run check` (`js/tools/trap-sim.mjs`): builds two trap-test variants and runs 10 forced traps through each ADR-003 recovery mode |
 
 `npm run check` runs all of these at once (`js/tools/check.mjs`). Still report each row separately.
 

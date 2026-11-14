@@ -1,12 +1,13 @@
 // Stages a fresh release build for the MMO GitHub link (ADR-012). Usage:
 //   npm run stage                 build, then copy main.js and the .wasm into the tracked deploy/ folder
 //   npm run stage -- --out <dir>  the same into <dir> (tests and dry runs); <dir> must be new or empty
+//   --features trap-test           a trap-test build, for the P1 gate's recovery test (ADR-003)
 // It reports the module names, sizes, the .wasm hashes and the build ID. It never commits or pushes:
 // committing and pushing deploy/ to main is the user's deploy step.
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { build, DIST } from './build.mjs';
+import { build, DIST, parseFeatures } from './build.mjs';
 import { ROOT, WASM_MODULE, canonicalPath, fail, isInside, sha256 } from './lib/common.mjs';
 import { crc32Hex } from './lib/crc32.mjs';
 import { measure, report } from './size.mjs';
@@ -15,14 +16,14 @@ const DEPLOY = join(ROOT, 'deploy');
 const FILES = ['main.js', `${WASM_MODULE}.wasm`];
 // Writing into the Steam client's script mirror uploads at once (VERIFICATION_LOG V74), so never stage there.
 const STEAM_MIRROR = join(homedir(), '.config', 'Screeps');
-const PLACEHOLDER_MARKER = 'rustedscreep build-pipeline placeholder';
 
 function parseArgs(argv) {
-  const args = { out: null };
+  const args = { out: null, rest: [] };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--out' && argv[i + 1]) args.out = argv[++i];
-    else fail(`unknown argument: ${argv[i]} (usage: npm run stage [-- --out <dir>])`);
+    else args.rest.push(argv[i]);
   }
+  args.features = parseFeatures(args.rest);
   return args;
 }
 
@@ -55,11 +56,7 @@ if (existsSync(target)) {
   }
 }
 
-const info = build();
-const mainText = readFileSync(join(DIST, 'main.js'), 'utf8');
-if (!args.out && mainText.includes(PLACEHOLDER_MARKER)) {
-  fail('dist/main.js is the build-pipeline placeholder (P1 module 3), not the loader; it must not reach deploy/');
-}
+const info = build({ features: args.features });
 const size = measure(DIST);
 if (!size.withinBudget) fail('the upload estimate is over budget (V76); not staging');
 
@@ -70,6 +67,7 @@ if (sha256(staged) !== info.modules[WASM_MODULE].sha256) fail('the staged .wasm 
 
 console.log(`\n== staged into ${target}`);
 console.log(`modules: main (main.js), ${WASM_MODULE} (${WASM_MODULE}.wasm)`);
+console.log(`features: ${info.features.length ? info.features.join(', ') : 'none'}`);
 report(size);
 console.log(`  wasm crc32 ${crc32Hex(staged)}  sha256 ${sha256(staged)}`);
 if (!args.out) {

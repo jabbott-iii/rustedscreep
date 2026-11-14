@@ -1,0 +1,11 @@
+{
+  // Compiles the loader's pure modules (everything except main.ts, which imports the generated glue)
+  // into js/build-test for the node:test unit tests in js/test. Same compiler settings as tsconfig.json.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "build-test",
+    "noEmitOnError": true
+  },
+  "include": ["src"],
+  "exclude": ["src/main.ts"]
+}

@@ -17,6 +17,7 @@ default-members = [
 screeps-game-api = "=0.23.5"
 # The wasm-bindgen CLI must be this exact version; the build script checks it (ADR-001, V4).
 wasm-bindgen = "=0.2.130"
+console_error_panic_hook = "=0.1.7"
 
 [workspace.package]
 version = "0.1.0"

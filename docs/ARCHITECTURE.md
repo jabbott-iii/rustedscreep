@@ -37,5 +37,14 @@ _P1._ Segment map, format versions, dirty policy, rebuild path.
 ## 6. Failure handling
 _P1._ Error isolation boundaries, loader recovery (ADR-003), reset behavior, respawn, shard travel, missing Memory.
 
+Loader (P1.4, js/src/loader.ts): any throw from the wasm, or a tick that ended inside it (the `running` flag still set), poisons
+the instance. The loader records the incident in `Memory.rustedscreepLoader` on that tick and recovers on the next: `Game.cpu.halt()`
+by default (a global reset and a recompile), or `__wbg_reset_state` (a new instance from the cached module) in reinstantiate mode or
+when the server has no halt. Compile and load failures do not halt; they back off. From the third consecutive incident the next
+boot waits, doubling up to a cap (the streak is kept in Memory), so a crash loop cannot drain the bucket, and the bot retries
+without human action; a capped re-instantiation without halt waits for its window. The loader itself never throws out of `loop`.
+Every read of the loader record repairs it (`sanitizeLoaderMemory`), and a `Memory` that is not an object (null after invalid JSON)
+falls back to a heap record and one notification.
+
 ## 7. Offense subsystem
 _P10–P11._ State machines, formations, the breaker solver, budgets, and safety gates.

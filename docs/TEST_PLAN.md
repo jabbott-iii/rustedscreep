@@ -25,6 +25,8 @@ and the siege-breaker scenario with towers: predicted ETK and survival compared 
 
 ## 6. Loader robustness
 _P1._ `trap-test` loop, aborted-tick simulation, compile failure, corrupt segments, and missing Memory.
+- Unit (js/test/loader.test.mjs, a fake runtime where a halt starts a new Loader on the same Memory): the bucket gate and its log throttle, the split and unsplit boot, the CRC-32 check and its once-per-global notice, a trap and an aborted tick each giving one incident and a halt, compile failures starting backoff at the third in a row, the doubling and capped delay, a persistent trap whose boot gaps grow to the cap, a new streak after a quiet spell, future-dated incidents ignored, a 10-trap trap-test run (3 ticks each, no backoff, one summary), reinstantiate mode and its cap, a failing reset, the no-halt fallback, retries after the cap window, the running flag around instantiation and reset, the record sanitizer against every malformed shape, and no Memory reads on steady-state ticks.
+- Sandbox, real bundle (js/tools/smoke.mjs and trap-sim.mjs, following the open-source runtime as V96 records it): every build boots and runs; the harness also models a halt discarding Memory and a null Memory after invalid JSON; `npm run check` builds two trap-test variants and runs 10 forced traps through the panic hook, the polyfill and each recovery mode. Corrupt segments arrive with persistence (P1 module 9); on the MMO the P1 gate repeats the 10-trap test.
 
 ## 7. Native scenario tests (core)
 _P2 onward._ Pure-Rust scenario tests in `rustedscreep-core` that stand in for in-game scenarios on the core track: zero-creep recovery

@@ -4,6 +4,7 @@
 /pkg
 /js/pkg
 /js/build
+/js/build-test
 node_modules/
 
 # Project-local tools (npm run setup:binaryen)

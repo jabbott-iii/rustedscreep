@@ -1,8 +1,12 @@
 // Bundles the tsc output (js/build) and the wasm-bindgen glue (js/pkg) into one CommonJS dist/main.js,
-// the module Screeps loads (ADR-008). No plugins besides the build-ID substitution below.
-const buildId = process.env.RUSTEDSCREEP_BUILD_ID;
-if (!buildId) {
-  throw new Error('RUSTEDSCREEP_BUILD_ID is not set; run `npm run build` instead of rollup directly');
+// the module Screeps loads (ADR-008). No plugins besides the substitution of the build's values below.
+const values = {
+  __RUSTEDSCREEP_BUILD__: process.env.RUSTEDSCREEP_BUILD,
+  __RUSTEDSCREEP_LOADER_CONFIG__: process.env.RUSTEDSCREEP_LOADER_CONFIG,
+};
+for (const [token, json] of Object.entries(values)) {
+  if (!json) throw new Error(`${token}: its environment variable is not set; run \`npm run build\` instead of rollup directly`);
+  JSON.parse(json); // must be valid JSON, which is also a valid JS object literal
 }
 
 export default {
@@ -16,10 +20,11 @@ export default {
   },
   plugins: [
     {
-      name: 'rustedscreep-build-id',
+      name: 'rustedscreep-build-values',
       transform(code) {
-        const token = '__RUSTEDSCREEP_BUILD_ID__';
-        return code.includes(token) ? { code: code.replaceAll(token, JSON.stringify(buildId)), map: null } : null;
+        let out = code;
+        for (const [token, json] of Object.entries(values)) out = out.replaceAll(token, `(${json})`);
+        return out === code ? null : { code: out, map: null };
       },
     },
   ],

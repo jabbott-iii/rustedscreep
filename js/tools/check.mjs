@@ -61,6 +61,7 @@ const ROWS = [
   ['7 Release build + bundle + smoke', 'node', [join(ROOT, 'js', 'tools', 'build.mjs')]],
   ['8 TypeScript', join(BIN, 'tsc'), ['--noEmit', '-p', join(ROOT, 'js')], true],
   ['9 Sizes', size, [], true],
+  ['10 Trap recovery (sandbox, both ADR-003 modes)', 'node', [join(ROOT, 'js', 'tools', 'trap-sim.mjs')], true],
 ];
 
 function main() {

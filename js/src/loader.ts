@@ -1,0 +1,444 @@
+// The loader's boot, run and recovery state machine (ADR-003). Every Screeps global it needs comes in
+// through `Env` and the wasm through `Glue`, so js/test/loader.test.mjs can drive it natively; main.ts
+// wires it to the real runtime. No game logic lives here.
+import { crc32Hex } from './crc32.js';
+
+/** Loader thresholds, injected at build time from rustedscreep-core's config.rs (LOADER_MMO). */
+export interface LoaderConfig {
+  bootBucketMin: number;
+  bootSplitTicks: boolean;
+  recoveryMode: 'halt' | 'reinstantiate';
+  backoffWindowTicks: number;
+  backoffIncidents: number;
+  backoffBaseTicks: number;
+  backoffMaxTicks: number;
+  notifyGroupMinutes: number;
+  trapTestMax: number;
+}
+
+/** What npm run build knows about this bundle. */
+export interface BuildInfo {
+  id: string;
+  /** CRC-32 of the .wasm that npm run stage reports, to compare with the bytes require() returns (V77). */
+  wasmCrc32: string;
+  features: string[];
+}
+
+/** The wasm-bindgen glue, as the loader uses it. */
+export interface Glue {
+  /** Instantiates `module` (initSync); this runs the Rust start function. */
+  init(module: WebAssembly.Module): void;
+  /**
+   * Re-instantiates from the module the glue holds and reruns the start function (wasm-bindgen's
+   * __wbg_reset_state, from --experimental-reset-state-function; V97). `init` cannot do this: it
+   * returns early once an instance exists, even a poisoned one.
+   */
+  reset?: () => void;
+  loop(): void;
+  /** Present only in a `--features trap-test` build. */
+  trapTest?: () => void;
+}
+
+/** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
+export interface LoaderMemory {
+  /** Game.time of recent incidents that count toward backoff (newest last; the last 20 are kept). */
+  incidents: number[];
+  /**
+   * Consecutive incidents, each within backoffWindowTicks plus the delay then in force of the previous
+   * one. Backoff starts when it reaches backoffIncidents and doubles with each further incident.
+   */
+  streak: number;
+  /** Traps still to fire in a trap-test run. */
+  pendingTraps: number;
+  trapRun?: {
+    total: number;
+    startedAt: number;
+    /** Game.time of the last trap, while its recovery is not yet seen. */
+    awaitingSince?: number;
+    /** Ticks from each trap to the next successful loop. */
+    recoveryTicks: number[];
+  };
+}
+
+export interface Env {
+  time(): number;
+  bucket(): number;
+  cpuUsed(): number;
+  /** Game.cpu.halt(); false when the server has none, so the loader must recover another way. */
+  halt(): boolean;
+  notify(message: string, groupMinutes: number): void;
+  log(message: string): void;
+  /** require() of a bundled module; throws when it does not exist. */
+  requireModule(name: string): unknown;
+  compile(bytes: Uint8Array): WebAssembly.Module;
+  /** The loader's Memory record, created on first use. */
+  memory(): LoaderMemory;
+  /** `typeof` of the globals VERIFICATION_LOG V95 asks about, for the boot log. */
+  globalsReport(): string;
+}
+
+export const WASM_MODULE = 'rustedscreep_wasm';
+/** A module the user may add in the in-game editor to see whether a GitHub sync deletes it (V77). */
+export const SENTINEL_MODULE = 'sentinel';
+const MAX_INCIDENTS_KEPT = 20;
+const DEFERRED_LOG_EVERY = 100;
+const ERROR_TEXT_MAX = 500;
+
+type Phase = 'idle' | 'compiled' | 'ready' | 'poisoned';
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+/**
+ * Repairs a loader record read from Memory, in place where it can (CLAUDE.md: missing or corrupt data
+ * triggers a rebuild, never a crash). A malformed trap-test run is dropped together with its pending traps.
+ */
+export function sanitizeLoaderMemory(raw: unknown, trapTestMax: number): LoaderMemory {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { incidents: [], streak: 0, pendingTraps: 0 };
+  const rec = raw as Record<string, unknown>;
+  const incidents = Array.isArray(rec.incidents) ? rec.incidents.filter(isFiniteNumber).slice(-MAX_INCIDENTS_KEPT) : [];
+  const streak = isFiniteNumber(rec.streak) && rec.streak >= 0 && incidents.length > 0 ? Math.trunc(rec.streak) : 0;
+  const run = rec.trapRun as Record<string, unknown> | null | undefined;
+  let trapRun: LoaderMemory['trapRun'];
+  if (
+    run !== null && typeof run === 'object' && isFiniteNumber(run.total) && isFiniteNumber(run.startedAt) &&
+    Array.isArray(run.recoveryTicks) && (run.awaitingSince === undefined || isFiniteNumber(run.awaitingSince))
+  ) {
+    trapRun = { total: run.total, startedAt: run.startedAt, recoveryTicks: run.recoveryTicks.filter(isFiniteNumber) };
+    if (run.awaitingSince !== undefined) trapRun.awaitingSince = run.awaitingSince;
+  }
+  const pending = trapRun && isFiniteNumber(rec.pendingTraps) ? Math.min(Math.max(0, Math.trunc(rec.pendingTraps)), trapTestMax) : 0;
+  const out = rec as unknown as LoaderMemory;
+  out.incidents = incidents;
+  out.streak = streak;
+  out.pendingTraps = pending;
+  if (trapRun) out.trapRun = trapRun;
+  else delete out.trapRun;
+  return out;
+}
+
+function typeTag(value: unknown): string {
+  const tag = Object.prototype.toString.call(value).slice(8, -1);
+  const ctor = value !== null && typeof value === 'object' ? (value as { constructor?: { name?: string } }).constructor?.name : undefined;
+  return ctor && ctor !== tag ? `${tag}(${ctor})` : tag;
+}
+
+/** The bytes of a binary module, whatever view require() returned (V31: never trust instanceof). */
+export function toBytes(value: unknown): Uint8Array {
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  if (Object.prototype.toString.call(value) === '[object ArrayBuffer]') return new Uint8Array(value as ArrayBuffer);
+  throw new TypeError(`require('${WASM_MODULE}') returned ${typeTag(value)}, not bytes`);
+}
+
+function message(e: unknown): string {
+  return e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+}
+
+export class Loader {
+  phase: Phase = 'idle';
+  /** Set while the wasm runs; still set at the start of a tick means that tick was aborted. */
+  running = false;
+  private module: WebAssembly.Module | undefined;
+  private lastError = '';
+  private lastDeferredLog = -Infinity;
+  private reinstantiations: number[] = [];
+  /** Whether the incident that poisoned the instance was a trap-test trap (exempt from the caps). */
+  private poisonedByTest = false;
+  /** A CRC-32 mismatch is notified once per global; repeated boot attempts only log it. */
+  private mismatchNotified = false;
+  private stoppedLogged = false;
+  /** Set while a capped or failed re-instantiation waits to be retried (logged once per episode). */
+  private retryWaitLogged = false;
+  private bootCpu: { load: number; compile: number; instantiate: number } | undefined;
+  private bootStartedAt: number | undefined;
+
+  constructor(
+    private readonly env: Env,
+    private readonly glue: Glue,
+    private readonly config: LoaderConfig,
+    private readonly build: BuildInfo,
+  ) {}
+
+  /** The text of the last console.error, attached to the next incident (the panic hook writes there). */
+  noteError(text: string): void {
+    this.lastError = text.length > ERROR_TEXT_MAX ? `${text.slice(0, ERROR_TEXT_MAX)}...` : text;
+  }
+
+  tick(): void {
+    if (this.running) {
+      this.running = false;
+      this.phase = 'poisoned';
+      this.incident('aborted', 'the previous tick ended inside the wasm (CPU limit?)');
+      return;
+    }
+    if (this.phase === 'poisoned') {
+      this.recover();
+      return;
+    }
+    if (this.phase === 'idle') {
+      if (!this.boot()) return;
+      if (this.config.bootSplitTicks) return;
+    }
+    if (this.phase === 'compiled') {
+      if (!this.instantiate()) return;
+    }
+    if (this.phase === 'ready') this.run();
+  }
+
+  private deferred(text: string): void {
+    const t = this.env.time();
+    if (t - this.lastDeferredLog >= DEFERRED_LOG_EVERY) {
+      this.lastDeferredLog = t;
+      this.env.log(`rustedscreep boot deferred: ${text}`);
+    }
+  }
+
+  /** The boot delay after `streak` consecutive incidents: 0 below backoffIncidents, then doubling to the cap. */
+  delayFor(streak: number): number {
+    if (streak < this.config.backoffIncidents) return 0;
+    return Math.min(this.config.backoffMaxTicks, this.config.backoffBaseTicks * 2 ** (streak - this.config.backoffIncidents));
+  }
+
+  /** The tick before which the next boot waits (0 = boot now). An incident dated in the future is ignored. */
+  backoffUntil(mem: LoaderMemory, now: number): number {
+    const last = mem.incidents.at(-1);
+    if (last === undefined || last > now) return 0;
+    const delay = this.delayFor(mem.streak);
+    return delay > 0 ? last + delay : 0;
+  }
+
+  private boot(): boolean {
+    const now = this.env.time();
+    const bucket = this.env.bucket();
+    if (bucket < this.config.bootBucketMin) {
+      this.deferred(`bucket ${bucket} < ${this.config.bootBucketMin}`);
+      return false;
+    }
+    const mem = this.env.memory();
+    const until = this.backoffUntil(mem, now);
+    if (now < until) {
+      this.deferred(`backing off after ${mem.streak} consecutive incidents, until tick ${until}`);
+      return false;
+    }
+
+    this.bootStartedAt = now;
+    const c0 = this.env.cpuUsed();
+    let bytes: Uint8Array;
+    let tag: string;
+    try {
+      const raw = this.env.requireModule(WASM_MODULE);
+      tag = typeTag(raw);
+      bytes = toBytes(raw);
+    } catch (e) {
+      this.incident('load', message(e));
+      return false;
+    }
+    const crc = crc32Hex(bytes);
+    let sentinel = 'absent';
+    try {
+      this.env.requireModule(SENTINEL_MODULE);
+      sentinel = 'present';
+    } catch {
+      // A missing module throws; absent is the normal case.
+    }
+    const c1 = this.env.cpuUsed();
+    this.env.log(
+      `rustedscreep boot: build ${this.build.id} | Game.time ${now} | wasm ${tag} ${bytes.length} B crc32 ${crc} ` +
+        `(stage ${this.build.wasmCrc32}: ${crc === this.build.wasmCrc32 ? 'match' : 'MISMATCH'}) | sentinel ${sentinel} | ` +
+        `${this.env.globalsReport()}`,
+    );
+    if (crc !== this.build.wasmCrc32 && !this.mismatchNotified) {
+      this.mismatchNotified = true;
+      this.env.notify(`rustedscreep: wasm crc32 ${crc} does not match the build's ${this.build.wasmCrc32} (build ${this.build.id})`,
+        this.config.notifyGroupMinutes);
+    }
+    try {
+      this.module = this.env.compile(bytes);
+    } catch (e) {
+      this.incident('compile', message(e));
+      return false;
+    }
+    const c2 = this.env.cpuUsed();
+    this.bootCpu = { load: c1 - c0, compile: c2 - c1, instantiate: 0 };
+    this.phase = 'compiled';
+    return true;
+  }
+
+  private instantiate(): boolean {
+    if (!this.module) {
+      this.phase = 'idle';
+      return false;
+    }
+    const c0 = this.env.cpuUsed();
+    // Instantiation runs Rust (the start function), so a tick killed here must also count as aborted.
+    this.running = true;
+    try {
+      this.glue.init(this.module);
+      this.running = false;
+    } catch (e) {
+      // A failed start function can leave the glue half-initialized, so treat it like a trap.
+      this.running = false;
+      this.phase = 'poisoned';
+      this.incident('instantiate', message(e));
+      return false;
+    }
+    if (this.bootCpu) this.bootCpu.instantiate = this.env.cpuUsed() - c0;
+    this.phase = 'ready';
+    return true;
+  }
+
+  private run(): void {
+    const firstAfterBoot = this.bootCpu !== undefined;
+    const c0 = firstAfterBoot ? this.env.cpuUsed() : 0;
+    // Memory is read only on the first loop after a boot (to see a pending recovery) and in trap-test
+    // builds; a normal tick never touches it.
+    const record = firstAfterBoot || this.glue.trapTest ? this.env.memory() : undefined;
+    // A trap counts as recovered once a fresh instance is about to run, even if that run is the next trap.
+    if (record?.trapRun?.awaitingSince !== undefined) this.recovered(record);
+    const trapNow = record !== undefined && record.pendingTraps > 0 && this.glue.trapTest !== undefined;
+    this.running = true;
+    try {
+      if (trapNow && record && this.glue.trapTest) {
+        record.pendingTraps -= 1;
+        if (record.trapRun) record.trapRun.awaitingSince = this.env.time();
+        this.glue.trapTest();
+      } else {
+        this.glue.loop();
+      }
+      this.running = false;
+    } catch (e) {
+      this.running = false;
+      this.phase = 'poisoned';
+      this.poisonedByTest = trapNow;
+      this.incident(trapNow ? 'trap-test' : 'trap', message(e));
+      return;
+    }
+    if (firstAfterBoot && this.bootCpu) {
+      const loopCpu = this.env.cpuUsed() - c0;
+      const b = this.bootCpu;
+      this.env.log(
+        `rustedscreep booted in ${this.env.time() - (this.bootStartedAt ?? this.env.time())} ticks: ` +
+          `load+crc ${b.load.toFixed(2)} CPU, compile ${b.compile.toFixed(2)}, instantiate ${b.instantiate.toFixed(2)}, ` +
+          `first loop ${loopCpu.toFixed(2)}`,
+      );
+      this.bootCpu = undefined;
+    }
+    if (record) this.finishTrapRun(record);
+  }
+
+  private recovered(record: LoaderMemory): void {
+    const run = record.trapRun;
+    if (!run || run.awaitingSince === undefined) return;
+    run.recoveryTicks.push(this.env.time() - run.awaitingSince);
+    run.awaitingSince = undefined;
+    this.env.log(`rustedscreep trap-test: recovery ${run.recoveryTicks.length}/${run.total} after ${run.recoveryTicks.at(-1)} ticks`);
+  }
+
+  /** After a successful loop: if every scheduled trap has recovered, report the run and clear it. */
+  private finishTrapRun(record: LoaderMemory): void {
+    const run = record.trapRun;
+    if (run && record.pendingTraps === 0 && run.recoveryTicks.length >= run.total) {
+      const summary = `rustedscreep trap-test done: ${run.total} traps, each recovered (ticks: ${run.recoveryTicks.join(', ')})`;
+      this.env.log(summary);
+      this.env.notify(summary, this.config.notifyGroupMinutes);
+      record.trapRun = undefined;
+    }
+  }
+
+  private incident(kind: 'aborted' | 'load' | 'compile' | 'instantiate' | 'trap' | 'trap-test', detail: string): void {
+    const now = this.env.time();
+    const mem = this.env.memory();
+    const text = `rustedscreep incident: ${kind} at tick ${now} (build ${this.build.id}): ${detail}` +
+      (this.lastError ? ` | console.error: ${this.lastError}` : '');
+    this.lastError = '';
+    this.env.log(text);
+    if (kind === 'trap-test') return;
+    const prev = mem.incidents.at(-1);
+    const continues = prev !== undefined && now >= prev && now - prev < this.config.backoffWindowTicks + this.delayFor(mem.streak);
+    mem.streak = continues ? mem.streak + 1 : 1;
+    mem.incidents.push(now);
+    if (mem.incidents.length > MAX_INCIDENTS_KEPT) mem.incidents.splice(0, mem.incidents.length - MAX_INCIDENTS_KEPT);
+    this.env.notify(text, this.config.notifyGroupMinutes);
+  }
+
+  private recover(): void {
+    // Nothing is left to try once stopped; the next global reset (a code push or a VM restart) boots again.
+    if (this.stoppedLogged) return;
+    const now = this.env.time();
+    let result: 'done' | 'unavailable' | 'capped' | 'failed';
+    if (this.config.recoveryMode === 'halt') {
+      if (!this.retryWaitLogged) this.env.log('rustedscreep recovering: Game.cpu.halt() resets the global; the next tick boots again (ADR-003 a)');
+      if (this.env.halt()) return;
+      // No halt here: re-instantiate instead, so the bot still recovers without human action.
+      result = this.reinstantiate(now, 'Game.cpu.halt is not available');
+    } else {
+      result = this.reinstantiate(now, 'recovery mode reinstantiate');
+      if (result === 'done') return;
+      this.env.log('rustedscreep recovering: Game.cpu.halt() resets the global; the next tick boots again (ADR-003 a)');
+      if (this.env.halt()) return;
+    }
+    if (result === 'done') return;
+    if (result === 'unavailable') {
+      this.stopped('neither Game.cpu.halt nor a glue reset is available');
+      return;
+    }
+    // Capped or failed, with no halt to fall back on: wait for the cap window and try again.
+    if (!this.retryWaitLogged) {
+      this.retryWaitLogged = true;
+      const text = `rustedscreep: re-instantiation ${result} and Game.cpu.halt is not available; retrying as the ` +
+        `${this.config.backoffWindowTicks}-tick cap window allows`;
+      this.env.log(text);
+      this.env.notify(text, this.config.notifyGroupMinutes);
+    }
+  }
+
+  /** ADR-003 option (b). Capped at backoffIncidents per window (trap-test traps exempt). */
+  private reinstantiate(now: number, why: string): 'done' | 'unavailable' | 'capped' | 'failed' {
+    if (!this.glue.reset) return 'unavailable';
+    this.reinstantiations = this.reinstantiations.filter((t) => now - t < this.config.backoffWindowTicks);
+    // Trap-test recoveries do not count toward the cap, so a 10-trap run measures option (b) every time.
+    const byTest = this.poisonedByTest;
+    this.poisonedByTest = false;
+    if (!byTest && this.reinstantiations.length >= this.config.backoffIncidents) return 'capped';
+    if (!byTest) this.reinstantiations.push(now);
+    try {
+      this.running = true;
+      this.glue.reset();
+      this.running = false;
+      this.phase = 'ready';
+      this.retryWaitLogged = false;
+      this.env.log(`rustedscreep recovered by re-instantiating from the cached module (ADR-003 b; ${why})`);
+      return 'done';
+    } catch (e) {
+      this.running = false;
+      this.env.log(`rustedscreep re-instantiation failed (${message(e)})`);
+      return 'failed';
+    }
+  }
+
+  private stopped(why: string): void {
+    if (this.stoppedLogged) return;
+    this.stoppedLogged = true;
+    const text = `rustedscreep stopped: ${why}; the wasm stays stopped until the next global reset`;
+    this.env.log(text);
+    this.env.notify(text, this.config.notifyGroupMinutes);
+  }
+
+  /** Console command: schedule `n` traps, one per boot, to test recovery (P1 gate: 10 in a row). */
+  scheduleTraps(n: number): string {
+    if (!this.glue.trapTest) return 'rustedscreep: this build has no trapTest export; build with npm run build -- --features trap-test';
+    if (!Number.isInteger(n) || n < 1 || n > this.config.trapTestMax) return `rustedscreep: give a whole number from 1 to ${this.config.trapTestMax}`;
+    const mem = this.env.memory();
+    mem.pendingTraps = n;
+    mem.trapRun = { total: n, startedAt: this.env.time(), recoveryTicks: [] };
+    return `rustedscreep: ${n} trap(s) scheduled; each fires in the next loop after a boot`;
+  }
+
+  /** Console command: a one-line summary of the loader's state. */
+  status(): string {
+    const mem = this.env.memory();
+    return `rustedscreep: build ${this.build.id} | phase ${this.phase} | recovery ${this.config.recoveryMode} | ` +
+      `incidents ${mem.incidents.join(',') || 'none'} | pending traps ${mem.pendingTraps}`;
+  }
+}

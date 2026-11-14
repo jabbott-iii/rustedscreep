@@ -10,5 +10,10 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# A debug export that panics on demand, to test the loader's recovery (ADR-003, P1 gate).
+trap-test = []
+
 [dependencies]
 wasm-bindgen.workspace = true
+console_error_panic_hook.workspace = true

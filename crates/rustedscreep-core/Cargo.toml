@@ -6,3 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[dependencies]
+# Game constants and pure local types come in only through the facade (CLAUDE.md).
+rustedscreep-consts = { path = "../rustedscreep-consts" }

@@ -15,3 +15,5 @@
         clippy::unreachable
     )
 )]
+
+pub mod config;
