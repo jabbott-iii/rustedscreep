@@ -4,9 +4,11 @@
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
 import { textCodecSource } from './text-polyfill.js';
 import {
-  __wbg_reset_state, actSummary as wasmActSummary, initSync, loop as wasmLoop, persistSummary as wasmPersistSummary,
-  persistTest as wasmPersistTest, profilerSummary as wasmProfilerSummary, queueSay as wasmQueueSay,
-  schedulerSummary as wasmSchedulerSummary, snapshotSummary as wasmSnapshotSummary, trapTest as wasmTrapTest,
+  __wbg_reset_state, actSummary as wasmActSummary, configReset as wasmConfigReset, configSet as wasmConfigSet,
+  configSummary as wasmConfigSummary, configUnset as wasmConfigUnset, initSync, loop as wasmLoop,
+  persistSummary as wasmPersistSummary, persistTest as wasmPersistTest, profilerSummary as wasmProfilerSummary,
+  queueSay as wasmQueueSay, schedulerSummary as wasmSchedulerSummary, snapshotSummary as wasmSnapshotSummary,
+  trapTest as wasmTrapTest,
 } from '../pkg/rustedscreep_wasm.js';
 import { type BuildInfo, type Env, type Glue, Loader, type LoaderConfig, type LoaderMemory, sanitizeLoaderMemory } from './loader.js';
 
@@ -88,6 +90,10 @@ const glue: Glue = {
   queueSay: wasmQueueSay,
   persistSummary: wasmPersistSummary,
   persistTest: wasmPersistTest,
+  configSummary: wasmConfigSummary,
+  configSet: wasmConfigSet,
+  configUnset: wasmConfigUnset,
+  configReset: wasmConfigReset,
 };
 
 const loader = new Loader(env, glue, CONFIG, BUILD);
@@ -116,7 +122,9 @@ function routeConsole(): void {
 
 // Console commands, for example `rustedscreep.trapTest(10)`, `rustedscreep.status()`, `rustedscreep.snapshot()`,
 // `rustedscreep.scheduler()`, `rustedscreep.act()`, `rustedscreep.profiler()`, `rustedscreep.say("hi")`,
-// `rustedscreep.persist()` or `rustedscreep.persistTest()`.
+// `rustedscreep.persist()`, `rustedscreep.persistTest()`, `rustedscreep.config()`,
+// `rustedscreep.configSet("log.level", "debug")`, `rustedscreep.configUnset("log.level")` or
+// `rustedscreep.configReset()`.
 g.rustedscreep = {
   trapTest: (n: unknown = 1) => loader.scheduleTraps(Number(n)),
   status: () => loader.status(),
@@ -127,6 +135,10 @@ g.rustedscreep = {
   say: (text: unknown) => loader.say(text),
   persist: () => loader.persist(),
   persistTest: (bytes?: unknown) => loader.persistTest(bytes),
+  config: () => loader.runtimeConfig(),
+  configSet: (key: unknown, value: unknown) => loader.configSet(key, value),
+  configUnset: (key: unknown) => loader.configUnset(key),
+  configReset: () => loader.configReset(),
 };
 
 export function loop(): void {

@@ -236,6 +236,8 @@ pub struct Structures {
     handle: Vec<StructureHandle>,
     kind: Vec<StructureType>,
     pos: Vec<Position>,
+    /// The static-data cache is off (`CacheConfig::structure_static` false): read every push.
+    reread_static: bool,
 }
 
 impl Structures {
@@ -250,15 +252,27 @@ impl Structures {
         self.ids.end_pass()
     }
 
-    /// Adds a structure and returns its handle. `read_static` runs only when the id is new; on any
-    /// error nothing is added, so a structure whose static read fails is read again next tick.
+    /// Switches the static-data cache (`CacheConfig::structure_static`, on by default): off, every
+    /// push reads the type and position again (the naive baseline), and the handles stay as they are.
+    pub fn set_static_cache(&mut self, on: bool) {
+        self.reread_static = !on;
+    }
+
+    /// Adds a structure and returns its handle. With the static-data cache on, `read_static` runs
+    /// only when the id is new; on any error nothing is added, so a structure whose static read fails
+    /// is read again next tick. With it off, `read_static` runs on every push, and its error skips
+    /// the structure for this tick (its handle is released at the end of the pass).
     pub fn push(
         &mut self,
         key: ObjectKey,
         read_static: impl FnOnce() -> Result<StructureStatic, SkipReason>,
     ) -> Result<StructureHandle, SkipReason> {
         let index = u32::try_from(self.handle.len()).map_err(|_| SkipReason::SlotsExhausted)?;
-        let (handle, data) = self.ids.mark(key, index, read_static)?;
+        let (handle, data) = if self.reread_static {
+            self.ids.mark_fresh(key, index, read_static)?
+        } else {
+            self.ids.mark(key, index, read_static)?
+        };
         let data = *data;
         self.handle.push(handle);
         self.kind.push(data.kind);
@@ -507,5 +521,75 @@ mod tests {
         );
         assert_eq!(structures.row_of(handles[0]), None);
         assert_eq!(structures.live(), 0);
+    }
+
+    /// With the static-data cache off, every push reads the static data again and the new values
+    /// win, while the handle stays the same; a failed re-read skips the structure for that tick and
+    /// releases its handle; switching the cache back on stops the reads.
+    #[test]
+    fn structure_statics_are_read_every_push_with_the_cache_off() {
+        let mut structures = Structures::default();
+        structures.set_static_cache(false);
+        let at = |x| StructureStatic {
+            kind: StructureType::Spawn,
+            pos: pos(x, 25, "W1N1"),
+        };
+        let mut reads = 0;
+        let mut handles = Vec::new();
+        for x in 1..=3 {
+            structures.begin();
+            let h = structures
+                .push(ObjectKey(9), || {
+                    reads += 1;
+                    Ok(at(x))
+                })
+                .expect("pushed");
+            handles.push(h);
+            assert_eq!(
+                structures.positions(),
+                [at(x).pos],
+                "the re-read value is used"
+            );
+            structures.finish();
+        }
+        assert_eq!(reads, 3);
+        assert!(
+            handles.windows(2).all(|w| w[0] == w[1]),
+            "handles do not churn"
+        );
+        assert_eq!(structures.added(), 0);
+
+        structures.begin();
+        let failed = structures.push(ObjectKey(9), || Err(SkipReason::UnknownStructureType));
+        assert_eq!(failed, Err(SkipReason::UnknownStructureType));
+        assert!(structures.is_empty());
+        assert_eq!(structures.finish(), 1);
+        assert_eq!(structures.live(), 0);
+
+        // A duplicate is refused before any read.
+        structures.begin();
+        structures.push(ObjectKey(5), || Ok(at(5))).expect("pushed");
+        let mut dup_reads = 0;
+        let dup = structures.push(ObjectKey(5), || {
+            dup_reads += 1;
+            Ok(at(6))
+        });
+        assert_eq!(dup, Err(SkipReason::Duplicate));
+        assert_eq!(dup_reads, 0);
+        assert_eq!(structures.positions(), [at(5).pos]);
+        structures.finish();
+
+        structures.set_static_cache(true);
+        let mut cached_reads = 0;
+        structures.begin();
+        structures
+            .push(ObjectKey(5), || {
+                cached_reads += 1;
+                Ok(at(7))
+            })
+            .expect("pushed");
+        structures.finish();
+        assert_eq!(cached_reads, 0);
+        assert_eq!(structures.positions(), [at(5).pos]);
     }
 }

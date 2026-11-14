@@ -22,7 +22,7 @@
 // whatever dist/ holds: node js/tools/persist-sim.mjs [dir].
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
-import { commandResults, driverRawMemory, simulate } from './smoke.mjs';
+import { CONFIG_SEGMENT, commandResults, driverRawMemory, simulate } from './smoke.mjs';
 
 const T0 = 50000000;
 /** PERSIST_MMO.self_test_segment and PROFILER_MMO.stats_segment (config.rs). */
@@ -130,10 +130,11 @@ export function persistSim(dir = join(ROOT, 'dist')) {
     }
   });
 
-  // The first run: one write, the set on and off around the read.
+  // The global's start: the config record (P1.10) is activated on the first loop and read on the second,
+  // which clears the set. The first run: one write, the set on and off around the read.
   const active = world.loopCalls.flatMap((c, offset) => c.setActive.map((ids) => [offset, ids]));
-  const want = [[1, []], [3, [SEGMENT]], [4, []]];
-  if (JSON.stringify(active.slice(0, 3)) !== JSON.stringify(want)) problems.push(`first setActiveSegments calls ${JSON.stringify(active.slice(0, 3))}, expected ${JSON.stringify(want)}`);
+  const want = [[1, [CONFIG_SEGMENT]], [2, []], [3, [SEGMENT]], [4, []]];
+  if (JSON.stringify(active.slice(0, 4)) !== JSON.stringify(want)) problems.push(`first setActiveSegments calls ${JSON.stringify(active.slice(0, 4))}, expected ${JSON.stringify(want)}`);
   if (sizes[4] !== textUnits(SMALL)) problems.push(`the small run stored ${sizes[4]} units, expected ${textUnits(SMALL)}`);
   if (sizes[8] !== LIMIT || sizes[10] !== LIMIT || textUnits(MAX_PAYLOAD) !== LIMIT) problems.push(`the full runs stored ${sizes[8]} and ${sizes[10]} units, expected the limit ${LIMIT}`);
   if (active.some(([, ids]) => ids.includes(RESERVED))) problems.push('the manager activated the profiler segment');
@@ -155,12 +156,13 @@ export function persistSim(dir = join(ROOT, 'dist')) {
   const activations = active.length;
   const runs = VERDICTS.length;
   const failedLoads = CORRUPTIONS.length;
-  // Every run but the refused write wrote; every run that wrote also loaded.
+  // Every run but the refused write wrote; every run that wrote also loaded, and so did the config
+  // record at the global's start (an empty segment: no overrides, a successful load).
   const written = runs - 1;
   for (const part of [
     `active [] (set at ${T0 + BUSY_AT + 2})`,
     `| wanted [] | dirty [] | reserved [${RESERVED}] |`,
-    `| loads ${written - failedLoads} (${failedLoads} failed, 1 retries) |`,
+    `| loads ${written - failedLoads + 1} (${failedLoads} failed, 1 retries) |`,
     `| writes ${written} (0 failed, 1 rejected, 1 ticks short of a key) |`,
     `| activations ${activations} (0 failed) | JS failures 1 |`,
     `| self-test: FAILED at ${T0 + FROZEN_AT}: the write failed`,

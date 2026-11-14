@@ -121,7 +121,8 @@ struct Slot<S> {
     /// The object's row in the tables of pass `seen`.
     row: u32,
     live: bool,
-    /// Data read once, when the object was first pushed (it never changes for the object's life).
+    /// Data read once, when the object was first pushed (it never changes for the object's life), or
+    /// on every pass by [`Interner::mark_fresh`].
     data: S,
 }
 
@@ -176,7 +177,31 @@ impl<C, S> Interner<C, S> {
         row: u32,
         init: impl FnOnce() -> Result<S, SkipReason>,
     ) -> Result<(Handle<C>, &S), SkipReason> {
+        self.mark_with(key, row, false, init)
+    }
+
+    /// As [`Self::mark`], but `init` runs for every key, and for a key with a live slot its data
+    /// replaces the slot's: a static-data cache switched off (`crate::config::CacheConfig`), which
+    /// keeps the handles. Its error leaves the slot unmarked, so the object is skipped for this pass
+    /// and its handle is released at the end of the pass, as when the object is gone.
+    pub fn mark_fresh(
+        &mut self,
+        key: ObjectKey,
+        row: u32,
+        init: impl FnOnce() -> Result<S, SkipReason>,
+    ) -> Result<(Handle<C>, &S), SkipReason> {
+        self.mark_with(key, row, true, init)
+    }
+
+    fn mark_with(
+        &mut self,
+        key: ObjectKey,
+        row: u32,
+        fresh: bool,
+        init: impl FnOnce() -> Result<S, SkipReason>,
+    ) -> Result<(Handle<C>, &S), SkipReason> {
         let pass = self.pass;
+        let mut init = Some(init);
         let existing = self
             .by_key
             .get(&key)
@@ -187,6 +212,10 @@ impl<C, S> Interner<C, S> {
             None => {
                 // A key whose slot does not hold it would be a bug; dropping it keeps the map in step.
                 self.by_key.remove(&key);
+                // `init` is untouched on this path; the `else` cannot run.
+                let Some(init) = init.take() else {
+                    return Err(SkipReason::SlotsExhausted);
+                };
                 let data = init()?;
                 let slot_index = self.allocate(key, data)?;
                 self.by_key.insert(key, slot_index);
@@ -200,6 +229,10 @@ impl<C, S> Interner<C, S> {
             .ok_or(SkipReason::SlotsExhausted)?;
         if slot.seen == pass {
             return Err(SkipReason::Duplicate);
+        }
+        // `init` is still here only for a key that already had a slot.
+        if fresh && let Some(init) = init {
+            slot.data = init()?;
         }
         slot.seen = pass;
         slot.row = row;

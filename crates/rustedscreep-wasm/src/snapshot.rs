@@ -20,6 +20,7 @@
 //!   hostile results never include spawning creeps, V101);
 //! - structure: 3 (`get`, `id`, the id copy), plus on the tick it is first seen `structureType`,
 //!   and `pos` and `__packedPos` when the type is known (again every tick while that read fails).
+//!   With `cache.structure_static` off (the naive baseline, P1.10) those three are read every tick.
 //!
 //! Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and one
 //! `__externref_table_alloc` (with a JS `Table.set`) per object returned through an `Option`: every
@@ -28,13 +29,17 @@
 //! The id and name copies are separate calls (`__wbindgen_string_get`) because that call is the
 //! type check: a getter typed `-> Option<String>` would save one call per object but traps on a
 //! non-string (V100). Each copy is one ASCII string in wasm memory, freed in the same tick.
+//!
+//! Skipped objects are counted every tick and logged through [`log_skips`], at most one line per
+//! `log.skip_window_ticks` (`rustedscreep_core::snapshot::SkipLog`).
 
 use std::fmt::Write as _;
 
 use js_sys::{Array, Object};
+use rustedscreep_core::config::CacheConfig;
 use rustedscreep_core::snapshot::{
-    Controller, CreepRow, ObjectKey, SkipReason, Snapshot, StructureStatic, TickContext,
-    known_structure_type, parse_room_name, position_from_packed,
+    Controller, CreepRow, ObjectKey, SkipCounts, SkipLog, SkipReason, SkipReport, Snapshot,
+    StructureStatic, TickContext, known_structure_type, parse_room_name, position_from_packed,
 };
 use screeps::{
     Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Position, Room, RoomObject,
@@ -102,9 +107,10 @@ impl JsWorld {
     }
 }
 
-/// Takes this tick's snapshot.
-pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld) {
+/// Takes this tick's snapshot, with the cache toggles in force.
+pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld, cache: &CacheConfig) {
     js.clear();
+    snapshot.structures.set_static_cache(cache.structure_static);
     snapshot.begin(TickContext::from_raw(
         game::time(),
         game::cpu::limit(),
@@ -201,6 +207,46 @@ fn position_of(object: &RoomObject) -> Result<Position, SkipReason> {
         .packed_pos()
         .and_then(position_from_packed)
         .ok_or(SkipReason::BadPosition)
+}
+
+/// Logs the skipped objects when the rate limit lets a line through (one per `window_ticks` at
+/// most; the first skip at once).
+#[inline]
+pub fn log_skips(log: &mut SkipLog, snapshot: &Snapshot, window_ticks: u32) {
+    if let Some(report) = log.note(snapshot.tick.time, &snapshot.skipped, window_ticks) {
+        log_skip_report(&report);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn log_skip_report(r: &SkipReport) {
+    let mut text = format!(
+        "rustedscreep snapshot: skipped {} object(s) on {} tick(s) from tick {} to {}:",
+        r.counts.total(),
+        r.ticks,
+        r.first,
+        r.last
+    );
+    reasons(&mut text, &r.counts);
+    log::warn!("{text}");
+}
+
+/// Appends `, reason n` for every reason with skips.
+fn reasons(text: &mut String, counts: &SkipCounts) {
+    let mut first = true;
+    for reason in SkipReason::ALL {
+        let n = counts.get(reason);
+        if n > 0 {
+            let _ = write!(
+                text,
+                "{} {} {n}",
+                if first { "" } else { "," },
+                reason.as_str()
+            );
+            first = false;
+        }
+    }
 }
 
 /// Rooms the summary lists by name; the rest are counted.

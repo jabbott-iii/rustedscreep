@@ -6,7 +6,7 @@ Claude Code fills each section in as its phase lands. Keep it factual: describe 
 _P1._ A diagram plus a step list: loader → `loop` → tick context → snapshot → caches → scheduler tiers → decisions →
 intent buffer (no-op filtering, pipeline check) → act → persistence flush → profiler flush. Include JS crossings per step.
 
-Current state (P1.8): loader → `loop` (rustedscreep-wasm `game_loop`) → snapshot → the intent buffer opened for it → scheduler tick (the decide step: no job until P2; until then only the console's `say` queues intents) → act step → fault log → profiler record. A build with the `profiler` feature (step 9) reads the clock around these steps; without it the profiler compiles out. The snapshot
+Current state (P1.10): loader → `loop` (rustedscreep-wasm `game_loop`) → a copy of the config in force (`config::Runtime`, the active profile with the runtime overrides; the whole tick runs on it, so a record that loads during the decide step applies from the next tick, except the log level and the flush's segment limits) → snapshot → the rate-limited skipped-object log (`SkipLog`, at most one line per `log.skip_window_ticks`) → the intent buffer opened for it → scheduler tick (the decide step: no job until P2; until then only the console's `say` queues intents) → act step → fault log → profiler record. A build with the `profiler` feature (step 9) reads the clock around these steps; without it the profiler compiles out. The snapshot
 (`rustedscreep-wasm/src/snapshot.rs` filling `rustedscreep_core::snapshot::Snapshot`) makes one pass, in this order:
 1. Tick context: `Game.time`, `Game.cpu.limit`, `tickLimit`, `bucket` (4 JS calls), sanitized by `TickContext::from_raw`.
 2. `Game.creeps` (own creeps, spawning ones included; V101): 3 calls for the collection (getter, `Object.values`, `length`),
@@ -17,7 +17,8 @@ Current state (P1.8): loader → `loop` (rustedscreep-wasm `game_loop`) → snap
    The name is parsed from its bytes (`snapshot::parse_room_name`, the crate's `RoomName::from_str` semantics without its str
    slicing, which costs 8139 bytes of release wasm; V114).
 4. `Game.structures` (own structures; V101): 3 calls, then per structure 3 (`get`, `id`, the id copy), plus on the tick it is
-   first seen `structureType`, and `pos` and `__packedPos` when the type is known (again every tick while that read fails).
+   first seen `structureType`, and `pos` and `__packedPos` when the type is known (again every tick while that read fails). With
+   `cache.structure_static` off (the naive baseline, P1.10) those three are read on every tick.
 Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and one `__externref_table_alloc` (with a JS
 `Table.set`) per object returned through an `Option` (every creep's `id`, a room's `controller` when present).
 5. `finish`: handles of objects the pass did not push are released.
@@ -41,7 +42,10 @@ Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and o
    classified (OK, a known `ErrorCode`, or unknown), and a throw is a fault under job `act` (unit: the actor's handle slot),
    rate-limited with the scheduler's, after which the next issue runs. `rustedscreep.act()` prints the last tick's counts and the
    totals since boot. The buffer issues only a creep's last push of a method, with no fallback to an earlier push if that call fails.
-8. The fault reports queued this tick (jobs' and the act step's) go to `console.log`.
+8. The persistence output step (P1.9; while the tick runs the Standard tier): dirty records are written (the config record after a
+   console change, P1.10) and the active set is issued when the manager asks; see section 5. Then the fault reports queued this tick
+   (jobs' and the act step's) go out through `log::warn!` (`logging.rs`: `log` macros, a `fern` dispatch whose one output is
+   `console.log`; V126, V127).
 9. Profiler (P1.8, `rustedscreep-wasm/src/profiler.rs` over `rustedscreep_core::profiler`), only with the `profiler` feature: two
    `Game.cpu.getUsed()` readings back to back at the start of `loop`, then one each after the snapshot, the decide step, the act step
    and the fault log (6 per loop). `Profiler::record` adds the spans to a 1000-loop window (no JS call). On a global's first loop, one
@@ -73,6 +77,13 @@ natively. rustedscreep-wasm's `snapshot.rs` reads the game into it and keeps the
 or a re-instantiation starts empty. rustedscreep-core now depends on rustc-hash (ADR-006); rustedscreep-wasm on screeps-game-api,
 js-sys and rustedscreep-core.
 
+Config (P1.10): `rustedscreep_core::config` holds every threshold struct, `Config` (one of each), the profile table `PROFILES`
+(`mmo` only; PS1 and SE2 add rows), the field table `FIELDS` (runtime key, safe range, whether a runtime override may change it,
+getter and setter) and the cross-field `RULES`; `config::overrides` parses, clamps and checks overrides, encodes and decodes their
+record, and `Store` holds the profile's values, the overrides and the config in force. rustedscreep-wasm's `config.rs` selects the
+active profile (`PROFILE`) and answers the `rustedscreep.config*` console commands; `logging.rs` installs the logger once per
+instance, from the start function, and sets the level. rustedscreep-wasm depends on log 0.4.35 and fern 0.7.1 (ADR-006, no features).
+
 Act layer (P1.7): `rustedscreep_core::intents` holds the engine's creep intent-priority table as data (`CreepAction`, `ActionSet`,
 `ActionSet::executed` as the engine model, `PRIORITY_ORDER` and `ActionSet::kept` for what is issued, with the engine commit), the
 per-tick `IntentBuffer` with its `CreepIntent` variants (move by direction, move toward a creep, say, drop, transfer, withdraw, heal,
@@ -92,7 +103,8 @@ _P1 onward._
 | Cache | Key | Contents | Built in tier | Invalidated by | TTL | Approx. size | Toggle (naive mode) |
 |---|---|---|---|---|---|---|---|
 | Object handles, creeps and structures (P1.5) | packed object id (`ObjectKey`, u128) | per slot: generation, last pass seen, row, live flag; FxHashMap id → slot | Critical (snapshot, every tick) | the first pass that does not push the object: the slot is released and its generation advances, so old handles stop resolving; free slots are reused oldest first; a slot whose generation would wrap is retired | none (pass-based) | about 48 B per slot plus a map entry | none: handles are the identity scheme, not an optimization |
-| Structure static data (P1.5) | structure handle | `structureType` and position | Critical (snapshot), read only when a structure is first seen | the structure's handle being released (destroyed, or missing from one pass) | none | 8 B per slot | none yet; the toggle to re-read every tick arrives with runtime config (P1.10) |
+| Structure static data (P1.5) | structure handle | `structureType` and position | Critical (snapshot), read only when a structure is first seen | the structure's handle being released (destroyed, or missing from one pass) | none | 8 B per slot | `cache.structure_static` (P1.10): off, every push reads both again (`Interner::mark_fresh`) and keeps the handle; a failed re-read skips the structure for that tick and releases its handle |
+| Config in force (P1.10) | one per global | the profile's values, the overrides, the config they give, the record's state | at the global's start (profile values), then on a console change or when the record loads (Standard, a tick or two after the start) | `configSet`, `configUnset`, `configReset`, the record loading; a global reset starts again from the profile | none | under 1 KB | none: it is the switchboard for the others |
 | Job state (P1.6) | one per job, owned by its subsystem | round-robin cursor, measured CPU per unit | the job's tier | nothing during a global; a global reset restarts it at unit 0 with no estimate (only costs extra clock samples on that tick) | none | 16 B per job | none |
 | Sleep wheel (P1.6) | item (a handle or a job) | wake tick and an optional event | the owner's tier | the wake tick passing (gaps included), its event firing, a new sleep or a cancel; time going back wakes everyone; a global reset empties it, so every item starts awake | none | about 28 B per entry, 256 slot vectors, a heap for wakes beyond 256 ticks, one list per event being waited for (emptied lists are reused, at most 64 kept) | none |
 | Intent buffer (P1.7) | creep row in this tick's snapshot | every accepted push of the tick (actor and target rows, the intent), the methods queued per row, the latest push per row and method, and the planned issues | the decide step (any tier) and the act step | `IntentBuffer::begin` each tick, after the snapshot; a push before `begin`, after the plan, or with a snapshot whose `Game.time` or creep count differs from the one `begin` saw is refused (`closed`) | one tick | 44 B per push and per issue (`Issue`, measured natively; it holds no pointers), 4 B per row, plus 92 B per row for the latest-push slots, which only grow (the rows' method sets say which are this tick's) | none: it holds one tick's intents |
@@ -142,17 +154,42 @@ Current state (P1.6, `rustedscreep_core::scheduler`; values from `SCHEDULER_MMO`
 - Isolation: each unit returns `Result<(), Fault>`; a fault is counted, queued for the log within a rate limit shared by all
   jobs (`fault_reports_per_window` per `fault_window_ticks`), and the next unit runs. The note that closes a window gives the
   count it held back and names up to 4 of those jobs, so one stuck unit cannot hide a new failure. A failing step stops its step
-  job for the tick. rustedscreep-wasm prints the reports with `console.log` until `log` + `fern` arrive (P1.10).
+  job for the tick. rustedscreep-wasm prints the reports with `log::warn!` (P1.10).
 - All of it lives in the heap. A global reset fails open: cursors restart, every item is awake, Optional is in warm-up.
 - Not yet: per-tier and per-job CPU accounting (P2, once jobs exist: from `TickCpu`'s samples at job start and after each batch, with no
-  extra `getUsed` calls, likely as stats segment format v2; P1.8's profiler has one `decide` span over every tier), runtime overrides of
-  the thresholds (P1.10), the first jobs (P2).
+  extra `getUsed` calls, likely as stats segment format v2; P1.8's profiler has one `decide` span over every tier), the first jobs (P2).
+- Every threshold above can be overridden at runtime under its key (`scheduler.<field>`, P1.10; TUNING.md's runtime-key column):
+  the value is clamped to its safe range, and a change that breaks a rule (Standard gate ≥ boot gate + `CPU_TICK_LIMIT_MAX`, Standard
+  ≤ Optional ≤ target) is refused. A change applies from the next tick.
 
 ## 5. Persistence
 _P1._ Segment map, format versions, dirty policy, rebuild path.
 
+Current state (P1.10; the manager and the frame are P1.9, ADR-004):
+
+| Segment | Owner | Format | Written | Read |
+|---|---|---|---|---|
+| 97 (`PersistConfig::config_segment`) | runtime config overrides (`config::overrides`) | frame kind 2, schema 1; payload ASCII `key=value\n` lines in field order | after a console change, on the next tick that runs the Standard tier | once per global: requested at the start, looked up on the first loop, read on the next after the activation |
+| 98 (`PersistConfig::self_test_segment`) | the self-test (`rustedscreep.persistTest`) | frame kind 1, a test pattern | on the tick after the command | on the tick after the write |
+| 99 (`ProfilerConfig::stats_segment`) | the profiler (`profiler` builds) | JSON, format v1 (`profiler/text.rs`) | once per 1000-loop window, without activation | never by the bot (`npm run stats`); the manager reserves it |
+
+- Frame (ADR-004): `rs1b` + base64 of a 16-byte header (kind, schema, write tick, length, CRC-32) and the payload. Every decode
+  failure is an error the owner answers by rebuilding: for the config record, the profile's values apply (an empty segment means no
+  overrides; anything else that is not a valid record is logged once and its overrides are not used). The record's lines are
+  checked again on load like a console change: unknown keys, fields only a profile sets and bad values are dropped with a note,
+  numbers are clamped, and overrides that break a rule together are dropped.
+- Console changes wait until the record has loaded, so they cannot overwrite a record not yet read. Clearing segment 97 from the
+  console (`RawMemory.segments[97] = ""`) leaves the next global with no overrides, without the bot.
+- The driver re-saves every segment loaded on a tick (V119), so each load costs a save key on its tick; the manager keeps one key
+  free for segment 99 in a `profiler` build.
+
 ## 6. Failure handling
 _P1._ Error isolation boundaries, loader recovery (ADR-003), reset behavior, respawn, shard travel, missing Memory.
+
+Config (P1.10): a console change the store cannot use (an unknown key, a field only a profile sets, a bad value, a broken rule, or
+a record still loading) is refused with its reason and changes nothing; a number outside its safe range is clamped. A record that
+fails to load or decode leaves the profile's values in force and is replaced by the next change. Logging cannot fail the tick: the
+logger is installed once per instance (a second install keeps the first), prints with `console.log` only, and never logs itself.
 
 Act step (P1.7): a push that the game API would refuse, or that would be a billed no-op the snapshot can already see, is refused in
 Rust and counted; other refusals come back from JS as known codes and are counted as failed. An intent call that throws in JS is

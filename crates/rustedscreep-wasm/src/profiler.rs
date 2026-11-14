@@ -4,12 +4,16 @@
 //!
 //! With the `profiler` feature, JS calls per loop: six `Game.cpu.getUsed()` (two back to back at the
 //! start, then after the snapshot, the decide step, the act step and the fault log). On a global's
-//! first loop, one `console.log`. On the loop that closes a window: the `RawMemory.segments` getter,
+//! first loop, one `console.log` (a `log::info!`, logging.rs). On the loop that closes a window: the `RawMemory.segments` getter,
 //! an `is_object` check, two glue casts (the id to a number, the segment text to a JS string, which
 //! the glue's TextDecoder decodes), one `Reflect.has` and, when the key is not present yet,
 //! `Object.keys` and its length, one `Reflect.set`, one more reading, and a `console.log` if the
 //! write failed. Every segment call catches a JS exception, so a missing or broken `RawMemory` costs
 //! a log line, never a trap (V115).
+//!
+//! The profiler's own values come from the active profile and cannot be overridden at runtime (a
+//! changed window length would split a window); the act-cost bound reads the scheduler values in
+//! force, since `scheduler.tick_reserve_pct` can be.
 //!
 //! The segment is written without being activated; the driver saves every key of
 //! `RawMemory.segments` at the end of the tick, and more than `MEMORY_SEGMENT_SAVE_LIMIT` keys throw
@@ -27,7 +31,7 @@ pub use imp::{Probe, Profiler, summary};
 #[cfg(feature = "profiler")]
 mod imp {
     use rustedscreep_consts::extra::MEMORY_SEGMENT_SAVE_LIMIT;
-    use rustedscreep_core::config::{PROFILER_MMO, SCHEDULER_MMO};
+    use rustedscreep_core::config::{ProfilerConfig, SchedulerConfig};
     use rustedscreep_core::intents::IssueStats;
     use rustedscreep_core::profiler::{self, Marks, Recorded, Sample};
     use rustedscreep_core::snapshot::TickContext;
@@ -46,11 +50,10 @@ mod imp {
         /// `Object.keys(obj)`, what the driver's end-of-tick save counts (V119).
         #[wasm_bindgen(js_namespace = Object, js_name = keys, catch)]
         fn object_keys(obj: &JsValue) -> Result<js_sys::Array, JsValue>;
-
-        /// `console.log`, looked up on every call: Screeps builds a new console before every tick (V96).
-        #[wasm_bindgen(js_namespace = console, js_name = log)]
-        fn console_log(message: &str);
     }
+
+    /// The profiler's values: the active profile's, fixed for the build.
+    const CFG: &ProfilerConfig = &crate::config::PROFILE.config.profiler;
 
     /// Why a write was skipped when the tick already holds the most keys the driver saves.
     const NO_FREE_KEY: &str =
@@ -95,7 +98,13 @@ mod imp {
         /// Takes the loop's last reading and records the loop; logs the cold loop, or writes the
         /// stats segment when the loop closed a window. Returns true when that write found no free
         /// save key.
-        pub fn finish(&mut self, probe: Probe, ctx: &TickContext, issues: &IssueStats) -> bool {
+        pub fn finish(
+            &mut self,
+            probe: Probe,
+            ctx: &TickContext,
+            issues: &IssueStats,
+            sched: &SchedulerConfig,
+        ) -> bool {
             let mut marks = probe.0;
             marks.end = game::cpu::get_used();
             let sample = Sample {
@@ -103,13 +112,13 @@ mod imp {
                 calls: issues.issued,
                 billed: issues.billed,
             };
-            match self.core.record(ctx, &sample, &PROFILER_MMO) {
+            match self.core.record(ctx, &sample, CFG) {
                 Recorded::Open => false,
                 Recorded::Cold => {
                     self.log_cold();
                     false
                 }
-                Recorded::Closed => self.flush(ctx.time, marks.end),
+                Recorded::Closed => self.flush(ctx.time, marks.end, sched),
             }
         }
 
@@ -118,7 +127,7 @@ mod imp {
         #[inline(never)]
         fn log_cold(&self) {
             if let Some(cold) = self.core.cold() {
-                console_log(&profiler::cold_line(cold));
+                log::info!("{}", profiler::cold_line(cold));
             }
         }
 
@@ -127,20 +136,19 @@ mod imp {
         /// when the write found no free save key.
         #[cold]
         #[inline(never)]
-        fn flush(&mut self, now: u32, end: f64) -> bool {
+        fn flush(&mut self, now: u32, end: f64, sched: &SchedulerConfig) -> bool {
             self.text.clear();
-            self.core
-                .write_segment(now, &PROFILER_MMO, &SCHEDULER_MMO, &mut self.text);
-            let result = write_segment(PROFILER_MMO.stats_segment, &self.text);
+            self.core.write_segment(now, CFG, sched, &mut self.text);
+            let result = write_segment(CFG.stats_segment, &self.text);
             let after = game::cpu::get_used();
             // The same rule as the spans: a bad or falling reading measures nothing.
             let cost = profiler::span(end, after);
             self.core.note_flush(result.is_ok(), cost);
             if let Err(why) = result {
-                console_log(&format!(
+                log::warn!(
                     "rustedscreep profiler: writing stats segment {} failed at tick {now}: {why}",
-                    PROFILER_MMO.stats_segment
-                ));
+                    CFG.stats_segment
+                );
             }
             result == Err(NO_FREE_KEY)
         }
@@ -173,13 +181,14 @@ mod imp {
     }
 
     /// One line for `rustedscreep.profiler()`.
-    pub fn summary(prof: &Profiler, now: u32) -> String {
-        prof.core.summary(now, &PROFILER_MMO, &SCHEDULER_MMO)
+    pub fn summary(prof: &Profiler, now: u32, sched: &SchedulerConfig) -> String {
+        prof.core.summary(now, CFG, sched)
     }
 }
 
 #[cfg(not(feature = "profiler"))]
 mod imp {
+    use rustedscreep_core::config::SchedulerConfig;
     use rustedscreep_core::intents::IssueStats;
     use rustedscreep_core::snapshot::TickContext;
 
@@ -208,12 +217,18 @@ mod imp {
     impl Profiler {
         /// Never writes a segment, so it never lacks a save key.
         #[inline(always)]
-        pub fn finish(&mut self, _probe: Probe, _ctx: &TickContext, _issues: &IssueStats) -> bool {
+        pub fn finish(
+            &mut self,
+            _probe: Probe,
+            _ctx: &TickContext,
+            _issues: &IssueStats,
+            _sched: &SchedulerConfig,
+        ) -> bool {
             false
         }
     }
 
-    pub fn summary(_prof: &Profiler, _now: u32) -> String {
+    pub fn summary(_prof: &Profiler, _now: u32, _sched: &SchedulerConfig) -> String {
         String::from(
             "rustedscreep profiler: not in this build; build with npm run build -- --features profiler",
         )

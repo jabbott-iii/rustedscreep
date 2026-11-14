@@ -18,6 +18,8 @@
 mod act;
 #[cfg(feature = "act-test")]
 mod act_test;
+mod config;
+mod logging;
 mod persist;
 mod profiler;
 mod scheduler;
@@ -25,17 +27,19 @@ mod snapshot;
 
 use std::cell::RefCell;
 
-use rustedscreep_core::config::SCHEDULER_MMO;
 use rustedscreep_core::scheduler::{Scheduler, Tier};
-use rustedscreep_core::snapshot::Snapshot;
+use rustedscreep_core::snapshot::{SkipLog, Snapshot};
 use wasm_bindgen::prelude::wasm_bindgen;
 
 /// Everything the bot keeps between ticks. It lives in Rust memory only: a global reset (or a
 /// re-instantiation by the loader) starts it empty, and the next tick rebuilds it.
 #[derive(Default)]
 struct State {
+    /// The config in force: the active profile with the runtime overrides (P1.10).
+    config: config::Runtime,
     snapshot: Snapshot,
     js: snapshot::JsWorld,
+    skip_log: SkipLog,
     scheduler: Scheduler,
     act: act::Act,
     persist: persist::Persist,
@@ -51,16 +55,20 @@ thread_local! {
 
 /// Runs once per instance, when the loader instantiates it (wasm-bindgen's start function). A panic
 /// then reports its message and a stack through `console.error`, which the loader routes; with
-/// `panic = "abort"` the panic still ends in a trap that the loader recovers from (ADR-003).
+/// `panic = "abort"` the panic still ends in a trap that the loader recovers from (ADR-003). The
+/// logger starts at the profile's level; a loaded override changes it a tick or two later.
 #[wasm_bindgen(start)]
 fn start() {
     console_error_panic_hook::set_once();
+    logging::init(config::PROFILE.config.log.level);
 }
 
 /// Exported to JS as `loop`; the loader calls it once per tick: the snapshot, then the scheduler's
 /// tick (its budget from the snapshot's tick context), in which the persistence loads run and jobs
 /// queue intents (P2 onward; the console's `say` until then), then the act step, which issues them
 /// in one batch, then the persistence writes and the active segments (`persist::Persist::flush`).
+/// The tick runs on the config in force at its start (`cfg`, a copy): a record that loads during
+/// the decide step takes effect on the next tick, except for the log level and the flush's limits.
 /// A `profiler` build reads the CPU clock around each step (`profiler::Probe`); the flush falls in
 /// its `end` span with the fault log. Other builds compile the probe out.
 ///
@@ -74,8 +82,10 @@ pub fn game_loop() {
         .try_with(|cell| match cell.try_borrow_mut() {
             Ok(mut state) => {
                 let State {
+                    config: runtime,
                     snapshot,
                     js,
+                    skip_log,
                     scheduler: sched,
                     act,
                     persist,
@@ -84,13 +94,15 @@ pub fn game_loop() {
                     act_test,
                 } = &mut *state;
                 let mut probe = profiler::Probe::start();
-                snapshot::take(snapshot, js);
+                let cfg = *runtime.get();
+                snapshot::take(snapshot, js, &cfg.cache);
+                snapshot::log_skips(skip_log, snapshot, cfg.log.skip_window_ticks);
                 probe.snapshot();
                 act.begin(snapshot);
-                let mut tick = sched.begin(&snapshot.tick, &SCHEDULER_MMO, scheduler::GameClock);
+                let mut tick = sched.begin(&snapshot.tick, &cfg.scheduler, scheduler::GameClock);
                 // Critical, then Standard, then Optional jobs run here and queue intents (P2 onward).
                 // The persistence loads are a Standard job; Critical jobs will run before them (P2).
-                persist.load(&mut tick, snapshot.tick.time);
+                persist.load(&mut tick, snapshot.tick.time, runtime);
                 act.queue_console_say(snapshot, tick.commit());
                 #[cfg(feature = "act-test")]
                 act_test.queue(&mut act.buffer, snapshot, tick.commit());
@@ -99,14 +111,14 @@ pub fn game_loop() {
                 // After the decide step: the scheduler reads the CPU clock no more (scheduler docs); the
                 // profiler's readings from here on measure the act step outside the budget. The
                 // `TickCpu` held `&mut Scheduler` until `finish`, so `act::issue` cannot run earlier.
-                act::issue(act, snapshot, js, sched);
+                act::issue(act, snapshot, js, sched, &cfg.scheduler);
                 probe.act();
                 let standard = sched
                     .last_tick()
                     .is_some_and(|r| r.budget.allows(Tier::Standard));
-                persist.flush(snapshot.tick.time, standard);
+                persist.flush(snapshot.tick.time, standard, runtime);
                 scheduler::log_faults(sched);
-                if prof.finish(probe, &snapshot.tick, act.issues()) {
+                if prof.finish(probe, &snapshot.tick, act.issues(), &cfg.scheduler) {
                     persist.keys_short();
                 }
                 true
@@ -162,7 +174,11 @@ pub fn act_summary() -> String {
 pub fn profiler_summary() -> String {
     STATE
         .try_with(|cell| match cell.try_borrow() {
-            Ok(state) => profiler::summary(&state.profiler, state.snapshot.tick.time),
+            Ok(state) => profiler::summary(
+                &state.profiler,
+                state.snapshot.tick.time,
+                &state.config.get().scheduler,
+            ),
             Err(_) => String::from("rustedscreep profiler: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep profiler: state unavailable"))
@@ -194,6 +210,54 @@ pub fn persist_test(bytes: Option<u32>) -> String {
             Err(_) => String::from("rustedscreep persist self-test: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep persist self-test: state unavailable"))
+}
+
+/// Exported to JS as `configSummary`, for the `rustedscreep.config()` console command: one line with
+/// the profile, the stored record, the overrides and every overridable key with its value in force.
+#[wasm_bindgen(js_name = "configSummary")]
+pub fn config_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state.config.summary(state.persist.config_dirty()),
+            Err(_) => String::from("rustedscreep config: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep config: state unavailable"))
+}
+
+/// A console change to the overrides: `change` runs on the config, and a change that took is
+/// written to the config segment on the next tick that runs the Standard tier.
+fn config_change(change: impl FnOnce(&mut config::Runtime) -> (String, bool)) -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow_mut() {
+            Ok(mut state) => {
+                let (reply, changed) = change(&mut state.config);
+                if changed {
+                    state.persist.config_changed();
+                }
+                reply
+            }
+            Err(_) => String::from("rustedscreep config: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep config: state unavailable"))
+}
+
+/// Exported to JS as `configSet`, for `rustedscreep.configSet(key, value)`: overrides one field from
+/// the next tick. A number outside the safe range is clamped; anything else invalid is refused.
+#[wasm_bindgen(js_name = "configSet")]
+pub fn config_set(key: &str, value: &str) -> String {
+    config_change(|c| c.set(key, value))
+}
+
+/// Exported to JS as `configUnset`, for `rustedscreep.configUnset(key)`: the profile's value again.
+#[wasm_bindgen(js_name = "configUnset")]
+pub fn config_unset(key: &str) -> String {
+    config_change(|c| c.unset(key))
+}
+
+/// Exported to JS as `configReset`, for `rustedscreep.configReset()`: removes every override.
+#[wasm_bindgen(js_name = "configReset")]
+pub fn config_reset() -> String {
+    config_change(config::Runtime::reset)
 }
 
 /// Exported to JS as `queueSay`, for the `rustedscreep.say(text)` console command: every own creep

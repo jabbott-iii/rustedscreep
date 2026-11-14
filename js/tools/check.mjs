@@ -78,6 +78,7 @@ const ROWS = [
   ['11 Act layer (sandbox, act-test build)', 'node', [join(ROOT, 'js', 'tools', 'act-sim.mjs')], true],
   ['12 Profiler (sandbox, profiler build)', 'node', [join(ROOT, 'js', 'tools', 'profiler-sim.mjs')], true],
   ['13 Persistence (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'persist-sim.mjs')], true],
+  ['14 Runtime config (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'config-sim.mjs')], true],
 ];
 
 function main() {

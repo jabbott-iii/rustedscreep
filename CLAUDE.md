@@ -84,6 +84,7 @@ The live server's constants are the ground truth for that server. At init, the b
 | Act layer in the sandbox (the `act-test` build's scripted intents) | `node js/tools/act-sim.mjs` |
 | Profiler in the sandbox (the `profiler` build over six windows, stats segment and write failures) | `node js/tools/profiler-sim.mjs` |
 | Persistence in the sandbox (the plain build's self-test: round trips, corrupt segments, console overrides, the save cap) | `node js/tools/persist-sim.mjs` |
+| Runtime config in the sandbox (the plain build's overrides across four globals: refusals, clamps, the record, log level, naive toggle) | `node js/tools/config-sim.mjs` |
 | Tool tests (Node) / sizes and upload budget | `npm run test` / `npm run size` |
 | Full gate (same as `/check`) | `npm run check` |
 | Stage the MMO deploy folder for the GitHub link (ask first; the user pushes) | `npm run stage` (`-- --out <dir>` for a dry run, `-- --features trap-test` for the gate's recovery test, `-- --features profiler` for the live CPU measurements) |

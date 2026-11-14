@@ -3,21 +3,14 @@
 //!
 //! JS calls per tick: none for the budget (it reads the snapshot's tick context), one
 //! `Game.cpu.getUsed()` per clock sample (only while a time-sliced job runs; no job exists before
-//! P2), and one `console.log` per fault report the rate limit lets through.
+//! P2), and one `console.log` (a `log::warn!`, logging.rs) per fault report the rate limit lets
+//! through.
 
 use std::fmt::{self, Write as _};
 
 use rustedscreep_core::scheduler::{Cap, Clock, Scheduler, Suppressed};
 use rustedscreep_core::snapshot::TickContext;
 use screeps::game;
-use wasm_bindgen::prelude::wasm_bindgen;
-
-#[wasm_bindgen]
-extern "C" {
-    /// `console.log`, looked up on every call: Screeps builds a new console before every tick (V96).
-    #[wasm_bindgen(js_namespace = console, js_name = log)]
-    fn console_log(message: &str);
-}
 
 /// `Game.cpu.getUsed()`: isolate CPU time since the tick started plus 0.2 per intent made so far
 /// (V106). The core sanitizes what it returns.
@@ -34,10 +27,13 @@ impl Clock for GameClock {
 pub fn log_faults(sched: &mut Scheduler) {
     let (reports, suppressed) = sched.faults_mut().drain();
     for r in reports {
-        console_log(&format!(
+        log::warn!(
             "rustedscreep fault at tick {}: job {} unit {}: {}",
-            r.time, r.job, r.fault.unit, r.fault.what
-        ));
+            r.time,
+            r.job,
+            r.fault.unit,
+            r.fault.what
+        );
     }
     if let Some(Suppressed {
         count,
@@ -55,7 +51,7 @@ pub fn log_faults(sched: &mut Scheduler) {
         if more_jobs {
             text.push_str(" and more");
         }
-        console_log(&text);
+        log::warn!("{text}");
     }
 }
 

@@ -5,7 +5,8 @@
 // - each window closes after exactly window_loops loops and only then touches RawMemory;
 // - the first two writes reach segment 99 with the driver's save rules (one key, a string under the size
 //   limit), and the segment parses as JSON with the documented layout (crates/rustedscreep-core/src/profiler/text.rs);
-// - the loop makes six getUsed calls, seven when it closes a window, and reads RawMemory.segments only then;
+// - the loop makes six getUsed calls, seven when it closes a window, and reads RawMemory.segments only then,
+//   except the global's second loop, which reads the config record (P1.10) with two more clock samples;
 // - a say's two calls appear in the first window's calls and act counters, counted as calls made (the act
 //   layer's `issued`) even though the game refuses one of them;
 // - each failure the binding guards against (no RawMemory, a segments value that is not an object, a set
@@ -18,7 +19,7 @@
 import { join } from 'node:path';
 import { build } from './build.mjs';
 import { ROOT, fail, isMain } from './lib/common.mjs';
-import { checkResults, commandResults, driverRawMemory, simulate } from './smoke.mjs';
+import { CONFIG_SEGMENT, checkResults, commandResults, driverRawMemory, simulate } from './smoke.mjs';
 import { sceneAt } from './lib/world.mjs';
 
 /** PROFILER_MMO (config.rs): window length, kept windows and segment id. */
@@ -183,8 +184,11 @@ export function profilerSim() {
   const noRawMemory = FAILURES.find((f) => f.raw() === undefined);
   world.loopCalls.forEach((c, offset) => {
     if (offset < 2) return; // the loader also reads the clock on the boot ticks and the first loop
-    const reads = closing.has(offset) && offset !== closeAt(noRawMemory.window) ? 1 : 0;
-    const want = { getUsed: closing.has(offset) ? 7 : 6, segments: reads };
+    // The second loop reads the config record (P1.10) the first activated: one more RawMemory.segments
+    // read and the load job's two clock samples.
+    const config = offset === 2 ? 1 : 0;
+    const reads = (closing.has(offset) && offset !== closeAt(noRawMemory.window) ? 1 : 0) + config;
+    const want = { getUsed: (closing.has(offset) ? 7 : 6) + 2 * config, segments: reads };
     if (c.getUsed !== want.getUsed || c.segments !== want.segments) {
       problems.push(`offset ${offset}: loop calls ${JSON.stringify(c)}, expected ${JSON.stringify(want)}`);
     }
@@ -192,7 +196,10 @@ export function profilerSim() {
   const cold = world.logs.filter((l) => l.startsWith('rustedscreep profiler: first loop'));
   if (cold.length !== 1) problems.push(`cold lines: ${cold.length}`);
   const saves = JSON.stringify(world.segmentSaves);
-  const wantSaves = JSON.stringify([closeAt(1), closeAt(2)].map((offset) => ({ offset, keys: [SEGMENT] })));
+  // The driver re-saves the loaded config segment on the second loop (V119); then the two window writes.
+  const wantSaves = JSON.stringify([
+    { offset: 2, keys: [String(CONFIG_SEGMENT)] }, ...[closeAt(1), closeAt(2)].map((offset) => ({ offset, keys: [SEGMENT] })),
+  ]);
   if (saves !== wantSaves) problems.push(`segment saves ${saves}, expected ${wantSaves}`);
   if (world.segmentErrors.length) problems.push(`segment errors: ${world.segmentErrors.join(' / ')}`);
   const failures = world.logs.filter((l) => l.startsWith('rustedscreep profiler: writing stats segment'));

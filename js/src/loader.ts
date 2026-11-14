@@ -51,6 +51,14 @@ export interface Glue {
   persistSummary?: () => string;
   /** Starts the persistence self-test with `bytes` payload bytes, the largest that fits when undefined (P1 module 9). */
   persistTest?: (bytes?: number) => string;
+  /** One line about the runtime config: profile, stored record, overrides, the values in force (P1 module 10). */
+  configSummary?: () => string;
+  /** Overrides config field `key` with `value` (as text) from the next tick; returns the outcome (P1 module 10). */
+  configSet?: (key: string, value: string) => string;
+  /** Removes the override of config field `key`; returns the outcome (P1 module 10). */
+  configUnset?: (key: string) => string;
+  /** Removes every config override; returns the outcome (P1 module 10). */
+  configReset?: () => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -97,6 +105,7 @@ export const SENTINEL_MODULE = 'sentinel';
 const MAX_INCIDENTS_KEPT = 20;
 const DEFERRED_LOG_EVERY = 100;
 const ERROR_TEXT_MAX = 500;
+const CONFIG_KEY_HELP = 'rustedscreep: give the config key as a string, for example rustedscreep.configSet("scheduler.tick_reserve_pct", 12); rustedscreep.config() lists the keys';
 
 type Phase = 'idle' | 'compiled' | 'ready' | 'poisoned';
 
@@ -495,9 +504,45 @@ export class Loader {
     return this.guarded('persistTest', 'persist test', () => call(bytes));
   }
 
+  /** Console command `rustedscreep.config()`: the wasm's runtime config (profile, stored record, overrides, values in force). */
+  runtimeConfig(): string {
+    return this.summary('configSummary', 'config summary');
+  }
+
+  /**
+   * Console command: overrides config field `key` from the next tick. `value` is a number, true or false, or a
+   * level name; the wasm clamps a number to the field's safe range and refuses what it cannot use.
+   */
+  configSet(key: unknown, value: unknown): string {
+    const call = this.glue.configSet;
+    if (!call) return 'rustedscreep: this build has no configSet export';
+    if (typeof key !== 'string') return CONFIG_KEY_HELP;
+    const ok = (typeof value === 'number' && Number.isFinite(value)) || typeof value === 'boolean' || typeof value === 'string';
+    if (!ok) {
+      return 'rustedscreep: give the value as a number, true or false, or a level name, for example rustedscreep.configSet("log.level", "debug")';
+    }
+    const text = String(value);
+    return this.guarded('configSet', 'config change', () => call(key, text));
+  }
+
+  /** Console command: removes the override of config field `key`, so the profile's value applies again. */
+  configUnset(key: unknown): string {
+    const call = this.glue.configUnset;
+    if (!call) return 'rustedscreep: this build has no configUnset export';
+    if (typeof key !== 'string') return CONFIG_KEY_HELP;
+    return this.guarded('configUnset', 'config change', () => call(key));
+  }
+
+  /** Console command: removes every config override. */
+  configReset(): string {
+    const call = this.glue.configReset;
+    if (!call) return 'rustedscreep: this build has no configReset export';
+    return this.guarded('configReset', 'config change', call);
+  }
+
   /** Calls a wasm summary export for a console command (see `guarded`). */
   private summary(
-    name: 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary' | 'persistSummary',
+    name: 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary' | 'persistSummary' | 'configSummary',
     noun: string,
   ): string {
     const call = this.glue[name];

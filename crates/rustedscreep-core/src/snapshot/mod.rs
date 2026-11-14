@@ -91,6 +91,78 @@ impl SkipCounts {
     pub fn total(&self) -> u32 {
         self.counts.iter().fold(0, |sum, &c| sum.saturating_add(c))
     }
+
+    /// Adds `other`'s counts, saturating.
+    pub fn add(&mut self, other: &Self) {
+        for (c, &o) in self.counts.iter_mut().zip(&other.counts) {
+            *c = c.saturating_add(o);
+        }
+    }
+}
+
+/// The skipped objects of the ticks one [`SkipLog`] line covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SkipReport {
+    /// The first and last tick with skips in the span.
+    pub first: u32,
+    pub last: u32,
+    /// Ticks in the span that skipped anything.
+    pub ticks: u32,
+    pub counts: SkipCounts,
+}
+
+/// Rate limit for logging skipped objects (`LogConfig::skip_window_ticks`). The first tick that
+/// skips anything is reported at once; after a report, further skips are summed and reported once
+/// `window_ticks` have passed since it, on the first tick after that (with skips or not). So a
+/// steady skip costs one line per window and a one-off skip shows up at once. A global reset starts
+/// it over.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SkipLog {
+    pending: SkipCounts,
+    ticks: u32,
+    first: u32,
+    last: u32,
+    reported: Option<u32>,
+}
+
+impl SkipLog {
+    /// Notes tick `now`'s skips; returns the report that is due, if one is. A `window_ticks` of 0
+    /// counts as 1.
+    #[inline]
+    pub fn note(
+        &mut self,
+        now: u32,
+        skipped: &SkipCounts,
+        window_ticks: u32,
+    ) -> Option<SkipReport> {
+        if skipped.total() > 0 {
+            if self.ticks == 0 {
+                self.first = now;
+            }
+            self.pending.add(skipped);
+            self.ticks = self.ticks.saturating_add(1);
+            self.last = now;
+        }
+        if self.ticks == 0 {
+            return None;
+        }
+        let due = self
+            .reported
+            .is_none_or(|at| now.wrapping_sub(at) >= window_ticks.max(1));
+        if !due {
+            return None;
+        }
+        self.reported = Some(now);
+        let report = SkipReport {
+            first: self.first,
+            last: self.last,
+            ticks: self.ticks,
+            counts: self.pending,
+        };
+        self.pending = SkipCounts::default();
+        self.ticks = 0;
+        Some(report)
+    }
 }
 
 /// Everything the snapshot read this tick.
@@ -147,6 +219,76 @@ mod tests {
         }
         let n = u32::try_from(SkipReason::ALL.len()).expect("small");
         assert_eq!(counts.total(), n * (n + 1) / 2);
+    }
+
+    fn skips(reasons: &[SkipReason]) -> SkipCounts {
+        let mut c = SkipCounts::default();
+        for &r in reasons {
+            c.record(r);
+        }
+        c
+    }
+
+    /// The first skip is reported at once; later skips are summed and reported once a window has
+    /// passed since the last report, on the first tick after that even without new skips; quiet
+    /// ticks report nothing.
+    #[test]
+    fn skip_log_reports_at_most_once_per_window() {
+        let w = crate::config::LOG_MMO.skip_window_ticks;
+        let none = SkipCounts::default();
+        let bad = skips(&[SkipReason::BadId, SkipReason::BadPosition]);
+        let mut log = SkipLog::default();
+        assert_eq!(log.note(10, &none, w), None);
+        let first = log.note(11, &bad, w).expect("first skip at once");
+        assert_eq!(
+            (first.first, first.last, first.ticks, first.counts),
+            (11, 11, 1, bad)
+        );
+        // Skips on every tick from 12 to 11 + w + w/2: one report when the window since tick 11 has
+        // passed (ticks 12 to 11 + w), the rest pending.
+        let stop = 11 + w + w / 2;
+        let reports: Vec<SkipReport> = (12..=stop).filter_map(|t| log.note(t, &bad, w)).collect();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        let r0 = reports[0];
+        assert_eq!((r0.first, r0.last, r0.ticks), (12, 11 + w, w));
+        assert_eq!(r0.counts.get(SkipReason::BadId), w);
+        // Skips stop: what is pending is reported once a window has passed since that report, on a
+        // tick without skips, and then nothing.
+        let quiet: Vec<(u32, SkipReport)> = (stop + 1..stop + 3 * w)
+            .filter_map(|t| log.note(t, &none, w).map(|r| (t, r)))
+            .collect();
+        assert_eq!(quiet.len(), 1, "{quiet:?}");
+        let (at, r1) = quiet[0];
+        assert_eq!(at, 11 + 2 * w);
+        assert_eq!((r1.first, r1.last, r1.ticks), (12 + w, stop, stop - 11 - w));
+        // A skip less than a window after the last report waits; one a window after it shows at once.
+        assert_eq!(log.note(at + w - 1, &bad, w), None);
+        let again = log
+            .note(at + w, &bad, w)
+            .expect("a window after the last report");
+        assert_eq!((again.first, again.ticks), (at + w - 1, 2));
+        // A window of 0 counts as 1: every tick with skips may report.
+        let mut every = SkipLog::default();
+        assert!((0..5).all(|t| every.note(t, &bad, 0).is_some()));
+    }
+
+    #[test]
+    fn skip_counts_add_saturating() {
+        let mut a = skips(&[SkipReason::NoId]);
+        a.add(&skips(&[SkipReason::NoId, SkipReason::Duplicate]));
+        assert_eq!(
+            (
+                a.get(SkipReason::NoId),
+                a.get(SkipReason::Duplicate),
+                a.total()
+            ),
+            (2, 1, 3)
+        );
+        let mut big = SkipCounts {
+            counts: [u32::MAX; SkipReason::ALL.len()],
+        };
+        big.add(&a);
+        assert_eq!(big.get(SkipReason::NoId), u32::MAX);
     }
 
     #[test]

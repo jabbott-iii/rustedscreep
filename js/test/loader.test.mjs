@@ -465,6 +465,7 @@ test('every console command refuses while the wasm is running, without calling i
   const h = harness({
     glue: {
       snapshotSummary: count, schedulerSummary: count, actSummary: count, queueSay: count, persistSummary: count, persistTest: count,
+      configSummary: count, configSet: count, configUnset: count, configReset: count,
     },
   });
   h.tick(2);
@@ -476,6 +477,10 @@ test('every console command refuses while the wasm is running, without calling i
   assert.match(h.loader.say('hi'), /no say while the loader is ready/);
   assert.match(h.loader.persist(), /no persist summary while the loader is ready/);
   assert.match(h.loader.persistTest(undefined), /no persist test while the loader is ready/);
+  assert.match(h.loader.runtimeConfig(), /no config summary while the loader is ready/);
+  assert.match(h.loader.configSet('log.level', 'debug'), /no config change while the loader is ready/);
+  assert.match(h.loader.configUnset('log.level'), /no config change while the loader is ready/);
+  assert.match(h.loader.configReset(), /no config change while the loader is ready/);
   assert.equal(calls, 0);
   h.loader.running = false;
   assert.equal(h.loader.act(), 'called');
@@ -520,6 +525,49 @@ test('the persistTest command passes a whole byte count or nothing, and refuses 
   const bad = harness({ glue: { persistTest: () => { throw new Error('RuntimeError: unreachable'); } } });
   bad.tick(2);
   assert.match(bad.loader.persistTest(undefined), /persistTest trapped; the loader recovers on the next tick/);
+  assert.equal(bad.loader.phase, 'poisoned');
+  bad.tick();
+  assert.equal(bad.halts, 1);
+});
+
+test('the config commands share the guard, pass keys and values as strings, and refuse other arguments', () => {
+  const none = harness();
+  assert.match(none.loader.runtimeConfig(), /no configSummary export/);
+  assert.match(none.loader.configSet('log.level', 'debug'), /no configSet export/);
+  assert.match(none.loader.configUnset('log.level'), /no configUnset export/);
+  assert.match(none.loader.configReset(), /no configReset export/);
+  const calls = [];
+  const h = harness({
+    glue: {
+      configSummary: () => 'summary',
+      configSet: (key, value) => { calls.push(['set', key, value]); return `set ${key}=${value}`; },
+      configUnset: (key) => { calls.push(['unset', key]); return `unset ${key}`; },
+      configReset: () => { calls.push(['reset']); return 'reset'; },
+    },
+  });
+  assert.match(h.loader.configSet('log.level', 'debug'), /no config change while the loader is idle/);
+  h.tick(2);
+  assert.equal(h.loader.runtimeConfig(), 'summary');
+  for (const bad of [undefined, null, 12, {}]) {
+    assert.match(h.loader.configSet(bad, 1), /give the config key as a string/, String(bad));
+    assert.match(h.loader.configUnset(bad), /give the config key as a string/, String(bad));
+  }
+  for (const bad of [undefined, null, Number.NaN, Infinity, {}, [1]]) {
+    assert.match(h.loader.configSet('scheduler.tick_reserve_pct', bad), /give the value as a number, true or false, or a level name/, String(bad));
+  }
+  assert.equal(h.loader.configSet('scheduler.tick_reserve_pct', 12), 'set scheduler.tick_reserve_pct=12');
+  assert.equal(h.loader.configSet('cache.structure_static', false), 'set cache.structure_static=false');
+  assert.equal(h.loader.configSet('log.level', 'debug'), 'set log.level=debug');
+  assert.equal(h.loader.configUnset('log.level'), 'unset log.level');
+  assert.equal(h.loader.configReset(), 'reset');
+  assert.deepEqual(calls, [
+    ['set', 'scheduler.tick_reserve_pct', '12'], ['set', 'cache.structure_static', 'false'], ['set', 'log.level', 'debug'],
+    ['unset', 'log.level'], ['reset'],
+  ], 'only valid arguments reached the wasm, as strings');
+
+  const bad = harness({ glue: { configSet: () => { throw new Error('RuntimeError: unreachable'); } } });
+  bad.tick(2);
+  assert.match(bad.loader.configSet('log.level', 'info'), /configSet trapped; the loader recovers on the next tick/);
   assert.equal(bad.loader.phase, 'poisoned');
   bad.tick();
   assert.equal(bad.halts, 1);

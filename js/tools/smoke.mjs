@@ -219,17 +219,22 @@ const SNAPSHOT_EXPECTED = {
   ],
 };
 
+/** PERSIST_MMO.config_segment (crates/rustedscreep-core/src/config.rs): the runtime config overrides. */
+export const CONFIG_SEGMENT = 97;
+
 /**
  * What `rustedscreep.scheduler()` must report after the loops at these offsets. The fake world has CPU limit
  * 20, tickLimit 500 and bucket 10000, so with SCHEDULER_MMO (crates/rustedscreep-core/src/config.rs) the
  * ceiling is 500 × (100 − 10) / 100 = 450 and the Optional cap 20 + (10000 − 9000) / 100 = 30. The first loop
- * of a global runs no Optional work (warm-up), and no job runs yet, so the clock is never sampled.
+ * of a global runs no Optional work (warm-up); its only job is the persistence load's one step, the config
+ * record's look-up (P1.10), which samples the clock twice. Later loops run no job here.
  */
 const SCHEDULER_EXPECTED = {
   1: [
     'rustedscreep scheduler at tick 50000001 (loop 0 of this global): cpu limit 20, tickLimit 500, bucket 10000',
     'ceiling 450.0; critical on; standard on (cap 450.0); optional off (warm-up)',
-    'samples 0 (bad 0), units 0, budget stops 0, tier-off skips 0, out of order 0, faults 0',
+    // The persistence load job's one step: the first loop looks up the config segment (P1.10).
+    'samples 2 (bad 0), units 1, budget stops 0, tier-off skips 0, out of order 0, faults 0',
     'faults since boot 0 (this window 0)',
   ],
   4: ['(loop 3 of this global)', 'optional on (cap 30.0)', ' | clock now '],
@@ -345,19 +350,27 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [] } = {}) {
   }
   // Readings inside loop once booted (the loader also reads the clock on the boot ticks and the first
   // loop): none without the profiler, six with it (crates/rustedscreep-wasm/src/profiler.rs), so the
-  // feature compiles out and its documented count holds. No build reads RawMemory.segments here, and the
-  // segment manager (crates/rustedscreep-wasm/src/persist.rs) calls setActiveSegments once, with no ids,
-  // on the global's first loop (offset 1), to clear a set an earlier global left.
+  // feature compiles out and its documented count holds. The segment manager
+  // (crates/rustedscreep-wasm/src/persist.rs) wants the config record (segment CONFIG_SEGMENT, P1.10) from
+  // the global's start: the first loop (offset 1) looks it up (one RawMemory.segments read, inside the
+  // load job's one step) and activates it; the next loop reads it (one more read and the job's two clock
+  // samples; a segment never written loads as '', no overrides) and clears the set. After that no loop
+  // touches the segments.
   const perLoop = features.includes('profiler') ? 6 : 0;
   world.loopCalls.forEach((c, offset) => {
-    if (offset >= 2 && c.getUsed !== perLoop) throw new Error(`offset ${offset}: ${c.getUsed} getUsed calls in loop, expected ${perLoop}`);
-    if (c.segments) throw new Error(`offset ${offset}: the loop read RawMemory.segments ${c.segments} time(s)`);
-    const wantActive = offset === 1 ? '[[]]' : '[]';
+    const wantUsed = perLoop + (offset === 2 ? 2 : 0);
+    if (offset >= 2 && c.getUsed !== wantUsed) throw new Error(`offset ${offset}: ${c.getUsed} getUsed calls in loop, expected ${wantUsed}`);
+    const wantReads = offset === 1 || offset === 2 ? 1 : 0;
+    if (c.segments !== wantReads) throw new Error(`offset ${offset}: the loop read RawMemory.segments ${c.segments} time(s), expected ${wantReads}`);
+    const wantActive = JSON.stringify({ 1: [[CONFIG_SEGMENT]], 2: [[]] }[offset] ?? []);
     if (JSON.stringify(c.setActive) !== wantActive) throw new Error(`offset ${offset}: setActiveSegments calls ${JSON.stringify(c.setActive)}, expected ${wantActive}`);
   });
-  // No window closes in 9 ticks, so no build writes a segment here.
-  if (world.segmentSaves.length || world.segmentErrors.length) {
-    throw new Error(`segments: saves ${JSON.stringify(world.segmentSaves)}, errors ${world.segmentErrors.join(' / ')}`);
+  // No window closes in 9 ticks and no override is set, so no build writes a segment here. The only save
+  // is the driver's re-save of the config segment the second loop loaded (every key present is saved,
+  // V119), with the value it loaded: '' for a segment never written.
+  const wantSaves = JSON.stringify([{ offset: 2, keys: [String(CONFIG_SEGMENT)] }]);
+  if (JSON.stringify(world.segmentSaves) !== wantSaves || world.segments[CONFIG_SEGMENT] !== '' || world.segmentErrors.length) {
+    throw new Error(`segments: saves ${JSON.stringify(world.segmentSaves)} (expected ${wantSaves}), errors ${world.segmentErrors.join(' / ')}`);
   }
   if (world.logs.some((l) => l.startsWith('rustedscreep fault'))) throw new Error('a fault was logged with no job running');
   const boot = world.logs.find((l) => l.startsWith('rustedscreep boot:'));

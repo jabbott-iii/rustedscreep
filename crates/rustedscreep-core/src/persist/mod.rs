@@ -28,4 +28,6 @@ pub use set::{Iter, SegmentId, SegmentSet};
 pub mod kind {
     /// The self-test record (`rustedscreep.persistTest()`).
     pub const SELF_TEST: u16 = 1;
+    /// The runtime config overrides (`crate::config::overrides`).
+    pub const CONFIG: u16 = 2;
 }

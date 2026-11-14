@@ -23,6 +23,8 @@ Run these in order. Do not stop at the first failure, because the user wants the
 | 10 | Trap recovery (sandbox) | run by `npm run check` (`js/tools/trap-sim.mjs`): builds two trap-test variants and runs 10 forced traps through each ADR-003 recovery mode |
 | 11 | Act layer (sandbox) | run by `npm run check` (`js/tools/act-sim.mjs`): builds the act-test variant and checks every intent call, its arguments, the return classification and `rustedscreep.act()` against the scripted producer |
 | 12 | Profiler (sandbox) | run by `npm run check` (`js/tools/profiler-sim.mjs`): builds the profiler variant and runs it through six 1000-loop windows, checking the cold loop, the stats segment's writes and layout under the driver's save rules, four guarded write failures, and `rustedscreep.profiler()` |
+| 13 | Persistence (sandbox) | run by `npm run check` (`js/tools/persist-sim.mjs`): the plain build's self-test round trips, corrupt segments, console overrides of the active set, the save cap and `rustedscreep.persist()` |
+| 14 | Runtime config (sandbox) | run by `npm run check` (`js/tools/config-sim.mjs`): the plain build's overrides across four globals: refusals, clamps, the stored record, the log level, the naive structure toggle, a corrupt record and the console clear |
 
 `npm run check` runs all of these at once (`js/tools/check.mjs`). Still report each row separately.
 

@@ -2,6 +2,11 @@
 //! `rustedscreep_core::persist`'s segment manager, the self-test behind
 //! `rustedscreep.persistTest(bytes)`, and the `rustedscreep.persist()` summary.
 //!
+//! Owners: the runtime config overrides (`PersistConfig::config_segment`, P1.10; requested when the
+//! global starts, so the first loop looks it up and the next tick reads it after the activation) and
+//! the self-test (`PersistConfig::self_test_segment`). The manager's limits come from the config in
+//! force (`config::Runtime`), so the overridable ones apply from the tick after a change.
+//!
 //! Each tick, in this order:
 //! - In the decide step, the loads: a Standard-tier step job, one wanted segment per step, so the
 //!   scheduler's cap time-slices a burst. JS calls: none unless a load is due; then the
@@ -23,7 +28,7 @@
 use std::fmt::Write as _;
 
 use js_sys::{Array, Reflect};
-use rustedscreep_core::config::{PERSIST_MMO, PROFILER_MMO};
+use rustedscreep_core::config::overrides;
 use rustedscreep_core::persist::selftest::{self, Failure, Phase, Requested, SelfTest, Verdict};
 use rustedscreep_core::persist::{
     Keys, LoadError, SegmentId, SegmentSet, Segments, WriteResult, frame, kind,
@@ -32,6 +37,8 @@ use rustedscreep_core::profiler;
 use rustedscreep_core::scheduler::{Clock, Job, JobState, Step, TickCpu, Tier};
 use screeps::game;
 use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
+
+use crate::config::{PROFILE, Runtime};
 
 #[wasm_bindgen]
 extern "C" {
@@ -49,10 +56,6 @@ extern "C" {
     /// `Object.keys(obj)`, what the driver's end-of-tick save counts (V119).
     #[wasm_bindgen(js_namespace = Object, js_name = keys, catch)]
     fn object_keys(obj: &JsValue) -> Result<Array, JsValue>;
-
-    /// `console.log`, looked up on every call: Screeps builds a new console before every tick (V96).
-    #[wasm_bindgen(js_namespace = console, js_name = log)]
-    fn console_log(message: &str);
 }
 
 /// The load job: Standard tier (persisted records are never needed for Critical work: an owner
@@ -94,6 +97,7 @@ pub struct Persist {
     job: JobState,
     test: SelfTest,
     test_id: Option<SegmentId>,
+    config_id: Option<SegmentId>,
     /// Frame text for writes.
     text: String,
     /// Decoded frame bytes for loads.
@@ -106,14 +110,22 @@ pub struct Persist {
 }
 
 impl Default for Persist {
+    /// A new global: the config record is wanted at once, so the first loop looks it up.
     fn default() -> Self {
+        let ids = PROFILE.config;
         let reserved =
-            SegmentId::new(PROFILER_MMO.stats_segment).map_or(SegmentSet::EMPTY, SegmentSet::of);
+            SegmentId::new(ids.profiler.stats_segment).map_or(SegmentSet::EMPTY, SegmentSet::of);
+        let config_id = SegmentId::new(ids.persist.config_segment);
+        let mut mgr = Segments::new(reserved);
+        if let Some(id) = config_id {
+            mgr.request_load(id);
+        }
         Self {
-            mgr: Segments::new(reserved),
+            mgr,
             job: JobState::default(),
             test: SelfTest::default(),
-            test_id: SegmentId::new(PERSIST_MMO.self_test_segment),
+            test_id: SegmentId::new(ids.persist.self_test_segment),
+            config_id,
             text: String::new(),
             bytes: Vec::new(),
             scratch: Vec::new(),
@@ -171,33 +183,41 @@ impl Persist {
         self.js_failures = self.js_failures.saturating_add(1);
         if self.logged & op.bit() == 0 {
             self.logged |= op.bit();
-            console_log(&format!(
+            log::warn!(
                 "rustedscreep persist: {} failed at tick {now}: {why} (later failures of this kind are counted, not logged)",
                 op.name()
-            ));
+            );
         }
     }
 
-    /// The decide step's part: reads the segments due this tick, one per step of the load job.
+    /// The decide step's part: reads the segments due this tick, one per step of the load job, and
+    /// hands each to its owner (`cfg` for the config record).
     #[inline]
-    pub fn load<C: Clock>(&mut self, tick: &mut TickCpu<'_, C>, now: u32) {
+    pub fn load<C: Clock>(&mut self, tick: &mut TickCpu<'_, C>, now: u32, cfg: &mut Runtime) {
         let due = self.mgr.due(now);
         if !due.is_empty() && tick.allows(LOAD.tier) {
-            self.load_due(tick, due, now);
+            self.load_due(tick, due, now, cfg);
         }
     }
 
     /// Kept out of the per-tick `loop` function: loads are rare (once per global, or on request).
     #[inline(never)]
-    fn load_due<C: Clock>(&mut self, tick: &mut TickCpu<'_, C>, due: SegmentSet, now: u32) {
+    fn load_due<C: Clock>(
+        &mut self,
+        tick: &mut TickCpu<'_, C>,
+        due: SegmentSet,
+        now: u32,
+        cfg: &mut Runtime,
+    ) {
         let segs = match read_segments() {
             Ok(s) => s,
             Err(why) => {
                 self.fail(Op::Segments, now, why);
                 // Each due segment counts as missing, so the loads give up after `load_retries`.
                 for id in due.iter() {
-                    if let Some(err) = self.mgr.absent(id, &PERSIST_MMO) {
-                        self.deliver(id, now, err, None);
+                    let limits = cfg.get().persist;
+                    if let Some(err) = self.mgr.absent(id, &limits) {
+                        self.deliver(id, now, err, None, cfg);
                     }
                 }
                 return;
@@ -207,7 +227,7 @@ impl Persist {
         let mut job = self.job;
         tick.run_steps(&LOAD, &mut job, |_, _| {
             if let Some(id) = ids.next() {
-                self.load_one(&segs, id, now);
+                self.load_one(&segs, id, now, cfg);
             }
             Ok(if ids.peek().is_some() {
                 Step::More
@@ -218,7 +238,7 @@ impl Persist {
         self.job = job;
     }
 
-    fn load_one(&mut self, segs: &JsValue, id: SegmentId, now: u32) {
+    fn load_one(&mut self, segs: &JsValue, id: SegmentId, now: u32, cfg: &mut Runtime) {
         let testing = Some(id) == self.test_id && matches!(self.test.phase(), Phase::Read { .. });
         let t0 = if testing { game::cpu::get_used() } else { 0.0 };
         let value = match Reflect::get(segs, &key(id)) {
@@ -229,8 +249,9 @@ impl Persist {
             }
         };
         if value.is_undefined() {
-            if let Some(err) = self.mgr.absent(id, &PERSIST_MMO) {
-                self.deliver(id, now, err, None);
+            let limits = cfg.get().persist;
+            if let Some(err) = self.mgr.absent(id, &limits) {
+                self.deliver(id, now, err, None, cfg);
             }
             return;
         }
@@ -241,14 +262,28 @@ impl Persist {
             None
         };
         let ok = match text {
-            None => self.deliver(id, now, LoadError::NotText, get),
-            Some(text) => self.deliver_text(id, now, &text, get),
+            None => self.deliver(id, now, LoadError::NotText, get, cfg),
+            Some(text) => self.deliver_text(id, now, &text, get, cfg),
         };
         self.mgr.loaded(id, ok);
     }
 
     /// Decodes `text` and hands it to `id`'s owner. Returns whether the owner accepted it.
-    fn deliver_text(&mut self, id: SegmentId, now: u32, text: &str, get: Option<u32>) -> bool {
+    fn deliver_text(
+        &mut self,
+        id: SegmentId,
+        now: u32,
+        text: &str,
+        get: Option<u32>,
+        cfg: &mut Runtime,
+    ) -> bool {
+        if Some(id) == self.config_id {
+            let mut bytes = std::mem::take(&mut self.bytes);
+            let frame = frame::decode(text, &mut bytes).map_err(LoadError::Decode);
+            let ok = cfg.loaded(id.get(), frame);
+            self.bytes = bytes;
+            return ok;
+        }
         if Some(id) != self.test_id {
             // No other owner exists before P2.
             return false;
@@ -272,8 +307,19 @@ impl Persist {
         })
     }
 
-    /// Hands a failed load to `id`'s owner (the self-test before P2). Returns false.
-    fn deliver(&mut self, id: SegmentId, now: u32, err: LoadError, get: Option<u32>) -> bool {
+    /// Hands a failed load to `id`'s owner. Returns whether the owner accepted it (the config
+    /// store never does for a failed load).
+    fn deliver(
+        &mut self,
+        id: SegmentId,
+        now: u32,
+        err: LoadError,
+        get: Option<u32>,
+        cfg: &mut Runtime,
+    ) -> bool {
+        if Some(id) == self.config_id {
+            return cfg.loaded(id.get(), Err(err));
+        }
         if Some(id) == self.test_id
             && let Some(v) = self.test.loaded(now, Err(err), get, &mut self.scratch)
         {
@@ -285,27 +331,27 @@ impl Persist {
     /// The output step's part, after the act step: writes the dirty records the save cap allows,
     /// then sets the active set if the manager asks. Runs only while the tick runs the Standard tier.
     #[inline]
-    pub fn flush(&mut self, now: u32, standard: bool) {
-        if standard
-            && (!self.mgr.dirty().is_empty() || self.mgr.plan_active(&PERSIST_MMO).is_some())
-        {
-            self.flush_work(now);
+    pub fn flush(&mut self, now: u32, standard: bool, cfg: &mut Runtime) {
+        let limits = &cfg.get().persist;
+        if standard && (!self.mgr.dirty().is_empty() || self.mgr.plan_active(limits).is_some()) {
+            self.flush_work(now, cfg);
         }
     }
 
     /// Kept out of the per-tick `loop` function: writes and activations are rare.
     #[inline(never)]
-    fn flush_work(&mut self, now: u32) {
+    fn flush_work(&mut self, now: u32, cfg: &mut Runtime) {
+        let limits = cfg.get().persist;
         if !self.mgr.dirty().is_empty() {
             match read_segments() {
-                Ok(segs) => self.write(&segs, now),
+                Ok(segs) => self.write(&segs, now, cfg),
                 Err(why) => {
                     self.fail(Op::Segments, now, why);
                     self.abort_test_write(now);
                 }
             }
         }
-        if let Some(set) = self.mgr.plan_active(&PERSIST_MMO) {
+        if let Some(set) = self.mgr.plan_active(&limits) {
             let ids = Array::new();
             for id in set.iter() {
                 ids.push(&key(id));
@@ -321,7 +367,7 @@ impl Persist {
         }
     }
 
-    fn write(&mut self, segs: &JsValue, now: u32) {
+    fn write(&mut self, segs: &JsValue, now: u32, cfg: &mut Runtime) {
         let (count, present) = match present_keys(segs) {
             Ok(k) => k,
             Err(why) => {
@@ -332,16 +378,19 @@ impl Persist {
         // The profiler writes its segment at the end of a window-closing tick; it checks for a free
         // key itself (profiler.rs), and this keeps one free for it.
         let profiler_key = cfg!(feature = "profiler")
-            && SegmentId::new(PROFILER_MMO.stats_segment).is_some_and(|p| !present.contains(p));
+            && SegmentId::new(PROFILE.config.profiler.stats_segment)
+                .is_some_and(|p| !present.contains(p));
         let keys = Keys {
             count,
             present,
             extra: u32::from(profiler_key),
         };
-        let plan = self.mgr.plan_writes(&keys, &PERSIST_MMO);
+        let plan = self.mgr.plan_writes(&keys, &cfg.get().persist);
         self.mgr.planned(&plan);
         for id in plan.write.iter() {
-            let result = if Some(id) == self.test_id {
+            let result = if Some(id) == self.config_id {
+                self.write_config(segs, id, now, cfg)
+            } else if Some(id) == self.test_id {
                 self.write_test(segs, id, now)
             } else {
                 // No other owner exists before P2: nothing to write.
@@ -349,6 +398,55 @@ impl Persist {
             };
             self.mgr.written(id, result);
         }
+    }
+
+    /// Writes the config record. A failed JS write stays dirty and is tried again next tick (logged
+    /// once per global).
+    fn write_config(
+        &mut self,
+        segs: &JsValue,
+        id: SegmentId,
+        now: u32,
+        cfg: &mut Runtime,
+    ) -> WriteResult {
+        self.scratch.clear();
+        cfg.payload(&mut self.scratch);
+        let encoded = frame::encode(
+            kind::CONFIG,
+            overrides::SCHEMA,
+            now,
+            &self.scratch,
+            &mut self.text,
+        );
+        if encoded.is_err() {
+            // A record is a few hundred bytes at most, far below a segment.
+            log::warn!("rustedscreep config: the record does not fit a segment; not written");
+            return WriteResult::Rejected;
+        }
+        match set_segment(segs, id, &self.text) {
+            Ok(()) => {
+                cfg.written(now);
+                WriteResult::Written
+            }
+            Err(why) => {
+                self.fail(Op::Set, now, why);
+                WriteResult::Failed
+            }
+        }
+    }
+
+    /// A console command changed the overrides: the record is written on the next output step that
+    /// runs the Standard tier.
+    pub fn config_changed(&mut self) {
+        if let Some(id) = self.config_id {
+            self.mgr.mark_dirty(id);
+        }
+    }
+
+    /// Whether a config write is pending, for `rustedscreep.config()`.
+    pub fn config_dirty(&self) -> bool {
+        self.config_id
+            .is_some_and(|id| self.mgr.dirty().contains(id))
     }
 
     /// Writes the self-test frame; on success requests it back.
@@ -517,7 +615,14 @@ fn verdict_text(s: &mut String, v: &Verdict) {
 
 #[cold]
 fn log_verdict(v: &Verdict) {
+    if v.result.is_ok() && !log::log_enabled!(log::Level::Info) {
+        return;
+    }
     let mut s = String::from("rustedscreep persist self-test: ");
     verdict_text(&mut s, v);
-    console_log(&s);
+    if v.result.is_ok() {
+        log::info!("{s}");
+    } else {
+        log::warn!("{s}");
+    }
 }

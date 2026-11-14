@@ -14,7 +14,7 @@
 
 use std::fmt::Write as _;
 
-use rustedscreep_core::config::SCHEDULER_MMO;
+use rustedscreep_core::config::SchedulerConfig;
 use rustedscreep_core::intents::{
     ActLog, CreepIntent, ERROR_CODES, IntentBuffer, Issue, IssueStats, Outcome, Rejected, SayText,
     TargetRow, error_name,
@@ -143,12 +143,19 @@ impl Act {
 /// (stable for the creep's life); an issue whose JS object is missing (the snapshot keeps them
 /// aligned, so this would be a bug) is a fault whose unit is the row, and no call is made. Faults
 /// are rate-limited like a job's.
-pub fn issue(act: &mut Act, snapshot: &Snapshot, js: &JsWorld, sched: &mut Scheduler) {
+pub fn issue(
+    act: &mut Act,
+    snapshot: &Snapshot,
+    js: &JsWorld,
+    sched: &mut Scheduler,
+    cfg: &SchedulerConfig,
+) {
     let Act { buffer, log, .. } = act;
     buffer.issue(log, |issue| {
         let Some(actor) = js.creeps.get(issue.actor as usize) else {
             fault(
                 sched,
+                cfg,
                 snapshot,
                 "no JS object for the actor row",
                 issue.actor,
@@ -163,12 +170,13 @@ pub fn issue(act: &mut Act, snapshot: &Snapshot, js: &JsWorld, sched: &mut Sched
                     .handles()
                     .get(issue.actor as usize)
                     .map_or(issue.actor, |h| h.slot());
-                fault(sched, snapshot, threw(&issue.intent), slot);
+                fault(sched, cfg, snapshot, threw(&issue.intent), slot);
                 Some(Outcome::Threw)
             }
             None => {
                 fault(
                     sched,
+                    cfg,
                     snapshot,
                     "no JS object for the target row",
                     issue.actor,
@@ -223,13 +231,19 @@ const fn threw(intent: &CreepIntent) -> &'static str {
     }
 }
 
-fn fault(sched: &mut Scheduler, snapshot: &Snapshot, what: &'static str, row: u32) {
+fn fault(
+    sched: &mut Scheduler,
+    cfg: &SchedulerConfig,
+    snapshot: &Snapshot,
+    what: &'static str,
+    row: u32,
+) {
     let record = FaultRecord {
         time: snapshot.tick.time,
         job: JOB,
         fault: Fault::new(what, row),
     };
-    sched.faults_mut().record(record, &SCHEDULER_MMO);
+    sched.faults_mut().record(record, cfg);
 }
 
 /// One line for `rustedscreep.act()`: the last tick's buffer and call counters, totals since the
