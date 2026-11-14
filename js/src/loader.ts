@@ -37,6 +37,8 @@ export interface Glue {
   loop(): void;
   /** Present only in a `--features trap-test` build. */
   trapTest?: () => void;
+  /** One line about the wasm's latest snapshot (P1 module 5), for a console command. */
+  snapshotSummary?: () => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -433,6 +435,26 @@ export class Loader {
     mem.pendingTraps = n;
     mem.trapRun = { total: n, startedAt: this.env.time(), recoveryTicks: [] };
     return `rustedscreep: ${n} trap(s) scheduled; each fires in the next loop after a boot`;
+  }
+
+  /**
+   * Console command: the wasm's summary of this tick's snapshot. It calls into the wasm only while the
+   * instance is healthy, and a throw poisons it like a trap in loop, so the next tick recovers.
+   */
+  snapshot(): string {
+    if (!this.glue.snapshotSummary) return 'rustedscreep: this build has no snapshotSummary export';
+    if (this.phase !== 'ready' || this.running) return `rustedscreep: no snapshot while the loader is ${this.phase}`;
+    this.running = true;
+    try {
+      const text = this.glue.snapshotSummary();
+      this.running = false;
+      return text;
+    } catch (e) {
+      this.running = false;
+      this.phase = 'poisoned';
+      this.incident('trap', `snapshotSummary: ${message(e)}`);
+      return 'rustedscreep: snapshotSummary trapped; the loader recovers on the next tick';
+    }
   }
 
   /** Console command: a one-line summary of the loader's state. */

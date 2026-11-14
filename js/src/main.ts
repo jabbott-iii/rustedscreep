@@ -3,7 +3,9 @@
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
 import { textCodecSource } from './text-polyfill.js';
-import { __wbg_reset_state, initSync, loop as wasmLoop, trapTest as wasmTrapTest } from '../pkg/rustedscreep_wasm.js';
+import {
+  __wbg_reset_state, initSync, loop as wasmLoop, snapshotSummary as wasmSnapshotSummary, trapTest as wasmTrapTest,
+} from '../pkg/rustedscreep_wasm.js';
 import { type BuildInfo, type Env, type Glue, Loader, type LoaderConfig, type LoaderMemory, sanitizeLoaderMemory } from './loader.js';
 
 // Replaced with object literals by rollup.config.mjs; npm run build sets them.
@@ -77,6 +79,7 @@ const glue: Glue = {
   reset: __wbg_reset_state,
   loop: wasmLoop,
   trapTest: BUILD.features.includes('trap-test') ? wasmTrapTest : undefined,
+  snapshotSummary: wasmSnapshotSummary,
 };
 
 const loader = new Loader(env, glue, CONFIG, BUILD);
@@ -103,10 +106,11 @@ function routeConsole(): void {
   }
 }
 
-// Console commands, for example `rustedscreep.trapTest(10)` or `rustedscreep.status()`.
+// Console commands, for example `rustedscreep.trapTest(10)`, `rustedscreep.status()` or `rustedscreep.snapshot()`.
 g.rustedscreep = {
   trapTest: (n: unknown = 1) => loader.scheduleTraps(Number(n)),
   status: () => loader.status(),
+  snapshot: () => loader.snapshot(),
 };
 
 export function loop(): void {

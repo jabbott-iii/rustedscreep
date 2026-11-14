@@ -10,15 +10,18 @@ import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import vm from 'node:vm';
 import { ROOT, WASM_MODULE, fail, isMain } from './lib/common.mjs';
+import { sceneAt } from './lib/world.mjs';
 
 const ABSENT_GLOBALS = ['TextDecoder', 'TextEncoder', 'fetch', 'URL', 'document'];
 
 /**
  * Runs the bundle in `dir` for up to `ticks` ticks. `command(world)` may return console command source
  * to evaluate after that tick's loop, as the game does. Stops early once `until(world)` is true.
+ * `scene(offset)` gives the tick's Game.creeps, Game.rooms and Game.structures (js/tools/lib/world.mjs).
  */
 export function simulate(dir, {
   ticks = 6, bucket = 10000, command = null, until = null, memoryJson = '{}', withHalt = true, wasmBytes = null,
+  scene = sceneAt,
 } = {}) {
   const code = readFileSync(join(dir, 'main.js'), 'utf8');
   const bytes = wasmBytes ?? readFileSync(join(dir, `${WASM_MODULE}.wasm`));
@@ -59,6 +62,7 @@ export function simulate(dir, {
     });
     context.Memory = memory;
     context.Game = {
+      ...scene(offset),
       time: world.time,
       cpu: {
         bucket, limit: 20, tickLimit: 500,
@@ -90,9 +94,47 @@ export function simulate(dir, {
   return world;
 }
 
-/** The plain smoke test npm run build runs: the bundle boots, logs a matching CRC-32 and runs clean. */
+/**
+ * What `rustedscreep.snapshot()` must report after the loops at these offsets of sceneAt (js/tools/lib/world.mjs):
+ * the first loop runs at offset 1, so at 3 the Invader (new at 2) is old and the spawning builder is new,
+ * and at 5 the scout and the Invader are gone and two objects are skipped each tick. The per-room counts
+ * come from decoded positions, so they also cover W, E, N and S room bits and the room without a controller.
+ */
+const SNAPSHOT_EXPECTED = {
+  3: [
+    'rustedscreep snapshot at tick 50000003: cpu limit 20, tickLimit 500, bucket 10000',
+    'rooms 3 (owned 1): W1N1 mine RCL 2 (creeps 2, structures 2), W2N1 neutral (creeps 2, structures 0), ' +
+      'E0S0 no controller (creeps 1, structures 0)',
+    'creeps 5 (mine 4, hostile 1, spawning 1; new 1, gone 0, live handles 5)',
+    'structures 2 (new 0, gone 0, live handles 2)',
+    'skipped 0',
+  ],
+  5: [
+    'rooms 2 (owned 1): W1N1 mine RCL 2 (creeps 2, structures 2), E0S0 no controller (creeps 1, structures 0)',
+    'creeps 3 (mine 3, hostile 0, spawning 1; new 0, gone 0, live handles 3)',
+    'structures 2 (new 0, gone 0, live handles 2)',
+    'skipped 2, bad id 1, unknown structure type 1',
+  ],
+};
+
+/**
+ * The plain smoke test npm run build runs: the bundle boots, logs a matching CRC-32, runs clean, and its
+ * snapshot of the fake world matches SNAPSHOT_EXPECTED.
+ */
 export function smoke(dir = join(ROOT, 'dist')) {
-  const world = simulate(dir, { ticks: 6 });
+  const world = simulate(dir, {
+    ticks: 6,
+    command: (w) => (SNAPSHOT_EXPECTED[w.ticksRun] ? 'rustedscreep.snapshot()' : null),
+  });
+  // Each command's result is logged right after it, in tick order.
+  const summaries = world.logs.filter((l, i) => i > 0 && world.logs[i - 1] === '> rustedscreep.snapshot()');
+  const expected = Object.entries(SNAPSHOT_EXPECTED);
+  if (summaries.length !== expected.length) throw new Error(`${summaries.length} snapshot summaries, expected ${expected.length}`);
+  expected.forEach(([offset, parts], i) => {
+    const missing = parts.filter((p) => !summaries[i].includes(p));
+    if (missing.length) throw new Error(`snapshot at offset ${offset} lacks ${missing.join(' / ')}: ${summaries[i]}`);
+    if (summaries[i].includes('NOT aligned')) throw new Error(`snapshot at offset ${offset}: JS objects and rows differ: ${summaries[i]}`);
+  });
   const boot = world.logs.find((l) => l.startsWith('rustedscreep boot:'));
   if (!boot) throw new Error(`no boot log; logs: ${world.logs.join(' / ')}`);
   if (!boot.includes(': match)')) throw new Error(`the boot log does not report a matching CRC-32: ${boot}`);

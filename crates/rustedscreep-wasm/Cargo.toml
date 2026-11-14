@@ -17,3 +17,7 @@ trap-test = []
 [dependencies]
 wasm-bindgen.workspace = true
 console_error_panic_hook.workspace = true
+js-sys.workspace = true
+# Game objects for the snapshot; no cargo features yet (V2, V87).
+screeps-game-api.workspace = true
+rustedscreep-core = { path = "../rustedscreep-core" }

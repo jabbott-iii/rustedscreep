@@ -335,3 +335,32 @@ test('toBytes accepts views and ArrayBuffers and rejects anything else', () => {
   assert.deepEqual(Array.from(toBytes(new Uint8Array([5]).buffer)), [5]);
   assert.throws(() => toBytes('not bytes'), /returned String, not bytes/);
 });
+
+test('the snapshot command calls the wasm only while it is ready, and reports a missing export', () => {
+  const none = harness();
+  assert.match(none.loader.snapshot(), /no snapshotSummary export/);
+  let calls = 0;
+  const h = harness({ glue: { snapshotSummary: () => `summary ${++calls}` } });
+  assert.match(h.loader.snapshot(), /no snapshot while the loader is idle/);
+  h.tick(2);
+  assert.equal(h.loader.phase, 'ready');
+  assert.equal(h.loader.snapshot(), 'summary 1');
+  assert.equal(h.loader.running, false);
+  h.loopThrows = true;
+  h.tick();
+  assert.equal(h.loader.phase, 'poisoned');
+  assert.match(h.loader.snapshot(), /no snapshot while the loader is poisoned/);
+  assert.equal(calls, 1);
+});
+
+test('a snapshot command that throws poisons the instance like a trap, and the next tick recovers', () => {
+  const h = harness({ glue: { snapshotSummary: () => { throw new Error('RuntimeError: unreachable'); } } });
+  h.tick(2);
+  assert.match(h.loader.snapshot(), /trapped; the loader recovers on the next tick/);
+  assert.equal(h.loader.phase, 'poisoned');
+  assert.equal(h.loader.running, false);
+  assert.equal(h.mem.incidents.length, 1);
+  assert.ok(h.logs.some((l) => l.includes('incident: trap at') && /snapshotSummary: Error: RuntimeError/.test(l)));
+  h.tick();
+  assert.equal(h.halts, 1, 'the next tick halts, as after a trap in loop');
+});
