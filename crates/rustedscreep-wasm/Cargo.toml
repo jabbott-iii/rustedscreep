@@ -21,9 +21,8 @@ profiler = []
 [dependencies]
 wasm-bindgen.workspace = true
 console_error_panic_hook.workspace = true
-# Logging through `log` macros to a `fern` dispatch that prints with `console.log` (logging.rs).
+# Logging through `log` macros to a minimal logger that prints with `console.log` (logging.rs, ADR-014).
 log.workspace = true
-fern.workspace = true
 js-sys.workspace = true
 # Game objects for the snapshot; no cargo features yet (V2, V87).
 screeps-game-api.workspace = true

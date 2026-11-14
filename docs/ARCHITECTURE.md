@@ -44,8 +44,8 @@ Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and o
    totals since boot. The buffer issues only a creep's last push of a method, with no fallback to an earlier push if that call fails.
 8. The persistence output step (P1.9; while the tick runs the Standard tier): dirty records are written (the config record after a
    console change, P1.10) and the active set is issued when the manager asks; see section 5. Then the fault reports queued this tick
-   (jobs' and the act step's) go out through `log::warn!` (`logging.rs`: `log` macros, a `fern` dispatch whose one output is
-   `console.log`; V126, V127).
+   (jobs' and the act step's) go out through `log::warn!` (`logging.rs`: `log` macros and a minimal logger that prints with
+   `console.log`; ADR-014, V127, V128).
 9. Profiler (P1.8, `rustedscreep-wasm/src/profiler.rs` over `rustedscreep_core::profiler`), only with the `profiler` feature: two
    `Game.cpu.getUsed()` readings back to back at the start of `loop`, then one each after the snapshot, the decide step, the act step
    and the fault log (6 per loop). `Profiler::record` adds the spans to a 1000-loop window (no JS call). On a global's first loop, one
@@ -82,7 +82,7 @@ Config (P1.10): `rustedscreep_core::config` holds every threshold struct, `Confi
 getter and setter) and the cross-field `RULES`; `config::overrides` parses, clamps and checks overrides, encodes and decodes their
 record, and `Store` holds the profile's values, the overrides and the config in force. rustedscreep-wasm's `config.rs` selects the
 active profile (`PROFILE`) and answers the `rustedscreep.config*` console commands; `logging.rs` installs the logger once per
-instance, from the start function, and sets the level. rustedscreep-wasm depends on log 0.4.35 and fern 0.7.1 (ADR-006, no features).
+instance, from the start function, and sets the level. rustedscreep-wasm depends on log 0.4.35 (ADR-006, no features); fern was dropped for its own minimal logger (ADR-014).
 
 Act layer (P1.7): `rustedscreep_core::intents` holds the engine's creep intent-priority table as data (`CreepAction`, `ActionSet`,
 `ActionSet::executed` as the engine model, `PRIORITY_ORDER` and `ActionSet::kept` for what is issued, with the engine commit), the

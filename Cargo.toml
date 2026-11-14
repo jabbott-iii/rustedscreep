@@ -22,11 +22,10 @@ js-sys = "=0.3.107"
 console_error_panic_hook = "=0.1.7"
 # FxHash maps for the snapshot's id interner (ADR-006; default features only, which is `std`).
 rustc-hash = "=2.1.3"
-# Logging facade and backend for rustedscreep-wasm (ADR-006, V68). No features: log has no default
-# features and fern turns on log's `std` (V126, V127); STATIC_MAX_LEVEL stays Trace, and the runtime
-# level from config is `log::set_max_level`.
+# Logging facade for rustedscreep-wasm (ADR-006, V68), with a minimal logger of its own instead of
+# fern (ADR-014). No features (log has no default features): `set_logger` needs none, STATIC_MAX_LEVEL
+# stays Trace, and the runtime level from config is `log::set_max_level` (V127, V128).
 log = "=0.4.35"
-fern = "=0.7.1"
 
 [workspace.package]
 version = "0.1.0"

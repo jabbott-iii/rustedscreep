@@ -128,7 +128,7 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
 - Decision: as recommended; the user accepted it on 2026-11-13 ("Accept all four", covering ADR-001, 003, 005 and 006 as recommended).
 - Consequences:
   - rustedscreep-core gets rustc-hash, arrayvec and log, plus criterion and proptest as dev-dependencies only.
-  - rustedscreep-wasm gets log, fern and console_error_panic_hook.
+  - rustedscreep-wasm gets log, fern and console_error_panic_hook. (fern was dropped by ADR-014 on 2026-11-14: rustedscreep-wasm has its own minimal logger.)
   - smallvec waits for a measured need.
   - No optional features are enabled, and versions are pinned in Cargo.lock in P1. `cargo add` always asks first.
   - If ADR-002 falls back to an older stable, criterion and proptest move to versions within that MSRV.
@@ -219,11 +219,16 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
 - Consequences: on a tick that reaches the ceiling, Critical jobs that run after it are skipped for that tick. Round-robin cursors start the next tick with the units that were skipped. `rustedscreep.scheduler()` shows budget stops and a broken clock, and TickStats counts tier-order breaches. `bad_samples_to_break` is a config field (TUNING.md), so the threshold can be raised without a code change.
 - Evidence: V37, V105 and V106 (driver cf63d8a, engine a90d26f; researcher and skeptic). The P1.6 tests pin the behavior: `the_ceiling_keeps_the_reserve`, `an_empty_bucket_still_runs_critical`, `bad_clock_readings`, `the_break_threshold_is_configurable`, `a_cost_jump_stays_inside_the_reserve`.
 
-## ADR-014 Log backend: fern or a minimal logger: Proposed (2026-11-14)
+## ADR-014 Log backend: fern or a minimal logger: Accepted (2026-11-14)
 - Context: SPEC §1 lists `log`/`fern`, and ADR-006 accepted fern 0.7.1 for rustedscreep-wasm. P1.10 added it as specified: one `fern::Dispatch` at level Trace whose only output is `Output::call` to `console.log`, and the level from config through `log::set_max_level` (V126, V127). The bot uses nothing else fern offers (formatting closures, per-module levels, chaining, file, stream or syslog outputs). Wasm size is a cost every global pays: the loader compiles the whole module on each boot (ADR-003), and the boot gate is set from the measured cold start (P1 gate).
 - Options:
   - (a) Keep fern, as SPEC and ADR-006 say.
   - (b) Replace fern with a minimal `log::Log` in `logging.rs`: `enabled` returns true and `log` prints `record.args()` with `console.log` (`as_str` first, so a message without arguments does not allocate), installed with `log::set_logger` on a static. Behavior is the same: `log` macros, the same level gate (`log::set_max_level`) and the same lines. `log` stays, and fern leaves Cargo.toml and Cargo.lock.
 - Evidence (local, 2026-11-14, `npm run build`, same tree but `logging.rs`): release wasm 170534 bytes with fern and 123394 with (b), so fern costs 47140 bytes, 28% of the module (V126). Before P1.10 the plain build was 89000 bytes (STATUS). The MMO cold-start cost of either size is not measured yet (P1 gate).
 - Recommendation: (b), since it removes 47 KB of wasm with no change in behavior. It deviates from SPEC §1's dependency list, which is your call. If accepted: VERIFICATION_LOG section C gets a discrepancy row, and ADR-006's consequences say fern was dropped.
-- Decision: pending (the user's).
+- Decision: (b), as recommended; the user chose it on 2026-11-14 ("Yes, drop fern"), after P1.10 was committed with fern (83f1254).
+- Consequences:
+  - fern leaves the root `[workspace.dependencies]`, rustedscreep-wasm's Cargo.toml and Cargo.lock. `log` 0.4.35 stays, now with no features at all: `log::set_logger` on a static needs none (V128).
+  - rustedscreep-wasm `logging.rs` holds `Console`, a `log::Log` whose `log` prints the message with `console.log`, installed once per instance from the start function; the level is `log::set_max_level` as before, and every log line reads as before.
+  - Release wasm of the plain build: 170756 bytes at 83f1254, 123705 after (`npm run build`, 2026-11-14), so 47051 bytes less (V128).
+  - VERIFICATION_LOG D8 records the deviation from SPEC §1; ADR-006's consequences note it.

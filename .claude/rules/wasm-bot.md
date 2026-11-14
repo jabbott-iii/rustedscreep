@@ -31,7 +31,7 @@ paths:
 ## Errors, logging, resets
 - Process each room, creep, and task in its own `Result` boundary. A failure is logged with a rate limit and skipped. The tick continues.
 - Same no-panic clippy denies as `rustedscreep-core`, at the crate root for non-test code.
-- Logging goes through `log` + `fern`, with the level from config. Guard expensive formatting with `log::log_enabled!`.
+- Logging goes through `log` macros and the minimal logger in `logging.rs` (ADR-014 replaced `fern`), with the level from config. Guard expensive formatting with `log::log_enabled!`.
 - On a global reset, initialize in small steps across ticks: Critical tier first, caches rebuilt lazily by tier.
   The first tick after a reset must not run Optional work.
 

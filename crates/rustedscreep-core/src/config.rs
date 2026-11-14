@@ -197,7 +197,7 @@ pub const PERSIST_MMO: PersistConfig = PersistConfig {
 };
 
 /// How much the bot logs, least verbose first. rustedscreep-wasm maps it to `log::LevelFilter`
-/// (`log` + `fern`, ADR-006). It starts at warn, with no "error" or "off": faults, failed JS calls
+/// (`log` with a minimal logger, ADR-014). It starts at warn, with no "error" or "off": faults, failed JS calls
 /// and refused records are warnings, and they always print (the rate limits bound them).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
