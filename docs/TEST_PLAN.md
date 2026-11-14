@@ -29,5 +29,5 @@ _P2 onward._ Pure-Rust scenario tests in `rustedscreep-core` that stand in for i
 abort (P10), and the siege scenario against simulated towers (P11). Expected outcomes derive from constants.
 
 ## 8. Live MMO checks (core)
-_P1 onward._ What each core gate observes on the official MMO, how it is captured (`npm run console` and `npm run stats` into `logs/`),
+_P1 onward._ Deploys reach the MMO when the user pushes the staged `deploy/` folder through the GitHub link (ADR-012); P1 first verifies that path (VERIFICATION_LOG V77). What each core gate observes on the official MMO, how it is captured (`npm run console` and `npm run stats` into `logs/`),
 and which checks need the user's approval first (live offense sorties in P10 and P11).

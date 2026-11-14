@@ -21,7 +21,7 @@ This kit turns your spec (`docs/SPEC.md`, verbatim) into a phase-gated Claude Co
 | Full validation gate | `/check` |
 | CPU / robustness review (forked subagent) | `/cpu-audit diff` |
 | Combat math review (forked subagent) | `/combat-verify diff` |
-| Deploy (dry run first; official servers only when you name them) | `/deploy mmo --dryrun` |
+| Deploy: `mmo` stages `deploy/` for your push through the GitHub link (ADR-012), and `--dryrun` stages to a scratch folder only. Official servers only when you name them | `/deploy mmo --dryrun` |
 | Commit message to copy (no trailers, never commits) | `/commit-msg` |
 
 Use one phase per session. After `/phase-gate` passes, run `/clear`. The SessionStart hook re-injects `docs/STATUS.md` at startup,
@@ -35,7 +35,7 @@ on resume, and after compaction, so long work keeps its place.
   - `screeps-verifier` (Sonnet, read-only plus web) handles research, and several run in parallel.
   - `hot-path-reviewer`, `combat-math-auditor` and `wasm-build-doctor` are read-only reviewers.
 - `.claude/hooks/`:
-  - `guard-bash.mjs` blocks git history and publish operations, work-discarding git commands, package publishing, and credential access. It also catches compound and `git -C` forms.
+  - `guard-bash.mjs` blocks git history and publish operations, work-discarding git commands, package publishing, GitHub writes, and credential access. It also catches compound, `git -C`, quoted, wrapped, nested-shell and `eval` forms (`node .claude/hooks/test-guard-bash.mjs` tests it).
   - `guard-purity.mjs` keeps `rustedscreep-core` and `rustedscreep-consts` free of JS bindings.
   - `session-context.mjs` re-injects status.
 - `.claude/settings.json`: allow, ask and deny rules, the hooks, and empty commit/PR attribution.

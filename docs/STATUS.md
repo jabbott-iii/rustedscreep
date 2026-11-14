@@ -5,11 +5,11 @@
 **Target servers:** official MMO, shard3 (free tier) on the core track. Optional tracks: private server (`docs/ROADMAP_PRIVATE.md`, none running yet) and Seasonal (`docs/ROADMAP_SEASONAL.md`, after P12). See `docs/PROJECT_CONTEXT.md`.
 
 ## Blockers
-- The repository root is linked in the game client (most likely Account → GitHub sync, VERIFICATION_LOG V75). A push may overwrite the live MMO `default` branch without a `/deploy`. Per ADR-011 the user unlinks it; this stays here until the user confirms.
-- Local Node is 18.19.1. The deploy tool (screeps-api 2.x) needs Node 22 or 24 (V11). It blocks `npm run deploy` in P1, not the build. Upgrading is the user's call.
+- The GitHub link stays (the user's decision, ADR-012) and every push to `main` triggers the sync (V77, user-observed). It still points at the repository root, which has no modules, so every push syncs the root. Order (ADR-012): first push a commit containing a checked `deploy/`, then re-point the Folder to `deploy` and press Sync, which overwrites the account's code at once with what `deploy/` holds on GitHub.
+- Local Node is 18.19.1. The API tools (`npm run deploy`, `console` and `stats`, all on screeps-api 2.x) need Node 22 or 24 (V11). The MMO push deploy (ADR-012) and the build do not, but P1's live captures use `console` and `stats`. Upgrading is the user's call.
 
 ## Open decisions
-See `docs/DECISIONS.md`. Accepted: ADR-001 (build tool), 002 (toolchain and wasm features), 003 (trap recovery), 005 (constants source), 006 (dependencies), 008 (loader and transpile target), 009 (crate names), 010 (roadmap tracks), 011 (deploy path). Proposed: ADR-004 (decided in P1), ADR-007 (decided in P4).
+See `docs/DECISIONS.md`. Accepted: ADR-001 (build tool), 002 (toolchain and wasm features), 003 (trap recovery), 005 (constants source), 006 (dependencies), 008 (loader and transpile target), 009 (crate names), 010 (roadmap tracks), 012 (deploy through the GitHub link; supersedes 011). Proposed: ADR-004 (decided in P1), ADR-007 (decided in P4).
 
 ## Phases: MMO core track (`docs/ROADMAP.md`)
 - [x] P0 Kickoff and verification (gate passed 2026-11-13)
@@ -47,8 +47,9 @@ Seasonal (`docs/ROADMAP_SEASONAL.md`):
 Before P1 code (each install asks first): Rust 1.100.0 plus the `wasm32-unknown-unknown` target (rustup), wasm-bindgen-cli 0.2.130 (cargo install), binaryen version_133. Deploying also needs Node 22 or 24 (see Blockers).
 - [ ] 1. Workspace: root `Cargo.toml`, the three crates, `default-members` without rustedscreep-wasm, release profile, `rust-toolchain.toml`, clippy no-panic denies
 - [ ] 2. `rustedscreep-consts`: re-exports of the crate's constants and pure local types (ADR-005), `extra.rs`, constant-derived tests
-- [ ] 3. Build: cargo build, then wasm-bindgen CLI at the Cargo.lock version, then wasm-opt `-O4` (ADR-001/002); `tsc` to ES2022 plus Rollup (ADR-008); npm scripts; `.example-screeps.yaml`
-- [ ] 4. Loader: bucket-gated boot, `loop`, trap and abort recovery (ADR-003), `console.error` routing, `trap-test`, TextEncoder/TextDecoder polyfill
+- [ ] 3. Build: cargo build, then wasm-bindgen CLI at the Cargo.lock version, then wasm-opt `-O4` (ADR-001/002); `tsc` to ES2022 plus Rollup (ADR-008); npm scripts including `stage` into the tracked `deploy/` folder (ADR-012); `.example-screeps.yaml`
+- [ ] GitHub-link deploy path verified (V77; needs the user to name `mmo` and push): wasm hash matches in game, sentinel shows deletion behavior, delay, identical re-sync (the trigger on `main` is confirmed)
+- [ ] 4. Loader: bucket-gated boot, `loop`, trap and abort recovery (ADR-003), `console.error` routing, `trap-test`, TextEncoder/TextDecoder polyfill, boot log of build ID and wasm hash (V77)
 - [ ] 5. Snapshot
 - [ ] 6. Scheduler
 - [ ] 7. Act layer
@@ -68,6 +69,10 @@ Timing for the P1 live checks: an RCL1 room with no upgrading is lost about 2000
 | Largest console probe unit | n/a | 864 JSON characters (limit 1024, V69) | 2026-11-13 | `node js/probe/check.mjs` |
 
 ## Log (newest first)
+- 2026-11-13: With the user's OK, hardened `.claude/hooks/guard-bash.mjs` (GitHub writes, git plumbing that publishes, quoted, wrapped, nested and eval forms) and added `ask` rules for `npm run stage` and `gh api` to `.claude/settings.json`. Evidence: `node .claude/hooks/test-guard-bash.mjs` passes 60 block and 32 allow cases; `node --check` and the JSON parse pass.
+- 2026-11-13: Independent review of the ADR-012 change: 20 findings confirmed and fixed (deploy dry run no longer writes `deploy/`; re-point order and its immediate overwrite stated; API fallback requires unlinking first; V77 test uses the first checked build with a byte hash, a sentinel module and a docs-only push; Steam mirror rule; ADR-012 Evidence field; V74/V75 repointed), 8 refuted. Hardening guard-bash.mjs and settings.json `ask` rules await the user's OK.
+- 2026-11-13: The user confirmed that every push to `main` triggers the GitHub sync and that the bot script will deploy from a `deploy/` folder. V77, ADR-012, ROADMAP P1 gate and STATUS updated; the P1 check now covers only `.wasm` handling, deletion and delay.
+- 2026-11-13: The user keeps the client's GitHub link for live testing. ADR-012 (deploy through the link, from a tracked `deploy/` folder that `npm run stage` fills with a checked build) accepted and supersedes ADR-011. V77 records the link's unknowns as a P1 check. ROADMAP P1, `/deploy`, CLAUDE.md, PROJECT_CONTEXT and TEST_PLAN updated.
 - 2026-11-13: P0 gate passed. Evidence: (1) the user answered both question rounds (PROJECT_CONTEXT); (2) MMO probe recorded (VERIFICATION_LOG section D, V72; raw output in docs/probe-results/); (3) ADR-001, 002, 003, 005, 006 and 008 Accepted (002 and 008 with 011 on "Accept all three"); (4) every tooling row with an unverified part states an assumption and a fallback (only V69 remains, with a safe default; V27 and V62 superseded by V72). `node js/probe/check.mjs` passes; SPEC unchanged. Also aligned ROADMAP P1.3, the js-loader rule and the CLAUDE.md wasm trap with ADR-002/008. Current phase set to P1.
 - 2026-11-13: Researched the client's code-sync paths (two researchers plus a reconciler that read the installed client, packageVersion 248): the Steam mirror has a fixed path, is two-way and corrupts `.wasm` on write-back (V74); the repo link is most likely the GitHub integration (V75); MMO code size 2 MB per a 2018 staff post (V76, inferred). ADR-011 (deploy path) proposed: deploy only with the repo's tool.
 - 2026-11-13: MMO probe recorded (shard3, Game.time 84257673): all 10 wasm features and all 21 syntax checks through ES2022 accepted, controls correct; TextDecoder/TextEncoder undefined; heap_size_limit 775946240; CPU limit 20, bucket 6387. Raw output in docs/probe-results/; rows V72 and V73. ADR-002 and ADR-008 evidence updated; both are ready for acceptance.

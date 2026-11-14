@@ -22,7 +22,7 @@ Answers recorded 2026-11-13 (P0 kickoff).
 
 ## Environment
 - Private server (screeps-launcher / Docker / none) and mods: none at the moment. It is the optional private-server track (PS1 sets it up when the user wants it).
-- Game client and code sync (2026-11-13): the Steam client (packageVersion 248) keeps a two-way local mirror at `~/.config/Screeps/scripts/screeps.com/` (VERIFICATION_LOG V74). The user linked the repository root in the client on 2026-11-13, most likely through Account → GitHub (V75). Recommendation pending (ADR-011): unlink it and deploy only with the repo's tool.
+- Game client and code sync (2026-11-13): the Steam client (packageVersion 248) keeps a two-way local mirror at `~/.config/Screeps/scripts/screeps.com/` (VERIFICATION_LOG V74). The user linked the repository in the client on 2026-11-13, most likely through Account → GitHub (V75), and keeps the link for live testing (ADR-012). Every push to `main` triggers the sync (user-observed), so a push deploys. The user plans to point the link at the tracked `deploy/` folder instead of the root.
 - Toolchain policy (stable pinned, or nightly allowed): stable only, pinned. If a target server rejects the wasm features that current stable emits, the options are an older pinned stable or wasm-opt lowering passes (ADR-002), never nightly.
 - Developer OS and Node version (checked 2026-11-13 with `uname -sr`, `node -v`, `rustc -Vv`):
   - Linux 7.2.15 (x86_64).

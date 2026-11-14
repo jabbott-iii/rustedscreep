@@ -12,7 +12,8 @@ No core gate needs a private server or a Seasonal server.
 
 Evidence conventions:
 - **Live run:** the bot running on the official MMO under the user's account, with the result captured through `npm run console` and
-  `npm run stats` into `logs/`. Deploying to the MMO needs the user to name it (CLAUDE.md).
+  `npm run stats` into `logs/`. A deploy to the MMO is a push of the staged `deploy/` folder through the GitHub link (ADR-012). Claude stages it
+  only when the user names `mmo`, and the user pushes.
 - **Native scenario test:** a pure-Rust test in `rustedscreep-core` that drives a decision module (bootstrap recovery, combat sim,
   formations, offense state machines, breaker solver) through a scripted situation, with expectations derived from constants.
   Scripted in-game scenarios belong to the private-server track.
@@ -45,7 +46,7 @@ Modules:
    release profile at the root (`opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip`, per SPEC §1 and ADR-002).
    Toolchain pinned in `rust-toolchain.toml`. Clippy no-panic denies at the crate roots.
 2. `rustedscreep-consts`: the facade over the API constants, `extra.rs` with sources and dates, and constant-derived tests.
-3. Build: wasm build (ADR-001) + `wasm-opt` (flags from ADR-002) + a Rollup bundle of the TypeScript loader compiled by `tsc` to ES2022, no Babel (ADR-008), into `dist/`. npm scripts: `build`, `check`,
+3. Build: wasm build (ADR-001) + `wasm-opt` (flags from ADR-002) + a Rollup bundle of the TypeScript loader compiled by `tsc` to ES2022, no Babel (ADR-008), into `dist/`. npm scripts: `build`, `check`, `stage` (runs the release build and copies `main.js` and the `.wasm` into the tracked `deploy/` folder for the GitHub link, or into `--out <dir>` for tests and dry runs; reports sizes, a `.wasm` byte hash and a build ID; ADR-012),
    `size`, `deploy`, `console`, `stats`. Add `.example-screeps.yaml` to the repo with no secrets. The user creates `.screeps.yaml`.
 4. Loader (`js/src/main.ts`):
    - Boot gated on bucket, with compile and instantiate spread across ticks.
@@ -53,6 +54,7 @@ Modules:
    - Trap and aborted-tick detection, with recovery per ADR-003 and backoff.
    - `console.error` routing and one notification per incident.
    - `trap-test` export wired to a console command.
+   - At boot, logs the build ID, `Game.time`, the type of the value `require()` returned for the wasm and a hash over its bytes (V77).
 5. Snapshot: one pass building SoA structs with interned handles. The tick context includes time, CPU limit, tickLimit and bucket.
 6. Scheduler:
    - Critical, Standard and Optional tiers.
@@ -83,6 +85,10 @@ a day on the MMO. Run the P1 live checks shortly before P2 is ready, or respawn 
 - Empty-bot CPU per tick is measured on the MMO. This is the floor.
 - The persistence round-trip test passes natively, including the corrupt-segment test, and one live round trip on the MMO succeeds.
 - Sizes are recorded.
+- The GitHub-link deploy path is verified with the first checked build, staged by `/deploy mmo` and pushed by the user (V77): the
+  wasm hash the loader logs in game equals the one `npm run stage` reported, the sentinel module shows the deletion behavior, the
+  push-to-first-run delay is recorded, and a docs-only push shows whether an identical re-sync reloads the code. If the hashes differ,
+  ADR-012's fallback is in place.
 
 ## P2 Bootstrap (SPEC §3.1) and movement core
 Modules:

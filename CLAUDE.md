@@ -24,7 +24,9 @@ at the lowest CPU per tick. **Never trade real performance for CPU savings. Cut 
 - If instructions conflict, do not silently choose the path that weakens safety, breaks compatibility,
   or cannot be undone. State the conflict and propose the safest compliant option.
 - Deploy to a private server only when asked. Deploy to an official server (mmo, season, ptr) only when the user names
-  that server in the current message.
+  that server in the current message. For the MMO, deploying means staging a checked build in `deploy/`; the user's push through
+  the GitHub link uploads it (ADR-012). Never write to `deploy/` otherwise. Never write, copy or link anything into the Steam
+  client's script mirror (`~/.config/Screeps/scripts/`): any change there uploads at once (VERIFICATION_LOG V74).
 
 ## Source-of-truth rule (do not trust memory)
 Before writing code that depends on a game rule, an API signature, or tool behavior, look it up in this order:
@@ -78,7 +80,8 @@ The live server's constants are the ground truth for that server. At init, the b
 | Benches (native only) | `cargo bench -p rustedscreep-core` |
 | Release build (wasm + wasm-opt + Rollup to `dist/`) | `npm run build` |
 | Full gate (same as `/check`) | `npm run check` |
-| Deploy (ask first) | `npm run deploy -- --server <name> [--dryrun]` |
+| Stage the MMO deploy folder for the GitHub link (ask first; the user pushes) | `npm run stage` |
+| Deploy through the API (ask first; private, season, or the ADR-012 fallback) | `npm run deploy -- --server <name> [--dryrun]` |
 | Capture console / profiler stats to `logs/` | `npm run console -- --server <name>` / `npm run stats -- --server <name>` |
 
 ## Workflow
