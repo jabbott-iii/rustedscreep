@@ -29,7 +29,7 @@ paths:
   measurement and record it in TUNING.md. The starter's 1500 is only a starting point.
 
 ## Bundle
-- Transpile to the JS level the probe measured on the server (ADR-008). Babel is required for the older Node on official servers.
+- Transpile to the JS level the probe measured on the server (ADR-008): `tsc` to ES2022 on the MMO (VERIFICATION_LOG V72), with no Babel. The optional tracks re-probe their own servers (PS1, SE1).
 - Bundle nothing at runtime besides the generated wasm-bindgen glue. Keep the bundle small and record its size and the
   wasm size in STATUS at each phase gate.
 - If the probe shows `TextDecoder`/`TextEncoder` are missing, add the smallest polyfill the glue needs.

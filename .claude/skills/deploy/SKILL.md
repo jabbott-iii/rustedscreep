@@ -15,6 +15,7 @@ disable-model-invocation: true
    and state the risk.
 4. Run `npm run deploy -- --server <server> --dryrun` and report what would be uploaded (module names and sizes).
 5. Unless `--dryrun` was requested, run `npm run deploy -- --server <server>` (the permission prompt applies).
-6. For a private server, offer to capture the first minutes with `npm run console -- --server <server>` and `npm run stats -- --server <server>`
-   into `logs/`. Then report boot ticks, cold-start CPU, errors, and the bucket trend.
+6. For any server (an official one only once step 1 is satisfied), offer to capture the first minutes with `npm run console -- --server <server>`
+   and `npm run stats -- --server <server>` into `logs/`. Then report boot ticks, cold-start CPU, errors, and the bucket trend. On the
+   MMO this capture is the evidence for core gates such as P1.
 7. Record the deploy in `docs/STATUS.md`: server, wasm size, bundle size, and the observations made.

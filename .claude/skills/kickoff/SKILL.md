@@ -50,10 +50,12 @@ No deploy is needed for the first pass: the user pastes a console snippet.
   - JS syntax support probed with `new Function(...)` in try/catch: optional chaining, nullish coalescing, class fields, BigInt,
     and async/await. This sets the Babel target.
   - It prints one compact JSON line that the user copies back.
-- `js/probe/main.js` is the same probe as a deployable module, for private servers or a spare branch. Never deploy it to an official
-  server's active branch, because that replaces the running bot.
+- `js/probe/main.js` is the same probe as a module. On an official server, add it as an extra module next to `main` and call its `run()`
+  from the console. Never deploy it as `main` on an official server's active branch, because that replaces the running bot. On a private
+  server (optional track, PS1) it can run as `main`.
 Ask the user to run the snippet on each target server and paste the output. Record it per server in VERIFICATION_LOG with the date.
-If the console lacks `WebAssembly`, record that and use the private-server deploy path.
+If the console lacks `WebAssembly`, record that, stop, and tell the user: the bot cannot run on that server, and the core track has no
+fallback server. (The optional private track probes its own server in PS1.)
 
 ## 4. Draft the ADRs in `docs/DECISIONS.md`
 Fill in context, options and evidence for each one, and leave the status Proposed:

@@ -21,7 +21,7 @@ This kit turns your spec (`docs/SPEC.md`, verbatim) into a phase-gated Claude Co
 | Full validation gate | `/check` |
 | CPU / robustness review (forked subagent) | `/cpu-audit diff` |
 | Combat math review (forked subagent) | `/combat-verify diff` |
-| Deploy (dry run first; official servers only when you name them) | `/deploy private` |
+| Deploy (dry run first; official servers only when you name them) | `/deploy mmo --dryrun` |
 | Commit message to copy (no trailers, never commits) | `/commit-msg` |
 
 Use one phase per session. After `/phase-gate` passes, run `/clear`. The SessionStart hook re-injects `docs/STATUS.md` at startup,
@@ -39,8 +39,8 @@ on resume, and after compaction, so long work keeps its place.
   - `guard-purity.mjs` keeps `rustedscreep-core` and `rustedscreep-consts` free of JS bindings.
   - `session-context.mjs` re-injects status.
 - `.claude/settings.json`: allow, ask and deny rules, the hooks, and empty commit/PR attribution.
-- `docs/`: SPEC (verbatim), ROADMAP (P0–P12 with exit gates), STATUS, VERIFICATION_LOG (seeded with this kit's research and the full §0 checklist),
-  DECISIONS (ADR-001..008 proposed), PROJECT_CONTEXT, and skeletons for ARCHITECTURE, TEST_PLAN and TUNING.
+- `docs/`: SPEC (verbatim), ROADMAP (MMO core track P0–P12 with exit gates), ROADMAP_PRIVATE and ROADMAP_SEASONAL (optional tracks, ADR-010), STATUS, VERIFICATION_LOG (seeded with this kit's research and the full §0 checklist),
+  DECISIONS (the kit shipped ADR-001..008 as proposed; the project adds its own ADRs), PROJECT_CONTEXT, and skeletons for ARCHITECTURE, TEST_PLAN and TUNING.
 
 ## Customize
 - Personal overrides go in `.claude/settings.local.json` and `CLAUDE.local.md`. Both are gitignored.

@@ -1,11 +1,18 @@
 # Status
 
-**Current phase:** P0, kickoff (in progress; gate not passed). Waiting on probe output and ADR acceptance.
-**Pinned versions:** candidates found, not pinned yet (VERIFICATION_LOG V1–V13): screeps-game-api 0.23.5, wasm-bindgen and wasm-bindgen-cli 0.2.130, Rust 1.100.0, binaryen version_133. Pinning happens in P1 (ADR-001 and 006 accepted; ADR-002 waits on the probe).
-**Target servers:** official MMO (free tier), Seasonal, private server (none running yet). See `docs/PROJECT_CONTEXT.md`.
+**Current phase:** P1, build pipeline, loader, snapshot, scheduler, profiler, persistence, consts self-check (not started). P0 passed 2026-11-13.
+**Pinned versions:** to pin in P1 (ADR-001, 002 and 006 accepted; VERIFICATION_LOG V1–V13): Rust 1.100.0, edition 2024, screeps-game-api 0.23.5, wasm-bindgen and wasm-bindgen-cli 0.2.130, binaryen version_133.
+**Target servers:** official MMO, shard3 (free tier) on the core track. Optional tracks: private server (`docs/ROADMAP_PRIVATE.md`, none running yet) and Seasonal (`docs/ROADMAP_SEASONAL.md`, after P12). See `docs/PROJECT_CONTEXT.md`.
 
-## Phases
-- [ ] P0 Kickoff and verification
+## Blockers
+- The repository root is linked in the game client (most likely Account → GitHub sync, VERIFICATION_LOG V75). A push may overwrite the live MMO `default` branch without a `/deploy`. Per ADR-011 the user unlinks it; this stays here until the user confirms.
+- Local Node is 18.19.1. The deploy tool (screeps-api 2.x) needs Node 22 or 24 (V11). It blocks `npm run deploy` in P1, not the build. Upgrading is the user's call.
+
+## Open decisions
+See `docs/DECISIONS.md`. Accepted: ADR-001 (build tool), 002 (toolchain and wasm features), 003 (trap recovery), 005 (constants source), 006 (dependencies), 008 (loader and transpile target), 009 (crate names), 010 (roadmap tracks), 011 (deploy path). Proposed: ADR-004 (decided in P1), ADR-007 (decided in P4).
+
+## Phases: MMO core track (`docs/ROADMAP.md`)
+- [x] P0 Kickoff and verification (gate passed 2026-11-13)
 - [ ] P1 Build pipeline, loader, snapshot, scheduler, profiler, persistence, consts self-check
 - [ ] P2 Bootstrap and movement core
 - [ ] P3 Economy
@@ -19,29 +26,54 @@
 - [ ] P11 Siege breaker
 - [ ] P12 Debug, visuals and final deliverables
 
-## Current phase checklist
-- [x] Clarifying questions answered (`docs/PROJECT_CONTEXT.md`; unasked items recorded as assumptions)
-- [x] Seeded findings re-verified (S1–S15 superseded by V1–V70)
-- [x] Groups verified: tooling, cpu-memory, pipeline (V1–V63, V67–V70; each remaining unverified part states an assumption and a fallback)
-- [x] Probe built: `js/probe/console-snippet.js` (five pastes, each within the 1024-character console limit) and `js/probe/main.js`; `node js/probe/check.mjs` passes
-- [ ] Feature probe results recorded per server: official MMO, Seasonal (user pastes the five console outputs), private server (needs a server)
-- [x] ADR-001..006 and 008 proposed with evidence and recommendations; ADR-007 deferred to P4 (no evidence yet)
-- [x] ADR-001, 003, 005 and 006 accepted by the user (2026-11-13)
-- [ ] ADR-002 and 008 accepted by the user (they wait on the probe results)
+## Optional tracks (never block the core; ADR-010)
+Private server (`docs/ROADMAP_PRIVATE.md`):
+- [ ] PS1 Private server setup (after P1)
+- [ ] PS2 Baselines (after PS1 and P2)
+- PS3 Scripted scenarios (each after PS1 and its core phase):
+  - [ ] trap-test (P1)
+  - [ ] zero-creep recovery (P2)
+  - [ ] scripted invader (P6)
+  - [ ] scripted attacks (P7)
+  - [ ] dummy base (P10)
+  - [ ] breaker vs towers (P11)
+- [ ] PS4 Automated server tests (after PS1)
+
+Seasonal (`docs/ROADMAP_SEASONAL.md`):
+- [ ] SE1 Season verification (after P12)
+- [ ] SE2 Season profile and modules (after SE1)
+
+## Current phase checklist (P1, `docs/ROADMAP.md`)
+Before P1 code (each install asks first): Rust 1.100.0 plus the `wasm32-unknown-unknown` target (rustup), wasm-bindgen-cli 0.2.130 (cargo install), binaryen version_133. Deploying also needs Node 22 or 24 (see Blockers).
+- [ ] 1. Workspace: root `Cargo.toml`, the three crates, `default-members` without rustedscreep-wasm, release profile, `rust-toolchain.toml`, clippy no-panic denies
+- [ ] 2. `rustedscreep-consts`: re-exports of the crate's constants and pure local types (ADR-005), `extra.rs`, constant-derived tests
+- [ ] 3. Build: cargo build, then wasm-bindgen CLI at the Cargo.lock version, then wasm-opt `-O4` (ADR-001/002); `tsc` to ES2022 plus Rollup (ADR-008); npm scripts; `.example-screeps.yaml`
+- [ ] 4. Loader: bucket-gated boot, `loop`, trap and abort recovery (ADR-003), `console.error` routing, `trap-test`, TextEncoder/TextDecoder polyfill
+- [ ] 5. Snapshot
+- [ ] 6. Scheduler
+- [ ] 7. Act layer
+- [ ] 8. Profiler
+- [ ] 9. Persistence (decides ADR-004)
+- [ ] 10. Config: `mmo` profile, runtime overrides, TUNING.md and the doc-sync test
+- [ ] 11. Constants self-check
+Timing for the P1 live checks: an RCL1 room with no upgrading is lost about 20000 ticks after it is claimed (V71). Run them shortly before P2 is ready, or respawn before the P2 deploy.
 
 ## Measurements (latest)
 | Metric | Server | Value | Date | Method |
 |---|---|---|---|---|
-
-## Open decisions
-See `docs/DECISIONS.md`. Accepted: ADR-001 (build tool), 003 (trap recovery), 005 (constants source), 006 (dependencies), 009 (crate names). Proposed: ADR-002 and 008 (wait on the probe), 004 (P1), 007 (P4).
-
-## Blockers
-- No probe output yet for any target server (P0 gate).
-- No private server, although it is a target. P1's gate needs one (wasm load, trap-test, cold start).
-- Local Node is 18.19.1. screeps-api 2.x (deploy) needs Node 22 or 24, and Babel 8 needs ^22.18 or >=24.11 (V10, V11). Upgrading is the user's call.
+| CPU limit | MMO shard3 | 20 | 2026-11-13 | console probe (V72) |
+| tickLimit | MMO shard3 | 500 | 2026-11-13 | console probe (V72) |
+| Bucket at probe time | MMO shard3 | 6387 | 2026-11-13 | console probe (V72) |
+| Heap size limit | MMO shard3 | 775946240 bytes | 2026-11-13 | console probe, getHeapStatistics (V73) |
+| Largest console probe unit | n/a | 864 JSON characters (limit 1024, V69) | 2026-11-13 | `node js/probe/check.mjs` |
 
 ## Log (newest first)
+- 2026-11-13: P0 gate passed. Evidence: (1) the user answered both question rounds (PROJECT_CONTEXT); (2) MMO probe recorded (VERIFICATION_LOG section D, V72; raw output in docs/probe-results/); (3) ADR-001, 002, 003, 005, 006 and 008 Accepted (002 and 008 with 011 on "Accept all three"); (4) every tooling row with an unverified part states an assumption and a fallback (only V69 remains, with a safe default; V27 and V62 superseded by V72). `node js/probe/check.mjs` passes; SPEC unchanged. Also aligned ROADMAP P1.3, the js-loader rule and the CLAUDE.md wasm trap with ADR-002/008. Current phase set to P1.
+- 2026-11-13: Researched the client's code-sync paths (two researchers plus a reconciler that read the installed client, packageVersion 248): the Steam mirror has a fixed path, is two-way and corrupts `.wasm` on write-back (V74); the repo link is most likely the GitHub integration (V75); MMO code size 2 MB per a 2018 staff post (V76, inferred). ADR-011 (deploy path) proposed: deploy only with the repo's tool.
+- 2026-11-13: MMO probe recorded (shard3, Game.time 84257673): all 10 wasm features and all 21 syntax checks through ES2022 accepted, controls correct; TextDecoder/TextEncoder undefined; heap_size_limit 775946240; CPU limit 20, bucket 6387. Raw output in docs/probe-results/; rows V72 and V73. ADR-002 and ADR-008 evidence updated; both are ready for acceptance.
+- 2026-11-13: Independent review of the roadmap split: 18 findings confirmed and fixed (PS3 gates require the stated outcomes; PS2/PS3 build on PS1; per-server boot gates in PS1 and SE2; MMO naive-baseline method; `/phase-gate` keeps the core current phase for PS/SE gates; kickoff and deploy skills no longer lean on a private server; season feature may not exist; TEST_PLAN §7–§8), 6 refuted. Added the P1 controller-downgrade warning (V71, verified from engine a90d26f and common 2fb779b).
+- 2026-11-13: Split the roadmap into three tracks at the user's request (ADR-010): `docs/ROADMAP.md` is the MMO core (P0–P12) and never depends on the optional `docs/ROADMAP_PRIVATE.md` (PS1–PS4) or `docs/ROADMAP_SEASONAL.md` (SE1–SE2, after P12). The private-server dependencies in ten core phases (P0, P1, P2, P4–P8, P10, P11) now use native scenario tests plus live MMO runs (P0's private-server probe moved to PS1); the scripted and destructive scenarios moved to PS3. The P13 entry is replaced by SE1–SE2. Skills, CLAUDE.md, KIT_README, TEST_PLAN, PROJECT_CONTEXT, ADR-002/004/008 and the probe note updated.
+- 2026-11-13: Seasonal moved after the World MMO work at the user's request: new ROADMAP P13 (Seasonal), which starts only after P12's gate. P0 now probes the MMO and the private server only, and P1 builds the `mmo` and `private` profiles. PROJECT_CONTEXT, ADR-002/008 wording and the VERIFICATION_LOG probe note updated.
 - 2026-11-13: The user accepted ADR-001 (wasm-bindgen CLI + pinned wasm-opt), ADR-003 (hybrid recovery, halt first), ADR-005 (re-export the crate's constants) and ADR-006 (dependency list) as recommended ("Accept all four"). VERIFICATION_LOG D6 resolution updated. ADR-002 and 008 still wait on the probe.
 - 2026-11-13: P0 gate evaluated: not passed (probe results and ADR acceptance pending). Probe split into five console pastes after a review found the 1024-character console limit (V69). `node js/probe/check.mjs` passes on Node 18.19.1 (unit JSON lengths 777, 745, 713, 864, 724; bytes 10/10 match the references; 5 injected faults each fail it). acorn 8.8.1 parses all five units and main.js as ES5.
 - 2026-11-13: Independent review of the kickoff changes: 18 findings confirmed and fixed (console limit, V57/V62/V68 corrections, R2/R9 assumptions, S3 coverage via V70, source URLs, stale pointers); 13 refuted.

@@ -5,7 +5,7 @@ The goal is maximum colony performance (GCL/RCL growth, energy throughput, defen
 at the lowest CPU per tick. **Never trade real performance for CPU savings. Cut wasted work instead.**
 
 - Authoritative requirements: `docs/SPEC.md`. Do not edit it. Record deviations in `docs/DECISIONS.md`.
-- Where we are: `docs/STATUS.md`, which is injected at session start and after compaction. The phase plan and exit gates are in `docs/ROADMAP.md`.
+- Where we are: `docs/STATUS.md`, which is injected at session start and after compaction. The phase plan and exit gates are in `docs/ROADMAP.md` (MMO core track, P0–P12). Two optional tracks build on it and never block it: `docs/ROADMAP_PRIVATE.md` (PS#) and `docs/ROADMAP_SEASONAL.md` (SE#, after P12) (ADR-010).
 - Multi-step procedures live in skills: `/kickoff`, `/verify`, `/module`, `/phase-gate`, `/check`,
   `/cpu-audit`, `/combat-verify`, `/deploy`, `/commit-msg`. Area-specific rules live in `.claude/rules/` and load by path.
 
@@ -82,21 +82,21 @@ The live server's constants are the ground truth for that server. At init, the b
 | Capture console / profiler stats to `logs/` | `npm run console -- --server <name>` / `npm run stats -- --server <name>` |
 
 ## Workflow
-- Start with `/kickoff` (P0). Then run `/module` repeatedly. With no argument it takes the next item in STATUS and ROADMAP. Close each phase with `/phase-gate <P#>`.
+- Start with `/kickoff` (P0). Then run `/module` repeatedly. With no argument it takes the next item in STATUS and ROADMAP. Close each phase with `/phase-gate <P#|PS#|SE#>`.
 - Before each module, state the CPU and performance trade-offs, the cache strategy and its invalidation, and the tier, in a few lines.
   After each module, summarize what is done, what is stubbed, and what to test next, then update STATUS.md.
 - A phase is done only when its exit gate passes with evidence (command output, measured numbers) recorded in STATUS.md.
 - Delegate lookups to the `screeps-verifier` subagent, running in parallel for independent items, so raw pages stay out of this context.
   Run `hot-path-reviewer` before closing any module that touches the tick path, and `combat-math-auditor` for defense or offense math.
   Use `wasm-build-doctor` for build, load, or instantiate failures.
-- Measure before optimizing. Use the profiler (`profiler` feature) and private-server runs, not intuition.
+- Measure before optimizing. Use the profiler (`profiler` feature), native benches and live MMO runs (or private-server runs on the optional track), not intuition.
 - Definition of done for any change: `/check` passes, new logic has tests whose expectations derive from constants,
   formulas cite the constants they use, `docs/` is updated where the change touches it, and STATUS.md is updated.
 
 ## Known traps (seeded 2026-11-13; re-verify in P0, details in `docs/VERIFICATION_LOG.md`)
 - `screeps-game-api` 0.22 and later is not compatible with `cargo-screeps`. Build with wasm-pack or the wasm-bindgen CLI, then deploy with a Node script.
-- Rust 1.82 and later emit `reference-types` and `multivalue` by default on wasm32. Rust 1.87 and later add `bulk-memory`. The server's old Node may reject these.
-  Measure what the server accepts with the P0 feature probe before choosing a toolchain or edition (ADR-002).
+- Rust 1.82 and later emit `reference-types` and `multivalue` by default on wasm32. Rust 1.87 and later add `bulk-memory`. An old server Node may reject these.
+  The MMO (shard3) accepts all of them (P0 probe, 2026-11-13, VERIFICATION_LOG V72), so ADR-002 keeps the defaults. Re-probe any other server first (PS1, SE1).
 - A wasm trap can leave wasm-bindgen glue state poisoned. The starter loader calls `Game.cpu.halt()` on the tick after a `loop` that did not finish.
   Choosing between that and a cheaper re-instantiate is ADR-003 and must be measured.
 - Engine intent priorities: `heal` is never blocked, and it blocks `dismantle`, `attack`, `rangedHeal`, and others, even when the target is at full HP.

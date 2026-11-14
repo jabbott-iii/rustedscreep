@@ -1,15 +1,15 @@
 ---
 name: module
-description: Implement one bot module or roadmap item end to end with the project protocol (pre-brief on CPU and caching, verify game rules, pure logic plus tests first, WASM glue second, checks, reviews, post-summary, STATUS update). With no argument it picks the next incomplete item from docs/STATUS.md and docs/ROADMAP.md.
-argument-hint: "[module or roadmap item, e.g. P3.hauling]"
+description: Implement one bot module or roadmap item end to end with the project protocol (pre-brief on CPU and caching, verify game rules, pure logic plus tests first, WASM glue second, checks, reviews, post-summary, STATUS update). With no argument it picks the next incomplete item of the MMO core track from docs/STATUS.md and docs/ROADMAP.md.
+argument-hint: "[module or roadmap item, e.g. P3.hauling, PS3.dummy-base, SE2.profile]"
 ---
 
 # /module $ARGUMENTS
 
 ## 0. Pick and orient
-- No argument: take the first unchecked item of the current phase in `docs/STATUS.md`. If the previous phase's gate is not passed,
-  stop and say so.
-- Read the item's section in `docs/ROADMAP.md`, the related SPEC section, and the nearby code, tests and config.
+- No argument: take the first unchecked item of the current MMO core phase in `docs/STATUS.md`. If the previous phase's gate is not passed,
+  stop and say so. Optional-track items (PS#, SE#) run only when named, and only after every phase they build on (core or optional) has passed its gate.
+- Read the item's section in its track's roadmap (`docs/ROADMAP.md` for P#, `docs/ROADMAP_PRIVATE.md` for PS#, `docs/ROADMAP_SEASONAL.md` for SE#), the related SPEC section, and the nearby code, tests and config.
   Do not assume a helper exists. Search for it.
 
 ## 1. Pre-brief (no more than 8 lines, then proceed)
@@ -30,7 +30,7 @@ List every game rule or number the module depends on. Run `/verify` for any that
 1. Pure logic in `rustedscreep-core`, with unit and property tests whose expectations derive from `rustedscreep-consts`.
 2. Config fields for every threshold, mirrored in `docs/TUNING.md`.
 3. Glue in `rustedscreep-wasm`: snapshot fields and intent issuance. Add profiler spans for the new subsystem.
-4. Add a private-server scenario script or checklist entry to `docs/TEST_PLAN.md` if the behavior can only be tested in-game.
+4. If the behavior can only be tested in-game, add a native scenario test (`docs/TEST_PLAN.md` §7) and a live MMO check (§8). If it needs a scripted or destructive scenario, add it as a PS3 entry instead (optional track, §3/§5). Never make a core gate depend on it.
 
 ## 4. Validate honestly
 - Run `/check`. Fix the root cause of each failure. Never relax a lint or test to pass.

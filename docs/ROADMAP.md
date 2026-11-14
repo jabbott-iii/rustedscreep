@@ -1,13 +1,28 @@
-# Roadmap and exit gates
+# Roadmap and exit gates: MMO core track
+
+There are three roadmaps (user decision, 2026-11-13; ADR-010):
+- **MMO core track (this file, P0–P12):** the complete Screeps: World bot for the official MMO. It never depends on the other two.
+- **Private-server track (`docs/ROADMAP_PRIVATE.md`, PS1–PS4):** optional. It builds on the core and adds a private test server,
+  baseline comparisons and scripted scenarios.
+- **Seasonal track (`docs/ROADMAP_SEASONAL.md`, SE1–SE2):** optional. It builds on the finished core and adapts the bot to a Seasonal server.
 
 The feature order follows SPEC §3. Each phase lists its modules, which become STATUS checklist items, and an **exit gate**.
 A gate passes only with evidence recorded in STATUS.md (`/phase-gate P#`). Every module follows the `/module` protocol.
-"Private-server run" means screeps-launcher or equivalent, with the result captured through `npm run console` and `npm run stats` into `logs/`.
+No core gate needs a private server or a Seasonal server.
 
-Measurement conventions:
+Evidence conventions:
+- **Live run:** the bot running on the official MMO under the user's account, with the result captured through `npm run console` and
+  `npm run stats` into `logs/`. Deploying to the MMO needs the user to name it (CLAUDE.md).
+- **Native scenario test:** a pure-Rust test in `rustedscreep-core` that drives a decision module (bootstrap recovery, combat sim,
+  formations, offense state machines, breaker solver) through a scripted situation, with expectations derived from constants.
+  Scripted in-game scenarios belong to the private-server track.
 - CPU numbers are `Game.cpu.getUsed()` deltas from the profiler, reported as mean and p95 over ≥ 1000 ticks unless stated otherwise.
 - The **naive baseline** is the same bot with every cache and optimization toggled off through runtime config. This isolates the
-  value of each optimization. Each cache gets a toggle. A second reference is the unmodified screeps-starter-rust bot, used for P1–P2 only.
+  value of each optimization. Each cache gets a toggle. On the MMO it runs only in short, bucket-gated windows, because the free-tier
+  limit is 20 CPU (VERIFICATION_LOG V35): optimized, naive and optimized windows alternate at a comparable colony state, and each window
+  records its tick range, RCL, room count, creep count and intents. The window length and the bucket level that stops a window early
+  are TUNING values set in P2. They are the stated exception to the ≥ 1000-tick rule. Same-seed comparisons and the unmodified
+  screeps-starter-rust bot are on the private-server track (PS2).
 - Never record an estimated number as measured.
 
 ---
@@ -15,12 +30,12 @@ Measurement conventions:
 ## P0 Kickoff and verification (no bot code): `/kickoff`
 - Clarifying questions answered and recorded in `docs/PROJECT_CONTEXT.md`.
 - Seeded findings re-verified. The `tooling`, `cpu-memory` and `pipeline` groups verified.
-- Feature probe run on every target server, with results in VERIFICATION_LOG.
+- Feature probe run on the official MMO, with results in VERIFICATION_LOG. The private server is probed in PS1 and Seasonal in SE1.
 - ADR-001..006 and ADR-008 proposed with evidence.
 
 **Gate:**
 - The user has answered the questions or accepted the stated assumptions.
-- The probe results are recorded for each target server.
+- The probe results are recorded for the official MMO.
 - The user has accepted ADR-001, 002, 003, 005, 006 and 008.
 - No `tooling` row remains `unverified` without an assumption and a fallback.
 
@@ -30,7 +45,7 @@ Modules:
    release profile at the root (`opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip`, per SPEC §1 and ADR-002).
    Toolchain pinned in `rust-toolchain.toml`. Clippy no-panic denies at the crate roots.
 2. `rustedscreep-consts`: the facade over the API constants, `extra.rs` with sources and dates, and constant-derived tests.
-3. Build: wasm build (ADR-001) + `wasm-opt` (flags from ADR-002) + Rollup/Babel bundle (ADR-008) into `dist/`. npm scripts: `build`, `check`,
+3. Build: wasm build (ADR-001) + `wasm-opt` (flags from ADR-002) + a Rollup bundle of the TypeScript loader compiled by `tsc` to ES2022, no Babel (ADR-008), into `dist/`. npm scripts: `build`, `check`,
    `size`, `deploy`, `console`, `stats`. Add `.example-screeps.yaml` to the repo with no secrets. The user creates `.screeps.yaml`.
 4. Loader (`js/src/main.ts`):
    - Boot gated on bucket, with compile and instantiate spread across ticks.
@@ -52,17 +67,21 @@ Modules:
    - Versioned header with checksum.
    - Encoding per ADR-004.
    - Rebuild on any decode failure.
-10. Config: `config.rs` with server profiles (mmo, season, private) and runtime overrides from a segment (validated and clamped).
-    `docs/TUNING.md` plus the doc-sync test.
+10. Config: `config.rs` with the `mmo` server profile and runtime overrides from a segment (validated and clamped). Profiles are a table,
+    so the optional tracks can add `private` (PS1) and `season` (SE2) as new rows without changing `mmo` behavior or any core gate. `docs/TUNING.md` plus the doc-sync test.
 11. Constants self-check: at init (Optional tier, once per global), compare `rustedscreep-consts` against the server's JS globals and log mismatches.
+
+The MMO room has no economy code until P2 lands, so these P1 live checks cost no colony progress. But a controller that is never
+upgraded downgrades: an RCL1 room is lost about 20000 ticks after it is claimed (CONTROLLER_DOWNGRADE[1], VERIFICATION_LOG V71), roughly
+a day on the MMO. Run the P1 live checks shortly before P2 is ready, or respawn before the P2 deploy. When to respawn is the user's call.
 
 **Gate:**
 - `/check` is all green.
-- The wasm loads on the private server.
-- `trap-test` shows recovery within the ADR-003 bound, and the bot never bricks: 10 forced traps in a row recover.
-- Cold-start cost (compile + instantiate + first tick) is measured on each reachable server, and the boot gate is set from it.
-- Empty-bot CPU per tick is measured. This is the floor.
-- The persistence round-trip test passes, including the corrupt-segment test.
+- The wasm loads on the official MMO.
+- `trap-test` on the MMO shows recovery within the ADR-003 bound, and the bot never bricks: 10 forced traps in a row recover.
+- Cold-start cost (compile + instantiate + first tick) is measured on the MMO, and the boot gate is set from it.
+- Empty-bot CPU per tick is measured on the MMO. This is the floor.
+- The persistence round-trip test passes natively, including the corrupt-segment test, and one live round trip on the MMO succeeds.
 - Sizes are recorded.
 
 ## P2 Bootstrap (SPEC §3.1) and movement core
@@ -74,10 +93,11 @@ Modules:
 - RCL1–3 opening, zero-creep recovery, and deadlock watchdogs (for example no harvester, or energy stuck in containers).
 
 **Gate:**
-- A fresh spawn on the private server reaches RCL3 with no manual action. Record the tick count.
-- Killing every creep at RCL2 and RCL3 recovers automatically.
-- No deadlock over 20k ticks.
-- CPU per tick is recorded against the naive baseline and the starter bot.
+- The user's fresh MMO room reaches RCL3 with no manual action. Record the tick count.
+- Zero-creep recovery: native scenario tests (no creeps and an empty spawn, at RCL2 and at RCL3) recover. Any live recovery event is
+  logged. Deliberately killing the colony's creeps is a private-track scenario (PS3).
+- No deadlock over 20k live ticks.
+- CPU per tick is recorded against the naive baseline.
 
 ## P3 Economy (SPEC §3.2)
 Modules:
@@ -90,12 +110,12 @@ Modules:
 
 **Gate:**
 - Tests derive bodies and hauler sizing from constants.
-- Measured harvest efficiency (energy harvested per source per regen cycle against capacity) meets the target set in TUNING.
+- Measured live harvest efficiency (energy harvested per source per regen cycle against capacity) meets the target set in TUNING.
 - CPU per room per tick is recorded.
 
 ## P4 Base planner (SPEC §3.3): ADR-007 decided here
 Modules:
-- Terrain corpus fixtures (≥ 30 rooms exported from the private server and MMO maps) in `crates/rustedscreep-core/tests/fixtures/`.
+- Terrain corpus fixtures (≥ 30 rooms exported from MMO maps) in `crates/rustedscreep-core/tests/fixtures/`.
 - Candidates: a stamp/bunker planner, and distance transform with min-cut ramparts. Benchmark both, then decide ADR-007.
 - Placement of extensions, towers, labs, storage, terminal, links, roads, and ramparts. Incremental site placement per RCL, cached, with periodic verification.
 
@@ -112,7 +132,7 @@ Modules:
 
 **Gate:**
 - Replacement-timing tests pass.
-- A private-server run shows no idle spawn time with a non-empty queue, beyond the energy wait.
+- A live run shows no idle spawn time with a non-empty queue, beyond the energy wait.
 - Creep handover gaps are measured.
 
 ## P6 Remote mining (SPEC §3.5)
@@ -122,8 +142,9 @@ Modules:
 
 **Gate:**
 - Model tests pass.
-- A private-server run with a scripted invader shows abandon and evacuation.
-- Net energy per CPU is recorded.
+- Native scenario tests feed threat and contest inputs to the remote manager and show abandon and evacuation.
+- Net energy per CPU is recorded from a live run. Any natural threat event in a remote room (for example NPC invaders) is logged with the
+  bot's response. Scripted invaders are a private-track scenario (PS3).
 
 ## P7 Defense (SPEC §3.6)
 - Threat assessment from hostile bodies and boosts.
@@ -135,8 +156,10 @@ Modules:
 
 **Gate:**
 - `/combat-verify` reports no high-severity findings.
-- Scripted attack scenarios on the private server (melee, ranged and a healer duo) are logged.
+- Native combat scenario tests (melee, ranged and a healer duo against the room's tower and defender configuration) pass, with expected
+  outcomes derived from constants.
 - Safe-mode trigger tests pass.
+- Any live defense event is logged with the bot's response. Scripted attacks are a private-track scenario (PS3).
 
 ## P8 Expansion (SPEC §3.7)
 - Scouting and observers.
@@ -146,7 +169,8 @@ Modules:
 
 **Gate:**
 - Scoring tests pass.
-- A private-server run claims and bootstraps a second room without lowering the home room's RCL progress below the threshold in TUNING.
+- Once GCL allows a second room (VERIFICATION_LOG R28), a live run claims and bootstraps it without lowering the home room's RCL
+  progress below the threshold in TUNING.
 
 ## P9 Late game (SPEC §3.8)
 - Minerals.
@@ -161,7 +185,7 @@ Modules:
 **Gate:**
 - Per-feature tests pass.
 - Market sanity-limit tests pass.
-- Pixels are never generated below the configured bucket.
+- Live runs never generate pixels below the configured bucket.
 
 ## P10 Offense core (SPEC §4a, §4c budgets)
 - Offense energy and CPU budgets enforced first.
@@ -175,7 +199,9 @@ Modules:
 **Gate:**
 - Formation unit tests pass (rotation, fatigue sync, heal distribution).
 - Whitelist and protection tests pass.
-- A private-server run against a scripted dummy base logs every phase, including at least one tested abort.
+- Native scenario tests drive the state machine through every phase against simulated targets, including at least one abort.
+- Live evidence: one sortie on the MMO against a target the user approves, with every phase logged. If the user decides not to run live
+  offense, that decision is recorded in STATUS instead. A scripted dummy base is a private-track scenario (PS3).
 
 ## P11 Siege breaker (SPEC §4b)
 - Body solver (TOUGH, WORK, MOVE; up to 50 parts; boosts; MOVE from route terrain; TOUGH from measured towers) with ETK and survival outputs.
@@ -187,12 +213,16 @@ Modules:
 
 **Gate:**
 - Unit tests pass for the solver, targeting and survival sim.
-- The private-server scenario against a dummy base with towers completes. The log shows predicted ETK and survival against what actually happened.
+- A native siege scenario against simulated towers reports predicted ETK and survival, and the survival rules retreat when they should.
 - Telemetry records are present.
+- Live evidence: one breaker sortie on the MMO against a target the user approves, with predicted ETK and survival logged next to what
+  happened. If the user decides not to run it, that decision is recorded in STATUS instead. A dummy base with towers is a private-track
+  scenario (PS3).
 
 ## P12 Debug, visuals and final deliverables (SPEC §4c, §6)
 - RoomVisual overlays for squads, breaker targets and paths (`visuals` feature, Optional tier). Combat logs.
-- `docs/ARCHITECTURE.md`, `docs/TEST_PLAN.md` and `docs/TUNING.md` complete.
+- `docs/ARCHITECTURE.md`, `docs/TEST_PLAN.md` and `docs/TUNING.md` complete. TEST_PLAN covers the core evidence (unit, native scenario and
+  live MMO checks) and links to the optional tracks' sections.
 - VERIFICATION_LOG closing list of remaining unverified items and manual checks.
 
 **Gate:**

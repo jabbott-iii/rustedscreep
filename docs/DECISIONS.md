@@ -22,7 +22,7 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
 - Decision: (b), as recommended; the user accepted it on 2026-11-13 ("Accept all four", covering ADR-001, 003, 005 and 006 as recommended).
 - Consequences: the P1 build script runs `cargo build --release --target wasm32-unknown-unknown -p rustedscreep-wasm`, then `wasm-bindgen --target web`, failing if the installed CLI differs from the Cargo.lock version, then a pinned binaryen `wasm-opt` with the ADR-002 flags. wasm-pack is not used. This is the deviation from SPEC §1 that D6 records. Installing the wasm32 target, wasm-bindgen-cli and binaryen needs the user's approval (rustup and cargo install always ask).
 
-## ADR-002 Wasm feature target and Rust toolchain/edition: Proposed (P0)
+## ADR-002 Wasm feature target and Rust toolchain/edition: Accepted (2026-11-13)
 - Context: Rust 1.82 and later emit reference-types and multivalue, and Rust 1.87 and later add bulk-memory (S6). The server's Node may reject these, and the starter documents `--signext-lowering` (S4).
 - Options:
   - (a) Stable toolchain pinned to the newest version whose default features the probe accepts.
@@ -34,12 +34,14 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
 - Evidence (VERIFICATION_LOG section F):
   - Rust stable is 1.100.0 (V13). Its wasm32-unknown-unknown default features are multivalue, mutable-globals, reference-types and sign-ext, plus bulk-memory and nontrapping-fptoint since 1.87 (V22). Turning them off for std needs nightly build-std (V23), which the user's policy rules out.
   - wasm-opt (binaryen version_133) can lower sign-ext, bulk-memory (memory.copy/fill) and nontrapping-fptoint. It has no multivalue or reference-types lowering pass (V8). A caveat: rustc's reference-types default may only change the call_indirect table-index encoding, so `--disable-reference-types` may still work on a real binary. Test this in P1.
-  - The official servers have run Node 24 since 2026-04-01, per Screeps' own Steam announcement, which says the private server binaries were updated too (V62). It is an official changelog (priority 4), so the log marks it `inferred` until the probe confirms it per server. Node 24 supports all six Rust default features. By webassembly.org's table, Node added the last of them, reference-types, in 17.2 (V27). The starter dropped `--signext-lowering` and the mvp build on 2026-04-03 for that reason (V16). The probe confirms this per server, including Seasonal.
+  - The official servers have run Node 24 since 2026-04-01, per Screeps' own Steam announcement, which says the private server binaries were updated too (V62). It is an official changelog (priority 4), so the log marks it `inferred` until the probe confirms it per server. Node 24 supports all six Rust default features. By webassembly.org's table, Node added the last of them, reference-types, in 17.2 (V27). The starter dropped `--signext-lowering` and the mvp build on 2026-04-03 for that reason (V16). The probe confirms this on the MMO. The optional tracks probe the private server (PS1) and Seasonal (SE1).
   - The private server (screeps-launcher) installs Node 24 by default (V61).
   - Edition 2024 needs Rust 1.85+ (V25).
   - Local sanity check: Node 18.19.1 (V8 10.2) already accepts all six default features (js/probe/check.mjs).
-- Recommendation: (a) with today's stable. Pin Rust 1.100.0 (or the stable current when P1 starts) in `rust-toolchain.toml`, use edition 2024, keep the default target features, and run wasm-opt `-O4` only, provided the probe accepts mutable-globals, sign-ext, nontrapping-fptoint, bulk-memory, reference-types and multivalue on all three targets. Fallbacks, in order: if a server rejects only sign-ext, bulk-memory or nontrapping-fptoint, add the matching wasm-opt lowering pass (c). If it rejects reference-types or multivalue, test `--disable-*` on a real binary. If that fails, pin the newest older stable whose defaults pass (edition 2021 below 1.85). On that path criterion (MSRV 1.86) and proptest (MSRV 1.88) need older versions (ADR-006).
-- Decision: _pending probe results and user acceptance_
+  - Probe on the official MMO, shard3, 2026-11-13 (V72): all six default features accepted, plus simd128, legacy EH, exnref and tail-call, with correct controls. The recommendation's condition is met on the core target, so no lowering pass or `--disable-*` flag is needed there.
+- Recommendation: (a) with today's stable. Pin Rust 1.100.0 (or the stable current when P1 starts) in `rust-toolchain.toml`, use edition 2024, keep the default target features, and run wasm-opt `-O4` only, provided the probe accepts mutable-globals, sign-ext, nontrapping-fptoint, bulk-memory, reference-types and multivalue on the official MMO (core track). The optional tracks re-check it on the private server (PS1) and Seasonal (SE1). Fallbacks, in order: if a server rejects only sign-ext, bulk-memory or nontrapping-fptoint, add the matching wasm-opt lowering pass (c). If it rejects reference-types or multivalue, test `--disable-*` on a real binary. If that fails, pin the newest older stable whose defaults pass (edition 2021 below 1.85). On that path criterion (MSRV 1.86) and proptest (MSRV 1.88) need older versions (ADR-006).
+- Decision: (a), as recommended; the user accepted it on 2026-11-13 ("Accept all three", covering ADR-002, 008 and 011 as recommended).
+- Consequences: `rust-toolchain.toml` pins Rust 1.100.0 (the local machine has 1.99, so P1 installs 1.100.0 and the wasm32 target, and rustup asks first). Every crate uses edition 2024. The wasm build keeps the default target features, and wasm-opt runs `-O4` with no lowering pass. The private (PS1) and Seasonal (SE1) tracks re-run the probe and apply the fallback chain only if their server rejects a feature.
 
 ## ADR-003 Trap and abort recovery: Accepted (2026-11-13; (b) adopted only after P1 measurement)
 - Context: SPEC §1 asks to re-instantiate on the next tick and never brick the bot. The starter uses `Game.cpu.halt()` after an aborted tick because of wasm-bindgen #3130 (S5).
@@ -52,7 +54,7 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
   - The starter loader runs require, `new WebAssembly.Module` and `initSync` in one tick once the bucket gate (1500) passes. If `running` is still set at the start of a tick, it calls `Game.cpu.halt()`. Its catch block logs but does not reset `running`, so any thrown trap also leads to a halt on the next tick (V17).
   - `halt()` resets the runtime and wipes the heap. The isolate's heap limit is about 256 MB plus terrain data on the private server (driver 5.3.0, V43). The MMO limit is unverified, and the probe's env part reports `heap_size_limit`.
   - Unwinding on wasm needs nightly and build-std (V26), which the user's stable-only policy rules out, so panics abort and recovery has to live in JS (D3).
-  - The probe reports whether `Game.cpu.halt` exists on each server.
+  - `Game.cpu.halt` exists on the official MMO (V72). The MMO heap limit is about 740 MiB (V73).
   - Open question for P1: whether the `--target web` glue can be initialized a second time. That means reading the generated glue for the pinned wasm-bindgen to see how `initSync` treats an already-set instance, and whether the glue must be re-evaluated as a separate module.
 - Recommendation: (c), the hybrid. Ship (a) as the P1 baseline because it is proven. Prototype (b) behind a config flag and adopt it only if `trap-test` shows it is correct over 10 consecutive traps and cheaper than a halt plus recompile. Back off after repeated failures.
 - Decision: (c), the hybrid, as recommended; the user accepted it on 2026-11-13 ("Accept all four", covering ADR-001, 003, 005 and 006 as recommended).
@@ -66,7 +68,7 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
   - RawMemory has 100 segments (ids 0-99), at most 10 active at once, and 100 KB per segment. Requested segments appear on the next tick, and the driver rejects oversize writes at end of tick (V41). Memory itself is capped at 2 MB (V40).
   - The segment and Memory limits are checks on JS string `.length`, so they count UTF-16 code units, not bytes (V40, V41, read verbatim in the driver).
   - Every segment present in `RawMemory.segments` at end of tick is re-saved and counts toward the 10-segment cap. Exceeding the cap throws after the loop and likely loses the tick (V41, inferred), so the segment manager must unload segments it no longer needs.
-- Recommendation: decide in P1 by benchmark, as planned. Because the limit counts code units, (b) a dense UTF-16 packing (for example 15 bits per code unit, which avoids lone surrogates) holds about 2.5 times what base64 holds per segment (6 bits per code unit). Lean towards (b) with a versioned header and checksum, provided a round-trip test on the private server shows the storage path preserves every code unit. Otherwise use (a).
+- Recommendation: decide in P1 by benchmark, as planned. Because the limit counts code units, (b) a dense UTF-16 packing (for example 15 bits per code unit, which avoids lone surrogates) holds about 2.5 times what base64 holds per segment (6 bits per code unit). Lean towards (b) with a versioned header and checksum, provided a live round-trip test on the MMO shows the storage path preserves every code unit. Otherwise use (a).
 - Decision: _pending (P1)_
 
 ## ADR-005 Constants source for native tests: Accepted (2026-11-13)
@@ -118,7 +120,7 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
 - Evidence: none yet. It needs the P4 terrain corpus and the criterion benches. No recommendation before P4, because a recommendation now would not rest on measurement.
 - Decision: _pending (P4)_
 
-## ADR-008 Loader language and transpile target: Proposed (P0)
+## ADR-008 Loader language and transpile target: Accepted (2026-11-13)
 - Context: SPEC asks for a TypeScript loader. The starter says Babel is required for the older Node on official servers (S3).
 - Options: (a) TS → Babel preset-env targeting the probed JS level, then Rollup. (b) TS with `tsc` targeting ES5 or ES2015, then Rollup.
 - Decide by: probe syntax results, bundle size, and source-map usefulness.
@@ -127,9 +129,11 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
   - Babel 8 (@babel/core 8.1.2, @babel/preset-env 8.0.7) is ESM-only and needs Node ^22.18.0 or >=24.11.0. The Babel 7 line (7.29.x) is still published (V10).
   - The `screeps-api` npm package 2.1.0, used for deploy, needs Node 22.x or 24.x (V11). Rollup 4.68.3 needs Node >=18 (V9).
   - The local Node is 18.19.1 (PROJECT_CONTEXT), so neither Babel 8 nor screeps-api 2.x runs locally as installed.
+  - Probe on the official MMO, shard3, 2026-11-13 (V72): all 21 syntax checks through ES2022 compile, and `TextDecoder` and `TextEncoder` are undefined.
   - Neither Babel preset-env without core-js nor tsc adds runtime polyfills. Both only lower syntax. The one runtime gap the starter fills is a TextEncoder/TextDecoder polyfill, and the probe checks for both.
-- Recommendation: (b), TypeScript compiled by `tsc` (or Rollup's TypeScript plugin) with `target` set to the highest ES level the probe accepts on every target server, then Rollup. If the probe shows ES2022 or newer everywhere, Babel adds nothing and is one less toolchain with a Node 22+ requirement. Use (a) only if a server needs a syntax level that tsc handles badly. Separately, the local Node must move to 22 or 24 for the deploy tool. That upgrade is the user's call.
-- Decision: _pending probe results and user acceptance_
+- Recommendation: (b), TypeScript compiled by `tsc` (or Rollup's TypeScript plugin) with `target` set to the highest ES level the probe accepts on the official MMO (the optional tracks re-check the private server in PS1 and Seasonal in SE1), then Rollup. If the probe shows ES2022 or newer everywhere, Babel adds nothing and is one less toolchain with a Node 22+ requirement. On the MMO that target is ES2022 (V72), and the loader must ship the smallest TextEncoder/TextDecoder polyfill the wasm-bindgen glue needs. Use (a) only if a server needs a syntax level that tsc handles badly. Separately, the local Node must move to 22 or 24 for the deploy tool. That upgrade is the user's call.
+- Decision: (b), as recommended; the user accepted it on 2026-11-13 ("Accept all three", covering ADR-002, 008 and 011 as recommended).
+- Consequences: the loader is TypeScript compiled with `target: ES2022` and bundled by Rollup into `dist/main.js`, with no Babel. The bundle ships the smallest TextEncoder/TextDecoder polyfill the wasm-bindgen glue needs. The TypeScript and Rollup plugin versions are verified in P1 before pinning. The deploy tool (screeps-api 2.x) needs Node 22 or 24 locally (V11), so deploying waits on the user's Node upgrade. The PS1 and SE1 probes re-check the ES level on their servers.
 
 ## ADR-009 Crate names: Accepted (2026-11-13)
 - Context: the kit shipped with placeholder crate names `game-consts`, `bot-core` and `bot-wasm`. The repository is named `rustedscreep`. CLAUDE.md treats the crate layout as an architecture invariant, and KIT_README says a rename must update CLAUDE.md, the rule `paths` and `guard-purity.mjs` together.
@@ -140,3 +144,29 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
 - Decision: (a), chosen by the user. Each crate's directory matches its name (`crates/rustedscreep-consts`, `crates/rustedscreep-core`, `crates/rustedscreep-wasm`), and Rust paths use `rustedscreep_consts::`, `rustedscreep_core::` and `rustedscreep_wasm::`. Roles, boundaries and purity rules are unchanged.
 - Consequences: the wasm-bindgen output files are expected to be named after the cdylib (`rustedscreep_wasm.js`, `rustedscreep_wasm_bg.wasm`). This is an assumption until it is verified against the ADR-001 toolchain in P1. Formula doc comments read `/// Uses: rustedscreep_consts::X`. No crates existed yet, so nothing was migrated.
 - Evidence: the user's request on 2026-11-13. Every reference in CLAUDE.md, KIT_README.md, `.claude/` (rules, skills, agents, `guard-purity.mjs`) and `docs/` was renamed. Code-location cells in `VERIFICATION_LOG.md` were repointed without changing any finding. `SPEC.md` names no crates and was not edited.
+
+## ADR-010 Roadmap tracks: Accepted (2026-11-13)
+- Context: the kit shipped one roadmap whose gates leaned on a private server: wasm load, trap test, bootstrap, scripted invaders and attacks, a dummy base and the breaker scenario. The user has no private server, and asked for the private server and Seasonal work to be "totally optional and built off the MMO core track". SPEC §6.4 asks the test plan to include screeps-launcher/private-server instructions and offense tests against a scripted dummy base (including a siege-breaker scenario with towers).
+- Options:
+  - (a) Keep one roadmap with private-server evidence in the core gates (the kit default).
+  - (b) Three roadmaps: an MMO core track (`docs/ROADMAP.md`, P0–P12) that never depends on the others, plus optional private-server (`docs/ROADMAP_PRIVATE.md`, PS1–PS4) and Seasonal (`docs/ROADMAP_SEASONAL.md`, SE1–SE2) tracks built on it.
+- Decision: (b), the user's request on 2026-11-13: "make the private server portion an entirely option separate track from the main road map. Do the same for the seasonal changes." The Seasonal track starts only after P12, per the user's earlier instruction the same day.
+- Consequences:
+  - Core gates use native scenario tests in `rustedscreep-core` plus live MMO runs. Scripted and destructive in-game scenarios (killing the colony's creeps, scripted attackers, dummy bases) move to PS3.
+  - Live offense evidence for P10 and P11 needs a target the user approves, or the user's recorded decision to skip live offense.
+  - Naive-baseline comparisons on the MMO run only in short, bucket-gated windows (20 CPU free tier). Long comparisons and the starter-bot reference move to PS2.
+  - Server profiles: `mmo` in P1, `private` in PS1, `season` in SE2. The profile table lets optional tracks add profiles as new rows (and, for Seasonal, feature-gated modules) without changing `mmo` behavior or any core gate. The SE2 gate checks this.
+  - Skills and CLAUDE.md point at the right roadmap by phase ID: P# (core), PS# (private) and SE# (Seasonal).
+  - Deviation from SPEC §6.4: the screeps-launcher instructions (PS1) and the scripted dummy-base offense tests, including the breaker scenario with towers (PS3), are delivered only if the private track runs. The core TEST_PLAN covers unit, native scenario and live MMO evidence and links to the optional sections.
+- Evidence: the user's requests on 2026-11-13. The audit of core gates that depended on a private server, recorded in STATUS on 2026-11-13.
+
+## ADR-011 Deploy path to the official MMO: Accepted (2026-11-13)
+- Context: code can reach the MMO three ways: the repo's Node deploy tool (`npm run deploy`, POST /api/user/code through screeps-api, built in P1), the client's GitHub integration (Account → GitHub, VERIFICATION_LOG V75), and the Steam client's local-folder mirror (V74). Project rule (CLAUDE.md): deploy to an official server only when the user names it in the current message. On 2026-11-13 the user linked the repository root in the client and asked whether a subfolder would be better.
+- Options:
+  - (a) Deploy only with the repo's tool, to a named branch, through `/deploy mmo` (check, dry run, then upload). No GitHub link and no repo folder in the client mirror.
+  - (b) GitHub integration on a committed deploy folder (for example built `main.js` and `.wasm` committed to the repo).
+  - (c) Point the client mirror at the build output (for example a symlink from the mirror's branch folder to `dist/`).
+- Evidence: (b) deploys on every push the integration picks up, which bypasses `/check`, the dry run and the explicit-ask rule. Its `.wasm` handling and deletion behavior are unknown, and it needs build artifacts committed. The repo's top level has no `.js` files and `dist/` is git-ignored, so neither the root nor `dist/` works with it as-is (V75). (c) is two-way, uploads on every rebuild with no debounce, deletes server modules a folder lacks, and corrupts any `.wasm` it writes back (V74). (a) uploads binaries correctly as `{binary: base64}` (V19) and goes through `/deploy`.
+- Recommendation: (a). The user unlinks the GitHub integration (Reset in Account → GitHub) and keeps the Steam mirror as a plain folder that the repo never links into. During an API deploy with the client open, decline "replace local scripts" and never choose "Always replace without asking".
+- Decision: (a), as recommended; the user accepted it on 2026-11-13 ("Accept all three", covering ADR-002, 008 and 011 as recommended).
+- Consequences: `/deploy mmo` (check, dry run, then upload to a named branch) is the only way code reaches the MMO. Unlinking the GitHub integration is the user's action; until the user confirms it, STATUS keeps it as a blocker, because a push could overwrite the live `default` branch.
