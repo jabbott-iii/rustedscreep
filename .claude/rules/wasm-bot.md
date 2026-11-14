@@ -40,3 +40,5 @@ paths:
   that `npm run stats` can fetch. Without the feature, the profiler compiles out to nothing.
 - Features: `mmo` and `sim` (map them to the `screeps-game-api` features of the same name, after verifying the names for the pinned
   version), `profiler`, `visuals`, and `trap-test` (a debug export that traps on demand, used only to test loader recovery).
+  When `sim` maps to the crate's `sim`, the crate parses the room name `sim` (packed 0), so `rustedscreep_core::snapshot::parse_room_name`
+  must accept it too (VERIFICATION_LOG V114).

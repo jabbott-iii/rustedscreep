@@ -13,3 +13,12 @@
 /// (<https://github.com/screeps/driver/blob/cf63d8adf902663e2ebddd7f8c5b7baa425dc928/lib/runtime/runtime.js#L129-L146>),
 /// VERIFICATION_LOG V41 and V85. Last verified: 2026-11-13.
 pub const MEMORY_SEGMENT_COUNT: u8 = 100;
+
+/// Offset of room coordinates in a packed room name or position: a room coordinate `c` (`W`n and
+/// `N`n are -n-1, `E`n and `S`n are n) is stored as the byte `c + HALF_WORLD_SIZE`, so room
+/// coordinates run over `-HALF_WORLD_SIZE..HALF_WORLD_SIZE`. The API keeps its own copy private.
+///
+/// Source: screeps-game-api 0.23.5 `src/local.rs` L14-24 (`HALF_WORLD_SIZE`,
+/// `VALID_ROOM_NAME_COORDINATES`), the same layout as the engine's `__packedPos` (VERIFICATION_LOG
+/// V103, V114). Last verified: 2026-11-14.
+pub const HALF_WORLD_SIZE: i32 = 128;

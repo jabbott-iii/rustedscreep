@@ -160,6 +160,21 @@ mod tests {
     // one fails the test build.
 
     /// Uses: MEMORY_SEGMENT_ACTIVE_LIMIT, extra::MEMORY_SEGMENT_COUNT.
+    /// The packed room byte is the room coordinate plus `extra::HALF_WORLD_SIZE`, at both ends of
+    /// the range (the crate's own `x_coord` and `y_coord` read it back).
+    #[test]
+    fn half_world_size_matches_the_packed_layout() {
+        let lowest = RoomName::from_packed(0);
+        assert_eq!(
+            (lowest.x_coord(), lowest.y_coord()),
+            (-extra::HALF_WORLD_SIZE, -extra::HALF_WORLD_SIZE)
+        );
+        let highest = RoomName::from_packed(u16::MAX);
+        assert_eq!(highest.x_coord(), extra::HALF_WORLD_SIZE - 1);
+        assert_eq!(highest.y_coord(), extra::HALF_WORLD_SIZE - 1);
+        assert_eq!("W127N127".parse::<RoomName>().ok(), Some(lowest));
+    }
+
     #[test]
     fn segment_limits_are_consistent() {
         const { assert!(MEMORY_SEGMENT_ACTIVE_LIMIT >= 1) };

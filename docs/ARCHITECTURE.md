@@ -14,6 +14,8 @@ Current state (P1.7): loader → `loop` (rustedscreep-wasm `game_loop`) → snap
 3. `Game.rooms`: 3 calls, then per room 8 with a controller (`get`, `name`, the name copy, `controller`, `my`, `level`, `find`,
    `length`) or 6 without; per hostile 5 (`get`, `id`, the id copy, `pos`, `__packedPos`; hostile results never include spawning
    creeps, V101).
+   The name is parsed from its bytes (`snapshot::parse_room_name`, the crate's `RoomName::from_str` semantics without its str
+   slicing, which costs 8139 bytes of release wasm; V114).
 4. `Game.structures` (own structures; V101): 3 calls, then per structure 3 (`get`, `id`, the id copy), plus on the tick it is
    first seen `structureType`, and `pos` and `__packedPos` when the type is known (again every tick while that read fails).
 Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and one `__externref_table_alloc` (with a JS

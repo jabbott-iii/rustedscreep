@@ -34,11 +34,11 @@ use std::fmt::Write as _;
 use js_sys::{Array, Object};
 use rustedscreep_core::snapshot::{
     Controller, CreepRow, ObjectKey, SkipReason, Snapshot, StructureStatic, TickContext,
-    known_structure_type, position_from_packed,
+    known_structure_type, parse_room_name, position_from_packed,
 };
 use screeps::{
-    Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Position, Room, RoomName,
-    RoomObject, Structure, find, game,
+    Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Position, Room, RoomObject,
+    Structure, find, game,
 };
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
@@ -125,11 +125,16 @@ pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld) {
 }
 
 fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room) {
+    // `parse_room_name` has `RoomName::from_str`'s semantics without its str slicing, which links
+    // about 8 KB of Unicode and Debug tables into the release wasm (V114). Anything that parses a
+    // room name through the crate brings them back: `Room::name`, `RoomName::new`, `str::parse`,
+    // and the `JsCollectionFromValue` or `TryFrom<JsValue>` conversions to `RoomName` (for example
+    // `game::rooms().keys()`). Read names with `Named::name_value` and parse them here.
     let Some(name) = room
         .unchecked_ref::<Named>()
         .name_value()
         .as_string()
-        .and_then(|s| s.parse::<RoomName>().ok())
+        .and_then(|s| parse_room_name(s.as_bytes()))
     else {
         snapshot.skipped.record(SkipReason::BadRoomName);
         return;

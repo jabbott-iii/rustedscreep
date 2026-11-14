@@ -14,10 +14,12 @@
 //! global reset; handle order follows when objects were first seen.
 
 mod intern;
+mod room_name;
 mod tables;
 mod tick;
 
 pub use intern::{Handle, Interner, ObjectKey};
+pub use room_name::parse_room_name;
 pub use tables::{
     Controller, CreepClass, CreepHandle, CreepRow, Creeps, Rooms, StructureClass, StructureHandle,
     StructureStatic, Structures, known_structure_type, position_from_packed,
