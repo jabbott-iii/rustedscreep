@@ -26,10 +26,10 @@ Measurement conventions:
 
 ## P1 Build pipeline, loader, snapshot, scheduler, profiler, persistence, consts self-check
 Modules:
-1. Workspace: root `Cargo.toml` with members `crates/{game-consts,bot-core,bot-wasm}`, `default-members` excluding `bot-wasm`, and the
+1. Workspace: root `Cargo.toml` with members `crates/{rustedscreep-consts,rustedscreep-core,rustedscreep-wasm}`, `default-members` excluding `rustedscreep-wasm`, and the
    release profile at the root (`opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip`, per SPEC §1 and ADR-002).
    Toolchain pinned in `rust-toolchain.toml`. Clippy no-panic denies at the crate roots.
-2. `game-consts`: the facade over the API constants, `extra.rs` with sources and dates, and constant-derived tests.
+2. `rustedscreep-consts`: the facade over the API constants, `extra.rs` with sources and dates, and constant-derived tests.
 3. Build: wasm build (ADR-001) + `wasm-opt` (flags from ADR-002) + Rollup/Babel bundle (ADR-008) into `dist/`. npm scripts: `build`, `check`,
    `size`, `deploy`, `console`, `stats`. Add `.example-screeps.yaml` to the repo with no secrets. The user creates `.screeps.yaml`.
 4. Loader (`js/src/main.ts`):
@@ -54,7 +54,7 @@ Modules:
    - Rebuild on any decode failure.
 10. Config: `config.rs` with server profiles (mmo, season, private) and runtime overrides from a segment (validated and clamped).
     `docs/TUNING.md` plus the doc-sync test.
-11. Constants self-check: at init (Optional tier, once per global), compare `game-consts` against the server's JS globals and log mismatches.
+11. Constants self-check: at init (Optional tier, once per global), compare `rustedscreep-consts` against the server's JS globals and log mismatches.
 
 **Gate:**
 - `/check` is all green.
@@ -95,7 +95,7 @@ Modules:
 
 ## P4 Base planner (SPEC §3.3): ADR-007 decided here
 Modules:
-- Terrain corpus fixtures (≥ 30 rooms exported from the private server and MMO maps) in `crates/bot-core/tests/fixtures/`.
+- Terrain corpus fixtures (≥ 30 rooms exported from the private server and MMO maps) in `crates/rustedscreep-core/tests/fixtures/`.
 - Candidates: a stamp/bunker planner, and distance transform with min-cut ramparts. Benchmark both, then decide ADR-007.
 - Placement of extensions, towers, labs, storage, terminal, links, roads, and ramparts. Incremental site placement per RCL, cached, with periodic verification.
 

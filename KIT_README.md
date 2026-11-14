@@ -36,7 +36,7 @@ on resume, and after compaction, so long work keeps its place.
   - `hot-path-reviewer`, `combat-math-auditor` and `wasm-build-doctor` are read-only reviewers.
 - `.claude/hooks/`:
   - `guard-bash.mjs` blocks git history and publish operations, work-discarding git commands, package publishing, and credential access. It also catches compound and `git -C` forms.
-  - `guard-purity.mjs` keeps `bot-core` and `game-consts` free of JS bindings.
+  - `guard-purity.mjs` keeps `rustedscreep-core` and `rustedscreep-consts` free of JS bindings.
   - `session-context.mjs` re-injects status.
 - `.claude/settings.json`: allow, ask and deny rules, the hooks, and empty commit/PR attribution.
 - `docs/`: SPEC (verbatim), ROADMAP (P0–P12 with exit gates), STATUS, VERIFICATION_LOG (seeded with this kit's research and the full §0 checklist),

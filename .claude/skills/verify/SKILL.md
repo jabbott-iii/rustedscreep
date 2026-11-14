@@ -1,6 +1,6 @@
 ---
 name: verify
-description: Verify Screeps game rules, constants, API signatures or tool behavior against sources of truth, then record them in docs/VERIFICATION_LOG.md, game-consts, and constant-derived tests. Use before writing code that depends on any game number or engine behavior not already verified for the pinned version.
+description: Verify Screeps game rules, constants, API signatures or tool behavior against sources of truth, then record them in docs/VERIFICATION_LOG.md, rustedscreep-consts, and constant-derived tests. Use before writing code that depends on any game number or engine behavior not already verified for the pinned version.
 argument-hint: "[group or item, e.g. combat | boosts | creep.fatigue | tooling]"
 ---
 
@@ -20,8 +20,8 @@ argument-hint: "[group or item, e.g. combat | boosts | creep.fatigue | tooling]"
 - If sources conflict, the higher-priority source wins (CLAUDE.md source order). Record both, and note which won and why.
 - Add the rows to `docs/VERIFICATION_LOG.md`. Supersede rows. Never delete them.
 - Constants:
-  - Where an API constant exists, re-export it from `crates/game-consts` under its API name.
-  - Otherwise add it to `crates/game-consts/src/extra.rs` with a doc comment giving the source URL, the version it applies to, and `last verified: YYYY-MM-DD`.
+  - Where an API constant exists, re-export it from `crates/rustedscreep-consts` under its API name.
+  - Otherwise add it to `crates/rustedscreep-consts/src/extra.rs` with a doc comment giving the source URL, the version it applies to, and `last verified: YYYY-MM-DD`.
   - Server-specific values, such as the CPU limit, are not compile-time constants. Read them at runtime and record them in PROJECT_CONTEXT.
 - Add a self-check entry so the in-game init compares this constant with the server's JS global, where one exists.
 - Add or adjust tests that derive expected values from the constants.

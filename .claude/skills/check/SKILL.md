@@ -12,10 +12,10 @@ Run these in order. Do not stop at the first failure, because the user wants the
 | # | Check | Command |
 |---|---|---|
 | 1 | Format | `cargo fmt --all -- --check` |
-| 2 | Clippy, native | `cargo clippy -p bot-core -p game-consts --all-targets -- -D warnings` |
-| 3 | Clippy, wasm | `cargo clippy -p bot-wasm --target wasm32-unknown-unknown -- -D warnings` |
-| 4 | Native tests (includes the TUNING doc-sync test and the consts tests) | `cargo test -p bot-core -p game-consts` |
-| 5 | Purity: no JS crates in pure crates | `cargo tree -p bot-core -e normal` must not contain `wasm-bindgen`, `js-sys`, or `web-sys`. If ADR-005 allows `screeps-game-api` in `game-consts`, check only `bot-core`'s direct dependencies. |
+| 2 | Clippy, native | `cargo clippy -p rustedscreep-core -p rustedscreep-consts --all-targets -- -D warnings` |
+| 3 | Clippy, wasm | `cargo clippy -p rustedscreep-wasm --target wasm32-unknown-unknown -- -D warnings` |
+| 4 | Native tests (includes the TUNING doc-sync test and the consts tests) | `cargo test -p rustedscreep-core -p rustedscreep-consts` |
+| 5 | Purity: no JS crates in pure crates | `cargo tree -p rustedscreep-core -e normal` must not contain `wasm-bindgen`, `js-sys`, or `web-sys`. If ADR-005 allows `screeps-game-api` in `rustedscreep-consts`, check only `rustedscreep-core`'s direct dependencies. |
 | 6 | TypeScript | `npx tsc --noEmit -p js` |
 | 7 | Release build + bundle | `npm run build` |
 | 8 | Sizes | Report the sizes of the `.wasm` and the JS bundle in `dist/` and the delta against the last value in STATUS.md |

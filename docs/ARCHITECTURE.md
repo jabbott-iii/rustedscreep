@@ -7,8 +7,8 @@ _P1._ A diagram plus a step list: loader → `loop` → tick context → snapsho
 intent buffer (no-op filtering, pipeline check) → act → persistence flush → profiler flush. Include JS crossings per step.
 
 ## 2. Crates and modules
-_P1._ game-consts, bot-core (scheduler, planner, economy, spawning, logistics, defense, offense, expansion, movement,
-market, profiling, util), bot-wasm (snapshot, act, persistence, profiler, glue), and js/ (loader and tools).
+_P1._ rustedscreep-consts, rustedscreep-core (scheduler, planner, economy, spawning, logistics, defense, offense, expansion, movement,
+market, profiling, util), rustedscreep-wasm (snapshot, act, persistence, profiler, glue), and js/ (loader and tools).
 
 ## 3. Cache and invalidation table
 _P1 onward._ | Cache | Key | Contents | Built in tier | Invalidated by | TTL | Approx. size | Toggle (naive mode) |

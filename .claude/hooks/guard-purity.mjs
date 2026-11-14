@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // PreToolUse(Edit|Write|MultiEdit) guard: keeps the pure crates pure.
-//  - crates/bot-core:    no wasm-bindgen/js-sys/web-sys, no direct `screeps` crate usage
-//                        (game constants come in through `game_consts`).
-//  - crates/game-consts: no wasm-bindgen/js-sys/web-sys and no JS-backed screeps modules.
+//  - crates/rustedscreep-core:   no wasm-bindgen/js-sys/web-sys, no direct `screeps` crate usage
+//                                (game constants come in through `rustedscreep_consts`).
+//  - crates/rustedscreep-consts: no wasm-bindgen/js-sys/web-sys and no JS-backed screeps modules.
 // Only the text being written is checked (comments are stripped first).
 // Exit 2 blocks the edit; stderr is fed back to Claude.
 import { readFileSync } from 'node:fs';
@@ -15,7 +15,7 @@ try {
 }
 const ti = input?.tool_input ?? {};
 const path = String(ti.file_path ?? '').replace(/\\/g, '/');
-const m = path.match(/(?:^|\/)crates\/(bot-core|game-consts)\/(.+)$/);
+const m = path.match(/(?:^|\/)crates\/(rustedscreep-core|rustedscreep-consts)\/(.+)$/);
 if (!m) process.exit(0);
 const [, crate, rel] = m;
 
@@ -26,8 +26,8 @@ if (!text) process.exit(0);
 function block(reason) {
   process.stderr.write(
     `Blocked by .claude/hooks/guard-purity.mjs (${crate}/${rel}): ${reason}\n` +
-      'Pure crates must stay native-testable with no JS. Put JS-facing code in crates/bot-wasm, ' +
-      'or route constants through crates/game-consts. Changing this boundary needs an ADR the user accepts.\n',
+      'Pure crates must stay native-testable with no JS. Put JS-facing code in crates/rustedscreep-wasm, ' +
+      'or route constants through crates/rustedscreep-consts. Changing this boundary needs an ADR the user accepts.\n',
   );
   process.exit(2);
 }
@@ -40,8 +40,8 @@ if (rel === 'Cargo.toml') {
   if (/^\s*(wasm-bindgen|js-sys|web-sys)\s*=|\[(?:target\.[^\]]*\.)?dependencies\.(wasm-bindgen|js-sys|web-sys)\]/m.test(toml)) {
     block('adds a JS-binding dependency (wasm-bindgen / js-sys / web-sys).');
   }
-  if (crate === 'bot-core' && /^\s*screeps-game-api\s*=|dependencies\.screeps-game-api\]/m.test(toml)) {
-    block('bot-core must not depend on screeps-game-api directly; depend on game-consts.');
+  if (crate === 'rustedscreep-core' && /^\s*screeps-game-api\s*=|dependencies\.screeps-game-api\]/m.test(toml)) {
+    block('rustedscreep-core must not depend on screeps-game-api directly; depend on rustedscreep-consts.');
   }
   process.exit(0);
 }
@@ -54,14 +54,14 @@ const code = text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
 if (JS_CRATES.test(code)) {
   block('uses wasm_bindgen / js_sys / web_sys.');
 }
-if (crate === 'bot-core' && /\bscreeps\s*::|\buse\s+screeps\b|\bextern\s+crate\s+screeps\b/.test(code)) {
-  block('names the `screeps` crate directly; import constants and local types from `game_consts` instead.');
+if (crate === 'rustedscreep-core' && /\bscreeps\s*::|\buse\s+screeps\b|\bextern\s+crate\s+screeps\b/.test(code)) {
+  block('names the `screeps` crate directly; import constants and local types from `rustedscreep_consts` instead.');
 }
 if (
-  crate === 'game-consts' &&
+  crate === 'rustedscreep-consts' &&
   /\bscreeps\s*::\s*(game|objects|memory|raw_memory|pathfinder|inter_shard_memory|console|prototypes|js_collections|traits|enums)\b/.test(code)
 ) {
-  block('touches a JS-backed screeps module; game-consts may only re-export constants and pure local types.');
+  block('touches a JS-backed screeps module; rustedscreep-consts may only re-export constants and pure local types.');
 }
 
 process.exit(0);

@@ -27,9 +27,9 @@ format, or a new dependency.
 List every game rule or number the module depends on. Run `/verify` for any that are not `verified` in the log before writing code that uses them.
 
 ## 3. Implement (smallest complete change)
-1. Pure logic in `bot-core`, with unit and property tests whose expectations derive from `game-consts`.
+1. Pure logic in `rustedscreep-core`, with unit and property tests whose expectations derive from `rustedscreep-consts`.
 2. Config fields for every threshold, mirrored in `docs/TUNING.md`.
-3. Glue in `bot-wasm`: snapshot fields and intent issuance. Add profiler spans for the new subsystem.
+3. Glue in `rustedscreep-wasm`: snapshot fields and intent issuance. Add profiler spans for the new subsystem.
 4. Add a private-server scenario script or checklist entry to `docs/TEST_PLAN.md` if the behavior can only be tested in-game.
 
 ## 4. Validate honestly

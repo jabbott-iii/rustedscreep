@@ -1,17 +1,17 @@
 ---
 paths:
-  - "crates/bot-core/**"
-  - "crates/game-consts/**"
+  - "crates/rustedscreep-core/**"
+  - "crates/rustedscreep-consts/**"
 ---
 
-# Pure logic crates (`bot-core`, `game-consts`)
+# Pure logic crates (`rustedscreep-core`, `rustedscreep-consts`)
 
 ## Purity (a hook enforces this)
 - No `wasm-bindgen`, `js-sys`, or `web-sys` anywhere in these crates.
-- `bot-core` never names `screeps::`. Game constants and pure local types come in through `game_consts`.
-- `game-consts` may re-export `screeps-game-api` constants and pure `local` types (positions, room names, terrain/cost-matrix
+- `rustedscreep-core` never names `screeps::`. Game constants and pure local types come in through `rustedscreep_consts`.
+- `rustedscreep-consts` may re-export `screeps-game-api` constants and pure `local` types (positions, room names, terrain/cost-matrix
   value types). It must not touch JS-backed modules: `game`, `objects`, `memory`, `raw_memory`, `pathfinder`, `console`, and similar.
-  ADR-005 records whether `screeps-game-api` builds and tests on the native host. If it does not, `game-consts` mirrors the values
+  ADR-005 records whether `screeps-game-api` builds and tests on the native host. If it does not, `rustedscreep-consts` mirrors the values
   in `extra.rs` with sources, and the in-game self-check (P1) catches drift.
 
 ## Determinism
@@ -33,7 +33,7 @@ paths:
 - Crate roots set `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]`.
 
 ## Formulas and tests
-- Every non-trivial formula has a doc comment that lists the constants it uses (`/// Uses: game_consts::X, game_consts::Y`) and
+- Every non-trivial formula has a doc comment that lists the constants it uses (`/// Uses: rustedscreep_consts::X, rustedscreep_consts::Y`) and
   a source link for behavior the constants alone don't define.
 - Tests derive expected values from those constants, never from bare literals. A balance change should show up as a failing test,
   not as silent drift. The only exception is a pinned example taken from a cited source; cite it in the test.

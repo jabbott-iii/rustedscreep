@@ -35,18 +35,18 @@ Before writing code that depends on a game rule, an API signature, or tool behav
 5. Community sources (wiki.screepspl.us, open-source bots): hints only, cross-checked against 1 to 3
 
 Record every finding in `docs/VERIFICATION_LOG.md` with its source, value, version, date, and confidence (verified, inferred, or unverified).
-- Code reads constants through `crates/game-consts`.
-- A value with no API constant goes in `crates/game-consts/src/extra.rs`, with its source URL and a "last verified" date.
+- Code reads constants through `crates/rustedscreep-consts`.
+- A value with no API constant goes in `crates/rustedscreep-consts/src/extra.rs`, with its source URL and a "last verified" date.
 - If a source is unreachable, mark the item `VERIFY`, state the assumption, and choose the safest option.
 - Never invent a function, field, constant, or crate feature.
 - If a finding contradicts `docs/SPEC.md`, trust the source. Flag the discrepancy in the log and in your reply, then continue.
 
-The live server's constants are the ground truth for that server. At init, the bot checks `game-consts` against the server's JS globals (P1).
+The live server's constants are the ground truth for that server. At init, the bot checks `rustedscreep-consts` against the server's JS globals (P1).
 
 ## Architecture invariants (change only through an ADR)
-- `crates/game-consts` is the constants facade. Besides `bot-wasm`, it is the only crate that may name `screeps::`, and only for constants and pure local types.
-- `crates/bot-core` holds all decision logic in pure, deterministic Rust that is testable natively. It has no JS dependencies. It covers the scheduler, planner, economy, spawning, logistics, defense, offense (combat sim, formations, breaker solver), expansion, movement (flow fields, BFS, A*), market policy, profiling math, and util. Criterion benches live here.
-- `crates/bot-wasm` is the `cdylib`. It handles the snapshot (JS → Rust), the act step (Rust → intents), persistence (RawMemory), the profiler, and the exported `loop`. It is the only crate that uses `wasm-bindgen`, `js-sys`, or game-object APIs.
+- `crates/rustedscreep-consts` is the constants facade. Besides `rustedscreep-wasm`, it is the only crate that may name `screeps::`, and only for constants and pure local types.
+- `crates/rustedscreep-core` holds all decision logic in pure, deterministic Rust that is testable natively. It has no JS dependencies. It covers the scheduler, planner, economy, spawning, logistics, defense, offense (combat sim, formations, breaker solver), expansion, movement (flow fields, BFS, A*), market policy, profiling math, and util. Criterion benches live here.
+- `crates/rustedscreep-wasm` is the `cdylib`. It handles the snapshot (JS → Rust), the act step (Rust → intents), persistence (RawMemory), the profiler, and the exported `loop`. It is the only crate that uses `wasm-bindgen`, `js-sys`, or game-object APIs.
 - `js/` is the TypeScript loader and tools only. It handles bucket-gated compile/instantiate, calling `loop`, trap/panic recovery, and the deploy, console, and stats scripts. It contains no game logic.
 - Each tick runs **snapshot → decide → act**:
   - The snapshot makes one pass over game objects into Rust-native SoA structs with numeric handles.
@@ -58,10 +58,10 @@ The live server's constants are the ground truth for that server. At init, the b
   - **Standard** (hauling, upgrading, building, offense ops) runs unless the bucket is critical.
   - **Optional** (planning, market, scouting, visuals, pixels, offense planning) runs only above bucket thresholds.
   - Heavy work is time-sliced.
-- Every threshold lives in `crates/bot-core/src/config.rs` and is mirrored in `docs/TUNING.md`. A test keeps the two in sync.
+- Every threshold lives in `crates/rustedscreep-core/src/config.rs` and is mirrored in `docs/TUNING.md`. A test keeps the two in sync.
 - Error isolation:
   - `panic = "abort"` on wasm rules out `catch_unwind`, so isolation uses `Result` per room, creep, and task. A failing unit is logged with a rate limit and skipped.
-  - Non-test code in `bot-core` and `bot-wasm` has no `unwrap`, `expect`, `panic!`, or unchecked indexing. Clippy enforces this.
+  - Non-test code in `rustedscreep-core` and `rustedscreep-wasm` has no `unwrap`, `expect`, `panic!`, or unchecked indexing. Clippy enforces this.
   - Only the JS loader recovers from a trap.
 - Persistence:
   - Rust statics are lost on a global reset and must rebuild cheaply.
@@ -72,10 +72,10 @@ The live server's constants are the ground truth for that server. At init, the b
 ## Commands (P1 creates these; update this table if they change)
 | Purpose | Command |
 |---|---|
-| Native tests (pure logic) | `cargo test -p bot-core -p game-consts` |
-| Lints, native | `cargo clippy -p bot-core -p game-consts --all-targets -- -D warnings` |
-| Lints, wasm | `cargo clippy -p bot-wasm --target wasm32-unknown-unknown -- -D warnings` |
-| Benches (native only) | `cargo bench -p bot-core` |
+| Native tests (pure logic) | `cargo test -p rustedscreep-core -p rustedscreep-consts` |
+| Lints, native | `cargo clippy -p rustedscreep-core -p rustedscreep-consts --all-targets -- -D warnings` |
+| Lints, wasm | `cargo clippy -p rustedscreep-wasm --target wasm32-unknown-unknown -- -D warnings` |
+| Benches (native only) | `cargo bench -p rustedscreep-core` |
 | Release build (wasm + wasm-opt + Rollup to `dist/`) | `npm run build` |
 | Full gate (same as `/check`) | `npm run check` |
 | Deploy (ask first) | `npm run deploy -- --server <name> [--dryrun]` |
@@ -101,5 +101,5 @@ The live server's constants are the ground truth for that server. At init, the b
   Choosing between that and a cheaper re-instantiate is ADR-003 and must be measured.
 - Engine intent priorities: `heal` is never blocked, and it blocks `dismantle`, `attack`, `rangedHeal`, and others, even when the target is at full HP.
   A breaker cannot heal and dismantle in the same tick. Design every combat role around the verified table.
-- Cargo profiles only apply from the workspace root `Cargo.toml`. `[package.metadata.wasm-pack...]` belongs in `bot-wasm`.
-- Do not name a crate `core`, because it shadows `::core`. Keep `bot-wasm` out of `default-members` so native `cargo test` does not try to build it.
+- Cargo profiles only apply from the workspace root `Cargo.toml`. `[package.metadata.wasm-pack...]` belongs in `rustedscreep-wasm`.
+- Do not name a crate `core`, because it shadows `::core`. Keep `rustedscreep-wasm` out of `default-members` so native `cargo test` does not try to build it.

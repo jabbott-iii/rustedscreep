@@ -1,9 +1,9 @@
 # Test plan (SPEC §6.4)
 
-## 1. Unit and property tests (native, `cargo test -p bot-core -p game-consts`)
+## 1. Unit and property tests (native, `cargo test -p rustedscreep-core -p rustedscreep-consts`)
 _Per module._ The list of suites, what each asserts, and how expected values derive from constants.
 
-## 2. Benchmarks (native, `cargo bench -p bot-core`)
+## 2. Benchmarks (native, `cargo bench -p rustedscreep-core`)
 _P2 / P4 / P7._ Planner, flow field, and combat sim, with the latest numbers and the machine used.
 
 ## 3. Private server

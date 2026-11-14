@@ -1,6 +1,6 @@
 # Tuning guide (SPEC §6.5)
 
-This guide mirrors `crates/bot-core/src/config.rs` field for field, and a doc-sync test fails when the two diverge.
+This guide mirrors `crates/rustedscreep-core/src/config.rs` field for field, and a doc-sync test fails when the two diverge.
 Each row gives the default, the unit, the rationale (with a measurement or source), the safe range (overrides are clamped to it),
 and the server profile, if the value differs by profile.
 

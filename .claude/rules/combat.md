@@ -1,15 +1,15 @@
 ---
 paths:
-  - "crates/bot-core/src/defense/**"
-  - "crates/bot-core/src/offense/**"
-  - "crates/bot-core/src/combat/**"
-  - "crates/bot-core/src/intents/**"
+  - "crates/rustedscreep-core/src/defense/**"
+  - "crates/rustedscreep-core/src/offense/**"
+  - "crates/rustedscreep-core/src/combat/**"
+  - "crates/rustedscreep-core/src/intents/**"
 ---
 
 # Combat, defense and offense logic
 
 ## Intent pipeline (design around the verified table)
-- Encode the engine's intent-priority table as data in `bot-core::intents`, with the engine commit SHA in a comment, and test it.
+- Encode the engine's intent-priority table as data in `rustedscreep_core::intents`, with the engine commit SHA in a comment, and test it.
 - Seeded finding to re-verify: `heal` is never blocked. `dismantle` is blocked by `attackController`, `rangedHeal`, and `heal`.
   `attack` is blocked by `build`, `repair`, `dismantle`, `attackController`, `rangedHeal`, and `heal`. `rangedAttack` is blocked by `rangedMassAttack`, `build`, `repair`, and
   `rangedHeal`. Move, transfer, withdraw, pickup, and drop are outside the table. A heal on a full-HP target still blocks.

@@ -31,10 +31,11 @@
 |---|---|---|---|---|
 
 ## Open decisions
-See `docs/DECISIONS.md` (all Proposed).
+See `docs/DECISIONS.md` (ADR-001..008 Proposed; ADR-009 crate names Accepted).
 
 ## Blockers
 None yet.
 
 ## Log (newest first)
+- 2026-11-13: Renamed the placeholder crates to `rustedscreep-consts`, `rustedscreep-core` and `rustedscreep-wasm` (ADR-009) across CLAUDE.md, KIT_README.md, `.claude/` and `docs/`. Evidence: `node --check .claude/hooks/guard-purity.mjs` passes; settings.json parses; 8/8 guard-purity block/allow cases pass on the new paths; `grep -rnIE 'game[-_]consts|bot[-_](core|wasm)'` matches only ADR-009's history.
 - 2026-11-13: Claude Code kit installed. Next step: `/kickoff`.

@@ -41,8 +41,8 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
 ## ADR-005 Constants source for native tests: Proposed (P0)
 - Context: pure crates must test natively, and constants should come from the API (SPEC §0).
 - Options:
-  - (a) `game-consts` re-exports `screeps-game-api` constants and local types, which requires the crate to build and run natively.
-  - (b) `game-consts` mirrors the values with sources, and the in-game self-check catches drift.
+  - (a) `rustedscreep-consts` re-exports `screeps-game-api` constants and local types, which requires the crate to build and run natively.
+  - (b) `rustedscreep-consts` mirrors the values with sources, and the in-game self-check catches drift.
 - Decide by: R4 (native build of screeps-game-api).
 - Decision / evidence: _pending_
 
@@ -61,3 +61,13 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
 - Options: (a) TS → Babel preset-env targeting the probed JS level, then Rollup. (b) TS with `tsc` targeting ES5 or ES2015, then Rollup.
 - Decide by: probe syntax results, bundle size, and source-map usefulness.
 - Decision / evidence: _pending_
+
+## ADR-009 Crate names: Accepted (2026-11-13)
+- Context: the kit shipped with placeholder crate names `game-consts`, `bot-core` and `bot-wasm`. The repository is named `rustedscreep`. CLAUDE.md treats the crate layout as an architecture invariant, and KIT_README says a rename must update CLAUDE.md, the rule `paths` and `guard-purity.mjs` together.
+- Options:
+  - (a) Prefix all three: `rustedscreep-consts`, `rustedscreep-core`, `rustedscreep-wasm`.
+  - (b) As (a), but name the cdylib `rustedscreep`.
+  - (c) Rename only the `bot-*` crates and keep `game-consts`.
+- Decision: (a), chosen by the user. Each crate's directory matches its name (`crates/rustedscreep-consts`, `crates/rustedscreep-core`, `crates/rustedscreep-wasm`), and Rust paths use `rustedscreep_consts::`, `rustedscreep_core::` and `rustedscreep_wasm::`. Roles, boundaries and purity rules are unchanged.
+- Consequences: the wasm-bindgen output files are expected to be named after the cdylib (`rustedscreep_wasm.js`, `rustedscreep_wasm_bg.wasm`). This is an assumption until it is verified against the ADR-001 toolchain in P1. Formula doc comments read `/// Uses: rustedscreep_consts::X`. No crates existed yet, so nothing was migrated.
+- Evidence: the user's request on 2026-11-13. Every reference in CLAUDE.md, KIT_README.md, `.claude/` (rules, skills, agents, `guard-purity.mjs`) and `docs/` was renamed. Code-location cells in `VERIFICATION_LOG.md` were repointed without changing any finding. `SPEC.md` names no crates and was not edited.
