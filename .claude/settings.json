@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(cargo check)",
+      "Bash(cargo check *)",
+      "Bash(cargo build *)",
+      "Bash(cargo test)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo bench *)",
+      "Bash(cargo tree *)",
+      "Bash(cargo metadata *)",
+      "Bash(cargo search *)",
+      "Bash(cargo --version)",
+      "Bash(rustc --version)",
+      "Bash(rustc -Vv)",
+      "Bash(wasm-pack --version)",
+      "Bash(wasm-pack build *)",
+      "Bash(wasm-bindgen --version)",
+      "Bash(wasm-opt --version)",
+      "Bash(node -v)",
+      "Bash(node --version)",
+      "Bash(npm run build *)",
+      "Bash(npm run build)",
+      "Bash(npm run check)",
+      "Bash(npm run check *)",
+      "Bash(npm run size)",
+      "Bash(npm run test *)",
+      "Bash(npm run test)",
+      "Bash(npx tsc *)",
+      "Bash(git status *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git diff)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "WebSearch",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:lib.rs)",
+      "WebFetch(domain:docs.screeps.com)",
+      "WebFetch(domain:screeps.com)",
+      "WebFetch(domain:wiki.screepspl.us)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:doc.rust-lang.org)",
+      "WebFetch(domain:blog.rust-lang.org)",
+      "WebFetch(domain:wasm-bindgen.github.io)",
+      "WebFetch(domain:www.npmjs.com)",
+      "WebFetch(domain:nodejs.org)"
+    ],
+    "ask": [
+      "Bash(npm run deploy *)",
+      "Bash(npm run console *)",
+      "Bash(npm run stats *)",
+      "Bash(npm install *)",
+      "Bash(npm i *)",
+      "Bash(npm ci *)",
+      "Bash(cargo add *)",
+      "Bash(cargo update *)",
+      "Bash(cargo install *)",
+      "Bash(rustup *)",
+      "Bash(docker *)"
+    ],
+    "deny": [
+      "Read(./.screeps.yaml)",
+      "Edit(./.screeps.yaml)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git reset *)",
+      "Bash(git rebase *)",
+      "Bash(git merge *)",
+      "Bash(git tag *)",
+      "Bash(git cherry-pick *)",
+      "Bash(git revert *)",
+      "Bash(git clean *)",
+      "Bash(cargo publish *)",
+      "Bash(npm publish *)"
+    ]
+  },
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-bash.mjs",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-purity.mjs",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-context.mjs",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-context.mjs",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-context.mjs",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
