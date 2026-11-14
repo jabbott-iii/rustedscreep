@@ -1,7 +1,7 @@
 // Release build (ADR-001, ADR-002, ADR-008): cargo build for wasm32, then the wasm-bindgen CLI at the
 // exact Cargo.lock version (--target web), then the pinned wasm-opt -O4, then tsc and Rollup, then a
 // smoke run in a Screeps-like sandbox. Output: dist/main.js, dist/rustedscreep_wasm.wasm and
-// dist/build-info.json. Usage: npm run build [-- --features trap-test].
+// dist/build-info.json. Usage: npm run build [-- --features trap-test,profiler].
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -14,7 +14,7 @@ import { smoke } from './smoke.mjs';
 
 export const DIST = join(ROOT, 'dist');
 /** Cargo features of rustedscreep-wasm that a build may enable. */
-export const KNOWN_FEATURES = ['act-test', 'trap-test'];
+export const KNOWN_FEATURES = ['act-test', 'profiler', 'trap-test'];
 const PKG = join(ROOT, 'js', 'pkg');
 const TS_OUT = join(ROOT, 'js', 'build');
 const BIN = join(ROOT, 'node_modules', '.bin');

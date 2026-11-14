@@ -16,8 +16,8 @@ use std::fmt::Write as _;
 
 use rustedscreep_core::config::SCHEDULER_MMO;
 use rustedscreep_core::intents::{
-    ActLog, CreepIntent, ERROR_CODES, IntentBuffer, Issue, Outcome, Rejected, SayText, TargetRow,
-    error_name,
+    ActLog, CreepIntent, ERROR_CODES, IntentBuffer, Issue, IssueStats, Outcome, Rejected, SayText,
+    TargetRow, error_name,
 };
 use rustedscreep_core::scheduler::{Commit, Fault, FaultRecord, Scheduler};
 use rustedscreep_core::snapshot::Snapshot;
@@ -116,6 +116,11 @@ impl Act {
                 let _ = self.buffer.push(snapshot, handle, intent, commit);
             }
         }
+    }
+
+    /// This tick's call counters, for the profiler (`issued` JS calls, `billed` intents).
+    pub fn issues(&self) -> &IssueStats {
+        self.log.issues()
     }
 
     /// For the `rustedscreep.say(text)` console command: every own creep says `text` (cut to what

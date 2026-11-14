@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { WASM_MODULE } from './lib/common.mjs';
-import { simulate } from './smoke.mjs';
+import { saveSegments, simulate } from './smoke.mjs';
 
 // The smallest valid wasm module: magic number and version 1 (WebAssembly core spec, binary format).
 const EMPTY_WASM = Uint8Array.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
@@ -63,4 +63,38 @@ test('a bundle without exports.loop fails', () => {
   withBundle('exports.other = 1;', (dir) => {
     assert.throws(() => simulate(dir), /does not export loop/);
   });
+});
+
+/** A fresh world for saveSegments. */
+const segmentWorld = () => ({ segments: {}, segmentSaves: [], segmentErrors: [] });
+
+test('the segment save keeps the driver\'s limits: 10 keys, ids 0-99, strings of at most 100 × 1024 characters (V41, V85)', () => {
+  const ten = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [String(i * 11), `s${i}`]));
+  const ok = segmentWorld();
+  saveSegments({ ...ten }, ok, 1);
+  assert.deepEqual(ok.segmentErrors, []);
+  assert.equal(Object.keys(ok.segments).length, 10);
+  assert.deepEqual(ok.segmentSaves, [{ offset: 1, keys: Object.keys(ten) }]);
+  const full = segmentWorld();
+  saveSegments({ 5: 'x'.repeat(100 * 1024) }, full, 2);
+  assert.equal(full.segments[5].length, 100 * 1024);
+
+  const refused = [
+    [{ ...ten, 99: 'one more' }, /more than 10 segments \(11\)/],
+    [{ 100: 'x' }, /segment id 100/],
+    [{ '-1': 'x' }, /segment id -1/],
+    [{ 7: 42 }, /memory segment #7 is not a string/],
+    [{ 7: 'x'.repeat(100 * 1024 + 1) }, /memory segment #7 is 102401 long/],
+  ];
+  for (const [segments, why] of refused) {
+    const w = segmentWorld();
+    saveSegments({ 3: 'kept only if the whole save passes', ...segments }, w, 9);
+    assert.equal(w.segmentErrors.length, 1, String(why));
+    assert.match(w.segmentErrors[0], why);
+    assert.deepEqual(w.segments, {}, 'a failed save stores nothing');
+    assert.deepEqual(w.segmentSaves, []);
+  }
+  const none = segmentWorld();
+  for (const v of [undefined, null, 42]) saveSegments(v, none, 0);
+  assert.deepEqual(none, segmentWorld(), 'no segments object, nothing to save');
 });

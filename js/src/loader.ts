@@ -43,6 +43,8 @@ export interface Glue {
   schedulerSummary?: () => string;
   /** One line about the act layer's last tick: intents queued, refused, blocked, issued (P1 module 7). */
   actSummary?: () => string;
+  /** One line of CPU statistics from a `profiler` build, or a note that the build has none (P1 module 8). */
+  profilerSummary?: () => string;
   /** Asks every own creep to say `text` on the next tick (P1 module 7); returns a confirmation line. */
   queueSay?: (text: string) => string;
 }
@@ -458,6 +460,11 @@ export class Loader {
     return this.summary('actSummary', 'act summary');
   }
 
+  /** Console command: the wasm's profiler statistics (open window, act cost per call, segment writes). */
+  profiler(): string {
+    return this.summary('profilerSummary', 'profiler summary');
+  }
+
   /** Console command: every own creep says `text` on the next tick (a free intent; checks the act path). */
   say(text: unknown): string {
     const call = this.glue.queueSay;
@@ -467,7 +474,7 @@ export class Loader {
   }
 
   /** Calls a wasm summary export for a console command (see `guarded`). */
-  private summary(name: 'snapshotSummary' | 'schedulerSummary' | 'actSummary', noun: string): string {
+  private summary(name: 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary', noun: string): string {
     const call = this.glue[name];
     if (!call) return `rustedscreep: this build has no ${name} export`;
     return this.guarded(name, noun, call);

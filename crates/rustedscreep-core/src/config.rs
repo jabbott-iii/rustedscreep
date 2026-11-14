@@ -129,6 +129,27 @@ pub const SCHEDULER_MMO: SchedulerConfig = SchedulerConfig {
     fault_window_ticks: 100,
 };
 
+/// Profiler settings (ROADMAP P1 module 8), used only by a build with rustedscreep-wasm's `profiler`
+/// feature; `docs/TUNING.md` gives each one's rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProfilerConfig {
+    /// Loops per statistics window; a global's first loop is kept apart. Unit: loops.
+    pub window_loops: u32,
+    /// Closed windows kept in the heap and written to the stats segment, the oldest dropped first.
+    /// Unit: windows.
+    pub history_windows: u32,
+    /// The RawMemory segment the statistics are written to when a window closes (0 to 99,
+    /// `rustedscreep_consts::extra::MEMORY_SEGMENT_COUNT`). Unit: segment id.
+    pub stats_segment: u8,
+}
+
+/// Profiler values for the official MMO (the only profile until P1 module 10).
+pub const PROFILER_MMO: ProfilerConfig = ProfilerConfig {
+    window_loops: 1000,
+    history_windows: 8,
+    stats_segment: 99,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +278,37 @@ mod tests {
             ("trap_test_max", trap_test_max.to_string()),
         ];
         assert_tuning_rows(TUNING, "LoaderConfig", &expected);
+    }
+
+    /// Uses: rustedscreep_consts::extra::MEMORY_SEGMENT_COUNT. The window meets the ROADMAP's
+    /// evidence rule (mean and p95 over at least 1000 ticks), the history keeps at least one window,
+    /// and the segment id exists. The segment's worst-case length is checked in the profiler's tests.
+    #[test]
+    fn profiler_values_are_coherent() {
+        let c = PROFILER_MMO;
+        assert!(
+            (1000..=10_000).contains(&c.window_loops),
+            "ROADMAP: CPU numbers are mean and p95 over at least 1000 ticks"
+        );
+        assert!((1..=32).contains(&c.history_windows));
+        assert!(c.stats_segment < rustedscreep_consts::extra::MEMORY_SEGMENT_COUNT);
+    }
+
+    /// docs/TUNING.md mirrors PROFILER_MMO field for field (CLAUDE.md).
+    #[test]
+    fn tuning_md_mirrors_the_profiler_config() {
+        // Exhaustive: adding a field without a row here fails to compile.
+        let ProfilerConfig {
+            window_loops,
+            history_windows,
+            stats_segment,
+        } = PROFILER_MMO;
+        let expected = [
+            ("window_loops", window_loops.to_string()),
+            ("history_windows", history_windows.to_string()),
+            ("stats_segment", stats_segment.to_string()),
+        ];
+        assert_tuning_rows(TUNING, "ProfilerConfig", &expected);
     }
 
     #[test]

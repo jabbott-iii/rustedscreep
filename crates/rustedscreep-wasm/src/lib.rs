@@ -18,6 +18,7 @@
 mod act;
 #[cfg(feature = "act-test")]
 mod act_test;
+mod profiler;
 mod scheduler;
 mod snapshot;
 
@@ -36,6 +37,8 @@ struct State {
     js: snapshot::JsWorld,
     scheduler: Scheduler,
     act: act::Act,
+    /// Zero-sized without the `profiler` feature.
+    profiler: profiler::Profiler,
     #[cfg(feature = "act-test")]
     act_test: act_test::Script,
 }
@@ -54,7 +57,8 @@ fn start() {
 
 /// Exported to JS as `loop`; the loader calls it once per tick: the snapshot, then the scheduler's
 /// tick (its budget from the snapshot's tick context), in which jobs queue intents (P2 onward; the
-/// console's `say` until then), then the act step, which issues them in one batch.
+/// console's `say` until then), then the act step, which issues them in one batch. A `profiler`
+/// build reads the CPU clock around each step (`profiler::Probe`); other builds compile it out.
 ///
 /// A JS exception inside the pass ends the call without unwinding, which would leave the state
 /// borrowed. The loader treats that as a trap and replaces the instance (ADR-003), so the borrow
@@ -70,10 +74,13 @@ pub fn game_loop() {
                     js,
                     scheduler: sched,
                     act,
+                    profiler: prof,
                     #[cfg(feature = "act-test")]
                     act_test,
                 } = &mut *state;
+                let mut probe = profiler::Probe::start();
                 snapshot::take(snapshot, js);
+                probe.snapshot();
                 act.begin(snapshot);
                 let mut tick = sched.begin(&snapshot.tick, &SCHEDULER_MMO, scheduler::GameClock);
                 // Critical, then Standard, then Optional jobs run here and queue intents (P2 onward).
@@ -81,10 +88,14 @@ pub fn game_loop() {
                 #[cfg(feature = "act-test")]
                 act_test.queue(&mut act.buffer, snapshot, tick.commit());
                 tick.finish();
-                // After the decide step: nothing reads the CPU clock from here on (scheduler docs). The
+                probe.decide();
+                // After the decide step: the scheduler reads the CPU clock no more (scheduler docs); the
+                // profiler's readings from here on measure the act step outside the budget. The
                 // `TickCpu` held `&mut Scheduler` until `finish`, so `act::issue` cannot run earlier.
                 act::issue(act, snapshot, js, sched);
+                probe.act();
                 scheduler::log_faults(sched);
+                prof.finish(probe, &snapshot.tick, act.issues());
                 true
             }
             Err(_) => false,
@@ -129,6 +140,19 @@ pub fn act_summary() -> String {
             Err(_) => String::from("rustedscreep act: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep act: state unavailable"))
+}
+
+/// Exported to JS as `profilerSummary`, for the `rustedscreep.profiler()` console command: one line
+/// with the open window's CPU statistics, the act cost per call, the last loop, the last closed
+/// window, the stats-segment writes and the cold loop. A build without the `profiler` feature says so.
+#[wasm_bindgen(js_name = "profilerSummary")]
+pub fn profiler_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => profiler::summary(&state.profiler, state.snapshot.tick.time),
+            Err(_) => String::from("rustedscreep profiler: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep profiler: state unavailable"))
 }
 
 /// Exported to JS as `queueSay`, for the `rustedscreep.say(text)` console command: every own creep

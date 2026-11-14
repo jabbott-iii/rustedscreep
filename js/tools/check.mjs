@@ -41,7 +41,7 @@ function purity() {
     : { ok: true, detail: 'no JS crates outside the rustedscreep-consts subtree (ADR-005)' };
 }
 
-// The wasm crate's feature-gated code (trap-test, act-test) compiles only with its feature, so lint both ways.
+// The wasm crate's feature-gated code (trap-test, act-test, profiler) compiles only with its feature, so lint both ways.
 function wasmClippy() {
   for (const extra of [[], ['--all-features']]) {
     const args = ['clippy', '-p', 'rustedscreep-wasm', '--target', 'wasm32-unknown-unknown', ...extra, '--', '-D', 'warnings'];
@@ -76,6 +76,7 @@ const ROWS = [
   ['9 Sizes', size, [], true],
   ['10 Trap recovery (sandbox, both ADR-003 modes)', 'node', [join(ROOT, 'js', 'tools', 'trap-sim.mjs')], true],
   ['11 Act layer (sandbox, act-test build)', 'node', [join(ROOT, 'js', 'tools', 'act-sim.mjs')], true],
+  ['12 Profiler (sandbox, profiler build)', 'node', [join(ROOT, 'js', 'tools', 'profiler-sim.mjs')], true],
 ];
 
 function main() {

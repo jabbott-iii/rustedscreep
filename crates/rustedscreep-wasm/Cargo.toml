@@ -15,6 +15,8 @@ crate-type = ["cdylib"]
 trap-test = []
 # A scripted intent producer for the act layer's sandbox test (js/tools/act-sim.mjs); never deployed.
 act-test = []
+# Sparse CPU spans per subsystem and the stats segment (ROADMAP P1 module 8); off, it compiles out.
+profiler = []
 
 [dependencies]
 wasm-bindgen.workspace = true

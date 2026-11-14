@@ -14,5 +14,7 @@ test('an act-test build is refused for deploy/ in any spelling, and allowed into
 test('builds without a sandbox-only feature may be staged', () => {
   assert.equal(stageRefusal({ features: [] }), null);
   assert.equal(stageRefusal({ features: parseFeatures(['--features', 'trap-test']) }), null);
+  assert.equal(stageRefusal({ features: parseFeatures(['--features', 'profiler']) }), null);
+  assert.equal(stageRefusal({ features: parseFeatures(['--features', 'profiler,trap-test']) }), null);
   assert.equal(stageRefusal(), null);
 });

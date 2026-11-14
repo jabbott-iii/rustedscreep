@@ -2,7 +2,8 @@
 // VERIFICATION_LOG V96 records them: each tick gets a fresh console with only log and logUnsafe, Game
 // and Memory; Memory is parsed from a JSON string at the start of the tick and saved at its end; a halt
 // discards that tick's Memory and starts a new global, which evaluates main.js again; console commands
-// run after loop. TextDecoder and TextEncoder are absent (V72), and so are fetch, URL and document
+// run after loop. RawMemory.segments starts empty each tick (nothing is ever activated) and every key in
+// it is saved at the end of the tick with the driver's checks (V41, V85). TextDecoder and TextEncoder are absent (V72), and so are fetch, URL and document
 // (assumed, V95). npm run build runs the plain smoke test; npm run check also runs a trap-test build
 // through 10 forced traps. Standalone: node js/tools/smoke.mjs [dir].
 import { readFileSync } from 'node:fs';
@@ -14,18 +15,57 @@ import { sceneAt } from './lib/world.mjs';
 
 const ABSENT_GLOBALS = ['TextDecoder', 'TextEncoder', 'fetch', 'URL', 'document'];
 
+/** Driver runtime.js at cf63d8a (V41, V85): segment ids 0-99, at most 10 saved per tick, 100 × 1024 UTF-16 units each. */
+const SEGMENT_IDS = 100;
+const SEGMENTS_PER_TICK = 10;
+const SEGMENT_SIZE_LIMIT = 100 * 1024;
+
+/**
+ * The driver's end-of-tick segment save (V85): it throws, in this order, on more than 10 keys, a key outside
+ * 0-99, a value that is not a string and a value over the size limit, and otherwise stores `'' + value` for
+ * every key. A throw there would likely lose the tick (V41, inferred); the sandbox records it instead.
+ */
+export function saveSegments(segments, world, offset) {
+  if (segments === null || typeof segments !== 'object') return;
+  const keys = Object.keys(segments);
+  let error = null;
+  if (keys.length > SEGMENTS_PER_TICK) error = `more than ${SEGMENTS_PER_TICK} segments (${keys.length})`;
+  for (const key of keys) {
+    if (error) break;
+    const id = Number.parseInt(key, 10);
+    const value = segments[key];
+    if (!(id >= 0 && id < SEGMENT_IDS)) error = `segment id ${key}`;
+    else if (typeof value !== 'string') error = `memory segment #${key} is not a string`;
+    else if (value.length > SEGMENT_SIZE_LIMIT) error = `memory segment #${key} is ${value.length} long`;
+  }
+  if (error) {
+    world.segmentErrors.push(`offset ${offset}: ${error}`);
+    return;
+  }
+  for (const key of keys) world.segments[key] = `${segments[key]}`;
+  if (keys.length) world.segmentSaves.push({ offset, keys });
+}
+
 /**
  * Runs the bundle in `dir` for up to `ticks` ticks. `command(world)` may return console command source
  * to evaluate after that tick's loop, as the game does. Stops early once `until(world)` is true.
  * `scene(offset)` gives the tick's Game.creeps, Game.rooms and Game.structures (js/tools/lib/world.mjs).
+ * `rawMemory(offset)` gives the tick's RawMemory global (undefined for none); by default its segments
+ * object is empty. World: `segments` holds the saved segment strings by id, `segmentSaves` the ticks that
+ * saved any, and `segmentErrors` the saves the driver would have thrown on. `loopCalls[offset]` counts
+ * what the bundle did inside that tick's loop call (`getUsed` calls and `RawMemory.segments` reads), not
+ * in console commands or the end-of-tick save.
  */
 export function simulate(dir, {
   ticks = 6, bucket = 10000, command = null, until = null, memoryJson = '{}', withHalt = true, wasmBytes = null,
-  scene = sceneAt,
+  scene = sceneAt, rawMemory = () => ({ segments: {} }),
 } = {}) {
   const code = readFileSync(join(dir, 'main.js'), 'utf8');
   const bytes = wasmBytes ?? readFileSync(join(dir, `${WASM_MODULE}.wasm`));
-  const world = { time: 50000000, memoryJson, logs: [], notifies: [], halts: 0, globals: 0, ticksRun: 0 };
+  const world = {
+    time: 50000000, memoryJson, logs: [], notifies: [], halts: 0, globals: 0, ticksRun: 0,
+    segments: {}, segmentSaves: [], segmentErrors: [], loopCalls: [],
+  };
   let ctx = null;
 
   function newGlobal() {
@@ -61,12 +101,22 @@ export function simulate(dir, {
       logUnsafe: { value: (...a) => world.logs.push(a.map(String).join(' ')), writable: true, configurable: true },
     });
     context.Memory = memory;
+    const raw = rawMemory(offset);
+    const calls = { getUsed: 0, segments: 0 };
+    let inLoop = false;
+    // A view of `raw` whose `segments` getter counts the bundle's reads; the save reads `raw` itself.
+    context.RawMemory = raw === undefined || raw === null ? raw : Object.create(null, {
+      segments: { get: () => { if (inLoop) calls.segments += 1; return raw.segments; }, enumerable: true },
+    });
     context.Game = {
       ...scene(offset),
       time: world.time,
       cpu: {
         bucket, limit: 20, tickLimit: 500,
-        getUsed: () => performance.now() - start,
+        getUsed: () => {
+          if (inLoop) calls.getUsed += 1;
+          return performance.now() - start;
+        },
         ...(withHalt ? { halt: () => { halted = true; world.halts += 1; } } : {}),
       },
       notify: (message) => world.notifies.push(String(message)),
@@ -76,7 +126,13 @@ export function simulate(dir, {
       ctx.evaluated = true;
       if (typeof ctx.module.exports.loop !== 'function') throw new Error('main.js does not export loop');
     }
-    ctx.module.exports.loop();
+    inLoop = true;
+    try {
+      ctx.module.exports.loop();
+    } finally {
+      inLoop = false;
+    }
+    world.loopCalls[offset] = calls;
     const cmd = !halted && command ? command(world) : null;
     if (cmd) {
       world.logs.push(`> ${cmd}`);
@@ -85,9 +141,10 @@ export function simulate(dir, {
     world.ticksRun += 1;
     world.time += 1;
     if (halted) {
-      ctx = null; // halt: this tick's Memory is discarded, and the next tick starts a new global
-    } else if (memory !== null) {
-      world.memoryJson = JSON.stringify(memory); // a null Memory is not saved, so the raw string stays
+      ctx = null; // halt: this tick's Memory and segments are discarded, and the next tick starts a new global
+    } else {
+      if (memory !== null) world.memoryJson = JSON.stringify(memory); // a null Memory is not saved, so the raw string stays
+      saveSegments(raw?.segments, world, offset);
     }
     if (until && until(world)) break;
   }
@@ -132,6 +189,20 @@ const SCHEDULER_EXPECTED = {
   ],
   4: ['(loop 3 of this global)', 'optional on (cap 30.0)', ' | clock now '],
 };
+
+/**
+ * At offset PROFILER_AT, `rustedscreep.profiler()`. A build without the profiler says so; a profiler build
+ * shows 8 loops (offsets 1 to 8), the cold loop at the first, a window of the other 7, and the say's two
+ * calls (offset 7) with no billed intent (say is free, V34).
+ */
+const PROFILER_AT = 8;
+const PROFILER_EXPECTED = [
+  'rustedscreep profiler at tick 50000008: loops 8 in this global | open window 7/1000 loops from tick 50000002: ',
+  '; calls total 2 (max 2); billed total 0 (max 0) | act per call ',
+  ' CPU over 2 calls in 1 ticks (bound 0.0222)',
+  ' | last loop at tick 50000008: ',
+  ' | windows closed 0 (kept 0) | segment 99: writes 0, failed 0 | cold loop at tick 50000001: start ',
+];
 
 /** The console command the smoke test sends at offset SAY_AT, and what the creeps must say on the next loop. */
 const SAY_AT = 6;
@@ -188,6 +259,7 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [] } = {}) {
       if (checkAct && w.ticksRun === BAD_SAY_AT) return BAD_SAY_CMD;
       if (checkAct && w.ticksRun === SAY_AT) return SAY_CMD;
       if (checkAct && ACT_EXPECTED[w.ticksRun]) return 'rustedscreep.act()';
+      if (w.ticksRun === PROFILER_AT) return 'rustedscreep.profiler()';
       return null;
     },
     scene: (offset) => sceneAt(offset, {
@@ -212,6 +284,31 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [] } = {}) {
     // (offset 8, the loop after that, must call nothing).
     const wantCalls = [[SAY_AT + 1, 'say', 'Harvester', 'hi', false], [SAY_AT + 1, 'say', 'Scout2', 'hi', false]];
     if (JSON.stringify(calls) !== JSON.stringify(wantCalls)) throw new Error(`creep calls ${JSON.stringify(calls)}, expected ${JSON.stringify(wantCalls)}`);
+  }
+  const profiled = commandResults(world, 'rustedscreep.profiler()');
+  if (profiled.length !== 1) throw new Error(`${profiled.length} profiler summaries, expected 1`);
+  const cold = world.logs.filter((l) => l.startsWith('rustedscreep profiler: first loop of this global'));
+  if (features.includes('profiler')) {
+    const missing = checkAct ? PROFILER_EXPECTED.filter((p) => !profiled[0].includes(p)) : [];
+    if (missing.length) throw new Error(`profiler summary lacks ${missing.join(' / ')}: ${profiled[0]}`);
+    if (cold.length !== 1 || !cold[0].includes('at tick 50000001 (cpu limit 20, bucket 10000): start ')) {
+      throw new Error(`profiler cold line: ${cold.join(' / ') || 'none'}`);
+    }
+  } else {
+    if (!profiled[0].startsWith('rustedscreep profiler: not in this build')) throw new Error(`profiler: ${profiled[0]}`);
+    if (cold.length) throw new Error(`a build without the profiler logged ${cold[0]}`);
+  }
+  // Readings inside loop once booted (the loader also reads the clock on the boot ticks and the first
+  // loop): none without the profiler, six with it (crates/rustedscreep-wasm/src/profiler.rs), so the
+  // feature compiles out and its documented count holds. No build reads RawMemory here.
+  const perLoop = features.includes('profiler') ? 6 : 0;
+  world.loopCalls.forEach((c, offset) => {
+    if (offset >= 2 && c.getUsed !== perLoop) throw new Error(`offset ${offset}: ${c.getUsed} getUsed calls in loop, expected ${perLoop}`);
+    if (c.segments) throw new Error(`offset ${offset}: the loop read RawMemory.segments ${c.segments} time(s)`);
+  });
+  // No window closes in 9 ticks, so no build writes a segment here.
+  if (world.segmentSaves.length || world.segmentErrors.length) {
+    throw new Error(`segments: saves ${JSON.stringify(world.segmentSaves)}, errors ${world.segmentErrors.join(' / ')}`);
   }
   if (world.logs.some((l) => l.startsWith('rustedscreep fault'))) throw new Error('a fault was logged with no job running');
   const boot = world.logs.find((l) => l.startsWith('rustedscreep boot:'));

@@ -414,6 +414,29 @@ test('the act command shares the guard: missing export, idle, poisoned, and a th
   assert.equal(bad.halts, 1);
 });
 
+test('the profiler command shares the guard: missing export, idle, poisoned, and a throw poisons', () => {
+  const none = harness();
+  assert.match(none.loader.profiler(), /no profilerSummary export/);
+  let calls = 0;
+  const h = harness({ glue: { profilerSummary: () => `profiler ${++calls}` } });
+  assert.match(h.loader.profiler(), /no profiler summary while the loader is idle/);
+  h.tick(2);
+  assert.equal(h.loader.profiler(), 'profiler 1');
+  assert.equal(h.loader.running, false);
+  h.loopThrows = true;
+  h.tick();
+  assert.match(h.loader.profiler(), /no profiler summary while the loader is poisoned/);
+  assert.equal(calls, 1);
+
+  const bad = harness({ glue: { profilerSummary: () => { throw new Error('RuntimeError: unreachable'); } } });
+  bad.tick(2);
+  assert.match(bad.loader.profiler(), /profilerSummary trapped; the loader recovers on the next tick/);
+  assert.equal(bad.loader.phase, 'poisoned');
+  assert.ok(bad.logs.some((l) => l.includes('incident: trap at') && /profilerSummary: Error: RuntimeError/.test(l)));
+  bad.tick();
+  assert.equal(bad.halts, 1);
+});
+
 test('the say command passes a string to the wasm only while it is ready, and refuses other values', () => {
   const none = harness();
   assert.match(none.loader.say('hi'), /no queueSay export/);

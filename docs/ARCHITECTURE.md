@@ -6,7 +6,7 @@ Claude Code fills each section in as its phase lands. Keep it factual: describe 
 _P1._ A diagram plus a step list: loader → `loop` → tick context → snapshot → caches → scheduler tiers → decisions →
 intent buffer (no-op filtering, pipeline check) → act → persistence flush → profiler flush. Include JS crossings per step.
 
-Current state (P1.7): loader → `loop` (rustedscreep-wasm `game_loop`) → snapshot → the intent buffer opened for it → scheduler tick (the decide step: no job until P2; until then only the console's `say` queues intents) → act step → fault log. The snapshot
+Current state (P1.8): loader → `loop` (rustedscreep-wasm `game_loop`) → snapshot → the intent buffer opened for it → scheduler tick (the decide step: no job until P2; until then only the console's `say` queues intents) → act step → fault log → profiler record. A build with the `profiler` feature (step 9) reads the clock around these steps; without it the profiler compiles out. The snapshot
 (`rustedscreep-wasm/src/snapshot.rs` filling `rustedscreep_core::snapshot::Snapshot`) makes one pass, in this order:
 1. Tick context: `Game.time`, `Game.cpu.limit`, `tickLimit`, `bucket` (4 JS calls), sanitized by `TickContext::from_raw`.
 2. `Game.creeps` (own creeps, spawning ones included; V101): 3 calls for the collection (getter, `Object.values`, `length`),
@@ -42,6 +42,12 @@ Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and o
    rate-limited with the scheduler's, after which the next issue runs. `rustedscreep.act()` prints the last tick's counts and the
    totals since boot. The buffer issues only a creep's last push of a method, with no fallback to an earlier push if that call fails.
 8. The fault reports queued this tick (jobs' and the act step's) go to `console.log`.
+9. Profiler (P1.8, `rustedscreep-wasm/src/profiler.rs` over `rustedscreep_core::profiler`), only with the `profiler` feature: two
+   `Game.cpu.getUsed()` readings back to back at the start of `loop`, then one each after the snapshot, the decide step, the act step
+   and the fault log (6 per loop). `Profiler::record` adds the spans to a 1000-loop window (no JS call). On a global's first loop, one
+   `console.log` (the cold loop). On a window's last loop, the statistics, the stats segment text and its write: the
+   `RawMemory.segments` getter, an `is_object` check, two glue casts and one `Reflect.set`, all behind `catch`, plus one reading and,
+   if the write failed, a `console.log` (V115). Without the feature: no call.
 Each id or name copy is its own call (`__wbindgen_string_get`) because that call is the type check (V100). No Memory access, and intents only
 from the act step; on a steady tick the only Rust allocations are the copied id and name strings (the tables keep their capacity). This tick's JS objects stay in `JsWorld`, row
 for row, for the act layer (module 7). A failed read skips that object and counts it; `rustedscreep.snapshot()` prints the tick
@@ -126,7 +132,8 @@ Current state (P1.6, `rustedscreep_core::scheduler`; values from `SCHEDULER_MMO`
   what is left before the cap and at most a quarter of the reserve at the measured cost. So a cost that jumps up to 4 times passes
   the cap by at most half the reserve plus one unit (tested at a full and an empty bucket). Intents a unit queues for the act
   layer are committed at 0.2 CPU each (V34), so they count before `getUsed` sees them; the act layer issues them after the tick's
-  `finish`, and nothing reads the clock after that.
+  `finish`, and the scheduler reads the clock no more (a profiler build reads it twice more, after the act step and the fault log,
+  outside the budget).
 - Clock readings are sanitized: monotone within the tick (a `cancelOrder` refunds 0.2, V106); a NaN, infinite or negative reading
   keeps the last good one, and after `bad_samples_to_break` (2) such readings every tier stops for the rest of that tick
   (ADR-013).
@@ -137,7 +144,9 @@ Current state (P1.6, `rustedscreep_core::scheduler`; values from `SCHEDULER_MMO`
   count it held back and names up to 4 of those jobs, so one stuck unit cannot hide a new failure. A failing step stops its step
   job for the tick. rustedscreep-wasm prints the reports with `console.log` until `log` + `fern` arrive (P1.10).
 - All of it lives in the heap. A global reset fails open: cursors restart, every item is awake, Optional is in warm-up.
-- Not yet: per-tier CPU accounting (profiler, P1.8), runtime overrides of the thresholds (P1.10), the first jobs (P2).
+- Not yet: per-tier and per-job CPU accounting (P2, once jobs exist: from `TickCpu`'s samples at job start and after each batch, with no
+  extra `getUsed` calls, likely as stats segment format v2; P1.8's profiler has one `decide` span over every tier), runtime overrides of
+  the thresholds (P1.10), the first jobs (P2).
 
 ## 5. Persistence
 _P1._ Segment map, format versions, dirty policy, rebuild path.

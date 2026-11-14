@@ -2,6 +2,7 @@
 //   npm run stage                 build, then copy main.js and the .wasm into the tracked deploy/ folder
 //   npm run stage -- --out <dir>  the same into <dir> (tests and dry runs); <dir> must be new or empty
 //   --features trap-test           a trap-test build, for the P1 gate's recovery test (ADR-003)
+//   --features profiler            a profiler build, for the live CPU measurements (ROADMAP P1 module 8)
 //   (an act-test build is refused for deploy/: it issues scripted intents and is for the sandbox only)
 // It reports the module names, sizes, the .wasm hashes and the build ID. It never commits or pushes:
 // committing and pushing deploy/ to main is the user's deploy step.
