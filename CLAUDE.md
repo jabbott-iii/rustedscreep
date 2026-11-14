@@ -76,11 +76,12 @@ The live server's constants are the ground truth for that server. At init, the b
 |---|---|
 | Native tests (pure logic) | `cargo test -p rustedscreep-core -p rustedscreep-consts` |
 | Lints, native | `cargo clippy -p rustedscreep-core -p rustedscreep-consts --all-targets -- -D warnings` |
-| Lints, wasm | `cargo clippy -p rustedscreep-wasm --target wasm32-unknown-unknown -- -D warnings` |
+| Lints, wasm (`npm run check` also runs it with `--all-features`) | `cargo clippy -p rustedscreep-wasm --target wasm32-unknown-unknown -- -D warnings` |
 | Benches (native only) | `cargo bench -p rustedscreep-core` |
 | Install the pinned wasm-opt (binaryen version_133) into `.tools/` | `npm run setup:binaryen` |
 | Release build (wasm + wasm-opt + Rollup to `dist/`); a trap-test variant | `npm run build` / `npm run build -- --features trap-test` |
 | Trap recovery in the sandbox (10 traps, both ADR-003 modes) | `node js/tools/trap-sim.mjs` |
+| Act layer in the sandbox (the `act-test` build's scripted intents) | `node js/tools/act-sim.mjs` |
 | Tool tests (Node) / sizes and upload budget | `npm run test` / `npm run size` |
 | Full gate (same as `/check`) | `npm run check` |
 | Stage the MMO deploy folder for the GitHub link (ask first; the user pushes) | `npm run stage` (`-- --out <dir>` for a dry run, `-- --features trap-test` for the gate's recovery test) |

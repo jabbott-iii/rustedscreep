@@ -6,7 +6,7 @@ Claude Code fills each section in as its phase lands. Keep it factual: describe 
 _P1._ A diagram plus a step list: loader → `loop` → tick context → snapshot → caches → scheduler tiers → decisions →
 intent buffer (no-op filtering, pipeline check) → act → persistence flush → profiler flush. Include JS crossings per step.
 
-Current state (P1.6): loader → `loop` (rustedscreep-wasm `game_loop`) → snapshot → scheduler tick, and nothing after it yet. The snapshot
+Current state (P1.7): loader → `loop` (rustedscreep-wasm `game_loop`) → snapshot → the intent buffer opened for it → scheduler tick (the decide step: no job until P2; until then only the console's `say` queues intents) → act step → fault log. The snapshot
 (`rustedscreep-wasm/src/snapshot.rs` filling `rustedscreep_core::snapshot::Snapshot`) makes one pass, in this order:
 1. Tick context: `Game.time`, `Game.cpu.limit`, `tickLimit`, `bucket` (4 JS calls), sanitized by `TickContext::from_raw`.
 2. `Game.creeps` (own creeps, spawning ones included; V101): 3 calls for the collection (getter, `Object.values`, `length`),
@@ -21,10 +21,27 @@ Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and o
 5. `finish`: handles of objects the pass did not push are released.
 6. Scheduler (P1.6, `rustedscreep-wasm/src/scheduler.rs` over `rustedscreep_core::scheduler`): `Scheduler::begin` turns the
    snapshot's tick context into the tick's budget (no JS call, §4). No job runs under it until P2. Ending the tick records it for
-   `rustedscreep.scheduler()`, and queued fault reports go to `console.log` (none without jobs). A time-sliced job adds one
-   `Game.cpu.getUsed()` per clock sample.
-Each id or name copy is its own call (`__wbindgen_string_get`) because that call is the type check (V100). No intents, no Memory
-access; on a steady tick the only Rust allocations are the copied id and name strings (the tables keep their capacity). This tick's JS objects stay in `JsWorld`, row
+   `rustedscreep.scheduler()`, whose per-tick `faults` counts job faults only (act faults come later, step 7, and show in the
+   fault totals and lines). A time-sliced job adds one `Game.cpu.getUsed()` per clock sample.
+7. Act (P1.7, `rustedscreep-wasm/src/act.rs` over `rustedscreep_core::intents`): during the decide step, jobs push intents by creep
+   handle into the `IntentBuffer`, which commits 0.2 CPU per new intent that is not free (V34) and refuses, so that nothing is queued
+   and nothing earlier replaced: calls the game API refuses (an actor that is gone, hostile or spawning; a target that is gone; a
+   spawning creep target for transfer, pull or a move toward it; a target out of range or in another room; a controller or a type
+   built without a store for transfer and withdraw, also a nuker or power bank for withdraw; anything but a controller for
+   upgradeController; a self-pull), billed no-ops that the processor skips (heal or rangedHeal of a spawning creep, repair of a type
+   without a `CONSTRUCTION_COST`, a transfer to or move toward itself), and an amount of 0, which the API reads as "all" (V108, V109,
+   V113). Every other refusal reaches JS and comes back as a known code, counted as failed and not billed. After the scheduler's tick
+   ends, `issue` plans each creep's last push per method, blockers first (`PRIORITY_ORDER`), and walks the plan: it skips an
+   intent once a call on the same creep that blocks it was recorded (OK or unknown, V44, V45), so a blocker the game refused blocks
+   nothing and, when every call is accepted, it calls `ActionSet::kept`. Each call is one call of a `Creep` method on this tick's JS
+   object (`JsWorld`, row for row): one JS call per issued intent, none when the buffer is empty, plus a string decode
+   (`getStringFromWasm0`) per `say`. The methods are bound locally with `catch` and an `f64` return (V111, V112): the return value is
+   classified (OK, a known `ErrorCode`, or unknown), and a throw is a fault under job `act` (unit: the actor's handle slot),
+   rate-limited with the scheduler's, after which the next issue runs. `rustedscreep.act()` prints the last tick's counts and the
+   totals since boot. The buffer issues only a creep's last push of a method, with no fallback to an earlier push if that call fails.
+8. The fault reports queued this tick (jobs' and the act step's) go to `console.log`.
+Each id or name copy is its own call (`__wbindgen_string_get`) because that call is the type check (V100). No Memory access, and intents only
+from the act step; on a steady tick the only Rust allocations are the copied id and name strings (the tables keep their capacity). This tick's JS objects stay in `JsWorld`, row
 for row, for the act layer (module 7). A failed read skips that object and counts it; `rustedscreep.snapshot()` prints the tick
 context, each room with its controller and creep and structure counts, table sizes, handle churn and skips.
 
@@ -48,6 +65,14 @@ natively. rustedscreep-wasm's `snapshot.rs` reads the game into it and keeps the
 or a re-instantiation starts empty. rustedscreep-core now depends on rustc-hash (ADR-006); rustedscreep-wasm on screeps-game-api,
 js-sys and rustedscreep-core.
 
+Act layer (P1.7): `rustedscreep_core::intents` holds the engine's creep intent-priority table as data (`CreepAction`, `ActionSet`,
+`ActionSet::executed` as the engine model, `PRIORITY_ORDER` and `ActionSet::kept` for what is issued, with the engine commit), the
+per-tick `IntentBuffer` with its `CreepIntent` variants (move by direction, move toward a creep, say, drop, transfer, withdraw, heal,
+rangedHeal, repair, upgradeController, pull; harvest, build and pickup arrive with their target tables in P2, attacks with the ally
+check in P7 and P10, structure actors such as `spawnCreep` in P2) and its gated `issue` walk, the return-code classifier `Outcome`,
+and the counters `ActLog`. rustedscreep-wasm's `act.rs` binds the eleven methods and makes the calls; `act_test.rs` (feature
+`act-test`, refused by `npm run stage` for deploy/) is a scripted producer for the sandbox test.
+
 js/ (P1.3): `js/src/main.ts` is a build-pipeline placeholder until the loader lands (P1 module 4). `js/tools/` holds the build
 (cargo → wasm-bindgen `--target web` → `wasm-opt -O4` → tsc → Rollup CJS into `dist/`), stage (into `deploy/` for the GitHub link),
 size, check, smoke (the bundle in a Screeps-like sandbox, run at the end of every build) and setup-binaryen. Generated files go to the git-ignored `js/pkg/`,
@@ -62,6 +87,7 @@ _P1 onward._
 | Structure static data (P1.5) | structure handle | `structureType` and position | Critical (snapshot), read only when a structure is first seen | the structure's handle being released (destroyed, or missing from one pass) | none | 8 B per slot | none yet; the toggle to re-read every tick arrives with runtime config (P1.10) |
 | Job state (P1.6) | one per job, owned by its subsystem | round-robin cursor, measured CPU per unit | the job's tier | nothing during a global; a global reset restarts it at unit 0 with no estimate (only costs extra clock samples on that tick) | none | 16 B per job | none |
 | Sleep wheel (P1.6) | item (a handle or a job) | wake tick and an optional event | the owner's tier | the wake tick passing (gaps included), its event firing, a new sleep or a cancel; time going back wakes everyone; a global reset empties it, so every item starts awake | none | about 28 B per entry, 256 slot vectors, a heap for wakes beyond 256 ticks, one list per event being waited for (emptied lists are reused, at most 64 kept) | none |
+| Intent buffer (P1.7) | creep row in this tick's snapshot | every accepted push of the tick (actor and target rows, the intent), the methods queued per row, the latest push per row and method, and the planned issues | the decide step (any tier) and the act step | `IntentBuffer::begin` each tick, after the snapshot; a push before `begin`, after the plan, or with a snapshot whose `Game.time` or creep count differs from the one `begin` saw is refused (`closed`) | one tick | 44 B per push and per issue (`Issue`, measured natively; it holds no pointers), 4 B per row, plus 92 B per row for the latest-push slots, which only grow (the rows' method sets say which are this tick's) | none: it holds one tick's intents |
 | Fault log (P1.6) | one per global | fault totals, the current window's counts, up to `fault_reports_per_window` queued reports, up to 4 names of jobs whose faults were held back, the last fault | every tick (scheduler) | its window closing `fault_window_ticks` ticks after it opened, or `Game.time` falling before its start; a global reset clears it | the window | under 1 KB | none |
 
 ## 4. CPU tiers and budget
@@ -116,6 +142,12 @@ _P1._ Segment map, format versions, dirty policy, rebuild path.
 
 ## 6. Failure handling
 _P1._ Error isolation boundaries, loader recovery (ADR-003), reset behavior, respawn, shard travel, missing Memory.
+
+Act step (P1.7): a push that the game API would refuse, or that would be a billed no-op the snapshot can already see, is refused in
+Rust and counted; other refusals come back from JS as known codes and are counted as failed. An intent call that throws in JS is
+caught by its binding (`catch`), logged as a rate-limited fault under job `act`, and the next issue runs; a throw counts as not
+recorded, like the engine's own throw paths (V108). A return value that is not a known code is counted as unknown and treated as
+recorded. An issue whose JS object is missing is a fault, counted as missing, and makes no call. None of these traps.
 
 Loader (P1.4, js/src/loader.ts): any throw from the wasm, or a tick that ended inside it (the `running` flag still set), poisons
 the instance. The loader records the incident in `Memory.rustedscreepLoader` on that tick and recovers on the next: `Game.cpu.halt()`

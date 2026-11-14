@@ -2,6 +2,7 @@
 //   npm run stage                 build, then copy main.js and the .wasm into the tracked deploy/ folder
 //   npm run stage -- --out <dir>  the same into <dir> (tests and dry runs); <dir> must be new or empty
 //   --features trap-test           a trap-test build, for the P1 gate's recovery test (ADR-003)
+//   (an act-test build is refused for deploy/: it issues scripted intents and is for the sandbox only)
 // It reports the module names, sizes, the .wasm hashes and the build ID. It never commits or pushes:
 // committing and pushing deploy/ to main is the user's deploy step.
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
@@ -10,6 +11,7 @@ import { join } from 'node:path';
 import { build, DIST, parseFeatures } from './build.mjs';
 import { ROOT, WASM_MODULE, canonicalPath, fail, isInside, sha256 } from './lib/common.mjs';
 import { crc32Hex } from './lib/crc32.mjs';
+import { stageRefusal } from './lib/stage-rules.mjs';
 import { measure, report } from './size.mjs';
 
 const DEPLOY = join(ROOT, 'deploy');
@@ -36,6 +38,8 @@ function isSymlink(p) {
 }
 
 const args = parseArgs(process.argv.slice(2));
+const refusal = stageRefusal(args);
+if (refusal) fail(refusal);
 if (!args.out && isSymlink(DEPLOY)) fail('deploy/ is a symlink; refusing to stage through it');
 // Symlinks are resolved before every check (isInside canonicalizes both sides), so a link cannot slip past them.
 const target = canonicalPath(args.out ?? DEPLOY);

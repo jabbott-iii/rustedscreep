@@ -41,6 +41,19 @@ function purity() {
     : { ok: true, detail: 'no JS crates outside the rustedscreep-consts subtree (ADR-005)' };
 }
 
+// The wasm crate's feature-gated code (trap-test, act-test) compiles only with its feature, so lint both ways.
+function wasmClippy() {
+  for (const extra of [[], ['--all-features']]) {
+    const args = ['clippy', '-p', 'rustedscreep-wasm', '--target', 'wasm32-unknown-unknown', ...extra, '--', '-D', 'warnings'];
+    const res = run('cargo', args, { capture: true });
+    if (!res.ok) {
+      const tail = `${res.stdout}\n${res.stderr}`.trim().split('\n').filter(Boolean).slice(-3).join(' / ');
+      return { ok: false, detail: `${extra.length ? 'all features' : 'default features'}: ${tail}` };
+    }
+  }
+  return { ok: true, detail: 'default and all features' };
+}
+
 function size() {
   try {
     const m = measure();
@@ -54,7 +67,7 @@ function size() {
 const ROWS = [
   ['1 Format', 'cargo', ['fmt', '--all', '--', '--check']],
   ['2 Clippy, native', 'cargo', ['clippy', '-p', 'rustedscreep-core', '-p', 'rustedscreep-consts', '--all-targets', '--', '-D', 'warnings']],
-  ['3 Clippy, wasm', 'cargo', ['clippy', '-p', 'rustedscreep-wasm', '--target', 'wasm32-unknown-unknown', '--', '-D', 'warnings']],
+  ['3 Clippy, wasm', wasmClippy],
   ['4 Native tests', 'cargo', ['test', '-p', 'rustedscreep-core', '-p', 'rustedscreep-consts']],
   ['5 Purity', purity],
   ['6 Tool tests', 'npm', ['run', 'test', '--silent']],
@@ -62,6 +75,7 @@ const ROWS = [
   ['8 TypeScript', join(BIN, 'tsc'), ['--noEmit', '-p', join(ROOT, 'js')], true],
   ['9 Sizes', size, [], true],
   ['10 Trap recovery (sandbox, both ADR-003 modes)', 'node', [join(ROOT, 'js', 'tools', 'trap-sim.mjs')], true],
+  ['11 Act layer (sandbox, act-test build)', 'node', [join(ROOT, 'js', 'tools', 'act-sim.mjs')], true],
 ];
 
 function main() {

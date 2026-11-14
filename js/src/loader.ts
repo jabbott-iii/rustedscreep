@@ -41,6 +41,10 @@ export interface Glue {
   snapshotSummary?: () => string;
   /** One line about the wasm's scheduler: tier caps, work done, faults (P1 module 6), for a console command. */
   schedulerSummary?: () => string;
+  /** One line about the act layer's last tick: intents queued, refused, blocked, issued (P1 module 7). */
+  actSummary?: () => string;
+  /** Asks every own creep to say `text` on the next tick (P1 module 7); returns a confirmation line. */
+  queueSay?: (text: string) => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -449,13 +453,31 @@ export class Loader {
     return this.summary('schedulerSummary', 'scheduler summary');
   }
 
-  /**
-   * Calls a wasm summary export for a console command, only while the instance is healthy. A throw
-   * poisons the instance like a trap in loop, so the next tick recovers.
-   */
-  private summary(name: 'snapshotSummary' | 'schedulerSummary', noun: string): string {
+  /** Console command: the wasm's summary of the act layer's last tick. */
+  act(): string {
+    return this.summary('actSummary', 'act summary');
+  }
+
+  /** Console command: every own creep says `text` on the next tick (a free intent; checks the act path). */
+  say(text: unknown): string {
+    const call = this.glue.queueSay;
+    if (!call) return 'rustedscreep: this build has no queueSay export';
+    if (typeof text !== 'string') return 'rustedscreep: give the text as a string, for example rustedscreep.say("hi")';
+    return this.guarded('queueSay', 'say', () => call(text));
+  }
+
+  /** Calls a wasm summary export for a console command (see `guarded`). */
+  private summary(name: 'snapshotSummary' | 'schedulerSummary' | 'actSummary', noun: string): string {
     const call = this.glue[name];
     if (!call) return `rustedscreep: this build has no ${name} export`;
+    return this.guarded(name, noun, call);
+  }
+
+  /**
+   * Calls a wasm export for a console command, only while the instance is healthy. A throw poisons the
+   * instance like a trap in loop, so the next tick recovers.
+   */
+  private guarded(name: string, noun: string, call: () => string): string {
     if (this.phase !== 'ready' || this.running) return `rustedscreep: no ${noun} while the loader is ${this.phase}`;
     this.running = true;
     try {

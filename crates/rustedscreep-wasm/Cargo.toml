@@ -13,6 +13,8 @@ crate-type = ["cdylib"]
 [features]
 # A debug export that panics on demand, to test the loader's recovery (ADR-003, P1 gate).
 trap-test = []
+# A scripted intent producer for the act layer's sandbox test (js/tools/act-sim.mjs); never deployed.
+act-test = []
 
 [dependencies]
 wasm-bindgen.workspace = true

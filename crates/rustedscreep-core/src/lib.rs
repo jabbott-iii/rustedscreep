@@ -17,5 +17,6 @@
 )]
 
 pub mod config;
+pub mod intents;
 pub mod scheduler;
 pub mod snapshot;

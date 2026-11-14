@@ -6,7 +6,7 @@ This kit turns your spec (`docs/SPEC.md`, verbatim) into a phase-gated Claude Co
 1. Copy the contents of this folder into the root of a new, empty repository, then run `git init`.
 2. Prerequisites: Node 20+ on your PATH (the hooks are Node scripts, and the build needs Node anyway), plus Rust through rustup.
    Claude Code installs nothing on its own. `cargo install`, `npm install`, `rustup` and `docker` always ask first.
-3. Create `.screeps.yaml` yourself from `.example-screeps.yaml`, which P1 adds. Claude is blocked from reading or writing it.
+3. Create `.screeps.yaml` yourself, in the format `docs/VERIFICATION_LOG.md` V93 describes (the repo ships no example file). Claude is blocked from reading or writing it.
 4. Start `claude` in the repo root and trust the folder. The allow rules in `.claude/settings.json` only apply after you trust it.
    Run `/status` to confirm the project settings loaded, and `/context` to see which CLAUDE.md and rules files loaded.
 

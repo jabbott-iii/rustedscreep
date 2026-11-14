@@ -4,8 +4,8 @@
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
 import { textCodecSource } from './text-polyfill.js';
 import {
-  __wbg_reset_state, initSync, loop as wasmLoop, schedulerSummary as wasmSchedulerSummary,
-  snapshotSummary as wasmSnapshotSummary, trapTest as wasmTrapTest,
+  __wbg_reset_state, actSummary as wasmActSummary, initSync, loop as wasmLoop, queueSay as wasmQueueSay,
+  schedulerSummary as wasmSchedulerSummary, snapshotSummary as wasmSnapshotSummary, trapTest as wasmTrapTest,
 } from '../pkg/rustedscreep_wasm.js';
 import { type BuildInfo, type Env, type Glue, Loader, type LoaderConfig, type LoaderMemory, sanitizeLoaderMemory } from './loader.js';
 
@@ -82,6 +82,8 @@ const glue: Glue = {
   trapTest: BUILD.features.includes('trap-test') ? wasmTrapTest : undefined,
   snapshotSummary: wasmSnapshotSummary,
   schedulerSummary: wasmSchedulerSummary,
+  actSummary: wasmActSummary,
+  queueSay: wasmQueueSay,
 };
 
 const loader = new Loader(env, glue, CONFIG, BUILD);
@@ -108,13 +110,15 @@ function routeConsole(): void {
   }
 }
 
-// Console commands, for example `rustedscreep.trapTest(10)`, `rustedscreep.status()`, `rustedscreep.snapshot()`
-// or `rustedscreep.scheduler()`.
+// Console commands, for example `rustedscreep.trapTest(10)`, `rustedscreep.status()`, `rustedscreep.snapshot()`,
+// `rustedscreep.scheduler()`, `rustedscreep.act()` or `rustedscreep.say("hi")`.
 g.rustedscreep = {
   trapTest: (n: unknown = 1) => loader.scheduleTraps(Number(n)),
   status: () => loader.status(),
   snapshot: () => loader.snapshot(),
   scheduler: () => loader.scheduler(),
+  act: () => loader.act(),
+  say: (text: unknown) => loader.say(text),
 };
 
 export function loop(): void {

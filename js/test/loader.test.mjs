@@ -391,3 +391,63 @@ test('the scheduler command calls the wasm only while it is ready, reports a mis
   bad.tick();
   assert.equal(bad.halts, 1);
 });
+
+test('the act command shares the guard: missing export, idle, poisoned, and a throw poisons', () => {
+  const none = harness();
+  assert.match(none.loader.act(), /no actSummary export/);
+  let calls = 0;
+  const h = harness({ glue: { actSummary: () => `act ${++calls}` } });
+  assert.match(h.loader.act(), /no act summary while the loader is idle/);
+  h.tick(2);
+  assert.equal(h.loader.act(), 'act 1');
+  h.loopThrows = true;
+  h.tick();
+  assert.match(h.loader.act(), /no act summary while the loader is poisoned/);
+  assert.equal(calls, 1);
+
+  const bad = harness({ glue: { actSummary: () => { throw new Error('RuntimeError: unreachable'); } } });
+  bad.tick(2);
+  assert.match(bad.loader.act(), /actSummary trapped; the loader recovers on the next tick/);
+  assert.equal(bad.loader.phase, 'poisoned');
+  assert.ok(bad.logs.some((l) => l.includes('incident: trap at') && /actSummary: Error: RuntimeError/.test(l)));
+  bad.tick();
+  assert.equal(bad.halts, 1);
+});
+
+test('the say command passes a string to the wasm only while it is ready, and refuses other values', () => {
+  const none = harness();
+  assert.match(none.loader.say('hi'), /no queueSay export/);
+  const said = [];
+  const h = harness({ glue: { queueSay: (text) => { said.push(text); return `ok ${text}`; } } });
+  assert.match(h.loader.say('hi'), /no say while the loader is idle/);
+  h.tick(2);
+  for (const bad of [undefined, 42, null, { text: 'hi' }]) {
+    assert.match(h.loader.say(bad), /give the text as a string/);
+  }
+  assert.equal(h.loader.say('hi'), 'ok hi');
+  assert.equal(h.loader.running, false);
+  assert.deepEqual(said, ['hi'], 'only the string reached the wasm');
+
+  const bad = harness({ glue: { queueSay: () => { throw new Error('RuntimeError: unreachable'); } } });
+  bad.tick(2);
+  assert.match(bad.loader.say('hi'), /queueSay trapped; the loader recovers on the next tick/);
+  assert.equal(bad.loader.phase, 'poisoned');
+  bad.tick();
+  assert.equal(bad.halts, 1);
+});
+
+test('every console command refuses while the wasm is running, without calling it', () => {
+  let calls = 0;
+  const count = () => { calls += 1; return 'called'; };
+  const h = harness({ glue: { snapshotSummary: count, schedulerSummary: count, actSummary: count, queueSay: count } });
+  h.tick(2);
+  assert.equal(h.loader.phase, 'ready');
+  h.loader.running = true;
+  assert.match(h.loader.snapshot(), /no snapshot while the loader is ready/);
+  assert.match(h.loader.scheduler(), /no scheduler summary while the loader is ready/);
+  assert.match(h.loader.act(), /no act summary while the loader is ready/);
+  assert.match(h.loader.say('hi'), /no say while the loader is ready/);
+  assert.equal(calls, 0);
+  h.loader.running = false;
+  assert.equal(h.loader.act(), 'called');
+});

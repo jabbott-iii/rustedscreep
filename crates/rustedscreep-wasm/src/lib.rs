@@ -15,6 +15,9 @@
     )
 )]
 
+mod act;
+#[cfg(feature = "act-test")]
+mod act_test;
 mod scheduler;
 mod snapshot;
 
@@ -32,6 +35,9 @@ struct State {
     snapshot: Snapshot,
     js: snapshot::JsWorld,
     scheduler: Scheduler,
+    act: act::Act,
+    #[cfg(feature = "act-test")]
+    act_test: act_test::Script,
 }
 
 thread_local! {
@@ -47,8 +53,8 @@ fn start() {
 }
 
 /// Exported to JS as `loop`; the loader calls it once per tick: the snapshot, then the scheduler's
-/// tick (its budget from the snapshot's tick context). No job runs under it until P2 adds the first
-/// subsystems; the act layer lands in P1 module 7.
+/// tick (its budget from the snapshot's tick context), in which jobs queue intents (P2 onward; the
+/// console's `say` until then), then the act step, which issues them in one batch.
 ///
 /// A JS exception inside the pass ends the call without unwinding, which would leave the state
 /// borrowed. The loader treats that as a trap and replaces the instance (ADR-003), so the borrow
@@ -63,11 +69,21 @@ pub fn game_loop() {
                     snapshot,
                     js,
                     scheduler: sched,
+                    act,
+                    #[cfg(feature = "act-test")]
+                    act_test,
                 } = &mut *state;
                 snapshot::take(snapshot, js);
-                // Critical, then Standard, then Optional jobs run on this tick (P2 onward).
-                let tick = sched.begin(&snapshot.tick, &SCHEDULER_MMO, scheduler::GameClock);
+                act.begin(snapshot);
+                let mut tick = sched.begin(&snapshot.tick, &SCHEDULER_MMO, scheduler::GameClock);
+                // Critical, then Standard, then Optional jobs run here and queue intents (P2 onward).
+                act.queue_console_say(snapshot, tick.commit());
+                #[cfg(feature = "act-test")]
+                act_test.queue(&mut act.buffer, snapshot, tick.commit());
                 tick.finish();
+                // After the decide step: nothing reads the CPU clock from here on (scheduler docs). The
+                // `TickCpu` held `&mut Scheduler` until `finish`, so `act::issue` cannot run earlier.
+                act::issue(act, snapshot, js, sched);
                 scheduler::log_faults(sched);
                 true
             }
@@ -101,6 +117,30 @@ pub fn scheduler_summary() -> String {
             Err(_) => String::from("rustedscreep scheduler: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep scheduler: state unavailable"))
+}
+
+/// Exported to JS as `actSummary`, for the `rustedscreep.act()` console command: one line with the
+/// last tick's intent counts (queued, refused, blocked, issued and their results) and totals.
+#[wasm_bindgen(js_name = "actSummary")]
+pub fn act_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => act::summary(&state.act),
+            Err(_) => String::from("rustedscreep act: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep act: state unavailable"))
+}
+
+/// Exported to JS as `queueSay`, for the `rustedscreep.say(text)` console command: every own creep
+/// says `text` on the next tick (a free intent, V34), which checks the act path in game.
+#[wasm_bindgen(js_name = "queueSay")]
+pub fn queue_say(text: &str) -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow_mut() {
+            Ok(mut state) => state.act.request_say(text),
+            Err(_) => String::from("rustedscreep say: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep say: state unavailable"))
 }
 
 /// Debug export for the loader's trap-recovery test (ADR-003; the P1 gate forces 10 traps in a row).

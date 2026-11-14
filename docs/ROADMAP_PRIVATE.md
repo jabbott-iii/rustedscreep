@@ -18,7 +18,7 @@ Modules:
 - screeps-launcher pinned to `v1.17.0` (Docker image or release binary, VERIFICATION_LOG V59). `nodeVersion` pinned to an exact
   `vX.Y.Z` string so runs are reproducible (V61). Docker commands always ask first.
 - `config.yml`, mods, world reset and the bot user, written up in `docs/TEST_PLAN.md` §3 so the setup can be rebuilt from scratch.
-- A `private` server profile in `config.rs` and `docs/TUNING.md`, and a `private` deploy profile in `.example-screeps.yaml`.
+- A `private` server profile in `config.rs` and `docs/TUNING.md`, and a `private` server entry that the user adds to their `.screeps.yaml` (format: VERIFICATION_LOG V93).
   The profile handles an unlimited CPU setting, where `Game.cpu.limit` and `bucket` read `Infinity` (V37).
 - Feature probe on the private server, with results in VERIFICATION_LOG section D. Re-check ADR-002 and ADR-008 against them.
 - Cold-start cost measured on the private server, and the `private` profile's boot gate set from it.

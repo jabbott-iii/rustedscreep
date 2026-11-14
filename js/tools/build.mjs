@@ -14,7 +14,7 @@ import { smoke } from './smoke.mjs';
 
 export const DIST = join(ROOT, 'dist');
 /** Cargo features of rustedscreep-wasm that a build may enable. */
-export const KNOWN_FEATURES = ['trap-test'];
+export const KNOWN_FEATURES = ['act-test', 'trap-test'];
 const PKG = join(ROOT, 'js', 'pkg');
 const TS_OUT = join(ROOT, 'js', 'build');
 const BIN = join(ROOT, 'node_modules', '.bin');
@@ -151,7 +151,7 @@ export function build({ features = [], dist = DIST, loaderOverrides = {} } = {})
 
   step('smoke test (Screeps-like sandbox)');
   try {
-    const result = smoke(dist);
+    const result = smoke(dist, { features });
     console.log(`${result.ticks} ticks ran; booted on tick ${result.bootedAt}; ${result.logs.length} log line(s)`);
   } catch (e) {
     fail(`bundle smoke test failed: ${e.message}`);

@@ -133,13 +133,34 @@ const SCHEDULER_EXPECTED = {
   4: ['(loop 3 of this global)', 'optional on (cap 30.0)', ' | clock now '],
 };
 
+/** The console command the smoke test sends at offset SAY_AT, and what the creeps must say on the next loop. */
+const SAY_AT = 6;
+const SAY_CMD = 'rustedscreep.say("hi")';
+/** A say with a number, at offset BAD_SAY_AT: the loader refuses it before the wasm. */
+const BAD_SAY_AT = 2;
+const BAD_SAY_CMD = 'rustedscreep.say(42)';
+
+/**
+ * What `rustedscreep.act()` must report at offset SAY_AT + 1, after the loop that issued the say: the two own
+ * creeps that are not spawning say it (one call each, free, so billed 0, V34), the spawning builder is refused
+ * before any call, and the Invader in W1N1 is not asked (the say goes to own creeps only). The loops ran at
+ * offsets 1 to 7, so 7 ticks since boot. One more loop runs after it, which must call nothing.
+ */
+const ACT_EXPECTED = {
+  7: [
+    'rustedscreep act at tick 50000007: queued 2 (replaced 0), refused 1, spawning 1 | blocked 0 | ' +
+      'issued 2: ok 2 (billed 0), failed 0, unknown 0, threw 0, missing 0 | since boot: ticks 7, queued 2, ' +
+      'refused 1, blocked 0, issued 2, ok 2, billed 0, failed 0, unknown 0, threw 0, missing 0',
+  ],
+};
+
 /** The results of `cmd` in tick order: each command's result is logged right after it. */
-function commandResults(world, cmd) {
+export function commandResults(world, cmd) {
   return world.logs.filter((l, i) => i > 0 && world.logs[i - 1] === `> ${cmd}`);
 }
 
 /** Checks each result of `cmd` against the parts expected at its offset. */
-function checkResults(world, cmd, expectedByOffset, label) {
+export function checkResults(world, cmd, expectedByOffset, label) {
   const results = commandResults(world, cmd);
   const expected = Object.entries(expectedByOffset);
   if (results.length !== expected.length) throw new Error(`${results.length} ${label} summaries, expected ${expected.length}`);
@@ -151,17 +172,27 @@ function checkResults(world, cmd, expectedByOffset, label) {
 }
 
 /**
- * The plain smoke test npm run build runs: the bundle boots, logs a matching CRC-32, runs clean, and its
- * snapshot and scheduler summaries of the fake world match SNAPSHOT_EXPECTED and SCHEDULER_EXPECTED.
+ * The plain smoke test npm run build runs: the bundle boots, logs a matching CRC-32, runs clean, its
+ * snapshot and scheduler summaries of the fake world match SNAPSHOT_EXPECTED and SCHEDULER_EXPECTED, and a
+ * console say reaches exactly the right creeps through the act layer (ACT_EXPECTED).
  */
-export function smoke(dir = join(ROOT, 'dist')) {
+export function smoke(dir = join(ROOT, 'dist'), { features = [] } = {}) {
+  // An act-test build queues scripted intents every tick, so its act path is checked by act-sim.mjs instead.
+  const checkAct = !features.includes('act-test');
+  const calls = [];
   const world = simulate(dir, {
-    ticks: 6,
+    ticks: 9,
     command: (w) => {
       if (SNAPSHOT_EXPECTED[w.ticksRun]) return 'rustedscreep.snapshot()';
       if (SCHEDULER_EXPECTED[w.ticksRun]) return 'rustedscreep.scheduler()';
+      if (checkAct && w.ticksRun === BAD_SAY_AT) return BAD_SAY_CMD;
+      if (checkAct && w.ticksRun === SAY_AT) return SAY_CMD;
+      if (checkAct && ACT_EXPECTED[w.ticksRun]) return 'rustedscreep.act()';
       return null;
     },
+    scene: (offset) => sceneAt(offset, {
+      calls: { push: (call) => calls.push([offset, ...call]) },
+    }),
   });
   const summaries = checkResults(world, 'rustedscreep.snapshot()', SNAPSHOT_EXPECTED, 'snapshot');
   summaries.forEach((s) => {
@@ -170,6 +201,17 @@ export function smoke(dir = join(ROOT, 'dist')) {
   for (const s of checkResults(world, 'rustedscreep.scheduler()', SCHEDULER_EXPECTED, 'scheduler')) {
     // The sandbox's getUsed is real elapsed time since the tick started, so a reading of 0 or more.
     if (!/ \| clock now \d+\.\d\d \|/.test(s)) throw new Error(`scheduler: no clock reading: ${s}`);
+  }
+  if (checkAct) {
+    checkResults(world, 'rustedscreep.act()', ACT_EXPECTED, 'act');
+    const said = commandResults(world, SAY_CMD);
+    if (said.length !== 1 || !said[0].includes('says "hi" on the next tick')) throw new Error(`say command: ${said.join(' / ')}`);
+    const refused = commandResults(world, BAD_SAY_CMD);
+    if (refused.length !== 1 || !refused[0].includes('give the text as a string')) throw new Error(`say(42): ${refused.join(' / ')}`);
+    // The only JS calls a build without act-test makes are the console's says, on the loop after the command
+    // (offset 8, the loop after that, must call nothing).
+    const wantCalls = [[SAY_AT + 1, 'say', 'Harvester', 'hi', false], [SAY_AT + 1, 'say', 'Scout2', 'hi', false]];
+    if (JSON.stringify(calls) !== JSON.stringify(wantCalls)) throw new Error(`creep calls ${JSON.stringify(calls)}, expected ${JSON.stringify(wantCalls)}`);
   }
   if (world.logs.some((l) => l.startsWith('rustedscreep fault'))) throw new Error('a fault was logged with no job running');
   const boot = world.logs.find((l) => l.startsWith('rustedscreep boot:'));
