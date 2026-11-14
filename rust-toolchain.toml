@@ -1,7 +1,8 @@
 # Pinned stable toolchain (ADR-002, VERIFICATION_LOG V13). Bump by editing this file; `rustup update` does not move it.
 # rustup itself never prompts. With its default auto-install (V82), the first cargo command run here on a machine
-# without this toolchain (a fresh clone, or right after a bump) downloads and installs it. To install it deliberately,
-# run this first (in Claude Code, `rustup *` commands ask for approval; plain cargo commands do not):
+# without this toolchain (a fresh clone, or right after a bump) downloads and installs it. Claude Code sessions in this
+# repo set RUSTUP_AUTO_INSTALL=0 (`env` in .claude/settings.json), so there cargo stops with "toolchain ... is not
+# installed" instead. Install it deliberately (in Claude Code, `rustup *` commands ask for approval):
 #   rustup toolchain install 1.100.0 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
 [toolchain]
 channel = "1.100.0"
