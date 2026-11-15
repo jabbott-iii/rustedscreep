@@ -6,11 +6,12 @@ Claude Code fills each section in as its phase lands. Keep it factual: describe 
 _P1._ A diagram plus a step list: loader → `loop` → tick context → snapshot → caches → scheduler tiers → decisions →
 intent buffer (no-op filtering, pipeline check) → act → persistence flush → profiler flush. Include JS crossings per step.
 
-Current state (end of P1): loader → `loop` (rustedscreep-wasm `game_loop`) → a copy of the config in force (`config::Runtime`, the active profile with the runtime overrides; the whole tick runs on it, so a record that loads during the decide step applies from the next tick, except the log level and the flush's segment limits) → snapshot → the rate-limited skipped-object log (`SkipLog`, at most one line per `log.skip_window_ticks`) → the intent buffer opened for it → scheduler tick (the decide step: the persistence loads, a Standard step job (P1.9), then the constants self-check, an Optional step job that runs once per global (P1.11); no game job until P2, so only the console's `say` queues intents) → act step → fault log → profiler record. A build with the `profiler` feature (step 9) reads the clock around these steps; without it the profiler compiles out. The snapshot
+Current state (P2.1; P1 plus movement): loader → `loop` (rustedscreep-wasm `game_loop`) → a copy of the config in force (`config::Runtime`, the active profile with the runtime overrides; the whole tick runs on it, so a record that loads during the decide step applies from the next tick, except the log level and the flush's segment limits) → snapshot → movement's tick start (step 5a) → the rate-limited skipped-object log (`SkipLog`, at most one line per `log.skip_window_ticks`) → the intent buffer opened for it → scheduler tick (the decide step: movement's room reads, a Critical job (P2.1), the persistence loads, a Standard step job (P1.9), movement's rescans and the console's move order, Standard (P2.1), then the constants self-check, an Optional step job that runs once per global (P1.11), then movement's traffic resolution; no game job yet, so only the console's `say` and `moveTo` queue intents) → act step (and the refused moves back to movement) → fault log → profiler record. A build with the `profiler` feature (step 9) reads the clock around these steps; without it the profiler compiles out. The snapshot
 (`rustedscreep-wasm/src/snapshot.rs` filling `rustedscreep_core::snapshot::Snapshot`) makes one pass, in this order:
 1. Tick context: `Game.time`, `Game.cpu.limit`, `tickLimit`, `bucket` (4 JS calls), sanitized by `TickContext::from_raw`.
 2. `Game.creeps` (own creeps, spawning ones included; V101): 3 calls for the collection (getter, `Object.values`, `length`),
-   then per creep 6 (`Array.get`, `id`, the id string copy, `pos`, `__packedPos`, `spawning`).
+   then per creep 7 (`Array.get`, `id`, the id string copy, `pos`, `__packedPos`, `spawning`, and `fatigue` unless it is spawning,
+   P2.1, V160).
 3. `Game.rooms`: 3 calls, then per room 8 with a controller (`get`, `name`, the name copy, `controller`, `my`, `level`, `find`,
    `length`) or 6 without; per hostile 5 (`get`, `id`, the id copy, `pos`, `__packedPos`; hostile results never include spawning
    creeps, V101).
@@ -22,13 +23,18 @@ Current state (end of P1): loader → `loop` (rustedscreep-wasm `game_loop`) →
 Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and one `__externref_table_alloc` (with a JS
 `Table.set`) per object returned through an `Option` (every creep's `id`, a room's `controller` when present).
 5. `finish`: handles of objects the pass did not push are released.
+5a. Movement's tick (P2.1, `rustedscreep-wasm/src/movement.rs` over `rustedscreep_core::movement`): `Movement::begin` (no JS
+   call) notes the rooms with own creeps and the owned ones, checks last tick's moves (a creep not on the tile it was moved toward
+   counts as stuck; an engine failure into a tile no creep stands on counts as unexplained), drops suspect tiles past their time,
+   and drops rooms no own creep has been in for `movement.field_idle_ticks`. The rooms' reads are jobs in step 6. Own creeps'
+   `fatigue` is read in step 2 (one call each unless spawning, V160).
 6. Scheduler (P1.6, `rustedscreep-wasm/src/scheduler.rs` over `rustedscreep_core::scheduler`): `Scheduler::begin` turns the
-   snapshot's tick context into the tick's budget (no JS call, §4). Until P2 its only jobs are the persistence loads (P1.9) and the constants self-check (P1.11). Ending the tick records it for
+   snapshot's tick context into the tick's budget (no JS call, §4). Its jobs so far, in tier order: `movement read` (Critical, first: per room that is owned or had a request within `movement.scan_interval_ticks` and has not been read, the terrain, 5 calls: `getTerrain`, `getRawBuffer`, `length`, js-sys `copy_to`'s `length` and copy, V156, V157; sources and minerals, 2 `find` calls with their `length`s and 3 calls each; and a scan, below; one unit per room, a heavy unit), the persistence loads (Standard, P1.9), `movement rescan` (Standard: the same rooms' scans every `movement.scan_interval_ticks`, or `rescan_min_ticks` after an early-rescan request; a scan is 3 `find` calls, structures, own sites and deposits, V158, with their `length`s, 4 calls per structure plus `my` and `isPublic` per rampart, 4 per site, 3 per deposit, V159; a scan whose footprints equal the last one's rebuilds nothing), the console's move order (`rustedscreep.moveTo`, Standard, P2.1) and the constants self-check (Optional, P1.11). Jobs ask movement for steps with `Movement::request` (P2 jobs from the opening item on); a request builds its goal's flow field on first use and a stuck creep's detour (both heavy units, `Commit::heavy`, after which the slicer reads the clock), and a request that plans a move commits one intent. A job whose creep may make way calls `Movement::give_way`; any other own creep stays put. After every job, `Movement::resolve` runs the traffic manager per room with movers and pushes the moves into the intent buffer; on a tick with a planned move it reads the clock once and caps each mover's shoves by what its job's tier has left. After the act step (step 7), the moves the game refused are not counted as blocked, and one refused with `ERR_NO_BODYPART` holds its creep as fixed for `movement.immobile_retry_ticks`. Ending the tick records it for
    `rustedscreep.scheduler()`, whose per-tick `faults` counts job faults only (act faults come later, step 7, and show in the
    fault totals and lines). A time-sliced job adds one `Game.cpu.getUsed()` per clock sample.
 7. Act (P1.7, `rustedscreep-wasm/src/act.rs` over `rustedscreep_core::intents`): during the decide step, jobs push intents by creep
    handle into the `IntentBuffer`, which commits 0.2 CPU per new intent that is not free (V34) and refuses, so that nothing is queued
-   and nothing earlier replaced: calls the game API refuses (an actor that is gone, hostile or spawning; a target that is gone; a
+   and nothing earlier replaced: calls the game API refuses (an actor that is gone, hostile or spawning; a `move(direction)` while the actor is fatigued, P2.1; a target that is gone; a
    spawning creep target for transfer, pull or a move toward it; a target out of range or in another room; a controller or a type
    built without a store for transfer and withdraw, also a nuker or power bank for withdraw; anything but a controller for
    upgradeController; a self-pull), billed no-ops that the processor skips (heal or rangedHeal of a spawning creep, repair of a type
@@ -92,6 +98,22 @@ check in P7 and P10, structure actors such as `spawnCreep` in P2) and its gated 
 and the counters `ActLog`. rustedscreep-wasm's `act.rs` binds the eleven methods and makes the calls; `act_test.rs` (feature
 `act-test`, refused by `npm run stage` for deploy/) is a scripted producer for the sandbox test.
 
+Movement (P2.1): `rustedscreep_core::movement` is pure. `Tile` (column-major, the CostMatrix layout, V86), `TerrainGrid` (from
+the row-major raw buffer, V156), `CostGrid` (terrain costs from `MovementConfig`'s profile, roads, blocking footprints, edge tiles
+blocked because a creep that ends a tick there changes rooms, V151, V152; portals blocked, V153), `FlowField` (Dijkstra from the
+goal tiles with Dial's 256-bucket queue) and `FieldCache` (by room, goal and grid version; LRU and idle eviction), `PathSearch`
+(A* detours around creeps), `Traffic` (an augmenting-path matching: movers in priority order claim their best free step or push a
+chain of creeps on, at most `shove_depth` deep; holding creeps are shoved to a free tile beside the mover, swapped, or pushed on,
+within their anchor; shoves capped per mover, a claim budget per mover search) and `Movement`, which ties them together per tick:
+requests (the field's steps, or a detour after `stuck_ticks`, with backoff, skipped when no goal tile is free, dropped once the
+tile that blocked it is free), creeps with no request pinned unless their job calls `give_way`, suspect tiles learned from failed
+moves into tiles no creep stands on (what the snapshot cannot see, such as power creeps, V52; they are not read yet, P7 and P9),
+and creeps whose `move(direction)` the game refused with `ERR_NO_BODYPART` held as fixed. Inter-room routes (PathFinder) are a later P2 item: a target in another room
+is refused. rustedscreep-wasm's `movement.rs` runs the read and rescan jobs, the console order and `resolve`, and feeds the act
+step's refused moves back (`act.rs` collects them); the intent buffer refuses a `move(direction)` while the creep is fatigued
+(`Rejected::Tired`, V108, V160). The scheduler's `Commit::heavy` lets a unit end its batch so the slicer reads the clock right
+after it.
+
 Constants self-check (P1.11): `rustedscreep_core::consts_check` is pure. A `Globals` source gives the server's names, then one
 value's JSON text per step; `Check::step` reads them all, checks that at least one anchor constant (`OK`, `WORK`, `CREEP_LIFE_TIME`) was seen (otherwise the global holds no game constants and the check fails),
 then compares 15 groups (scalars, enum families by prefix, sets, tables entry by entry) with `rustedscreep_consts`, through a strict
@@ -123,6 +145,11 @@ _P1 onward._
 | Job state (P1.6) | one per job, owned by its subsystem | round-robin cursor, measured CPU per unit | the job's tier | nothing during a global; a global reset restarts it at unit 0 with no estimate (only costs extra clock samples on that tick) | none | 16 B per job | none |
 | Sleep wheel (P1.6) | item (a handle or a job) | wake tick and an optional event | the owner's tier | the wake tick passing (gaps included), its event firing, a new sleep or a cancel; time going back wakes everyone; a global reset empties it, so every item starts awake | none | about 28 B per entry, 256 slot vectors, a heap for wakes beyond 256 ticks, one list per event being waited for (emptied lists are reused, at most 64 kept) | none |
 | Intent buffer (P1.7) | creep row in this tick's snapshot | every accepted push of the tick (actor and target rows, the intent), the methods queued per row, the latest push per row and method, and the planned issues | the decide step (any tier) and the act step | `IntentBuffer::begin` each tick, after the snapshot; a push before `begin`, after the plan, or with a snapshot whose `Game.time` or creep count differs from the one `begin` saw is refused (`closed`) | one tick | 44 B per push and per issue (`Issue`, measured natively; it holds no pointers), 4 B per row, plus 92 B per row for the latest-push slots, which only grow (the rows' method sets say which are this tick's) | none: it holds one tick's intents |
+| Room terrain, sources and minerals (P2.1) | room name | the terrain masks, column-major (2500 B), and the tiles of sources and minerals | Critical (`movement read`), the first tick an owned room has own creeps or a request finds a room not read | the room evicted after `movement.field_idle_ticks` with no own creep in it; a global reset | none | about 2.5 KB per room | `cache.movement_grid`: off, read every tick for every room it would read |
+| Room objects and cost grid (P2.1) | room name | the last scan's footprints (structures, own sites, deposits; sorted), the grid (2500 B, allocated on the first build) and its version | Critical (the first scan) and Standard (`movement rescan`); the grid on the first request after a change | a rescan every `movement.scan_interval_ticks` while the room has own creeps and is owned or had a request within that interval, sooner (`rescan_min_ticks`) after repeated failed moves into a tile with no creep on it or `Movement::invalidate`; the grid is rebuilt only when the footprints, the terrain, the statics or the cost profile changed, which bumps its version; the room evicted as above | the scan interval | about 2.5 KB plus 4 B per object per room | `cache.movement_grid`: off, scanned and rebuilt every tick |
+| Suspect tiles (P2.1) | room and tile | tiles moves kept failing into with no creep on them (something the snapshot cannot see) | the requesting job's tier | `movement.suspect_ticks` after they were learned; the room evicted | `suspect_ticks` | 8 B per tile | none: it is learned state, not a cache |
+| Flow fields (P2.1) | room, goal tile and range | distances to the goal (2500 `u16`) and the grid version they were built on | the requesting job's tier, on first use | a newer grid version (rebuilt in place on next use), `movement.field_idle_ticks` without use, or LRU eviction beyond `movement.field_cache_size` | `field_idle_ticks` | 5 KB per field | `cache.flow_fields`: off, every request builds its field again |
+| Creep movement state (P2.1) | creep handle slot (with the handle) | goal, the tile it was moved toward, stuck and unexplained counts, the blocked tile, failed detours in a row (the backoff), an A* detour and the tile it went round, the tick it stays fixed until (a move refused with `ERR_NO_BODYPART`) | each request, resolve and the act step's refusals | a new goal (detour dropped), a detour step off its path or its blocker freed while the creep is within 2 tiles of it, the slot reused by another creep; a global reset | none | about 72 B plus the detour per slot | none: it is the creep's progress, not a cache |
 | Fault log (P1.6) | one per global | fault totals, the current window's counts, up to `fault_reports_per_window` queued reports, up to 4 names of jobs whose faults were held back, the last fault | every tick (scheduler) | its window closing `fault_window_ticks` ticks after it opened, or `Game.time` falling before its start; a global reset clears it | the window | under 1 KB | none |
 
 ## 4. CPU tiers and budget
@@ -132,8 +159,11 @@ Current state (P1.6, `rustedscreep_core::scheduler`; values from `SCHEDULER_MMO`
 - Tiers: Critical (spawning, defense, harvesting), Standard (hauling, upgrading, building, offense operations), Optional (planning,
   market, scouting, visuals, pixels, offense planning). A job declares its tier as a constant `Job { name, tier }`. A tick runs every
   subsystem's Critical jobs before any Standard job, and those before any Optional job: the tiers share one ceiling, so this order
-  across subsystems is what gives Critical its priority, and `TickStats::out_of_order` counts breaches. Until P2 the only jobs are the persistence loads
-  (Standard) and the constants self-check (Optional); P2 adds the first game jobs.
+  across subsystems is what gives Critical its priority, and `TickStats::out_of_order` counts breaches. The jobs so far are movement's room reads
+  (Critical) and rescans (Standard), the persistence loads (Standard), the console's move order (Standard) and the constants
+  self-check (Optional); the rest of P2 adds the first game jobs. A unit that does heavy work (a flow field, a detour, a room
+  read) marks itself (`Commit::heavy`): the slicer reads the clock right after it, leaves that batch out of the cost estimate and
+  makes the next batch one unit, so one heavy unit cannot carry a batch of cheap ones past the cap.
 - Budget (`Budget::compute`, once per tick from the snapshot's tick context, no JS call). Every cap is a level of the whole tick's CPU
   (the latest `getUsed` reading plus committed CPU), and a tier runs while the tick is below its cap:
   - ceiling = tickLimit × (100 − `tick_reserve_pct`) / 100, 450 at tickLimit 500. Every tier stops there, Critical included

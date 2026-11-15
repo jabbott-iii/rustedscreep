@@ -508,6 +508,7 @@ test('every console command refuses while the wasm is running, without calling i
     glue: {
       snapshotSummary: count, schedulerSummary: count, actSummary: count, queueSay: count, persistSummary: count, persistTest: count,
       configSummary: count, configSet: count, configUnset: count, configReset: count, constsSummary: count,
+      movementSummary: count, moveTo: count,
     },
   });
   h.tick(2);
@@ -524,6 +525,9 @@ test('every console command refuses while the wasm is running, without calling i
   assert.match(h.loader.configUnset('log.level'), /no config change while the loader is ready/);
   assert.match(h.loader.configReset(), /no config change while the loader is ready/);
   assert.match(h.loader.consts(), /no consts summary while the loader is ready/);
+  assert.match(h.loader.movement(), /no movement summary while the loader is ready/);
+  assert.match(h.loader.moveTo('W1N1', 25, 25, 1), /no move order while the loader is ready/);
+  assert.match(h.loader.moveTo(), /no move order while the loader is ready/);
   assert.equal(calls, 0);
   h.loader.running = false;
   assert.equal(h.loader.act(), 'called');
@@ -625,6 +629,47 @@ test('the config commands share the guard, pass keys and values as strings, and 
   const bad = harness({ glue: { configSet: () => { throw new Error('RuntimeError: unreachable'); } } });
   bad.tick(2);
   assert.match(bad.loader.configSet('log.level', 'info'), /configSet trapped; the loader recovers on the next tick/);
+  assert.equal(bad.loader.phase, 'poisoned');
+  bad.tick();
+  assert.equal(bad.halts, 1);
+});
+
+test('the movement command shares the guard: missing export, idle, ready, and a throw poisons', () => {
+  const none = harness();
+  assert.match(none.loader.movement(), /no movementSummary export/);
+  let calls = 0;
+  const h = harness({ glue: { movementSummary: () => `movement ${++calls}` } });
+  assert.match(h.loader.movement(), /no movement summary while the loader is idle/);
+  h.tick(2);
+  assert.equal(h.loader.movement(), 'movement 1');
+  const bad = harness({ glue: { movementSummary: () => { throw new Error('RuntimeError: unreachable'); } } });
+  bad.tick(2);
+  assert.match(bad.loader.movement(), /movementSummary trapped; the loader recovers on the next tick/);
+  assert.equal(bad.loader.phase, 'poisoned');
+});
+
+test('the moveTo command passes only a room string and whole numbers 0 to 49, or nothing to cancel', () => {
+  const none = harness();
+  assert.match(none.loader.moveTo('W1N1', 1, 1), /no moveTo export/);
+  const got = [];
+  const h = harness({ glue: { moveTo: (...args) => { got.push(args); return 'ok'; } } });
+  assert.match(h.loader.moveTo('W1N1', 25, 25, 1), /no move order while the loader is idle/);
+  h.tick(2);
+  const refused = [
+    [42, 25, 25, 1], ['W1N1', 25], ['W1N1', -1, 25], ['W1N1', 25, 50], ['W1N1', 2.5, 3], ['W1N1', 25, 25, 50],
+    ['W1N1', 25, 25, '1'], ['W1N1', '25', 25], [undefined, 25, 25], [null, 1, 1], ['W1N1', Number.NaN, 1],
+  ];
+  for (const args of refused) {
+    assert.match(h.loader.moveTo(...args), /give a room name and x, y/, JSON.stringify(args));
+  }
+  assert.equal(h.loader.moveTo('W1N1', 0, 49), 'ok');
+  assert.equal(h.loader.moveTo('W1N1', 25, 25, 3), 'ok');
+  assert.equal(h.loader.moveTo(), 'ok');
+  assert.deepEqual(got, [['W1N1', 0, 49, undefined], ['W1N1', 25, 25, 3], []]);
+  assert.equal(h.loader.running, false);
+  const bad = harness({ glue: { moveTo: () => { throw new Error('RuntimeError: unreachable'); } } });
+  bad.tick(2);
+  assert.match(bad.loader.moveTo('W1N1', 1, 1), /moveTo trapped; the loader recovers on the next tick/);
   assert.equal(bad.loader.phase, 'poisoned');
   bad.tick();
   assert.equal(bad.halts, 1);

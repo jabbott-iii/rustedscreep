@@ -21,6 +21,7 @@ mod act_test;
 mod config;
 mod consts_check;
 mod logging;
+mod movement;
 mod persist;
 mod profiler;
 mod scheduler;
@@ -43,6 +44,8 @@ struct State {
     skip_log: SkipLog,
     scheduler: Scheduler,
     act: act::Act,
+    /// Movement (P2.1): grids, fields, detours, traffic, the console's move order.
+    movement: movement::MovementGlue,
     persist: persist::Persist,
     /// The constants self-check, once per global (P1.11).
     consts: consts_check::ConstsCheck,
@@ -91,6 +94,7 @@ pub fn game_loop() {
                     skip_log,
                     scheduler: sched,
                     act,
+                    movement,
                     persist,
                     consts,
                     profiler: prof,
@@ -100,13 +104,20 @@ pub fn game_loop() {
                 let mut probe = profiler::Probe::start();
                 let cfg = *runtime.get();
                 snapshot::take(snapshot, js, &cfg.cache);
+                // Movement's tick starts with the snapshot (no JS call); its room reads are jobs.
+                movement.begin(snapshot, &cfg.movement, &cfg.cache);
                 snapshot::log_skips(skip_log, snapshot, cfg.log.skip_window_ticks);
                 probe.snapshot();
                 act.begin(snapshot);
                 let mut tick = sched.begin(&snapshot.tick, &cfg.scheduler, scheduler::GameClock);
+                // Critical: the rooms movement needs before anything in them can move, first.
+                movement.read_first(&mut tick, snapshot, js, &cfg.movement);
                 // Critical, then Standard, then Optional jobs run here and queue intents (P2 onward).
                 // The persistence loads are a Standard job; Critical jobs will run before them (P2).
                 persist.load(&mut tick, snapshot.tick.time, runtime);
+                // Standard: the periodic room rescans, then the console's move order.
+                movement.rescan(&mut tick, snapshot, js, &cfg.movement);
+                movement.run_console(&mut tick, snapshot, &cfg.movement);
                 // The constants self-check is an Optional job, after every Standard one. It logs with
                 // the config in force after the loads (on a global's second loop the record loads in
                 // this same step, and the check usually completes in it).
@@ -114,12 +125,15 @@ pub fn game_loop() {
                 act.queue_console_say(snapshot, tick.commit());
                 #[cfg(feature = "act-test")]
                 act_test.queue(&mut act.buffer, snapshot, tick.commit());
+                // After every job: the traffic manager turns the tick's move requests into moves.
+                movement.resolve(&mut tick, snapshot, &mut act.buffer, &cfg.movement);
                 tick.finish();
                 probe.decide();
                 // After the decide step: the scheduler reads the CPU clock no more (scheduler docs); the
                 // profiler's readings from here on measure the act step outside the budget. The
                 // `TickCpu` held `&mut Scheduler` until `finish`, so `act::issue` cannot run earlier.
                 act::issue(act, snapshot, js, sched, &cfg.scheduler);
+                movement.after_act(snapshot, act.refused_moves(), &cfg.movement);
                 probe.act();
                 let standard = sched
                     .last_tick()
@@ -173,6 +187,34 @@ pub fn act_summary() -> String {
             Err(_) => String::from("rustedscreep act: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep act: state unavailable"))
+}
+
+/// Exported to JS as `movementSummary`, for the `rustedscreep.movement()` console command: one line
+/// with the rooms, grid versions, cached fields, this tick's and the global's movement counters, and
+/// the console's move order.
+#[wasm_bindgen(js_name = "movementSummary")]
+pub fn movement_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state
+                .movement
+                .summary(&state.snapshot, &state.config.get().movement),
+            Err(_) => String::from("rustedscreep movement: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep movement: state unavailable"))
+}
+
+/// Exported to JS as `moveTo`, for `rustedscreep.moveTo(room, x, y, range)`: from the next tick, every
+/// own creep in `room` without a request of its own walks to within `range` (1 when omitted) of
+/// (x, y), until all of them are in range on one tick. With no room it cancels the order.
+#[wasm_bindgen(js_name = "moveTo")]
+pub fn move_to(room: Option<String>, x: Option<u32>, y: Option<u32>, range: Option<u32>) -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow_mut() {
+            Ok(mut state) => state.movement.set_order(room.as_deref(), x, y, range),
+            Err(_) => String::from("rustedscreep moveTo: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep moveTo: state unavailable"))
 }
 
 /// Exported to JS as `profilerSummary`, for the `rustedscreep.profiler()` console command: one line

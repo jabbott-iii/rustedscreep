@@ -6,7 +6,7 @@ import { textCodecSource } from './text-polyfill.js';
 import {
   __wbg_reset_state, actSummary as wasmActSummary, configReset as wasmConfigReset, configSet as wasmConfigSet,
   configSummary as wasmConfigSummary, configUnset as wasmConfigUnset, constsSummary as wasmConstsSummary, initSync,
-  loop as wasmLoop,
+  loop as wasmLoop, moveTo as wasmMoveTo, movementSummary as wasmMovementSummary,
   persistSummary as wasmPersistSummary, persistTest as wasmPersistTest, profilerSummary as wasmProfilerSummary,
   queueSay as wasmQueueSay, schedulerSummary as wasmSchedulerSummary, snapshotSummary as wasmSnapshotSummary,
   trapTest as wasmTrapTest,
@@ -97,6 +97,8 @@ const glue: Glue = {
   configUnset: wasmConfigUnset,
   configReset: wasmConfigReset,
   constsSummary: wasmConstsSummary,
+  movementSummary: wasmMovementSummary,
+  moveTo: wasmMoveTo,
 };
 
 const loader = new Loader(env, glue, CONFIG, BUILD);
@@ -127,7 +129,8 @@ function routeConsole(): void {
 // `rustedscreep.scheduler()`, `rustedscreep.act()`, `rustedscreep.profiler()`, `rustedscreep.say("hi")`,
 // `rustedscreep.persist()`, `rustedscreep.persistTest()`, `rustedscreep.config()`,
 // `rustedscreep.configSet("log.level", "debug")`, `rustedscreep.configUnset("log.level")`,
-// `rustedscreep.configReset()` or `rustedscreep.consts()`.
+// `rustedscreep.configReset()`, `rustedscreep.consts()`, `rustedscreep.movement()` or
+// `rustedscreep.moveTo("W1N1", 25, 25, 1)` (`rustedscreep.moveTo()` cancels).
 g.rustedscreep = {
   trapTest: (n: unknown = 1) => loader.scheduleTraps(Number(n)),
   status: () => loader.status(),
@@ -143,6 +146,8 @@ g.rustedscreep = {
   configUnset: (key: unknown) => loader.configUnset(key),
   configReset: () => loader.configReset(),
   consts: () => loader.consts(),
+  movement: () => loader.movement(),
+  moveTo: (room?: unknown, x?: unknown, y?: unknown, range?: unknown) => loader.moveTo(room, x, y, range),
 };
 
 export function loop(): void {

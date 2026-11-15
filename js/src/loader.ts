@@ -62,6 +62,13 @@ export interface Glue {
   configReset?: () => string;
   /** One line about the constants self-check: its phase, counts, findings and known differences (P1 module 11). */
   constsSummary?: () => string;
+  /** One line about movement: rooms, grids, cached fields, counters and the console's move order (P2 movement). */
+  movementSummary?: () => string;
+  /**
+   * Sets the console's move order: own creeps in `room` walk to within `range` of (x, y) from the next tick. With
+   * every argument undefined it cancels the order. Returns the outcome (P2 movement).
+   */
+  moveTo?: (room?: string, x?: number, y?: number, range?: number) => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -560,11 +567,34 @@ export class Loader {
     return this.summary('constsSummary', 'consts summary');
   }
 
+  /** Console command `rustedscreep.movement()`: the wasm's movement summary (rooms, grids, fields, counters, order). */
+  movement(): string {
+    return this.summary('movementSummary', 'movement summary');
+  }
+
+  /**
+   * Console command `rustedscreep.moveTo(room, x, y, range)`: own creeps in `room` walk to within `range` (1 when
+   * omitted) of (x, y), until all are in range; `rustedscreep.moveTo()` cancels. Only a room name string and whole
+   * numbers from 0 to 49 reach the wasm.
+   */
+  moveTo(room: unknown, x: unknown, y: unknown, range: unknown): string {
+    const call = this.glue.moveTo;
+    if (!call) return 'rustedscreep: this build has no moveTo export';
+    if (room === undefined && x === undefined && y === undefined && range === undefined) {
+      return this.guarded('moveTo', 'move order', () => call());
+    }
+    const coord = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 49;
+    if (typeof room !== 'string' || !coord(x) || !coord(y) || !(range === undefined || coord(range))) {
+      return 'rustedscreep: give a room name and x, y (and a range) from 0 to 49, for example rustedscreep.moveTo("W1N1", 25, 25, 1); rustedscreep.moveTo() cancels';
+    }
+    return this.guarded('moveTo', 'move order', () => call(room, x, y, range));
+  }
+
   /** Calls a wasm summary export for a console command (see `guarded`). */
   private summary(
     name:
       | 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary' | 'persistSummary' | 'configSummary'
-      | 'constsSummary',
+      | 'constsSummary' | 'movementSummary',
     noun: string,
   ): string {
     const call = this.glue[name];

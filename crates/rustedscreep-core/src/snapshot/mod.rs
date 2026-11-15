@@ -313,6 +313,7 @@ mod tests {
             pos: pos(x, 10),
             my: true,
             spawning: false,
+            fatigue: 0,
         };
 
         // Tick 1: one room, two creeps, a spawn, and an object with a bad id.
@@ -366,6 +367,7 @@ mod tests {
             pos: pos(40, 40),
             my: false,
             spawning: false,
+            fatigue: 0,
         };
         let h = snap.creeps.push(ObjectKey(5), hostile).expect("hostile");
         snap.structures

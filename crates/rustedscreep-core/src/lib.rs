@@ -19,6 +19,7 @@
 pub mod config;
 pub mod consts_check;
 pub mod intents;
+pub mod movement;
 pub mod persist;
 pub mod profiler;
 pub mod scheduler;

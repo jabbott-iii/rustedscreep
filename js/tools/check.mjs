@@ -80,6 +80,7 @@ const ROWS = [
   ['13 Persistence (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'persist-sim.mjs')], true],
   ['14 Runtime config (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'config-sim.mjs')], true],
   ['15 Constants self-check (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'consts-sim.mjs')], true],
+  ['16 Movement (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'move-sim.mjs')], true],
 ];
 
 function main() {

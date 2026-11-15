@@ -101,10 +101,12 @@ pub struct Report {
 }
 
 /// CPU a unit commits for later in the tick: the intents it queues for the act layer, which the
-/// clock sees only once they are issued (V106). The budget counts it as spent at once.
+/// clock sees only once they are issued (V106). The budget counts it as spent at once. A unit can
+/// also mark itself heavy ([`Commit::heavy`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Commit {
     cpu: f64,
+    heavy: bool,
 }
 
 impl Commit {
@@ -124,6 +126,15 @@ impl Commit {
     /// Total committed this tick. Unit: CPU.
     pub fn cpu(&self) -> f64 {
         self.cpu
+    }
+
+    /// Marks the unit now running as heavy: work far above the job's usual cost per unit (a flow
+    /// field build, a path search, a room scan). The slicer then reads the clock right after the
+    /// unit, ending its batch, and leaves that batch out of the cost estimate, so one heavy unit can
+    /// neither run on into the reserve with cheap units behind it nor shrink the following batches.
+    /// Outside a sliced job it has no effect.
+    pub fn heavy(&mut self) {
+        self.heavy = true;
     }
 }
 
@@ -372,6 +383,7 @@ impl<'a, C: Clock> TickCpu<'a, C> {
             let before = spent;
             let mut in_batch = 0u32;
             let mut stopped = None;
+            let mut heavy = false;
             while in_batch < batch {
                 let index = match count {
                     Some(n) if ran >= n => {
@@ -381,7 +393,9 @@ impl<'a, C: Clock> TickCpu<'a, C> {
                     Some(n) => wrap(start, ran, n),
                     None => ran,
                 };
+                self.commit.heavy = false;
                 let outcome = run(index, &mut self.commit);
+                heavy = std::mem::take(&mut self.commit.heavy);
                 ran = ran.saturating_add(1);
                 in_batch += 1;
                 match outcome {
@@ -399,13 +413,21 @@ impl<'a, C: Clock> TickCpu<'a, C> {
                         }
                     }
                 }
+                if heavy {
+                    break;
+                }
             }
             if stopped.is_none() && count.is_some_and(|n| ran >= n) {
                 stopped = Some(Stop::Done);
             }
             spent = self.sample();
-            if in_batch > 0 {
+            if in_batch > 0 && !heavy {
                 state.observe((spent - before) / f64::from(in_batch));
+            }
+            // After a heavy unit the next batch is one unit again, so the cost of the ordinary units
+            // is measured on this tick rather than trusted from the last.
+            if heavy {
+                first = true;
             }
             if let Some(stop) = stopped {
                 break stop;
@@ -1047,5 +1069,50 @@ mod tests {
             let spent = tick.sample();
             assert_eq!(spent.is_infinite(), n == 3, "reading {n}");
         }
+    }
+
+    /// A unit that marks itself heavy ends its batch: the clock is read right after it, and its
+    /// batch stays out of the cost estimate, so the cheap units after it are sized as before.
+    #[test]
+    fn a_heavy_unit_ends_its_batch_and_skips_the_estimate() {
+        let cfg = SCHEDULER_MMO;
+        let run_from = |mut state: JobState, heavy_unit: Option<u32>| {
+            let clock = FakeClock::default();
+            let mut sched = Scheduler::default();
+            let mut tick = sched.begin(&full_tick(100), &cfg, clock.clone());
+            let report = tick.run_units(&CRIT, &mut state, 6, |unit, commit| {
+                if Some(unit) == heavy_unit {
+                    clock.spend(5.0);
+                    commit.heavy();
+                } else {
+                    clock.spend(0.1);
+                }
+                Ok(())
+            });
+            tick.finish();
+            (report.ran, clock.reads.get(), state.unit_cost())
+        };
+        let run = |heavy_unit: Option<u32>| run_from(JobState::default(), heavy_unit);
+        // Without a heavy unit: a reading at the start, after the first unit, and after the other five.
+        let (ran, reads, cost) = run(None);
+        assert_eq!((ran, reads), (6, 3));
+        assert!(cost.is_some_and(|c| (c - 0.1).abs() < 1e-9));
+        // Unit 2 is heavy: its batch (units 1 and 2) ends after it, the next batch is one unit to
+        // re-measure, then the last two: two more readings, and the estimate stays at the cheap
+        // units' cost.
+        let (ran, reads, cost) = run(Some(2));
+        assert_eq!((ran, reads), (6, 5));
+        assert!(cost.is_some_and(|c| (c - 0.1).abs() < 1e-9), "{cost:?}");
+        // A heavy first unit: the next batch is one unit (to measure), then the other four, even
+        // when an estimate from an earlier tick exists (a stale one, too cheap), which would
+        // otherwise size the batch at once.
+        let (_, reads, cost) = run(Some(0));
+        assert_eq!(reads, 4);
+        assert!(cost.is_some_and(|c| (c - 0.1).abs() < 1e-9), "{cost:?}");
+        let mut stale = JobState::default();
+        stale.observe(0.01);
+        let (_, reads, cost) = run_from(stale, Some(0));
+        assert_eq!(reads, 4, "re-measured after the heavy unit");
+        assert!(cost.is_some_and(|c| (c - 0.1).abs() < 1e-9), "{cost:?}");
     }
 }

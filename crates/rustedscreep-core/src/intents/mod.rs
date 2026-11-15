@@ -29,7 +29,7 @@
 //! let at = |x| Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(10).unwrap(), room);
 //! let mut snap = Snapshot::default();
 //! snap.begin(TickContext::from_raw(100, 20, 500.0, 10_000));
-//! let row = |x| CreepRow { pos: at(x), my: true, spawning: false };
+//! let row = |x| CreepRow { pos: at(x), my: true, spawning: false, fatigue: 0 };
 //! let a = snap.creeps.push(ObjectKey(1), row(10)).unwrap();
 //! snap.finish();
 //!

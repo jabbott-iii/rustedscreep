@@ -262,16 +262,19 @@ export const CONFIG_SEGMENT = 97;
  * What `rustedscreep.scheduler()` must report after the loops at these offsets. The fake world has CPU limit
  * 20, tickLimit 500 and bucket 10000, so with SCHEDULER_MMO (crates/rustedscreep-core/src/config.rs) the
  * ceiling is 500 × (100 − 10) / 100 = 450 and the Optional cap 20 + (10000 − 9000) / 100 = 30. The first loop
- * of a global runs no Optional work (warm-up); its only job is the persistence load's one step, the config
- * record's look-up (P1.10), which samples the clock twice, and the constants self-check (P1.11), an Optional job,
- * is a tier-off skip. The check runs from the second loop (see CONSTS_DONE).
+ * of a global runs no Optional work (warm-up); its jobs are movement's first read of the owned room (P2.1) and
+ * the persistence load's one step, the config record's look-up (P1.10), each sampling the clock twice, and the
+ * constants self-check (P1.11), an Optional job, is a tier-off skip. The check runs from the second loop (see
+ * CONSTS_DONE).
  */
 const SCHEDULER_EXPECTED = {
   1: [
     'rustedscreep scheduler at tick 50000001 (loop 0 of this global): cpu limit 20, tickLimit 500, bucket 10000',
     'ceiling 450.0; critical on; standard on (cap 450.0); optional off (warm-up)',
-    // The persistence load job's one step: the first loop looks up the config segment (P1.10).
-    'samples 2 (bad 0), units 1, budget stops 0, tier-off skips 1, out of order 0, faults 0',
+    // Two jobs of one unit each, two samples each: movement's first read of the owned W1N1, where the
+    // Harvester is (P2.1, a Critical job), and the persistence load job's one step, the config
+    // segment's look-up (P1.10).
+    'samples 4 (bad 0), units 2, budget stops 0, tier-off skips 1, out of order 0, faults 0',
     'faults since boot 0 (this window 0)',
   ],
   4: ['(loop 3 of this global)', 'optional on (cap 30.0)', ' | clock now '],

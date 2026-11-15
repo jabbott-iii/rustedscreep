@@ -1,7 +1,8 @@
 // A small fake game world for the Screeps-like sandbox (js/tools/smoke.mjs), shaped like the engine's
 // objects as far as the snapshot reads them (VERIFICATION_LOG V101): Game.creeps keyed by name (spawning
 // creeps included), Game.structures keyed by id (owned structures, the controller among them),
-// Game.rooms keyed by name, and room.find(FIND_HOSTILE_CREEPS) without spawning creeps. Positions carry
+// Game.rooms keyed by name, room.find(FIND_HOSTILE_CREEPS) without spawning creeps (other find types give
+// nothing), and room.getTerrain() with an open plain room (the movement glue reads it; V156). Positions carry
 // the engine's __packedPos (V103). Plain objects suffice: the wasm reads properties and never checks
 // instanceof. Each creep has the action methods the act layer calls (crates/rustedscreep-wasm/src/act.rs),
 // which record the call and return a scripted value instead of acting. No game logic.
@@ -64,6 +65,7 @@ function room(name, controller, creeps) {
     energyAvailable: 300,
     energyCapacityAvailable: 300,
     find: (type) => (type === FIND_HOSTILE_CREEPS ? creeps.filter((c) => !c.my && !c.spawning) : []),
+    getTerrain: () => ({ getRawBuffer: () => new Uint8Array(2500) }),
   };
 }
 

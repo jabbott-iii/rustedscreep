@@ -20,7 +20,7 @@ pub mod overrides;
 
 use core::fmt;
 
-use rustedscreep_consts::CPU_TICK_LIMIT_MAX;
+use rustedscreep_consts::{CPU_TICK_LIMIT_MAX, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP};
 
 /// How the loader recovers after a trap or an aborted tick (ADR-003).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,11 +254,74 @@ pub struct CacheConfig {
     /// Keep each structure's type and position from the tick it is first seen (P1.5); off, the
     /// snapshot reads both every tick. Unit: flag.
     pub structure_static: bool,
+    /// Keep each room's terrain, scanned objects and cost grid (P2.1); off, the movement glue reads
+    /// the terrain and scans the room every tick, and the grid is rebuilt every tick. Unit: flag.
+    pub movement_grid: bool,
+    /// Keep flow fields between requests (P2.1); off, every request builds its field again and
+    /// nothing is kept. Unit: flag.
+    pub flow_fields: bool,
 }
 
 /// Cache toggles for the official MMO: every cache on.
 pub const CACHE_MMO: CacheConfig = CacheConfig {
     structure_static: true,
+    movement_grid: true,
+    flow_fields: true,
+};
+
+/// Movement thresholds (ROADMAP P2, movement); `docs/TUNING.md` gives each one's rationale and safe
+/// range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MovementConfig {
+    /// Cost of stepping onto a road (a road on a wall tile included). Unit: cost per tile.
+    pub road_cost: u8,
+    /// Cost of stepping onto plain terrain. Unit: cost per tile.
+    pub plain_cost: u8,
+    /// Cost of stepping onto swamp terrain. Unit: cost per tile.
+    pub swamp_cost: u8,
+    /// A room with own creeps that is owned or had a move request within this many ticks has its
+    /// objects scanned again this long after the last scan. Unit: ticks.
+    pub scan_interval_ticks: u32,
+    /// Earliest rescan after the last one when a move failed into a tile with no creep on it (the
+    /// grid may be missing an object). Unit: ticks.
+    pub rescan_min_ticks: u32,
+    /// Most flow fields kept; the least recently used goes first. Unit: fields.
+    pub field_cache_size: u32,
+    /// A field unused for more than this many ticks is dropped, and so is a room no own creep has been
+    /// in for longer. Unit: ticks.
+    pub field_idle_ticks: u32,
+    /// Failed moves in a row (or ticks the traffic manager kept a mover in place) before the creep
+    /// searches a detour around the creeps in its way. Unit: ticks.
+    pub stuck_ticks: u8,
+    /// Most entries one detour search may pop before it gives up. Unit: entries.
+    pub detour_max_pops: u32,
+    /// How deep the traffic manager may push a chain of creeps out of a mover's way. Unit: creeps.
+    pub shove_depth: u8,
+    /// Most tiles one mover's chain search may try to claim. Unit: claims.
+    pub shove_claims: u32,
+    /// A creep whose move the game refused (no active MOVE part) is held as fixed this long before
+    /// it is asked to move again. Unit: ticks.
+    pub immobile_retry_ticks: u32,
+    /// A tile moves kept failing into with no creep seen on it stays blocked this long. Unit: ticks.
+    pub suspect_ticks: u32,
+}
+
+/// Movement values for the official MMO. Uses: MOVE_COST_ROAD, MOVE_COST_PLAIN, MOVE_COST_SWAMP
+/// (the engine's fatigue rates per tile, V54, V154), which the config test checks fit a `u8`.
+pub const MOVEMENT_MMO: MovementConfig = MovementConfig {
+    road_cost: MOVE_COST_ROAD as u8,
+    plain_cost: MOVE_COST_PLAIN as u8,
+    swamp_cost: MOVE_COST_SWAMP as u8,
+    scan_interval_ticks: 50,
+    rescan_min_ticks: 10,
+    field_cache_size: 32,
+    field_idle_ticks: 300,
+    stuck_ticks: 2,
+    detour_max_pops: 5000,
+    shove_depth: 2,
+    shove_claims: 256,
+    immobile_retry_ticks: 50,
+    suspect_ticks: 10,
 };
 
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
@@ -271,6 +334,7 @@ pub struct Config {
     pub persist: PersistConfig,
     pub log: LogConfig,
     pub cache: CacheConfig,
+    pub movement: MovementConfig,
 }
 
 /// A server profile: a name and its values.
@@ -290,6 +354,7 @@ pub const MMO: Profile = Profile {
         persist: PERSIST_MMO,
         log: LOG_MMO,
         cache: CACHE_MMO,
+        movement: MOVEMENT_MMO,
     },
 };
 
@@ -450,7 +515,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 31;
+pub const FIELD_COUNT: usize = 46;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -601,6 +666,49 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         true
     ),
     flag!(cache, "CacheConfig", structure_static, true),
+    flag!(cache, "CacheConfig", movement_grid, true),
+    flag!(cache, "CacheConfig", flow_fields, true),
+    number!(movement, "MovementConfig", road_cost, 1, 25, true),
+    number!(movement, "MovementConfig", plain_cost, 1, 25, true),
+    number!(movement, "MovementConfig", swamp_cost, 1, 25, true),
+    number!(
+        movement,
+        "MovementConfig",
+        scan_interval_ticks,
+        1,
+        1000,
+        true
+    ),
+    number!(movement, "MovementConfig", rescan_min_ticks, 1, 1000, true),
+    number!(movement, "MovementConfig", field_cache_size, 1, 256, true),
+    number!(
+        movement,
+        "MovementConfig",
+        field_idle_ticks,
+        1,
+        10_000,
+        true
+    ),
+    number!(movement, "MovementConfig", stuck_ticks, 1, 20, true),
+    number!(
+        movement,
+        "MovementConfig",
+        detour_max_pops,
+        100,
+        20_000,
+        true
+    ),
+    number!(movement, "MovementConfig", shove_depth, 0, 3, true),
+    number!(movement, "MovementConfig", shove_claims, 16, 4096, true),
+    number!(
+        movement,
+        "MovementConfig",
+        immobile_retry_ticks,
+        1,
+        1000,
+        true
+    ),
+    number!(movement, "MovementConfig", suspect_ticks, 1, 1000, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -754,7 +862,24 @@ mod tests {
         } = LOG_MMO;
         let CacheConfig {
             structure_static: _,
+            movement_grid: _,
+            flow_fields: _,
         } = CACHE_MMO;
+        let MovementConfig {
+            road_cost: _,
+            plain_cost: _,
+            swamp_cost: _,
+            scan_interval_ticks: _,
+            rescan_min_ticks: _,
+            field_cache_size: _,
+            field_idle_ticks: _,
+            stuck_ticks: _,
+            detour_max_pops: _,
+            shove_depth: _,
+            shove_claims: _,
+            immobile_retry_ticks: _,
+            suspect_ticks: _,
+        } = MOVEMENT_MMO;
         let Config {
             loader: _,
             scheduler: _,
@@ -762,8 +887,9 @@ mod tests {
             persist: _,
             log: _,
             cache: _,
+            movement: _,
         } = MMO.config;
-        let expected: [(&str, &[&str]); 6] = [
+        let expected: [(&str, &[&str]); 7] = [
             (
                 "loader",
                 &[
@@ -808,7 +934,28 @@ mod tests {
                 ],
             ),
             ("log", &["level", "skip_window_ticks", "consts_findings"]),
-            ("cache", &["structure_static"]),
+            (
+                "cache",
+                &["structure_static", "movement_grid", "flow_fields"],
+            ),
+            (
+                "movement",
+                &[
+                    "road_cost",
+                    "plain_cost",
+                    "swamp_cost",
+                    "scan_interval_ticks",
+                    "rescan_min_ticks",
+                    "field_cache_size",
+                    "field_idle_ticks",
+                    "stuck_ticks",
+                    "detour_max_pops",
+                    "shove_depth",
+                    "shove_claims",
+                    "immobile_retry_ticks",
+                    "suspect_ticks",
+                ],
+            ),
         ];
         let mut total = 0;
         for (group, names) in expected {
@@ -1110,6 +1257,48 @@ mod tests {
         assert_ne!(c.self_test_segment, PROFILER_MMO.stats_segment);
         assert_ne!(c.config_segment, PROFILER_MMO.stats_segment);
         assert_ne!(c.config_segment, c.self_test_segment);
+    }
+
+    /// Uses: MOVE_COST_ROAD, MOVE_COST_PLAIN, MOVE_COST_SWAMP, ROOM_AREA. The default costs are
+    /// the engine's fatigue rates (V54, V154) and fit a `u8`; the highest cost allowed keeps every
+    /// in-room distance below the flow field's `u16` "unreached" value; a detour may pop at least
+    /// one entry per tile.
+    #[test]
+    fn movement_values_are_coherent() {
+        let c = MOVEMENT_MMO;
+        assert_eq!(u32::from(c.road_cost), MOVE_COST_ROAD);
+        assert_eq!(u32::from(c.plain_cost), MOVE_COST_PLAIN);
+        assert_eq!(u32::from(c.swamp_cost), MOVE_COST_SWAMP);
+        let max_cost = match by_key("movement.swamp_cost").kind {
+            Kind::Number { max, .. } => max,
+            _ => unreachable!("a number"),
+        };
+        for key in ["movement.road_cost", "movement.plain_cost"] {
+            assert_eq!(
+                by_key(key).kind,
+                by_key("movement.swamp_cost").kind,
+                "{key}"
+            );
+        }
+        let area = u32::try_from(rustedscreep_consts::ROOM_AREA).expect("fits");
+        assert!(
+            (area - 1) * max_cost < u32::from(u16::MAX),
+            "a field's distance fits below UNREACHED"
+        );
+        assert!(c.rescan_min_ticks <= c.scan_interval_ticks);
+        assert!(c.stuck_ticks >= 1 && c.field_cache_size >= 1);
+        assert!(
+            c.detour_max_pops >= area / 2,
+            "a detour can cover a good part of a room"
+        );
+        assert!(c.shove_depth <= 3, "the chain search grows as 8^depth");
+        // At the default depth the whole chain search fits the claim budget, so the budget only
+        // binds at a deeper setting: a claim at depth d may relocate its occupant to 8 tiles, each a
+        // claim at depth d - 1, so claims(d) = 1 + 8 claims(d - 1) = (8^(d+1) - 1) / 7, and a mover
+        // tries 3 steps.
+        let full = 3 * (8u32.pow(u32::from(c.shove_depth) + 1) - 1) / 7;
+        assert_eq!(full, 219, "depth 2");
+        assert!(c.shove_claims >= full, "{} < {full}", c.shove_claims);
     }
 
     #[test]

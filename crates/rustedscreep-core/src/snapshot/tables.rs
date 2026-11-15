@@ -130,6 +130,9 @@ pub struct CreepRow {
     pub my: bool,
     /// Still being spawned; its position is its spawn's.
     pub spawning: bool,
+    /// `creep.fatigue` (V160); read for own creeps only, 0 for hostile ones. A creep with fatigue
+    /// cannot move unless pulled (V50).
+    pub fatigue: u32,
 }
 
 /// Visible creeps: the bot's own (`Game.creeps`) and hostile ones in visible rooms.
@@ -140,6 +143,7 @@ pub struct Creeps {
     pos: Vec<Position>,
     my: Vec<bool>,
     spawning: Vec<bool>,
+    fatigue: Vec<u32>,
 }
 
 impl Creeps {
@@ -149,6 +153,7 @@ impl Creeps {
         self.pos.clear();
         self.my.clear();
         self.spawning.clear();
+        self.fatigue.clear();
     }
 
     pub(super) fn finish(&mut self) -> u32 {
@@ -163,6 +168,7 @@ impl Creeps {
         self.pos.push(row.pos);
         self.my.push(row.my);
         self.spawning.push(row.spawning);
+        self.fatigue.push(row.fatigue);
         Ok(handle)
     }
 
@@ -203,6 +209,10 @@ impl Creeps {
 
     pub fn spawning(&self) -> &[bool] {
         &self.spawning
+    }
+
+    pub fn fatigue(&self) -> &[u32] {
+        &self.fatigue
     }
 
     /// Creeps first seen this tick.
@@ -458,12 +468,14 @@ mod tests {
             pos: pos(10, 10, "W1N1"),
             my: true,
             spawning: false,
+            fatigue: 4,
         };
         let a = creeps.push(ObjectKey(1), row).expect("new");
         let hostile = CreepRow {
             pos: pos(20, 20, "W1N1"),
             my: false,
             spawning: false,
+            fatigue: 0,
         };
         let b = creeps.push(ObjectKey(2), hostile).expect("new");
         assert_eq!(creeps.push(ObjectKey(1), row), Err(SkipReason::Duplicate));
@@ -475,6 +487,7 @@ mod tests {
             (creeps.my(), creeps.spawning()),
             (&[true, false][..], &[false, false][..])
         );
+        assert_eq!(creeps.fatigue(), [4, 0]);
         assert_eq!(creeps.handles(), [a, b]);
         assert_eq!(creeps.handle_of(ObjectKey(2)), Some(b));
         assert_eq!(creeps.key_of(b), Some(ObjectKey(2)));

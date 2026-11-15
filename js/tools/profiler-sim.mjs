@@ -6,8 +6,10 @@
 // - the first two writes reach segment 99 with the driver's save rules (one key, a string under the size
 //   limit), and the segment parses as JSON with the documented layout (crates/rustedscreep-core/src/profiler/text.rs);
 // - the loop makes six getUsed calls, seven when it closes a window, and reads RawMemory.segments only then,
-//   except the global's second loop, which reads the config record (P1.10) with two more clock samples, and
-//   the loops the constants self-check (P1.11) runs in, which read the clock up to 64 more times;
+//   except the global's second loop, which reads the config record (P1.10) with two more clock samples, the
+//   loops the constants self-check (P1.11) runs in, which read the clock up to 64 more times, and every
+//   movement.scan_interval_ticks-th loop after the first, whose rescan of the owned W1N1 (P2.1, a Standard job
+//   of one unit) reads it twice more;
 // - a say's two calls appear in the first window's calls and act counters, counted as calls made (the act
 //   layer's `issued`) even though the game refuses one of them;
 // - each failure the binding guards against (no RawMemory, a segments value that is not an object, a set
@@ -18,6 +20,9 @@
 //   its write waits a tick; with 10, the profiler skips its write and the manager re-issues its set.
 // npm run check runs it; standalone: node js/tools/profiler-sim.mjs.
 import { join } from 'node:path';
+
+/** MOVEMENT_MMO.scan_interval_ticks (crates/rustedscreep-core/src/config.rs). */
+const SCAN_INTERVAL = 50;
 import { build } from './build.mjs';
 import { ROOT, fail, isMain } from './lib/common.mjs';
 import { CONFIG_SEGMENT, checkResults, commandResults, driverRawMemory, simulate } from './smoke.mjs';
@@ -193,8 +198,11 @@ export function profilerSim() {
     // The second loop reads the config record (P1.10) the first activated: one more RawMemory.segments
     // read and the load job's two clock samples.
     const config = offset === 2 ? 1 : 0;
+    // Movement (P2.1): the owned W1N1 (the Harvester's room) was first read on the first loop, so its
+    // periodic rescan comes every SCAN_INTERVAL loops after it: one unit, a sample before and after.
+    const rescan = offset > 1 && (offset - 1) % SCAN_INTERVAL === 0 ? 1 : 0;
     const reads = (closing.has(offset) && offset !== closeAt(noRawMemory.window) ? 1 : 0) + config;
-    const want = { getUsed: (closing.has(offset) ? 7 : 6) + 2 * config, segments: reads };
+    const want = { getUsed: (closing.has(offset) ? 7 : 6) + 2 * config + 2 * rescan, segments: reads };
     const checking = offset <= constsLast;
     const usedOk = checking ? c.getUsed >= want.getUsed && c.getUsed <= want.getUsed + 64 : c.getUsed === want.getUsed;
     if (!usedOk || c.segments !== want.segments) {

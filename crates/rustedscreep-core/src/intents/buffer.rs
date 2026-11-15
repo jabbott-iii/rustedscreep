@@ -20,9 +20,11 @@
 //!   first) and skips one only once a blocker's call was recorded. When every call is accepted this
 //!   issues [`ActionSet::kept`]; when a blocker is refused, the intents it would have blocked run.
 //!
-//! State-dependent checks need snapshot columns that later modules add with the jobs that read
-//! them: a move while fatigued and a transfer into a full store are refusals (unbilled; they must not
-//! replace an earlier push), and a repair at full hits is a billed no-op to drop (V109).
+//! A `move(direction)` while the creep is fatigued is refused (`ERR_TIRED` in the game API, unbilled,
+//! V108; the snapshot's fatigue column since P2.1, V160); a move toward a creep is not, since the API
+//! skips that check for it (V108). Other state-dependent checks need snapshot columns that later
+//! modules add with the jobs that read them: a transfer into a full store is a refusal (unbilled; it
+//! must not replace an earlier push), and a repair at full hits is a billed no-op to drop (V109).
 //!
 //! A tick allocates nothing here once the vectors have grown to the tick's intent count.
 
@@ -228,6 +230,8 @@ pub enum Rejected {
     NotMine,
     /// The actor is still spawning (every method returns `ERR_BUSY` next, V108).
     Spawning,
+    /// A `move(direction)` while the actor is fatigued (`ERR_TIRED`, unbilled, V108, V160).
+    Tired,
     /// The target is not in this tick's snapshot.
     GoneTarget,
     /// The target creep is still spawning: `transfer` and `pull` return `ERR_INVALID_TARGET`; `heal`
@@ -252,11 +256,12 @@ pub enum Rejected {
 
 impl Rejected {
     /// Every reason, in a fixed order (the order of the per-reason counters).
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Closed,
         Self::GoneActor,
         Self::NotMine,
         Self::Spawning,
+        Self::Tired,
         Self::GoneTarget,
         Self::SpawningTarget,
         Self::WrongTarget,
@@ -270,6 +275,7 @@ impl Rejected {
             Self::GoneActor => "gone actor",
             Self::NotMine => "not mine",
             Self::Spawning => "spawning",
+            Self::Tired => "tired",
             Self::GoneTarget => "gone target",
             Self::SpawningTarget => "spawning target",
             Self::WrongTarget => "wrong target",
@@ -429,6 +435,11 @@ impl IntentBuffer {
         }
         if creeps.spawning().get(row).copied().unwrap_or(true) {
             return Err(Rejected::Spawning);
+        }
+        if matches!(intent, CreepIntent::Move { .. })
+            && creeps.fatigue().get(row).copied().unwrap_or(0) > 0
+        {
+            return Err(Rejected::Tired);
         }
         let (target, at) = match intent.target() {
             None => (None, None),
@@ -641,6 +652,7 @@ mod tests {
             pos: at,
             my,
             spawning,
+            fatigue: 0,
         }
     }
 
@@ -992,7 +1004,9 @@ mod tests {
         assert_eq!(s.rejected_total() as usize, cases.len());
         for reason in Rejected::ALL {
             let want = cases.iter().filter(|c| c.2 == reason).count();
-            if reason != Rejected::Closed {
+            // Closed has its own test, and so has Tired (`a_tired_creep_cannot_move_by_direction`),
+            // which needs a fatigued creep this world does not have.
+            if reason != Rejected::Closed && reason != Rejected::Tired {
                 assert!(want > 0, "{} is exercised", reason.as_str());
             }
             assert_eq!(s.rejected(reason) as usize, want, "{}", reason.as_str());
@@ -1505,5 +1519,57 @@ mod tests {
         assert!(within(pos(10, 10), pos(10, 10), 1));
         assert!(!within(pos(0, 10), pos_in("W2N1", 49, 10), 1));
         assert!(!within(pos(0, 10), pos_in("W2N1", 0, 10), 1));
+    }
+
+    /// A fatigued creep's `move(direction)` is refused as `ERR_TIRED` would be (unbilled, nothing
+    /// replaced, V108, V160); its move toward a creep, which the API lets through (V108), and its
+    /// other methods are not.
+    #[test]
+    fn a_tired_creep_cannot_move_by_direction() {
+        let mut snap = Snapshot::default();
+        snap.begin(TickContext::from_raw(200, 20, 500.0, 10_000));
+        let tired = snap
+            .creeps
+            .push(
+                ObjectKey(1),
+                CreepRow {
+                    fatigue: 2,
+                    ..creep(pos(10, 10), true, false)
+                },
+            )
+            .expect("tired");
+        let other = snap
+            .creeps
+            .push(ObjectKey(2), creep(pos(11, 10), true, false))
+            .expect("other");
+        snap.finish();
+        let mut buf = IntentBuffer::default();
+        let mut commit = Commit::default();
+        buf.begin(&snap);
+        let toward = CreepIntent::MoveToward { target: other };
+        assert_eq!(buf.push(&snap, tired, toward, &mut commit), Ok(Queued::New));
+        let before = commit.cpu();
+        assert_eq!(
+            buf.push(&snap, tired, mv(Direction::Right), &mut commit),
+            Err(Rejected::Tired)
+        );
+        assert_eq!(commit.cpu(), before, "refused, nothing committed");
+        assert_eq!(buf.stats().rejected(Rejected::Tired), 1);
+        assert_eq!(
+            buf.push(&snap, other, mv(Direction::Left), &mut commit),
+            Ok(Queued::New)
+        );
+        let say = CreepIntent::Say {
+            text: SayText::new("z"),
+            public: false,
+        };
+        assert_eq!(buf.push(&snap, tired, say, &mut commit), Ok(Queued::New));
+        buf.resolve();
+        let calls = intents(&issue_ok(&mut buf));
+        assert!(
+            calls.contains(&(0, toward)),
+            "the earlier move toward is kept: {calls:?}"
+        );
+        assert!(calls.contains(&(1, mv(Direction::Left))));
     }
 }

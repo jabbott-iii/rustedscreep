@@ -14,7 +14,8 @@
 //! - tick context: 4 (`time`, `limit`, `tickLimit`, `bucket`);
 //! - each of `Game.creeps`, `Game.rooms`, `Game.structures`: 3 (the getter, `Object.values`,
 //!   `length`), plus one `Array.get` per element, counted below;
-//! - own creep: 6 (`get`, `id`, the id string copy, `pos`, `__packedPos`, `spawning`);
+//! - own creep: 7 (`get`, `id`, the id string copy, `pos`, `__packedPos`, `spawning`, and
+//!   `fatigue` unless it is spawning; the last since P2.1, V160);
 //! - room: 8 with a controller (`get`, `name`, the name copy, `controller`, `my`, `level`, `find`,
 //!   `length`), 6 without; hostile creep: 5 (`get`, `id`, the id copy, `pos`, `__packedPos`;
 //!   hostile results never include spawning creeps, V101);
@@ -68,11 +69,11 @@ extern "C" {
     fn name_value(this: &Named) -> JsValue;
 
     /// A room, for `find` without screeps-game-api's `Room::find`, which collects into a new `Vec`.
-    type Findable;
+    pub(crate) type Findable;
 
     /// `room.find(type)` as the engine's array (a clone of its per-tick cache, V101).
     #[wasm_bindgen(method, js_name = find)]
-    fn find_array(this: &Findable, ty: find::Find) -> Array;
+    pub(crate) fn find_array(this: &Findable, ty: find::Find) -> Array;
 
     /// A `RoomPosition`, for reading `__packedPos` as an option.
     type Packed;
@@ -166,7 +167,17 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
         let pos = position_of(&creep)?;
         // FIND_HOSTILE_CREEPS leaves out spawning creeps (V101), so only own creeps need the read.
         let spawning = my && creep.spawning();
-        snapshot.creeps.push(key, CreepRow { pos, my, spawning })
+        // Movement needs it only for own creeps that can move (V160); others read as 0.
+        let fatigue = if my && !spawning { creep.fatigue() } else { 0 };
+        snapshot.creeps.push(
+            key,
+            CreepRow {
+                pos,
+                my,
+                spawning,
+                fatigue,
+            },
+        )
     });
     match pushed {
         Ok(_) => js.creeps.push(creep),
@@ -200,7 +211,7 @@ fn key_of(id: Option<impl AsRef<JsValue>>) -> Result<ObjectKey, SkipReason> {
 }
 
 /// The object's position from `pos.__packedPos`, checked before `Position::from_packed` (V100).
-fn position_of(object: &RoomObject) -> Result<Position, SkipReason> {
+pub(crate) fn position_of(object: &RoomObject) -> Result<Position, SkipReason> {
     object
         .js_pos()
         .unchecked_ref::<Packed>()

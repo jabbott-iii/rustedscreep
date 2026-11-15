@@ -21,7 +21,7 @@ use rustedscreep_core::intents::{
 };
 use rustedscreep_core::scheduler::{Commit, Fault, FaultRecord, Scheduler};
 use rustedscreep_core::snapshot::Snapshot;
-use screeps::ResourceType;
+use screeps::{ErrorCode, ResourceType};
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
 use crate::snapshot::JsWorld;
@@ -90,6 +90,9 @@ pub struct Act {
     pub buffer: IntentBuffer,
     log: ActLog,
     pending_say: Option<SayText>,
+    /// Actor rows whose move the game refused this tick (an error code or a throw), for movement,
+    /// each with whether it was `ERR_NO_BODYPART` on a `move(direction)`.
+    refused_moves: Vec<(u32, bool)>,
 }
 
 impl Act {
@@ -97,6 +100,14 @@ impl Act {
     pub fn begin(&mut self, snapshot: &Snapshot) {
         self.buffer.begin(snapshot);
         self.log.begin(snapshot.tick.time);
+        self.refused_moves.clear();
+    }
+
+    /// The actor rows whose move the game refused in this tick's act step (an error code or a
+    /// throw: nothing was recorded, V108), so movement does not count them as blocked; with
+    /// whether the refusal was `ERR_NO_BODYPART` on a `move(direction)` (the creep cannot move).
+    pub fn refused_moves(&self) -> &[(u32, bool)] {
+        &self.refused_moves
     }
 
     /// Queues the `say` the console asked for, for every own creep (a spawning one is refused and
@@ -150,8 +161,36 @@ pub fn issue(
     sched: &mut Scheduler,
     cfg: &SchedulerConfig,
 ) {
-    let Act { buffer, log, .. } = act;
+    let Act {
+        buffer,
+        log,
+        refused_moves,
+        ..
+    } = act;
     buffer.issue(log, |issue| {
+        let outcome = issue_one(issue, snapshot, js, sched, cfg);
+        let is_move = matches!(
+            issue.intent,
+            CreepIntent::Move { .. } | CreepIntent::MoveToward { .. }
+        );
+        if is_move && let Some(o) = outcome.filter(|o| !o.recorded()) {
+            let no_move_part = matches!(issue.intent, CreepIntent::Move { .. })
+                && o == Outcome::Failed(ErrorCode::NoBodypart);
+            refused_moves.push((issue.actor, no_move_part));
+        }
+        outcome
+    });
+}
+
+/// One issue's JS call and its outcome (see [`issue`]).
+fn issue_one(
+    issue: &Issue,
+    snapshot: &Snapshot,
+    js: &JsWorld,
+    sched: &mut Scheduler,
+    cfg: &SchedulerConfig,
+) -> Option<Outcome> {
+    {
         let Some(actor) = js.creeps.get(issue.actor as usize) else {
             fault(
                 sched,
@@ -184,7 +223,7 @@ pub fn issue(
                 None
             }
         }
-    });
+    }
 }
 
 /// One JS call for `issue`, or `None` when the target's JS object is missing.

@@ -26,6 +26,7 @@ Run these in order. Do not stop at the first failure, because the user wants the
 | 13 | Persistence (sandbox) | run by `npm run check` (`js/tools/persist-sim.mjs`): the plain build's self-test round trips, corrupt segments, console overrides of the active set, the save cap and `rustedscreep.persist()` |
 | 14 | Runtime config (sandbox) | run by `npm run check` (`js/tools/config-sim.mjs`): the plain build's overrides across four globals: refusals, clamps, the stored record, the log level, the naive structure toggle, a corrupt record and the console clear |
 | 15 | Constants self-check (sandbox) | run by `npm run check` (`js/tools/consts-sim.mjs`): the plain build against the engine fixture: the read path, drift, the line cap, no constants, a low bucket |
+| 16 | Movement (sandbox) | run by `npm run check` (`js/tools/move-sim.mjs`): the plain build in a room whose wall gaps hold walkable and blocking ramparts, a wall and a site: terrain read once, scans at the interval, a console move order walked with engine-valid moves only and through the walkable gaps only, the order ending, a second one cancelled |
 
 `npm run check` runs all of these at once (`js/tools/check.mjs`). Still report each row separately.
 
