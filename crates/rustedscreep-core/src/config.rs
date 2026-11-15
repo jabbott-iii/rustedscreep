@@ -20,7 +20,9 @@ pub mod overrides;
 
 use core::fmt;
 
-use rustedscreep_consts::{CPU_TICK_LIMIT_MAX, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP};
+use rustedscreep_consts::{
+    CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP,
+};
 
 /// How the loader recovers after a trap or an aborted tick (ADR-003).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,6 +306,21 @@ pub struct MovementConfig {
     pub immobile_retry_ticks: u32,
     /// A tile moves kept failing into with no creep seen on it stays blocked this long. Unit: ticks.
     pub suspect_ticks: u32,
+    /// Most nodes one inter-room route search (PathFinder's `maxOps`, V163) may expand before it
+    /// gives up. Unit: ops.
+    pub route_max_ops: u32,
+    /// Most rooms one route search may enter (PathFinder's `maxRooms`; rooms its callback blocks do
+    /// not count, V165). Unit: rooms.
+    pub route_max_rooms: u8,
+    /// A cached route exit is searched again this long after it was found, and a room a creep could
+    /// not cross into is held closed this long. Unit: ticks.
+    pub route_ttl_ticks: u32,
+    /// A creep whose route search found nothing (or whose found exit it cannot reach) does not
+    /// search again for the same target from the same room for this long. Unit: ticks.
+    pub route_retry_ticks: u32,
+    /// Most routes kept whole (each a search's room visits and exits, shared by creeps in its origin
+    /// room); the least recently used goes first. Unit: routes.
+    pub route_cache_size: u32,
 }
 
 /// Movement values for the official MMO. Uses: MOVE_COST_ROAD, MOVE_COST_PLAIN, MOVE_COST_SWAMP
@@ -322,6 +339,11 @@ pub const MOVEMENT_MMO: MovementConfig = MovementConfig {
     shove_claims: 256,
     immobile_retry_ticks: 50,
     suspect_ticks: 10,
+    route_max_ops: 4000,
+    route_max_rooms: 16,
+    route_ttl_ticks: CREEP_LIFE_TIME,
+    route_retry_ticks: 100,
+    route_cache_size: 64,
 };
 
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
@@ -515,7 +537,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 46;
+pub const FIELD_COUNT: usize = 51;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -709,6 +731,18 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         true
     ),
     number!(movement, "MovementConfig", suspect_ticks, 1, 1000, true),
+    number!(movement, "MovementConfig", route_max_ops, 500, 50_000, true),
+    number!(movement, "MovementConfig", route_max_rooms, 2, 64, true),
+    number!(
+        movement,
+        "MovementConfig",
+        route_ttl_ticks,
+        100,
+        20_000,
+        true
+    ),
+    number!(movement, "MovementConfig", route_retry_ticks, 1, 5000, true),
+    number!(movement, "MovementConfig", route_cache_size, 4, 1024, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -879,6 +913,11 @@ mod tests {
             shove_claims: _,
             immobile_retry_ticks: _,
             suspect_ticks: _,
+            route_max_ops: _,
+            route_max_rooms: _,
+            route_ttl_ticks: _,
+            route_retry_ticks: _,
+            route_cache_size: _,
         } = MOVEMENT_MMO;
         let Config {
             loader: _,
@@ -954,6 +993,11 @@ mod tests {
                     "shove_claims",
                     "immobile_retry_ticks",
                     "suspect_ticks",
+                    "route_max_ops",
+                    "route_max_rooms",
+                    "route_ttl_ticks",
+                    "route_retry_ticks",
+                    "route_cache_size",
                 ],
             ),
         ];
@@ -1299,6 +1343,15 @@ mod tests {
         let full = 3 * (8u32.pow(u32::from(c.shove_depth) + 1) - 1) / 7;
         assert_eq!(full, 219, "depth 2");
         assert!(c.shove_claims >= full, "{} < {full}", c.shove_claims);
+        // PathFinder's own limits (V163): maxRooms is clamped to 64, and fewer than 2 rooms is no
+        // inter-room route. A route lasts about one traveller's life.
+        let rooms = match by_key("movement.route_max_rooms").kind {
+            Kind::Number { min, max } => (min, max),
+            _ => unreachable!("a number"),
+        };
+        assert_eq!(rooms, (2, 64));
+        assert_eq!(c.route_ttl_ticks, CREEP_LIFE_TIME);
+        assert!(c.route_retry_ticks <= c.route_ttl_ticks);
     }
 
     #[test]

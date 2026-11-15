@@ -38,6 +38,69 @@ impl Goal {
     }
 }
 
+/// What a creep heads for. `Near`: any walkable tile within range of the goal, where it stays.
+/// `Exit`: a way out of the room toward the next one on an inter-room route, any open exit
+/// ([`CostGrid::open_exit`]) on the side of `goal.tile` within `goal.range` of it. A creep steps onto
+/// one and the engine moves it to the next room at the end of the tick (V151).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Aim {
+    Near(Goal),
+    Exit(Goal),
+}
+
+impl From<Goal> for Aim {
+    fn from(goal: Goal) -> Self {
+        Self::Near(goal)
+    }
+}
+
+impl Aim {
+    pub fn goal(self) -> Goal {
+        match self {
+            Self::Near(g) | Self::Exit(g) => g,
+        }
+    }
+
+    /// Whether `t` is one of the aim's goal tiles on `grid`.
+    #[inline]
+    pub fn reaches(self, grid: &CostGrid, t: Tile) -> bool {
+        match self {
+            Self::Near(g) => g.contains(t) && grid.walkable(t),
+            Self::Exit(g) => {
+                g.contains(t)
+                    && grid.open_exit(t)
+                    && t.side().is_some_and(|s| g.tile.side() == Some(s))
+            }
+        }
+    }
+
+    /// The cost of stepping onto `t` for a creep with this aim, or `None` if it may not: walkable
+    /// tiles, and for `Exit` its goal tiles too, at the exit cost.
+    #[inline]
+    pub fn enter_cost(self, grid: &CostGrid, t: Tile) -> Option<u8> {
+        if grid.walkable(t) {
+            Some(grid.cost(t))
+        } else if matches!(self, Self::Exit(_)) && self.reaches(grid, t) {
+            Some(grid.exit_cost())
+        } else {
+            None
+        }
+    }
+
+    /// The aim's goal tiles on `grid`.
+    pub fn tiles(self, grid: &CostGrid) -> impl Iterator<Item = Tile> + '_ {
+        let g = self.goal();
+        let (gx, gy, r) = (g.tile.x(), g.tile.y(), g.range);
+        let last = ROOM_SIZE - 1;
+        (gx.saturating_sub(r)..=gx.saturating_add(r).min(last))
+            .flat_map(move |x| {
+                (gy.saturating_sub(r)..=gy.saturating_add(r).min(last))
+                    .filter_map(move |y| Tile::new(x, y))
+            })
+            .filter(move |&t| self.reaches(grid, t))
+    }
+}
+
 /// The best next steps from one tile.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Steps {
@@ -106,29 +169,25 @@ impl FlowField {
         self.dist.get(t.index()).copied().unwrap_or(UNREACHED)
     }
 
-    /// Builds the field for `goal` on `grid`. The goal tiles are the walkable tiles within range;
-    /// returns how many there are (0 means nothing can reach the goal).
-    pub fn compute(&mut self, grid: &CostGrid, goal: Goal, queue: &mut Dial) -> u32 {
+    /// Builds the field for `aim` on `grid` (a [`Goal`] is a `Near` aim). The goal tiles are
+    /// [`Aim::tiles`]: for `Near` the walkable tiles within range, for `Exit` the open exits on its
+    /// side within range (unwalkable in the grid, so only their neighbours inside the room are
+    /// relaxed). Returns how many there are (0 means nothing can reach the aim).
+    pub fn compute(&mut self, grid: &CostGrid, aim: impl Into<Aim>, queue: &mut Dial) -> u32 {
+        let aim = aim.into();
         self.dist.fill(UNREACHED);
         for b in &mut queue.buckets {
             b.clear();
         }
         let mut pending: usize = 0;
         let mut seeds: u32 = 0;
-        let (gx, gy, r) = (goal.tile.x(), goal.tile.y(), goal.range);
-        let last = ROOM_SIZE - 1;
-        for x in gx.saturating_sub(r)..=gx.saturating_add(r).min(last) {
-            for y in gy.saturating_sub(r)..=gy.saturating_add(r).min(last) {
-                let Some(t) = Tile::new(x, y) else { continue };
-                if grid.walkable(t) {
-                    self.set(t, 0);
-                    if let Some(b) = queue.buckets.first_mut() {
-                        b.push(t);
-                    }
-                    pending += 1;
-                    seeds += 1;
-                }
+        for t in aim.tiles(grid) {
+            self.set(t, 0);
+            if let Some(b) = queue.buckets.first_mut() {
+                b.push(t);
             }
+            pending += 1;
+            seeds += 1;
         }
         let mut d: u32 = 0;
         while pending > 0 {
@@ -142,7 +201,12 @@ impl FlowField {
                 if u32::from(self.distance(u)) != d {
                     continue; // a stale entry: u was reached more cheaply later
                 }
-                let next = d + u32::from(grid.cost(u));
+                // The cost of stepping onto u: a goal exit costs the exit step, which is not its
+                // (blocked) grid cost.
+                let Some(enter) = aim.enter_cost(grid, u) else {
+                    continue;
+                };
+                let next = d + u32::from(enter);
                 if next >= u32::from(UNREACHED) {
                     continue;
                 }
@@ -166,19 +230,29 @@ impl FlowField {
     }
 
     /// The best next steps from `from` (which need not be walkable itself, so a creep on an edge or
-    /// a blocked tile still finds its way): the walkable neighbours with a distance that minimize
-    /// the step's cost plus that distance, up to [`STEP_OPTIONS`] ties in direction order. Empty
-    /// when no neighbour reaches the goal.
+    /// a blocked tile still finds its way): the neighbours with a distance that minimize the step's
+    /// cost plus that distance, up to [`STEP_OPTIONS`] ties in direction order. Only walkable tiles
+    /// and the goal exits of an `Exit` field have a distance; an exit's step costs
+    /// [`CostGrid::exit_cost`]. Empty when no neighbour reaches the goal.
     pub fn steps(&self, grid: &CostGrid, from: Tile) -> Steps {
         let mut best = u32::MAX;
         let mut out = Steps::default();
         let mut n = 0usize;
         for (_, t) in from.neighbors() {
             let dist = self.distance(t);
-            if dist == UNREACHED || !grid.walkable(t) {
+            if dist == UNREACHED {
                 continue;
             }
-            let total = u32::from(grid.cost(t)) + u32::from(dist);
+            // A tile with a distance that is not walkable is a goal exit (only those are seeded
+            // off the walkable tiles).
+            let enter = if grid.walkable(t) {
+                grid.cost(t)
+            } else if grid.open_exit(t) {
+                grid.exit_cost()
+            } else {
+                continue;
+            };
+            let total = u32::from(enter) + u32::from(dist);
             if total < best {
                 best = total;
                 out = Steps::default();
@@ -195,6 +269,32 @@ impl FlowField {
         out
     }
 
+    /// Like [`Self::steps`], but the best [`STEP_OPTIONS`] neighbours with a distance whatever their
+    /// cost, best first (direction order on ties): for a creep on an edge tile, which leaves the room
+    /// if it stays (V151), a costlier way in beats waiting on one taken tile.
+    pub fn ranked_steps(&self, grid: &CostGrid, from: Tile) -> Steps {
+        let mut ranked: [(u32, usize, Option<Tile>); 8] = [(u32::MAX, 0, None); 8];
+        for (i, (_, t)) in from.neighbors().enumerate() {
+            let dist = self.distance(t);
+            if dist == UNREACHED {
+                continue;
+            }
+            let enter = if grid.walkable(t) {
+                grid.cost(t)
+            } else if grid.open_exit(t) {
+                grid.exit_cost()
+            } else {
+                continue;
+            };
+            if let Some(slot) = ranked.get_mut(i) {
+                *slot = (u32::from(enter) + u32::from(dist), i, Some(t));
+            }
+        }
+        ranked.sort_unstable();
+        let total = ranked.first().map_or(0, |&(total, _, _)| total);
+        Steps::from_tiles(ranked.iter().filter_map(|&(_, _, t)| t), total)
+    }
+
     fn set(&mut self, t: Tile, d: u16) {
         if let Some(cell) = self.dist.get_mut(t.index()) {
             *cell = d;
@@ -204,7 +304,7 @@ impl FlowField {
 
 struct Entry {
     room: RoomName,
-    goal: Goal,
+    goal: Aim,
     /// The grid version the field was built on.
     version: u32,
     last_used: u32,
@@ -212,7 +312,7 @@ struct Entry {
 }
 
 /// Cached fields, at most `capacity` of them, least recently used out first. Fields are keyed by room
-/// and goal and carry the grid version they were built on: a field of an older grid is rebuilt in
+/// and aim and carry the grid version they were built on: a field of an older grid is rebuilt in
 /// place on its next use, and one unused for `idle_ticks` is dropped ([`FieldCache::evict_idle`]).
 #[derive(Default)]
 pub struct FieldCache {
@@ -243,16 +343,17 @@ impl FieldCache {
         }
     }
 
-    /// The field for `goal` in `room` on a grid at `version`, built if it is missing or older.
-    /// Returns the field and whether it was built now.
+    /// The field for `goal` (a [`Goal`] is a `Near` aim) in `room` on a grid at `version`, built if
+    /// it is missing or older. Returns the field and whether it was built now.
     pub fn get(
         &mut self,
         room: RoomName,
-        goal: Goal,
+        goal: impl Into<Aim>,
         grid: &CostGrid,
         version: u32,
         now: u32,
     ) -> (&FlowField, bool) {
+        let goal = goal.into();
         if !self.keep {
             self.scratch.compute(grid, goal, &mut self.queue);
             self.built = self.built.saturating_add(1);
@@ -497,6 +598,62 @@ mod tests {
         assert_eq!(paid, start);
         assert_eq!(crossed, Some(tile(20, 26)));
         assert_eq!(f.distance(goal.tile), 0);
+    }
+
+    /// Uses: ROOM_SIZE, MOVE_COST_* (through `rates`). An `Exit` field is seeded on the open exits of
+    /// its side within range (never a wall exit, a corner, or another side's tiles near a corner),
+    /// a tile beside one is one exit step away (V54), and following the steps from inside the room
+    /// ends on one of them. A `Near` goal on the same tile seeds only walkable tiles, so its field
+    /// never leads onto an edge.
+    #[test]
+    fn exit_fields_lead_onto_the_open_exits_of_their_side() {
+        let wall = Terrain::Wall as u8;
+        let last = ROOM_SIZE - 1;
+        let terrain = TerrainGrid::from_row_major(&raw(|x, y| match (x, y) {
+            (49, 24) => wall,
+            _ => 0,
+        }))
+        .expect("length");
+        let grid = grid_of(&terrain, &[]);
+        let p = rates();
+        let goal = Goal {
+            tile: tile(last, 25),
+            range: 1,
+        };
+        let mut f = FlowField::default();
+        let seeds = f.compute(&grid, Aim::Exit(goal), &mut Dial::default());
+        assert_eq!(seeds, 2, "(49,25) and (49,26); (49,24) is a wall");
+        assert_eq!(f.distance(tile(last, 25)), 0);
+        assert_eq!(f.distance(tile(last, 24)), UNREACHED);
+        assert_eq!(f.distance(tile(last - 1, 25)), u16::from(grid.exit_cost()));
+        assert_eq!(grid.exit_cost(), p.cheapest());
+        let beside = f.steps(&grid, tile(last - 1, 24));
+        assert_eq!(beside.first(), Some(tile(last, 25)), "the open exit");
+        assert_eq!(beside.total, u32::from(grid.exit_cost()));
+        let mut at = tile(30, 10);
+        for _ in 0..usize::from(ROOM_SIZE) {
+            if grid.open_exit(at) {
+                break;
+            }
+            at = f.steps(&grid, at).first().expect("a step");
+        }
+        assert!(Aim::Exit(goal).reaches(&grid, at), "{at:?}");
+        // Near a corner the range box covers the top edge too, but only the right side seeds.
+        let corner = Goal {
+            tile: tile(last, 1),
+            range: 2,
+        };
+        let seeded: Vec<Tile> = Aim::Exit(corner).tiles(&grid).collect();
+        assert_eq!(seeded, vec![tile(last, 1), tile(last, 2), tile(last, 3)]);
+        // The same goal as a Near goal: walkable tiles only.
+        f.compute(&grid, goal, &mut Dial::default());
+        assert_eq!(f.distance(tile(last, 25)), UNREACHED);
+        assert_eq!(f.distance(tile(last - 1, 25)), 0);
+        assert!(
+            f.steps(&grid, tile(last - 2, 25))
+                .tiles()
+                .all(|t| !t.is_edge())
+        );
     }
 
     /// A creep on an edge tile (blocked in the grid, V151) still gets steps back into the room;

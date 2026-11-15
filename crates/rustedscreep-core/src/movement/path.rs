@@ -6,12 +6,13 @@ use std::collections::BinaryHeap;
 
 use rustedscreep_consts::ROOM_AREA;
 
-use super::field::{FlowField, Goal, UNREACHED};
+use super::field::{Aim, FlowField, Goal, UNREACHED};
 use super::grid::CostGrid;
 use super::tile::Tile;
 
-/// One search: from `start` to a walkable tile within the goal's range that `blocked` does not
-/// reject, on `grid`, popping at most `max_pops` entries. `estimate` gives a lower bound on the cost
+/// One search: from `start` to one of the aim's goal tiles ([`Aim::reaches`]: a walkable tile within
+/// range, or for an `Exit` aim one of its open exits) that `blocked` does not reject, on `grid`,
+/// popping at most `max_pops` entries. `estimate` gives a lower bound on the cost
 /// from a tile to the goal, or `None` when the goal cannot be reached from it at all (such tiles are
 /// never entered). Pass the goal's flow-field distance ([`field_estimate`]): blocked tiles only
 /// raise costs, so the field never overestimates, and a detour around a few creeps expands little
@@ -21,7 +22,7 @@ pub struct Query<'a, B, E> {
     pub blocked: B,
     pub estimate: E,
     pub start: Tile,
-    pub goal: Goal,
+    pub goal: Aim,
     pub max_pops: u32,
 }
 
@@ -84,7 +85,7 @@ impl PathSearch {
             max_pops,
         } = q;
         out.clear();
-        let is_goal = |t: Tile| goal.contains(t) && grid.walkable(t) && !blocked(t);
+        let is_goal = |t: Tile| goal.reaches(grid, t) && !blocked(t);
         if is_goal(start) {
             return true;
         }
@@ -113,11 +114,14 @@ impl PathSearch {
                 return true;
             }
             for (_, v) in u.neighbors() {
-                if !grid.walkable(v) || blocked(v) {
+                let Some(enter) = goal.enter_cost(grid, v) else {
+                    continue;
+                };
+                if blocked(v) {
                     continue;
                 }
                 let Some(hv) = estimate(v) else { continue };
-                let next = g.saturating_add(u32::from(grid.cost(v)));
+                let next = g.saturating_add(u32::from(enter));
                 if !self.was_seen(v) || next < self.cost_of(v) {
                     self.visit(v, next, u);
                     self.open
@@ -203,7 +207,7 @@ mod tests {
             blocked,
             estimate: range_estimate(goal, cheapest),
             start,
-            goal,
+            goal: goal.into(),
             max_pops,
         }
     }
@@ -274,7 +278,7 @@ mod tests {
                 blocked: |_| false,
                 estimate: field_estimate(&field),
                 start,
-                goal,
+                goal: goal.into(),
                 max_pops: u32::MAX,
             };
             let found_by_field = search.search(by_field, &mut field_path);
@@ -387,7 +391,7 @@ mod tests {
                 blocked: creeps,
                 estimate: field_estimate(&field),
                 start,
-                goal,
+                goal: goal.into(),
                 max_pops: pops,
             };
             if search.search(by_field, &mut path) {
@@ -407,5 +411,54 @@ mod tests {
         ));
         let (range_cost, _) = walk(&grid, start, &path, creeps);
         assert_eq!(field_cost, range_cost, "both are the cheapest detour");
+    }
+
+    /// Uses: MOVE_COST_* (through `rates`). An `Exit` detour ends on an open exit of its side, around
+    /// a creep on the field's own route, and enters the exit at the exit cost; a `Near` search for
+    /// the same tile never steps onto the edge.
+    #[test]
+    fn an_exit_detour_ends_on_an_open_exit() {
+        let last = rustedscreep_consts::ROOM_SIZE - 1;
+        let grid = {
+            let mut g = CostGrid::default();
+            g.build(&open_terrain(), [], rates());
+            g
+        };
+        let goal = Goal {
+            tile: tile(last, 25),
+            range: 0,
+        };
+        let aim = Aim::Exit(goal);
+        let mut field = FlowField::default();
+        field.compute(&grid, aim, &mut Dial::default());
+        let start = tile(last - 3, 25);
+        let creep = tile(last - 2, 25);
+        let mut search = PathSearch::default();
+        let mut path = Vec::new();
+        let query = Query {
+            grid: &grid,
+            blocked: |t: Tile| t == creep,
+            estimate: field_estimate(&field),
+            start,
+            goal: aim,
+            max_pops: u32::MAX,
+        };
+        assert!(search.search(query, &mut path));
+        assert_eq!(path.first(), Some(&goal.tile), "ends on the exit");
+        assert!(!path.contains(&creep));
+        assert_eq!(path.len(), 3, "around the creep in three steps");
+        assert!(path.iter().skip(1).all(|&t| grid.walkable(t)));
+        let near = Query {
+            grid: &grid,
+            blocked: |_: Tile| false,
+            estimate: range_estimate(goal, rates().cheapest()),
+            start,
+            goal: goal.into(),
+            max_pops: u32::MAX,
+        };
+        assert!(
+            !search.search(near, &mut path),
+            "an edge tile is no Near goal"
+        );
     }
 }

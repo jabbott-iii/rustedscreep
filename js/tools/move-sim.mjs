@@ -292,7 +292,8 @@ export function moveSim(dir = join(ROOT, 'dist')) {
   const parts = [
     'rooms tracked 1 (terrain 1, active 1, read 1)',
     `(${ROOM}: grid v1, ${OBJECTS} objects, scanned at ${T0 + 1 + SCAN_INTERVAL})`,
-    'scans 2 (changed 1), grids built 1, early rescans 0, suspect tiles 0 | read failures 0, scan skips 0',
+    'scans 2 (changed 1), grids built 1, early rescans 0, suspect tiles 0, routes searched 0 (failed 0, edge tiles learned 0), rooms crossed 0 (transfers refused 0) | read failures 0, scan skips 0',
+    'routes kept 0, closed rooms none, PathFinder searches 0',
     'no moveTo order',
   ];
   if (summary.length !== 1) problems.push(`${summary.length} movement summaries`);

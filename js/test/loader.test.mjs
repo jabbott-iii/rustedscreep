@@ -648,7 +648,7 @@ test('the movement command shares the guard: missing export, idle, ready, and a 
   assert.equal(bad.loader.phase, 'poisoned');
 });
 
-test('the moveTo command passes only a room string and whole numbers 0 to 49, or nothing to cancel', () => {
+test('the moveTo command passes only room strings and whole numbers 0 to 49, or nothing to cancel', () => {
   const none = harness();
   assert.match(none.loader.moveTo('W1N1', 1, 1), /no moveTo export/);
   const got = [];
@@ -658,14 +658,20 @@ test('the moveTo command passes only a room string and whole numbers 0 to 49, or
   const refused = [
     [42, 25, 25, 1], ['W1N1', 25], ['W1N1', -1, 25], ['W1N1', 25, 50], ['W1N1', 2.5, 3], ['W1N1', 25, 25, 50],
     ['W1N1', 25, 25, '1'], ['W1N1', '25', 25], [undefined, 25, 25], [null, 1, 1], ['W1N1', Number.NaN, 1],
+    ['W2N1', 25, 25, 1, 7], ['W2N1', 25, 25, 1, null], [undefined, undefined, undefined, undefined, 'W1N1'],
   ];
   for (const args of refused) {
     assert.match(h.loader.moveTo(...args), /give a room name and x, y/, JSON.stringify(args));
   }
   assert.equal(h.loader.moveTo('W1N1', 0, 49), 'ok');
   assert.equal(h.loader.moveTo('W1N1', 25, 25, 3), 'ok');
+  assert.equal(h.loader.moveTo('W2N1', 25, 25, 1, 'W1N1'), 'ok');
+  assert.equal(h.loader.moveTo('W2N1', 25, 25, undefined, 'W1N1'), 'ok');
   assert.equal(h.loader.moveTo(), 'ok');
-  assert.deepEqual(got, [['W1N1', 0, 49, undefined], ['W1N1', 25, 25, 3], []]);
+  assert.deepEqual(got, [
+    ['W1N1', 0, 49, undefined, undefined], ['W1N1', 25, 25, 3, undefined], ['W2N1', 25, 25, 1, 'W1N1'],
+    ['W2N1', 25, 25, undefined, 'W1N1'], [],
+  ]);
   assert.equal(h.loader.running, false);
   const bad = harness({ glue: { moveTo: () => { throw new Error('RuntimeError: unreachable'); } } });
   bad.tick(2);

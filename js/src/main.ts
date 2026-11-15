@@ -130,7 +130,8 @@ function routeConsole(): void {
 // `rustedscreep.persist()`, `rustedscreep.persistTest()`, `rustedscreep.config()`,
 // `rustedscreep.configSet("log.level", "debug")`, `rustedscreep.configUnset("log.level")`,
 // `rustedscreep.configReset()`, `rustedscreep.consts()`, `rustedscreep.movement()` or
-// `rustedscreep.moveTo("W1N1", 25, 25, 1)` (`rustedscreep.moveTo()` cancels).
+// `rustedscreep.moveTo("W1N1", 25, 25, 1)` (from another room: `rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1")`;
+// `rustedscreep.moveTo()` cancels).
 g.rustedscreep = {
   trapTest: (n: unknown = 1) => loader.scheduleTraps(Number(n)),
   status: () => loader.status(),
@@ -147,7 +148,8 @@ g.rustedscreep = {
   configReset: () => loader.configReset(),
   consts: () => loader.consts(),
   movement: () => loader.movement(),
-  moveTo: (room?: unknown, x?: unknown, y?: unknown, range?: unknown) => loader.moveTo(room, x, y, range),
+  moveTo: (room?: unknown, x?: unknown, y?: unknown, range?: unknown, from?: unknown) =>
+    loader.moveTo(room, x, y, range, from),
 };
 
 export function loop(): void {

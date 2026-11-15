@@ -246,8 +246,17 @@ impl Traffic {
         }
     }
 
-    fn enterable(&self, cx: &Ctx<'_>, t: Tile) -> bool {
-        cx.grid.walkable(t) && self.foreign.get(t.index()) != Some(&self.stamp)
+    /// Whether unit `c` may end the tick on `t`: a walkable tile, or an open exit that is one of its
+    /// own planned steps (an inter-room route leaving the room, V151); never a tile with a foreign
+    /// creep. A creep is never shoved onto an exit, since that would move it to another room.
+    fn enterable(&self, cx: &Ctx<'_>, c: usize, t: Tile) -> bool {
+        let open = cx.grid.walkable(t)
+            || (cx.grid.open_exit(t)
+                && cx
+                    .units
+                    .get(c)
+                    .is_some_and(|u| matches!(u.plan, Plan::Move(s) if s.tiles().any(|x| x == t))));
+        open && self.foreign.get(t.index()) != Some(&self.stamp)
     }
 
     /// Moves unit `c` (currently somewhere else) onto `t`.
@@ -270,7 +279,7 @@ impl Traffic {
 
     /// Unit `c` takes tile `t`, moving its occupant on if needed. On false nothing changed.
     fn claim(&mut self, cx: &Ctx<'_>, c: usize, t: Tile, depth: u8, chain_shoves: u32) -> bool {
-        if self.claims_left == 0 || !self.enterable(cx, t) || self.is_reserved(t) {
+        if self.claims_left == 0 || !self.enterable(cx, c, t) || self.is_reserved(t) {
             return false;
         }
         self.claims_left -= 1;
@@ -338,7 +347,7 @@ impl Traffic {
                 let mut cands: [(u8, u8, usize, Option<Tile>); 8] = [(u8::MAX, 0, 0, None); 8];
                 for (i, (_, t)) in from.neighbors().enumerate() {
                     if anchor.is_some_and(|g| !g.contains(t))
-                        || !self.enterable(cx, t)
+                        || !self.enterable(cx, o, t)
                         || self.is_reserved(t)
                     {
                         continue;
@@ -378,6 +387,7 @@ mod tests {
     use super::super::grid::tests::{open_terrain, rates, tile};
     use super::super::grid::{CostGrid, Footprint, TerrainGrid};
     use super::*;
+    use rustedscreep_consts::ROOM_SIZE;
 
     fn grid(objects: &[(Tile, Footprint)]) -> CostGrid {
         let terrain: TerrainGrid = open_terrain();
@@ -447,8 +457,10 @@ mod tests {
             if a[i] != u.tile {
                 assert!(u.can_move, "unit {i} cannot move");
                 assert_eq!(u.tile.range(a[i]), 1, "unit {i} jumps");
+                let own_exit = g.open_exit(a[i])
+                    && matches!(u.plan, Plan::Move(s) if s.tiles().any(|x| x == a[i]));
                 assert!(
-                    g.walkable(a[i]) && !foreign.contains(&a[i]),
+                    (g.walkable(a[i]) || own_exit) && !foreign.contains(&a[i]),
                     "unit {i} enters {:?}",
                     a[i]
                 );
@@ -489,6 +501,43 @@ mod tests {
         ];
         resolve_with(&mut t, &g, &tie, &[], 2, 10);
         assert_eq!(t.assigned()[1], target);
+    }
+
+    /// Uses: ROOM_SIZE. A mover whose step is an open exit takes it (it leaves the room, V151); a
+    /// creep that just arrived on that exit and moves on frees it in the same tick; a holder beside
+    /// the edge is never shoved onto an exit, even when every other tile is taken.
+    #[test]
+    fn movers_step_onto_their_exits_and_holders_never_do() {
+        let last = ROOM_SIZE - 1;
+        let g = grid(&[]);
+        let exit = tile(last, 20);
+        let units = [
+            mover(tile(last - 1, 20), &[exit], 1, 1),
+            // Arrived from the next room on the exit tile; heads inside.
+            mover(exit, &[tile(last - 1, 21)], 1, 2),
+        ];
+        let mut t = Traffic::default();
+        resolve_with(&mut t, &g, &units, &[], 2, 10);
+        check(&units, &t, &g, &[]);
+        assert_eq!(t.assigned(), [exit, tile(last - 1, 21)]);
+        // A creep that just arrived on an exit wants the tile of a holder whose inner neighbours
+        // all have foreign creeps: the holder's only free tiles are exits (the mover's own tile
+        // among them), so it stays and the mover waits.
+        let holder_at = tile(last - 1, 30);
+        let foreign: Vec<Tile> = holder_at
+            .neighbors()
+            .map(|(_, n)| n)
+            .filter(|n| !n.is_edge())
+            .collect();
+        let units = [
+            mover(tile(last, 30), &[holder_at], 1, 1),
+            holder(holder_at, None, 2),
+        ];
+        let r = resolve_with(&mut t, &g, &units, &foreign, 2, 10);
+        check(&units, &t, &g, &foreign);
+        assert_eq!(t.assigned(), [tile(last, 30), holder_at]);
+        assert_eq!(r.shoved, 0);
+        assert_eq!(r.blocked, 1);
     }
 
     #[test]

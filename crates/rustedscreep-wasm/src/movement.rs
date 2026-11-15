@@ -19,10 +19,13 @@
 //!   and counted.
 //! - resolve: one `Game.cpu.getUsed()` (the tiers' shove budgets) on a tick with a planned move,
 //!   none otherwise.
+//! - an inter-room route search, only when a request finds no cached exit (route.rs gives the
+//!   calls): inside that request's job unit, as a heavy unit.
 //! - intents: one `move(direction)` per creep the traffic manager moves (issued by act.rs).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 use js_sys::Uint8Array;
 use rustedscreep_consts::{Position, ROOM_AREA, ROOM_SIZE, RoomCoordinate, RoomName};
@@ -33,10 +36,11 @@ use rustedscreep_core::movement::{
     structure_footprint,
 };
 use rustedscreep_core::scheduler::{Clock, Fault, Job, JobState, TickCpu, Tier};
-use rustedscreep_core::snapshot::{Snapshot, known_structure_type, parse_room_name};
+use rustedscreep_core::snapshot::{CreepHandle, Snapshot, known_structure_type, parse_room_name};
 use screeps::{ConstructionSite, FindConstant, Room, RoomObject, Structure, StructureType, find};
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
+use crate::route::{PathFinderRoutes, RouteState};
 use crate::snapshot::{Findable, JsWorld, position_of};
 
 #[wasm_bindgen]
@@ -67,12 +71,16 @@ extern "C" {
     fn is_public_value(this: &Rampart) -> Option<bool>;
 }
 
-/// The console's move order (`rustedscreep.moveTo`): every own creep in the target's room without a
-/// request of its own heads for the target, until all of them are in range on one tick.
-#[derive(Clone, Copy)]
+/// The console's move order (`rustedscreep.moveTo`): every own creep in `from` (the target's room
+/// unless given) without a request of its own heads for the target, and keeps going once it left
+/// that room, until all of them are in range on one tick.
+#[derive(Clone)]
 struct Order {
     target: Position,
     range: u8,
+    from: RoomName,
+    /// The creeps the order took so far (those that left `from` included).
+    members: Vec<CreepHandle>,
 }
 
 /// The console order's job: Standard tier, one unit per creep.
@@ -107,6 +115,8 @@ pub struct MovementGlue {
     order: Option<Order>,
     order_job: JobState,
     order_creeps: Vec<usize>,
+    /// What the PathFinder route search (installed in `core`) answers its room callback from.
+    routes: Rc<RefCell<RouteState>>,
     /// Since the global started: room reads that failed, scan objects left out.
     read_failures: u32,
     scan_skips: u32,
@@ -114,8 +124,11 @@ pub struct MovementGlue {
 
 impl Default for MovementGlue {
     fn default() -> Self {
+        let mut core = Movement::default();
+        let (search, routes) = PathFinderRoutes::new();
+        core.set_router(Box::new(search));
         Self {
-            core: Movement::default(),
+            core,
             terrain: Box::new([0; ROOM_AREA]),
             rooms: Vec::new(),
             read_job: JobState::default(),
@@ -123,6 +136,7 @@ impl Default for MovementGlue {
             order: None,
             order_job: JobState::default(),
             order_creeps: Vec::new(),
+            routes,
             read_failures: 0,
             scan_skips: 0,
         }
@@ -134,6 +148,14 @@ impl MovementGlue {
     pub fn begin(&mut self, snapshot: &Snapshot, cfg: &MovementConfig, cache: &CacheConfig) {
         self.core.begin(snapshot, cfg);
         self.core.set_cache(cfg, cache);
+        if let Ok(mut routes) = self.routes.try_borrow_mut() {
+            // A search indexes at most `route_max_rooms` rooms, and each can have 4 neighbours it
+            // blocks (blocked rooms take no slot, V165): keep that many statuses at least.
+            let statuses = cfg
+                .route_cache_size
+                .max(u32::from(cfg.route_max_rooms).saturating_mul(5));
+            routes.begin(snapshot.tick.time, cfg.route_ttl_ticks, statuses);
+        }
     }
 
     /// The decide step's first job (Critical): reads the rooms movement needs before anything in
@@ -209,20 +231,31 @@ impl MovementGlue {
         snapshot: &Snapshot,
         cfg: &MovementConfig,
     ) {
-        let Some(order) = self.order else { return };
+        let Some(order) = self.order.as_mut() else {
+            return;
+        };
         let creeps = &snapshot.creeps;
+        order.members.retain(|&h| creeps.row_of(h).is_some());
         self.order_creeps.clear();
         for (row, pos) in creeps.positions().iter().enumerate() {
             let mine = creeps.my().get(row).copied().unwrap_or(false);
             let spawning = creeps.spawning().get(row).copied().unwrap_or(true);
+            let Some(&h) = creeps.handles().get(row) else {
+                continue;
+            };
+            let member = order.members.contains(&h);
             if mine
                 && !spawning
-                && pos.room_name() == order.target.room_name()
+                && (member || pos.room_name() == order.from)
                 && !self.core.planned(row)
             {
+                if !member {
+                    order.members.push(h);
+                }
                 self.order_creeps.push(row);
             }
         }
+        let (target, range) = (order.target, order.range);
         // A stable order across ticks (V102): by id.
         self.order_creeps.sort_unstable_by_key(|&row| {
             creeps
@@ -232,8 +265,8 @@ impl MovementGlue {
                 .map_or(u128::MAX, |k| k.0)
         });
         let to = MoveTo {
-            target: order.target,
-            range: order.range,
+            target,
+            range,
             priority: CONSOLE_PRIORITY,
             tier: CONSOLE.tier,
         };
@@ -262,11 +295,10 @@ impl MovementGlue {
         if count > 0 && report.ran == count && arrived.get() == count {
             self.order = None;
             if log::log_enabled!(log::Level::Info) {
-                let (x, y) = (order.target.x().u8(), order.target.y().u8());
+                let (x, y) = (target.x().u8(), target.y().u8());
                 log::info!(
-                    "rustedscreep moveTo: all {count} creep(s) in {} are within {} of ({x}, {y}); order done",
-                    order.target.room_name(),
-                    order.range
+                    "rustedscreep moveTo: all {count} creep(s) in {} are within {range} of ({x}, {y}); order done",
+                    target.room_name(),
                 );
             }
         }
@@ -274,7 +306,8 @@ impl MovementGlue {
 
     /// The end of the decide step: resolves every room's traffic and queues the moves. Each
     /// mover's shoves are capped by what is left before its job's tier cap, at `INTENT_CPU_COST`
-    /// each (V34): one clock reading, only on a tick with a planned move.
+    /// each (V34): one clock reading, only on a tick with a planned move (a creep stepping off an
+    /// edge after it found no way counts).
     pub fn resolve<C: Clock>(
         &mut self,
         tick: &mut TickCpu<'_, C>,
@@ -282,7 +315,7 @@ impl MovementGlue {
         buffer: &mut IntentBuffer,
         cfg: &MovementConfig,
     ) {
-        let caps = if self.core.tick().moving > 0 {
+        let caps = if self.core.has_movers() {
             tick.sample();
             let spent = tick.spent();
             let budget = *tick.budget();
@@ -305,13 +338,13 @@ impl MovementGlue {
             .moves_refused(snapshot, refused_moves.iter().copied(), cfg);
     }
 
-    /// Sets or clears the console's move order (`rustedscreep.moveTo`); returns the reply.
+    /// Sets or clears the console's move order (`rustedscreep.moveTo`); returns the reply. `from` is
+    /// the room whose creeps go (the target's room when `None`).
     pub fn set_order(
         &mut self,
         room: Option<&str>,
-        x: Option<u32>,
-        y: Option<u32>,
-        range: Option<u32>,
+        (x, y, range): (Option<u32>, Option<u32>, Option<u32>),
+        from: Option<&str>,
     ) -> String {
         let Some(room) = room else {
             let had = self.order.take().is_some();
@@ -334,17 +367,31 @@ impl MovementGlue {
                 ROOM_SIZE - 1
             );
         };
+        let origin = match from {
+            None => name,
+            Some(f) => match parse_room_name(f.as_bytes()) {
+                Some(f) => f,
+                None => return String::from("rustedscreep moveTo: not a room name to start from"),
+            },
+        };
         let range = range.map_or(1, |r| r.min(u32::from(ROOM_SIZE - 1)));
         let range = u8::try_from(range).unwrap_or(1);
         self.order = Some(Order {
             target: Position::new(cx, cy, name),
             range,
+            from: origin,
+            members: Vec::new(),
         });
-        format!(
-            "rustedscreep moveTo: own creeps in {name} head for ({}, {}) within {range} from the next tick, until all are in range; rustedscreep.moveTo() cancels",
-            cx.u8(),
-            cy.u8()
-        )
+        let (x, y) = (cx.u8(), cy.u8());
+        if origin == name {
+            format!(
+                "rustedscreep moveTo: own creeps in {name} head for ({x}, {y}) within {range} from the next tick, until all are in range; rustedscreep.moveTo() cancels"
+            )
+        } else {
+            format!(
+                "rustedscreep moveTo: own creeps in {origin} head for ({x}, {y}) in {name} within {range} from the next tick, until all are in range; rustedscreep.moveTo() cancels"
+            )
+        }
     }
 
     /// One line for `rustedscreep.movement()`.
@@ -381,7 +428,30 @@ impl MovementGlue {
             " | read failures {}, scan skips {}",
             self.read_failures, self.scan_skips
         );
-        match self.order {
+        let _ = write!(text, " | routes kept {}, closed rooms", m.routes().len());
+        if m.closed_rooms().is_empty() {
+            text.push_str(" none");
+        }
+        for (room, until) in m.closed_rooms() {
+            let _ = write!(text, " {room} (until {until})");
+        }
+        if let Ok(routes) = self.routes.try_borrow() {
+            let r = routes.stats;
+            let _ = write!(
+                text,
+                ", PathFinder searches {} (threw {}, incomplete {}, ops {}), room callbacks {} (blocked: closed {}, status {}, bad name {}), matrices {}",
+                r.searches,
+                r.throws,
+                r.incomplete,
+                r.ops,
+                r.callbacks,
+                r.blocked_closed,
+                r.blocked_status,
+                r.bad_names,
+                routes.matrices()
+            );
+        }
+        match &self.order {
             Some(o) => {
                 let _ = write!(
                     text,
@@ -391,6 +461,9 @@ impl MovementGlue {
                     o.target.room_name(),
                     o.range
                 );
+                if o.from != o.target.room_name() {
+                    let _ = write!(text, " from {} ({} creep(s))", o.from, o.members.len());
+                }
             }
             None => text.push_str(" | no moveTo order"),
         }
@@ -411,7 +484,8 @@ fn counts(text: &mut String, c: &Counts) {
         text,
         " requests {} (arrived {}, moving {}, tired {}, errors {}), fields built {}, detours {} (failed {}, skipped {}), \
          traffic moved {} blocked {} shoved {}, moves queued {} (refused {}, refused by the game {}), scans {} (changed {}), \
-         grids built {}, early rescans {}, suspect tiles {}",
+         grids built {}, early rescans {}, suspect tiles {}, routes searched {} (failed {}, edge tiles learned {}), \
+         rooms crossed {} (transfers refused {})",
         c.requests,
         c.arrived,
         c.moving,
@@ -432,6 +506,11 @@ fn counts(text: &mut String, c: &Counts) {
         c.grids_built,
         c.stale,
         c.suspects,
+        c.routes,
+        c.route_failures,
+        c.route_dips,
+        c.crossed,
+        c.transfers_refused,
     );
 }
 

@@ -5,6 +5,11 @@
 //! of its structures, own sites and deposits (rescanned on a cadence), and a [`CostProfile`] from
 //! config. Creeps are not in it: they move, so the
 //! traffic manager and the detour search handle them per tick.
+//!
+//! Edge tiles are [`BLOCKED`] for in-room movement (a creep that ends a tick on one changes rooms,
+//! V151), but the grid remembers which of them are open exits ([`CostGrid::open_exit`]): an
+//! inter-room route steps onto one on purpose, and PathFinder gets them back as terrain tiles
+//! ([`CostGrid::write_matrix`]).
 
 use rustedscreep_consts::{ROOM_AREA, ROOM_SIZE, StructureType, Terrain};
 
@@ -129,15 +134,27 @@ impl CostProfile {
     }
 }
 
-/// The cost of stepping onto each tile of one room, or [`BLOCKED`].
+/// Words in the open-exit bitset, one bit per tile.
+const EXIT_WORDS: usize = ROOM_AREA.div_ceil(64);
+
+/// The cost of stepping onto each tile of one room, or [`BLOCKED`], and which edge tiles are open
+/// exits.
 pub struct CostGrid {
     cost: Box<[u8; ROOM_AREA]>,
+    /// One bit per tile: an edge tile off the corners whose terrain and objects let a creep stand
+    /// on it.
+    exits: [u64; EXIT_WORDS],
+    /// What stepping onto an open exit costs: the profile's cheapest step, since a move onto an edge
+    /// tile from inside the room adds no fatigue (V54).
+    exit_cost: u8,
 }
 
 impl Default for CostGrid {
     fn default() -> Self {
         Self {
             cost: Box::new([BLOCKED; ROOM_AREA]),
+            exits: [0; EXIT_WORDS],
+            exit_cost: 1,
         }
     }
 }
@@ -145,8 +162,9 @@ impl Default for CostGrid {
 impl CostGrid {
     /// Rebuilds the grid in place: terrain costs from `profile`, then roads, then blocking
     /// footprints, then the room's edge tiles blocked, since a creep that ends a tick on one changes
-    /// rooms (V151, V152; inter-room movement is a separate P2 item). A road under a blocking object
-    /// stays blocked. `objects` is walked twice (roads, then blockers).
+    /// rooms (V151, V152). An edge tile that was walkable before that, off the corners, is kept as an
+    /// open exit. A road under a blocking object stays blocked. `objects` is walked twice (roads,
+    /// then blockers).
     pub fn build<I>(&mut self, terrain: &TerrainGrid, objects: I, profile: CostProfile)
     where
         I: IntoIterator<Item = (Tile, Footprint)>,
@@ -172,11 +190,68 @@ impl CostGrid {
                 self.set(t, BLOCKED);
             }
         }
+        self.exits = [0; EXIT_WORDS];
+        self.exit_cost = p.cheapest();
         for i in 0..ROOM_AREA {
-            if Tile::from_index(i).is_some_and(Tile::is_edge)
-                && let Some(cell) = self.cost.get_mut(i)
+            let Some(t) = Tile::from_index(i).filter(|t| t.is_edge()) else {
+                continue;
+            };
+            let Some(cell) = self.cost.get_mut(i) else {
+                continue;
+            };
+            if *cell != BLOCKED
+                && t.side().is_some()
+                && let Some(word) = self.exits.get_mut(i / 64)
             {
-                *cell = BLOCKED;
+                *word |= 1 << (i % 64);
+            }
+            *cell = BLOCKED;
+        }
+    }
+
+    /// Whether `t` is an open exit: an edge tile off the corners that a creep can step onto, which
+    /// takes it to the next room at the end of the tick (V151). Never walkable in the grid itself.
+    #[inline]
+    pub fn open_exit(&self, t: Tile) -> bool {
+        let i = t.index();
+        self.exits
+            .get(i / 64)
+            .is_some_and(|word| word & (1 << (i % 64)) != 0)
+    }
+
+    /// The cost of stepping onto an open exit (the profile's cheapest step; V54).
+    #[inline]
+    pub fn exit_cost(&self) -> u8 {
+        self.exit_cost
+    }
+
+    /// The cost of stepping onto `t` when open exits may be entered: the grid's cost for a walkable
+    /// tile, [`Self::exit_cost`] for an open exit, `None` otherwise.
+    #[inline]
+    pub fn enter_cost(&self, t: Tile) -> Option<u8> {
+        if self.walkable(t) {
+            Some(self.cost(t))
+        } else if self.open_exit(t) {
+            Some(self.exit_cost)
+        } else {
+            None
+        }
+    }
+
+    /// The grid as a PathFinder CostMatrix's bytes (`_bits`, index `x * 50 + y`, the tile order;
+    /// V164): each walkable tile's cost (so a road, or a tunnel through a wall, is walkable at the
+    /// road cost and an obstacle is 255), 0 on open exits (PathFinder charges their own terrain,
+    /// plain or swamp, V164: a cheaper byte would draw paths onto the edge and back, where no creep
+    /// can walk, V151), and 255 on every other tile. `avoid` tiles are 255 as well (edge tiles a
+    /// path stepped onto and back from).
+    pub fn write_matrix(&self, out: &mut [u8; ROOM_AREA], avoid: impl IntoIterator<Item = Tile>) {
+        for (i, (byte, &cost)) in out.iter_mut().zip(self.cost.iter()).enumerate() {
+            let exit = Tile::from_index(i).is_some_and(|t| self.open_exit(t));
+            *byte = if exit { 0 } else { cost };
+        }
+        for t in avoid {
+            if let Some(byte) = out.get_mut(t.index()) {
+                *byte = BLOCKED;
             }
         }
     }
@@ -292,6 +367,74 @@ pub(super) mod tests {
         grid.build(&terrain, [], p);
         assert_eq!(grid.cost(tile(10, 10)), BLOCKED);
         assert_eq!(grid.cost(tile(13, 10)), p.plain);
+    }
+
+    /// Uses: ROOM_SIZE, the `Terrain` discriminants, MOVE_COST_* (through `rates`). Open exits are
+    /// the edge tiles off the corners that are walkable before the edge is blocked (V151, V152): not
+    /// a wall, no blocking object. They cost the cheapest step in the grid (V54) and 0 (their
+    /// terrain) in the PathFinder bytes, where every other tile keeps its grid cost (V164) and
+    /// avoided tiles are 255.
+    #[test]
+    fn open_exits_and_the_pathfinder_bytes() {
+        let wall = Terrain::Wall as u8;
+        let last = ROOM_SIZE - 1;
+        let terrain = TerrainGrid::from_row_major(&raw(|x, y| match (x, y) {
+            (0, 5..=9) => wall, // a closed stretch of the west edge
+            (20, 20) => wall,
+            _ => 0,
+        }))
+        .expect("length");
+        let objects = [
+            (tile(last, 30), Footprint::Blocked),
+            (tile(20, 20), Footprint::Road), // a tunnel
+            (tile(21, 20), Footprint::Blocked),
+        ];
+        let mut grid = CostGrid::default();
+        let p = rates();
+        grid.build(&terrain, objects.iter().copied(), p);
+        let mut open = 0usize;
+        for t in (0..ROOM_AREA).filter_map(Tile::from_index) {
+            let expect = t.side().is_some()
+                && !(t.x() == 0 && (5..=9).contains(&t.y()))
+                && t != tile(last, 30);
+            assert_eq!(grid.open_exit(t), expect, "{t:?}");
+            assert!(!grid.walkable(t) || !grid.open_exit(t), "{t:?}");
+            open += usize::from(expect);
+        }
+        // 4 sides of ROOM_SIZE - 2 tiles, less 5 walls and one blocked tile.
+        assert_eq!(open, 4 * usize::from(ROOM_SIZE - 2) - 6);
+        assert_eq!(grid.exit_cost(), p.cheapest());
+        assert_eq!(grid.enter_cost(tile(0, 20)), Some(p.cheapest()));
+        assert_eq!(grid.enter_cost(tile(0, 7)), None, "a wall exit");
+        assert_eq!(grid.enter_cost(tile(0, 0)), None, "a corner");
+        assert_eq!(grid.enter_cost(tile(10, 10)), Some(p.plain));
+        assert_eq!(grid.enter_cost(tile(21, 20)), None);
+        let mut bytes = [7u8; ROOM_AREA];
+        grid.write_matrix(&mut bytes, [tile(0, 30)]);
+        for t in (0..ROOM_AREA).filter_map(Tile::from_index) {
+            let want = if t == tile(0, 30) {
+                BLOCKED
+            } else if grid.open_exit(t) {
+                0
+            } else {
+                grid.cost(t)
+            };
+            assert_eq!(bytes.get(t.index()).copied(), Some(want), "{t:?}");
+        }
+        assert_eq!(
+            bytes.get(tile(20, 20).index()).copied(),
+            Some(p.road),
+            "tunnel"
+        );
+        assert_eq!(
+            bytes.get(tile(0, 7).index()).copied(),
+            Some(BLOCKED),
+            "wall exit"
+        );
+        assert_eq!(bytes.get(tile(last, 30).index()).copied(), Some(BLOCKED));
+        // A rebuild without the blocker reopens its exit.
+        grid.build(&terrain, [], p);
+        assert!(grid.open_exit(tile(last, 30)));
     }
 
     /// Uses: `StructureType::is_obstacle`. Every known type's footprint follows the rules: roads are

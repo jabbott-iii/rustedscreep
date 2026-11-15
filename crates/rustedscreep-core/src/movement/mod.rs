@@ -29,9 +29,20 @@
 //! suspect for `suspect_ticks`, which the traffic manager and detours treat as blocked, and
 //! the room is rescanned early once. Reading power creeps in the snapshot comes with P7 and P9.
 //!
-//! Inter-room routes (PathFinder, cached) are a separate P2 item: a target in another room is
-//! refused here ([`MoveError::OtherRoom`]), and grids block the room's edge tiles, so in-room moves
-//! never take a creep out of its room (V151, V152).
+//! Inter-room routes (P2.2, [`route`]): grids block the room's edge tiles, so in-room moves never
+//! take a creep out of its room (V151, V152). A request whose target is in another room follows a
+//! route: the creep's own, else a kept route through its room whose exit it can reach, else one the
+//! installed [`RouteSearch`] (PathFinder in the game, with the rooms' cost grids as its matrices)
+//! finds now, in the request's unit (a heavy unit). The creep walks an `Exit` flow field
+//! ([`Aim::Exit`]) onto its leg's exit and the engine moves it to the next room (V151), where
+//! [`Movement::begin`] moves it on to the route's next leg and has the room read in the same tick
+//! (so it does not stand on the edge and go back). A creep still on an edge of the room it was in
+//! had its transfer refused (V152, V168): the room beyond is held closed and every route into it is
+//! dropped. A creep that cannot reach its leg's exit searches from where it stands (dropping the
+//! route for everyone when the room's grid changed since the search); one that cannot reach its
+//! target inside the target's room takes or searches a route out and back in; a failed search is
+//! kept by that creep only; a request that finds no way just after a crossing drops the route that
+//! led there, and a creep on an edge tile steps into the room instead of going back over the edge.
 //!
 //! Everything lives in the heap for one global; a reset starts it empty and it rebuilds from the
 //! next tick's reads (terrain and a scan per room, fields on first use).
@@ -39,16 +50,18 @@
 mod field;
 mod grid;
 mod path;
+pub mod route;
 mod tile;
 mod traffic;
 
-pub use field::{Dial, FieldCache, FlowField, Goal, STEP_OPTIONS, Steps, UNREACHED};
+pub use field::{Aim, Dial, FieldCache, FlowField, Goal, STEP_OPTIONS, Steps, UNREACHED};
 pub use grid::{
     BLOCKED, CostGrid, CostProfile, Footprint, TerrainGrid, TerrainKind, site_footprint,
     structure_footprint,
 };
 pub use path::{PathSearch, Query, field_estimate, range_estimate};
-pub use tile::{DIRECTIONS, Tile};
+pub use route::{Leg, Route, RouteBook, RouteId, RouteOutcome, RouteQuery, RouteSearch};
+pub use tile::{DIRECTIONS, Side, Tile};
 pub use traffic::{Limits, Plan, Resolved, Traffic, Unit};
 
 use rustedscreep_consts::{INTENT_CPU_COST, Position, ROOM_AREA, ROOM_SIZE, RoomName};
@@ -75,7 +88,9 @@ pub enum Progress {
     /// It is on a walkable tile within range: it holds there, and a mover may shove it only to
     /// another tile within range.
     Arrived,
-    /// A step was planned; [`Movement::resolve`] decides whether it moves.
+    /// A step was planned; [`Movement::resolve`] decides whether it moves. On an inter-room route
+    /// also a creep that stands on one of its exits: it holds, and the engine moves it to the next
+    /// room at the end of the tick (V151).
     Moving,
     /// It is fatigued and cannot move this tick (V50); it holds.
     Tired,
@@ -88,12 +103,13 @@ pub enum MoveError {
     GoneCreep,
     NotMine,
     Spawning,
-    /// The target is in another room (inter-room routes are a separate P2 item).
+    /// The target is in another room and no route search is installed ([`Movement::set_router`]).
     OtherRoom,
     /// The room's terrain or objects have not been read yet; the request asks for them, and the
     /// next tick's reads bring them.
     RoomNotReady,
-    /// No walkable tile within range can be reached from the creep.
+    /// No walkable tile within range can be reached from the creep, or no route leads to the
+    /// target's room (cached for `route_retry_ticks`).
     NoPath,
     /// The game refused the creep's last move (no active MOVE part, V108): it is held as fixed
     /// until `immobile_retry_ticks` have passed.
@@ -179,6 +195,15 @@ pub struct Counts {
     pub stale: u32,
     /// Tiles newly suspected of holding something the snapshot cannot see.
     pub suspects: u32,
+    /// Route searches made, of them those that found no route, and edge tiles learned from paths
+    /// that stepped onto an edge and back (searched again around them).
+    pub routes: u32,
+    pub route_failures: u32,
+    pub route_dips: u32,
+    /// Own creeps seen in another room than on the tick before, and transfers the game refused
+    /// (an own creep still on an edge of the room it was in; V152).
+    pub crossed: u32,
+    pub transfers_refused: u32,
 }
 
 impl Counts {
@@ -204,6 +229,11 @@ impl Counts {
             grids_built,
             stale,
             suspects,
+            routes,
+            route_failures,
+            route_dips,
+            crossed,
+            transfers_refused,
         } = self;
         for (a, b) in [
             (requests, o.requests),
@@ -226,6 +256,11 @@ impl Counts {
             (grids_built, o.grids_built),
             (stale, o.stale),
             (suspects, o.suspects),
+            (routes, o.routes),
+            (route_failures, o.route_failures),
+            (route_dips, o.route_dips),
+            (crossed, o.crossed),
+            (transfers_refused, o.transfers_refused),
         ] {
             *a = a.saturating_add(b);
         }
@@ -311,7 +346,19 @@ impl RoomNav {
 #[derive(Default)]
 struct Nav {
     handle: Option<CreepHandle>,
-    goal: Option<(RoomName, Goal)>,
+    goal: Option<(RoomName, Aim)>,
+    /// The room it was in at the last `begin`.
+    room: Option<RoomName>,
+    /// The room it came from at its last crossing, and the tick it was seen across.
+    came_from: Option<RoomName>,
+    crossed_at: Option<u32>,
+    /// The last tick a request was made for it.
+    requested_at: Option<u32>,
+    /// The route it follows and the leg it is on (the leg's room is the room it is in).
+    route: Option<(RouteId, u16)>,
+    /// A route search of its own that found nothing: the room, target and range, and when (kept
+    /// for `route_retry_ticks`; never shared, since it says nothing about another creep's tile).
+    no_route: Option<(RoomName, Position, u8, u32)>,
     /// The tile it was moved toward last tick.
     expected: Option<Tile>,
     /// Ticks in a row its move failed or the traffic manager kept it in place.
@@ -335,6 +382,34 @@ impl Nav {
     fn immobile(&self, now: u32) -> bool {
         self.immobile_until.is_some_and(|t| now < t)
     }
+}
+
+/// How a request plans again after its route exit turned out unreachable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retry {
+    No,
+    /// Leave the creep's own route and take a kept route it can reach, or search one (its exit
+    /// cannot be reached from where it stands).
+    Search,
+    /// Take a kept route through this room, or search one: the target cannot be reached inside
+    /// its own room from here, so the way may run through a neighbour.
+    Lookup,
+    /// Search once more around the edge tiles the last search's path stepped onto and back from.
+    Dips,
+}
+
+/// What a route lookup is for.
+#[derive(Clone, Copy)]
+struct RouteAsk {
+    creep: CreepHandle,
+    pos: Position,
+    target: Position,
+    range: u8,
+    /// Leave aside the creep's own route and its own failure ([`Retry::Search`], [`Retry::Lookup`],
+    /// [`Retry::Dips`]).
+    fresh: bool,
+    /// Search without looking at kept routes ([`Retry::Dips`]).
+    search: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -412,11 +487,84 @@ pub struct Movement {
     row_room: Vec<Option<u32>>,
     cursor: Vec<u32>,
     scratch: Vec<(Tile, Footprint)>,
+    routes: RouteBook,
+    router: Option<Box<dyn RouteSearch>>,
+    /// Rooms a creep could not cross into, and the tick each stays closed until.
+    closed: Vec<(RoomName, u32)>,
+    /// Edge tiles a search's path stepped onto and back into the room from (a creep cannot), and
+    /// the tick each is avoided until: every later search's matrix blocks them.
+    dips: Vec<(RoomName, Tile, u32)>,
+    route_path: Vec<Position>,
+    route_legs: Vec<route::Leg>,
+    /// The last search's dips: edge tiles its path stepped onto and back into the room from.
+    path_dips: Vec<(RoomName, Tile)>,
+    /// Candidate route legs (route, leg, exit) for a lookup.
+    route_picks: Vec<(RouteId, u16, Tile)>,
+    /// The last grid version handed out: versions are unique within a global, so a room dropped
+    /// and read again never reuses one (route matrices and fields compare them).
+    builds: u32,
     /// `CacheConfig::movement_grid` from the last [`Movement::set_cache`].
     grid_cache: bool,
     time: u32,
     tick: Counts,
     totals: Counts,
+}
+
+/// What a route search may know of the rooms: the cost grids movement has built, the rooms held
+/// closed after a refused transfer, and the edge tiles paths must not step onto and back from.
+pub struct RouteRooms<'a> {
+    rooms: &'a [RoomNav],
+    closed: &'a [(RoomName, u32)],
+    dips: &'a [(RoomName, Tile, u32)],
+}
+
+impl<'a> RouteRooms<'a> {
+    /// The edge tiles of `room` a search must treat as blocked (255): a path stepped onto them and
+    /// back into the room, which a creep cannot do (V151, V166).
+    pub fn dips(&self, room: RoomName) -> impl Iterator<Item = Tile> + 'a {
+        self.dips
+            .iter()
+            .filter(move |&&(r, _, _)| r == room)
+            .map(|&(_, t, _)| t)
+    }
+
+    /// Rooms with such tiles.
+    pub fn dip_rooms(&self) -> impl Iterator<Item = RoomName> + 'a {
+        self.dips.iter().map(|&(r, _, _)| r)
+    }
+
+    /// Whether a creep could not cross into `room` within the last `route_ttl_ticks`.
+    pub fn closed(&self, room: RoomName) -> bool {
+        self.closed.iter().any(|&(r, _)| r == room)
+    }
+
+    /// The rooms held closed.
+    pub fn closed_rooms(&self) -> impl Iterator<Item = RoomName> + 'a {
+        self.closed.iter().map(|&(r, _)| r)
+    }
+
+    /// The room's cost grid and its version, if movement has built one.
+    pub fn grid(&self, room: RoomName) -> Option<(&'a CostGrid, u32)> {
+        let i = self
+            .rooms
+            .binary_search_by_key(&room.packed_repr(), |r| r.name.packed_repr())
+            .ok()?;
+        let r = self.rooms.get(i)?;
+        r.grid
+            .as_ref()
+            .filter(|_| r.version != 0)
+            .map(|g| (g, r.version))
+    }
+
+    /// Every room with a cost grid, with its version, in room order.
+    pub fn grids(&self) -> impl Iterator<Item = (RoomName, u32, &'a CostGrid)> + 'a {
+        self.rooms.iter().filter_map(|r| {
+            r.grid
+                .as_ref()
+                .filter(|_| r.version != 0)
+                .map(|g| (r.name, r.version, g))
+        })
+    }
 }
 
 /// The cost profile in force.
@@ -469,8 +617,24 @@ impl Movement {
                 continue;
             };
             let at = Tile::of(pos);
+            let crossed = nav.room.is_some_and(|r| r != room);
+            // A creep that ends a tick on an edge tile is in the next room on the next tick (V151),
+            // so one still on an edge of the room it was in had its transfer refused (V152, V168).
+            let refused = nav.room == Some(room) && at.is_edge();
+            if crossed {
+                nav.came_from = nav.room;
+                nav.crossed_at = Some(now);
+                // On to the route's next leg if this is its room; off the route otherwise.
+                let routes = &mut self.routes;
+                nav.route = nav.route.and_then(|(id, leg)| {
+                    let next = leg.checked_add(1)?;
+                    let r = routes.get(id, now)?;
+                    (r.legs.get(usize::from(next))?.room == room).then_some((id, next))
+                });
+            }
+            nav.room = Some(room);
             if let Some(expected) = nav.expected.take() {
-                if at == expected {
+                if at == expected || crossed {
                     nav.stuck = 0;
                     nav.unexplained = 0;
                     nav.blocked_at = None;
@@ -494,6 +658,32 @@ impl Movement {
                     nav.blocked_at = Some(expected);
                 }
             }
+            if crossed {
+                nav.detour.clear();
+                nav.detour_blocker = None;
+                self.tick.crossed += 1;
+                // It walks a route: read its new room in this tick (the read jobs run before the
+                // requests), so it does not stand on the edge and go back (V151).
+                if nav.requested_at.is_some_and(|t| now.wrapping_sub(t) <= 1)
+                    && let Some(r) = self.rooms.get_mut(ri)
+                {
+                    r.wanted_at = Some(now);
+                }
+            }
+            if refused
+                && let Some(side) = at.side()
+                && let Some(beyond) = room.checked_add(side.room_offset())
+            {
+                let until = now.saturating_add(cfg.route_ttl_ticks.max(1));
+                match self.closed.iter_mut().find(|(r, _)| *r == beyond) {
+                    Some(c) => c.1 = until,
+                    None => self.closed.push((beyond, until)),
+                }
+                // Every route into the closed room goes; its creeps search again around it.
+                self.routes.remove_through(beyond);
+                nav.route = None;
+                self.tick.transfers_refused += 1;
+            }
         }
         for (&name, controller) in snap.rooms.names().iter().zip(snap.rooms.controllers()) {
             if matches!(controller, Controller::Mine { .. })
@@ -508,6 +698,11 @@ impl Movement {
         for r in &mut self.rooms {
             r.suspects.retain(|&(_, until)| now < until);
         }
+        self.closed.retain(|&(_, until)| now < until);
+        self.dips.retain(|&(_, _, until)| now < until);
+        if !self.routes.is_empty() {
+            self.routes.evict(now, route_ages(cfg).0);
+        }
         let idle = cfg.field_idle_ticks;
         self.rooms
             .retain(|r| r.active || now.wrapping_sub(r.last_active) <= idle);
@@ -519,6 +714,16 @@ impl Movement {
         let cap = usize::try_from(cfg.field_cache_size).unwrap_or(usize::MAX);
         self.fields.set_policy(cap, cache.flow_fields);
         self.grid_cache = cache.movement_grid;
+        self.routes.set_capacity(
+            usize::try_from(cfg.route_cache_size).unwrap_or(usize::MAX),
+            self.time,
+        );
+    }
+
+    /// Installs the search inter-room routes use (PathFinder, from rustedscreep-wasm). Without one, a
+    /// target in another room is refused ([`MoveError::OtherRoom`]).
+    pub fn set_router(&mut self, router: Box<dyn RouteSearch>) {
+        self.router = Some(router);
     }
 
     /// Rooms whose first read is due (terrain, sources and minerals, and a scan): wanted and not
@@ -641,7 +846,20 @@ impl Movement {
         commit: &mut Commit,
     ) -> Result<Progress, MoveError> {
         self.tick.requests += 1;
-        let result = self.plan(snap, creep, to, cfg, commit);
+        let mut retry = Retry::No;
+        let mut result = self.plan(snap, creep, to, cfg, commit, &mut retry);
+        // At most two more plans: one that looks up or searches a route from where the creep stands
+        // (its exit or target cannot be reached from there), and one more search around edge tiles
+        // that search learned. So a creep that just came in does not stand on the edge and go back.
+        for _ in 0..2 {
+            if retry == Retry::No {
+                break;
+            }
+            result = self.plan(snap, creep, to, cfg, commit, &mut retry);
+        }
+        if result == Err(MoveError::NoPath) {
+            self.no_way(snap, creep, to, commit);
+        }
         match result {
             Ok(Progress::Arrived) => self.tick.arrived += 1,
             Ok(Progress::Moving) => self.tick.moving += 1,
@@ -679,6 +897,61 @@ impl Movement {
         );
     }
 
+    /// After a request found no way (`NoPath`): a creep that crossed into its room this tick drops
+    /// the route that led it here, so no creep follows it again (the next search knows this room's
+    /// grid); and a creep on an edge tile, which would go back over it at the end of the tick
+    /// (V151), steps into the room instead.
+    fn no_way(&mut self, snap: &Snapshot, creep: CreepHandle, to: MoveTo, commit: &mut Commit) {
+        let now = self.time;
+        let creeps = &snap.creeps;
+        let (Some(row), Some(nav)) = (creeps.row_of(creep), nav_for(&mut self.navs, creep)) else {
+            return;
+        };
+        let Some(&pos) = creeps.positions().get(row) else {
+            return;
+        };
+        let room = pos.room_name();
+        if nav.crossed_at == Some(now)
+            && let Some((id, _)) = nav.route.take()
+        {
+            // The route led into a room with no way on from here: no creep takes it again.
+            self.routes.remove(id);
+        }
+        let from = Tile::of(pos);
+        if !from.is_edge() || nav.immobile(now) {
+            return;
+        }
+        let Some(r) = find_room(&mut self.rooms, room) else {
+            return;
+        };
+        let Some(grid) = r.grid.as_ref() else {
+            return;
+        };
+        let steps = inward_steps(grid, from);
+        if steps.is_empty() {
+            return;
+        }
+        let first = !self
+            .wants
+            .get(row)
+            .copied()
+            .flatten()
+            .is_some_and(|w| matches!(w.plan, Plan::Move(_)));
+        set_want(
+            &mut self.wants,
+            row,
+            Plan::Move(steps),
+            to.priority,
+            to.tier,
+            commit,
+        );
+        if first {
+            r.movers += 1;
+        }
+    }
+
+    /// One request's plan. `retry` says how to search (a second plan, after the first set it) and
+    /// is set when the route's exit turned out unreachable, so [`Self::request`] plans once more.
     fn plan(
         &mut self,
         snap: &Snapshot,
@@ -686,7 +959,10 @@ impl Movement {
         to: MoveTo,
         cfg: &MovementConfig,
         commit: &mut Commit,
+        retry: &mut Retry,
     ) -> Result<Progress, MoveError> {
+        let again = *retry;
+        *retry = Retry::No;
         let MoveTo {
             target,
             range,
@@ -709,9 +985,13 @@ impl Movement {
         let room = pos.room_name();
         let now = self.time;
         let from = Tile::of(pos);
-        if target.room_name() != room {
+        let elsewhere = target.room_name() != room;
+        if elsewhere && self.router.is_none() {
             set_want(&mut self.wants, row, pinned(from), priority, tier, commit);
             return Err(MoveError::OtherRoom);
+        }
+        if let Some(nav) = nav_for(&mut self.navs, creep) {
+            nav.requested_at = Some(now);
         }
         if let Some(r) = self.room_mut(room) {
             r.wanted_at = Some(now);
@@ -721,9 +1001,41 @@ impl Movement {
             set_want(&mut self.wants, row, pinned(from), priority, tier, commit);
             return Err(MoveError::RoomNotReady);
         }
-        let goal = Goal {
+        // Whether this request searched the route (its exit is then as good as the room's grid).
+        let mut searched = false;
+        let near = Aim::Near(Goal {
             tile: Tile::of(target),
             range: range.min(ROOM_SIZE - 1),
+        });
+        let has_router = self.router.is_some();
+        // A route is followed toward a target in another room, and in the target's room too while
+        // the creep's route has legs left (a path that leaves the room and comes back).
+        let routed = has_router
+            && (elsewhere || again != Retry::No || self.mid_route(creep, target, range, room));
+        let aim = if routed {
+            let ask = RouteAsk {
+                creep,
+                pos,
+                target,
+                range,
+                fresh: again != Retry::No,
+                search: again == Retry::Dips,
+            };
+            match self.route_exit(ask, cfg, commit, &mut searched) {
+                // The route's own exit tile only: a tile beside it may lead into a pocket of the
+                // next room that the search did not take.
+                Ok(Some(exit)) => Aim::Exit(Goal {
+                    tile: exit,
+                    range: 0,
+                }),
+                Ok(None) => near,
+                Err(e) => {
+                    set_want(&mut self.wants, row, pinned(from), priority, tier, commit);
+                    return Err(e);
+                }
+            }
+        } else {
+            near
         };
         let Self {
             rooms,
@@ -733,6 +1045,9 @@ impl Movement {
             search,
             occupancy,
             tick,
+            routes,
+            dips,
+            path_dips,
             ..
         } = self;
         let r = rooms.get_mut(ri).ok_or(MoveError::RoomNotReady)?;
@@ -740,25 +1055,36 @@ impl Movement {
             return Err(MoveError::RoomNotReady);
         };
         let nav = nav_for(navs, creep).ok_or(MoveError::GoneCreep)?;
-        if nav.goal != Some((room, goal)) {
-            nav.goal = Some((room, goal));
+        if nav.goal != Some((room, aim)) {
+            nav.goal = Some((room, aim));
             nav.detour.clear();
             nav.stuck = 0;
             nav.unexplained = 0;
             nav.blocked_at = None;
             nav.detour_fails = 0;
         }
-        if goal.contains(from) && grid.walkable(from) {
+        if aim.reaches(grid, from) {
             nav.detour.clear();
             nav.stuck = 0;
-            // A creep held as fixed stays put whatever its anchor says.
-            let plan = if nav.immobile(now) {
-                pinned(from)
-            } else {
-                Plan::Hold(Some(goal))
+            return match aim {
+                Aim::Near(goal) => {
+                    // A creep held as fixed stays put whatever its anchor says.
+                    let plan = if nav.immobile(now) {
+                        pinned(from)
+                    } else {
+                        Plan::Hold(Some(goal))
+                    };
+                    set_want(wants, row, plan, priority, tier, commit);
+                    Ok(Progress::Arrived)
+                }
+                Aim::Exit(_) => {
+                    // On one of its exits already (back over the edge, or its transfer was
+                    // refused): the engine moves it to the next room at the end of the tick if it
+                    // stays (V151).
+                    set_want(wants, row, pinned(from), priority, tier, commit);
+                    Ok(Progress::Moving)
+                }
             };
-            set_want(wants, row, plan, priority, tier, commit);
-            return Ok(Progress::Arrived);
         }
         if nav.immobile(now) {
             set_want(wants, row, pinned(from), priority, tier, commit);
@@ -768,7 +1094,7 @@ impl Movement {
             set_want(wants, row, pinned(from), priority, tier, commit);
             return Ok(Progress::Tired);
         }
-        let (field, built) = fields.get(room, goal, grid, r.version, now);
+        let (field, built) = fields.get(room, aim, grid, r.version, now);
         if built {
             tick.fields_built += 1;
             commit.heavy();
@@ -777,7 +1103,7 @@ impl Movement {
         let wait = u32::from(stuck_ticks) << nav.detour_fails.min(4);
         let mut stale = false;
         let mut suspect = None;
-        let mut searched = false;
+        let mut detoured = false;
         if u32::from(nav.stuck) >= wait {
             nav.stuck = 0;
             if nav.unexplained >= stuck_ticks
@@ -801,7 +1127,7 @@ impl Movement {
                 t != from
                     && (occ.has(t) || Some(t) == suspect || suspects.iter().any(|&(s, _)| s == t))
             };
-            if !goal_has_free_tile(grid, goal, blocked) {
+            if !aim.tiles(grid).any(|t| !blocked(t)) {
                 tick.detours_skipped += 1;
                 nav.detour_fails = nav.detour_fails.saturating_add(1);
             } else {
@@ -811,12 +1137,12 @@ impl Movement {
                     blocked,
                     estimate: field_estimate(field),
                     start: from,
-                    goal,
+                    goal: aim,
                     max_pops: cfg.detour_max_pops,
                 };
                 if search.search(query, &mut nav.detour) {
                     tick.detours += 1;
-                    searched = true;
+                    detoured = true;
                     // The field's own next step is the tile that held the creep up.
                     nav.detour_blocker = field.steps(grid, from).first();
                 } else {
@@ -830,7 +1156,7 @@ impl Movement {
         // may stand further on). Only while the creep is still near that tile: once it has gone some
         // way round, a gap that opens and closes again would make it shuttle back and forth, and the
         // detour is kept. Never on the tick the detour was searched.
-        if !searched
+        if !detoured
             && let Some(&next) = nav.detour.last()
             && from.range(next) == 1
             && let Some(blocker) = nav.detour_blocker
@@ -854,7 +1180,13 @@ impl Movement {
             Some(t) if from.range(t) == 1 => Steps::from_tiles([t], 0),
             _ => {
                 nav.detour.clear();
-                field.steps(grid, from)
+                if from.is_edge() {
+                    // It leaves the room if it stays (V151): every way in, best first, not only the
+                    // best ties, so one creep on the best tile does not send it back.
+                    field.ranked_steps(grid, from)
+                } else {
+                    field.steps(grid, from)
+                }
             }
         };
         if let Some(b) = suspect {
@@ -867,6 +1199,72 @@ impl Movement {
             tick.stale += 1;
         }
         if steps.is_empty() {
+            let rate_limited = nav.no_route.is_some_and(|(r, t, g, at)| {
+                r == room
+                    && t == target
+                    && g == range
+                    && now.wrapping_sub(at) <= cfg.route_retry_ticks.max(1)
+            });
+            if let Aim::Exit(_) = aim {
+                // The room's own grid cannot reach the route's exit from here.
+                if searched {
+                    // This request's own search gave it, so no creep takes that route. Its path
+                    // may have stepped onto an edge of this room and back to get past something
+                    // (PathFinder allows it, V166; no creep can, V151): those tiles are avoided
+                    // from now on, and the search runs once more around them. Otherwise no way
+                    // for this creep for `route_retry_ticks`.
+                    if let Some((id, _)) = nav.route.take() {
+                        routes.remove(id);
+                    }
+                    let until = now.saturating_add(cfg.route_ttl_ticks.max(1));
+                    let mut learned = false;
+                    for &(dr, dt) in path_dips.iter().filter(|&&(dr, _)| dr == room) {
+                        if !dips.iter().any(|&(r0, t0, _)| r0 == dr && t0 == dt) {
+                            dips.push((dr, dt, until));
+                            tick.route_dips += 1;
+                            learned = true;
+                        }
+                    }
+                    path_dips.clear();
+                    if learned && again != Retry::Dips {
+                        *retry = Retry::Dips;
+                    } else {
+                        nav.no_route = Some((room, target, range, now));
+                        tick.route_failures += 1;
+                    }
+                } else if again == Retry::No {
+                    // A route found on an older grid of this room is stale for every creep on it,
+                    // and so is one that landed this creep here: every creep on it lands on the
+                    // same tile. One found on this grid that the creep only joined is right where
+                    // its path starts. Either way, take another route or search from here at once.
+                    if let Some((id, leg)) = nav.route.take()
+                        && (nav.crossed_at == Some(now)
+                            || routes
+                                .peek(id)
+                                .and_then(|rt| rt.legs.get(usize::from(leg)))
+                                .is_some_and(|l| l.version != r.version))
+                    {
+                        routes.remove(id);
+                    }
+                    *retry = Retry::Search;
+                } else {
+                    // A kept route taken on a retry turned out out of reach after all.
+                    nav.route = None;
+                    nav.no_route = Some((room, target, range, now));
+                    tick.route_failures += 1;
+                }
+            } else if has_router
+                && again == Retry::No
+                && !rate_limited
+                && reaches_an_exit(field, grid)
+            {
+                // No way to the target inside its room from here, but the target can be reached from
+                // an exit: the way may run through a neighbour. Take a kept route through this room,
+                // or search one.
+                *retry = Retry::Lookup;
+            } else if has_router && searched {
+                nav.no_route = Some((room, target, range, now));
+            }
             set_want(wants, row, pinned(from), priority, tier, commit);
             return Err(MoveError::NoPath);
         }
@@ -1042,6 +1440,12 @@ impl Movement {
         }
     }
 
+    /// Whether any creep has a move planned this tick (requests that move, and creeps stepping off
+    /// an edge after finding no way), so the glue knows to read the clock for the shove caps.
+    pub fn has_movers(&self) -> bool {
+        self.rooms.iter().any(|r| r.movers > 0)
+    }
+
     /// Whether the creep in snapshot row `row` was requested (or given way) this tick, so a
     /// lower-priority source of requests can leave it alone.
     pub fn planned(&self, row: usize) -> bool {
@@ -1084,6 +1488,16 @@ impl Movement {
     /// Cached flow fields.
     pub fn fields(&self) -> &FieldCache {
         &self.fields
+    }
+
+    /// Kept routes.
+    pub fn routes(&self) -> &RouteBook {
+        &self.routes
+    }
+
+    /// Rooms held closed after a refused transfer, and the tick each stays closed until.
+    pub fn closed_rooms(&self) -> &[(RoomName, u32)] {
+        &self.closed
     }
 
     fn room_index(&self, name: RoomName) -> Option<usize> {
@@ -1146,6 +1560,245 @@ impl Movement {
         }
     }
 
+    /// Whether the creep follows a route to this target whose leg in `room` leaves the room again.
+    fn mid_route(&self, creep: CreepHandle, target: Position, range: u8, room: RoomName) -> bool {
+        let Some(nav) = usize::try_from(creep.slot())
+            .ok()
+            .and_then(|i| self.navs.get(i))
+            .filter(|n| n.handle == Some(creep))
+        else {
+            return false;
+        };
+        nav.route.is_some_and(|(id, leg)| {
+            self.routes.peek(id).is_some_and(|r| {
+                r.target == target
+                    && r.range == range
+                    && r.legs
+                        .get(usize::from(leg))
+                        .is_some_and(|l| l.room == room && l.exit.is_some())
+            })
+        })
+    }
+
+    /// The exit a creep leaves its room by on its route to a target (`None` on the route's last leg,
+    /// in the target's room): the route it follows; else a failure of its own within
+    /// `route_retry_ticks`; else a route from this room whose first exit it can reach (shared by
+    /// every creep there); else a search now (a heavy unit), whose route is kept whole. With
+    /// [`RouteAsk::fresh`] it searches whatever is kept. The search's dips (edge tiles its path
+    /// stepped onto and back from) are kept for [`Self::plan`]. Sets `searched` when it searched.
+    fn route_exit(
+        &mut self,
+        ask: RouteAsk,
+        cfg: &MovementConfig,
+        commit: &mut Commit,
+        searched: &mut bool,
+    ) -> Result<Option<Tile>, MoveError> {
+        let RouteAsk {
+            creep,
+            pos,
+            target,
+            range,
+            fresh,
+            search,
+        } = ask;
+        let room = pos.room_name();
+        let from = Tile::of(pos);
+        let now = self.time;
+        let (ttl, retry) = route_ages(cfg);
+        if fresh {
+            // On a retry the creep's own route is what failed it.
+            if let Some(nav) = nav_for(&mut self.navs, creep) {
+                nav.route = None;
+            }
+        } else {
+            if let Some(nav) = nav_for(&mut self.navs, creep) {
+                if let Some((id, leg)) = nav.route {
+                    let on = self
+                        .routes
+                        .get(id, now)
+                        .filter(|r| r.target == target && r.range == range)
+                        .and_then(|r| r.legs.get(usize::from(leg)))
+                        .filter(|l| l.room == room);
+                    match on {
+                        Some(l) => return Ok(l.exit),
+                        None => nav.route = None,
+                    }
+                }
+                if let Some((r0, t0, g0, at)) = nav.no_route
+                    && r0 == room
+                    && t0 == target
+                    && g0 == range
+                {
+                    if now.wrapping_sub(at) <= retry {
+                        return Err(MoveError::NoPath);
+                    }
+                    nav.no_route = None;
+                }
+            }
+        }
+        if !search
+            && let Some((id, leg, exit)) =
+                self.reachable_route(room, from, (target, range), commit, ttl)
+        {
+            if let Some(nav) = nav_for(&mut self.navs, creep) {
+                nav.route = Some((id, leg));
+            }
+            return Ok(Some(exit));
+        }
+        // A target in a room no creep could cross into: no search can get there (the room
+        // callback blocks it, so PathFinder would spend all its ops).
+        if self.closed.iter().any(|&(c, _)| c == target.room_name()) {
+            if let Some(nav) = nav_for(&mut self.navs, creep) {
+                nav.no_route = Some((room, target, range, now));
+            }
+            self.tick.route_failures += 1;
+            return Err(MoveError::NoPath);
+        }
+        let Self {
+            rooms,
+            closed,
+            dips,
+            router,
+            routes,
+            route_path,
+            route_legs: legs,
+            path_dips,
+            navs,
+            tick,
+            ..
+        } = self;
+        let Some(router) = router.as_mut() else {
+            return Err(MoveError::OtherRoom);
+        };
+        let p = profile(cfg);
+        let query = RouteQuery {
+            from: pos,
+            to: target,
+            range: route::pathfinder_range(target, range),
+            plain_cost: p.plain,
+            swamp_cost: p.swamp,
+            max_ops: cfg.route_max_ops,
+            max_rooms: cfg.route_max_rooms,
+        };
+        let mut found = false;
+        for attempt in 0..2 {
+            // Only this search's dips count (a failed search leaves none behind).
+            path_dips.clear();
+            commit.heavy();
+            *searched = true;
+            tick.routes += 1;
+            let known = RouteRooms {
+                rooms: rooms.as_slice(),
+                closed: closed.as_slice(),
+                dips: dips.as_slice(),
+            };
+            let outcome = router.search(&query, &known, route_path);
+            found = outcome == RouteOutcome::Found
+                && route::route_legs(pos, route_path, target.room_name(), legs, path_dips);
+            if found || path_dips.is_empty() || attempt > 0 {
+                break;
+            }
+            // A path that only works by stepping onto an edge of this room and back (it never
+            // leaves the room): avoid those tiles and search once more. Edge tiles elsewhere on the
+            // path do not stop it.
+            let until = now.saturating_add(ttl);
+            let mut learned = false;
+            for &(dr, dt) in path_dips.iter().filter(|&&(dr, _)| dr == room) {
+                if !dips.iter().any(|&(r0, t0, _)| r0 == dr && t0 == dt) {
+                    dips.push((dr, dt, until));
+                    tick.route_dips += 1;
+                    learned = true;
+                }
+            }
+            if !learned {
+                break;
+            }
+        }
+        let nav = nav_for(navs, creep);
+        if !found {
+            tick.route_failures += 1;
+            if let Some(nav) = nav {
+                nav.route = None;
+                nav.no_route = Some((room, target, range, now));
+            }
+            return Err(MoveError::NoPath);
+        }
+        let known = RouteRooms {
+            rooms: rooms.as_slice(),
+            closed: closed.as_slice(),
+            dips: dips.as_slice(),
+        };
+        for leg in legs.iter_mut() {
+            leg.version = known.grid(leg.room).map_or(0, |(_, v)| v);
+        }
+        let first = legs.first().and_then(|l| l.exit);
+        let id = routes.add(target, range, legs, now);
+        if let Some(nav) = nav {
+            nav.route = Some((id, 0));
+            nav.no_route = None;
+        }
+        Ok(first)
+    }
+
+    /// A leg in `room` of a kept route to the target whose exit the creep at `from` can reach in the
+    /// room's grid (its exit field reaches the creep's tile, or a tile beside it for a creep on an
+    /// edge): the one with the shortest way to its exit, a later leg on a tie (a later visit's
+    /// suffix is part of an earlier one's). The creep joins the route there. Building a field to
+    /// check is a heavy unit.
+    fn reachable_route(
+        &mut self,
+        room: RoomName,
+        from: Tile,
+        (target, range): (Position, u8),
+        commit: &mut Commit,
+        ttl: u32,
+    ) -> Option<(RouteId, u16, Tile)> {
+        let now = self.time;
+        let Self {
+            rooms,
+            fields,
+            routes,
+            route_picks,
+            tick,
+            ..
+        } = self;
+        route_picks.clear();
+        route_picks.extend(routes.through(room, target, range, now, ttl));
+        if route_picks.is_empty() {
+            return None;
+        }
+        let r = find_room(rooms, room)?;
+        let grid = r.grid.as_ref()?;
+        let mut best: Option<(u32, RouteId, u16, Tile)> = None;
+        for &(id, leg, exit) in route_picks.iter() {
+            let aim = Aim::Exit(Goal {
+                tile: exit,
+                range: 0,
+            });
+            let (field, built) = fields.get(room, aim, grid, r.version, now);
+            if built {
+                tick.fields_built += 1;
+                commit.heavy();
+            }
+            let dist = if grid.walkable(from) {
+                Some(field.distance(from))
+                    .filter(|&d| d != UNREACHED)
+                    .map(u32::from)
+            } else {
+                let steps = field.ranked_steps(grid, from);
+                (!steps.is_empty()).then_some(steps.total)
+            };
+            if let Some(d) = dist
+                && best.is_none_or(|(b, _, bl, _)| d < b || (d == b && leg > bl))
+            {
+                best = Some((d, id, leg, exit));
+            }
+        }
+        let (_, id, leg, exit) = best?;
+        let _ = routes.get(id, now);
+        Some((id, leg, exit))
+    }
+
     /// Builds the room's grid if it is missing or out of date, or (the naive baseline, the grid
     /// cache off) on every tick. False when the room has no terrain or no scan yet.
     fn ensure_grid(&mut self, ri: usize, cfg: &MovementConfig) -> bool {
@@ -1164,10 +1817,11 @@ impl Movement {
             r.grid
                 .get_or_insert_with(CostGrid::default)
                 .build(terrain, objects, p);
-            r.version = match r.version.wrapping_add(1) {
+            self.builds = match self.builds.wrapping_add(1) {
                 0 => 1,
                 v => v,
             };
+            r.version = self.builds;
             r.dirty = false;
             r.built_with = Some(p);
             r.built_at = now;
@@ -1189,20 +1843,42 @@ fn find_room(rooms: &mut [RoomNav], name: RoomName) -> Option<&mut RoomNav> {
 /// more than the detour can save and a gap that keeps opening and closing would make it shuttle.
 const DETOUR_DROP_RANGE: u8 = 2;
 
+/// Whether `field` reaches a tile beside one of the room's open exits: a way into the room from a
+/// neighbour leads to the field's goal. Without one, no route out of the room and back in helps.
+fn reaches_an_exit(field: &FlowField, grid: &CostGrid) -> bool {
+    (0..ROOM_AREA)
+        .filter_map(Tile::from_index)
+        .filter(|&t| grid.open_exit(t))
+        .any(|e| {
+            e.neighbors()
+                .any(|(_, n)| grid.walkable(n) && field.distance(n) != UNREACHED)
+        })
+}
+
+/// The walkable tiles beside `from` (an edge tile), cheapest first (direction order on ties), as
+/// steps: the way off the edge for a creep that has no way on.
+fn inward_steps(grid: &CostGrid, from: Tile) -> Steps {
+    let mut best: [(u8, usize, Option<Tile>); 8] = [(u8::MAX, 0, None); 8];
+    for (i, (_, t)) in from.neighbors().enumerate() {
+        if grid.walkable(t)
+            && let Some(slot) = best.get_mut(i)
+        {
+            *slot = (grid.cost(t), i, Some(t));
+        }
+    }
+    best.sort_unstable();
+    Steps::from_tiles(best.iter().filter_map(|&(_, _, t)| t), 0)
+}
+
 /// A plan that keeps the creep on its tile: never shoved.
 fn pinned(at: Tile) -> Plan {
     Plan::Hold(Some(Goal { tile: at, range: 0 }))
 }
 
-/// Whether some walkable tile within the goal's range has no creep on it (`blocked`).
-fn goal_has_free_tile(grid: &CostGrid, goal: Goal, blocked: impl Fn(Tile) -> bool) -> bool {
-    let (gx, gy, r) = (goal.tile.x(), goal.tile.y(), goal.range);
-    let last = ROOM_SIZE - 1;
-    (gx.saturating_sub(r)..=gx.saturating_add(r).min(last)).any(|x| {
-        (gy.saturating_sub(r)..=gy.saturating_add(r).min(last))
-            .filter_map(|y| Tile::new(x, y))
-            .any(|t| grid.walkable(t) && !blocked(t))
-    })
+/// The ages after which a cached route (`route_ttl_ticks`) and a cached failure
+/// (`route_retry_ticks`) are searched again.
+fn route_ages(cfg: &MovementConfig) -> (u32, u32) {
+    (cfg.route_ttl_ticks.max(1), cfg.route_retry_ticks.max(1))
 }
 
 /// The creep's state, reset when its slot now holds another creep. `None` only if the slot index
@@ -1216,6 +1892,12 @@ fn nav_for(navs: &mut Vec<Nav>, h: CreepHandle) -> Option<&mut Nav> {
     if nav.handle != Some(h) {
         nav.handle = Some(h);
         nav.goal = None;
+        nav.room = None;
+        nav.came_from = None;
+        nav.crossed_at = None;
+        nav.requested_at = None;
+        nav.route = None;
+        nav.no_route = None;
         nav.expected = None;
         nav.stuck = 0;
         nav.unexplained = 0;
@@ -1254,3 +1936,6 @@ fn set_want(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod route_tests;

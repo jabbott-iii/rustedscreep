@@ -87,6 +87,7 @@ The live server's constants are the ground truth for that server. At init, the b
 | Runtime config in the sandbox (the plain build's overrides across four globals: refusals, clamps, the record, log level, naive toggle) | `node js/tools/config-sim.mjs` |
 | Constants self-check in the sandbox (the plain build against the engine fixture: read path, drift, the line cap, no constants, low bucket) | `node js/tools/consts-sim.mjs` |
 | Movement in the sandbox (the plain build: terrain and scan cadence, a console move order with engine-checked moves) | `node js/tools/move-sim.mjs` |
+| Inter-room routes in the sandbox (the plain build with a PathFinder model: a cross-room order, room callback answers, a search that throws) | `node js/tools/route-sim.mjs` |
 | Regenerate the engine-constants fixture from an engine's `lib/constants.js` | `node js/tools/consts-fixture.mjs <path> <version>` |
 | Tool tests (Node) / sizes and upload budget | `npm run test` / `npm run size` |
 | Full gate (same as `/check`) | `npm run check` |

@@ -68,7 +68,7 @@ export interface Glue {
    * Sets the console's move order: own creeps in `room` walk to within `range` of (x, y) from the next tick. With
    * every argument undefined it cancels the order. Returns the outcome (P2 movement).
    */
-  moveTo?: (room?: string, x?: number, y?: number, range?: number) => string;
+  moveTo?: (room?: string, x?: number, y?: number, range?: number, from?: string) => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -573,21 +573,22 @@ export class Loader {
   }
 
   /**
-   * Console command `rustedscreep.moveTo(room, x, y, range)`: own creeps in `room` walk to within `range` (1 when
-   * omitted) of (x, y), until all are in range; `rustedscreep.moveTo()` cancels. Only a room name string and whole
-   * numbers from 0 to 49 reach the wasm.
+   * Console command `rustedscreep.moveTo(room, x, y, range, from)`: own creeps in `from` (`room` when omitted) walk
+   * to within `range` (1 when omitted) of (x, y) in `room`, across rooms if need be, until all are in range;
+   * `rustedscreep.moveTo()` cancels. Only room name strings and whole numbers from 0 to 49 reach the wasm.
    */
-  moveTo(room: unknown, x: unknown, y: unknown, range: unknown): string {
+  moveTo(room: unknown, x: unknown, y: unknown, range: unknown, from?: unknown): string {
     const call = this.glue.moveTo;
     if (!call) return 'rustedscreep: this build has no moveTo export';
-    if (room === undefined && x === undefined && y === undefined && range === undefined) {
+    if (room === undefined && x === undefined && y === undefined && range === undefined && from === undefined) {
       return this.guarded('moveTo', 'move order', () => call());
     }
     const coord = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 49;
-    if (typeof room !== 'string' || !coord(x) || !coord(y) || !(range === undefined || coord(range))) {
-      return 'rustedscreep: give a room name and x, y (and a range) from 0 to 49, for example rustedscreep.moveTo("W1N1", 25, 25, 1); rustedscreep.moveTo() cancels';
+    const fromOk = from === undefined || typeof from === 'string';
+    if (typeof room !== 'string' || !coord(x) || !coord(y) || !(range === undefined || coord(range)) || !fromOk) {
+      return 'rustedscreep: give a room name and x, y (and a range) from 0 to 49, and optionally the room the creeps start in, for example rustedscreep.moveTo("W1N1", 25, 25, 1) or rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1"); rustedscreep.moveTo() cancels';
     }
-    return this.guarded('moveTo', 'move order', () => call(room, x, y, range));
+    return this.guarded('moveTo', 'move order', () => call(room, x, y, range, from));
   }
 
   /** Calls a wasm summary export for a console command (see `guarded`). */

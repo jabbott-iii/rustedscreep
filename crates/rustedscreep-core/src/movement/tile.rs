@@ -87,6 +87,44 @@ impl Tile {
         x == 0 || y == 0 || x == ROOM_SIZE - 1 || y == ROOM_SIZE - 1
     }
 
+    /// The side of the room an edge tile is on, or `None` for an inner tile or a corner (a corner
+    /// is on two sides, so which room it leads to is ambiguous; inter-room routes never use one).
+    ///
+    /// Uses: `ROOM_SIZE`.
+    pub const fn side(self) -> Option<Side> {
+        let (x, y, last) = (self.x(), self.y(), ROOM_SIZE - 1);
+        let corner = (x == 0 || x == last) && (y == 0 || y == last);
+        if corner {
+            None
+        } else if y == 0 {
+            Some(Side::Top)
+        } else if x == last {
+            Some(Side::Right)
+        } else if y == last {
+            Some(Side::Bottom)
+        } else if x == 0 {
+            Some(Side::Left)
+        } else {
+            None
+        }
+    }
+
+    /// The tile a creep that ends a tick on this edge tile lands on in the next room: the mirrored
+    /// tile, the other coordinate kept (x 0 to 49, x 49 to 0, y 0 to 49, y 49 to 0; V151). `None`
+    /// off the edge and on a corner.
+    ///
+    /// Uses: `ROOM_SIZE`.
+    pub const fn across(self) -> Option<Self> {
+        let (x, y, last) = (self.x(), self.y(), ROOM_SIZE - 1);
+        match self.side() {
+            Some(Side::Top) => Self::new(x, last),
+            Some(Side::Bottom) => Self::new(x, 0),
+            Some(Side::Left) => Self::new(last, y),
+            Some(Side::Right) => Self::new(0, y),
+            None => None,
+        }
+    }
+
     /// The neighbour in direction `d`, or `None` past the room's edge.
     #[inline]
     pub fn step(self, d: Direction) -> Option<Self> {
@@ -120,6 +158,30 @@ impl Tile {
             .zip(OFFSETS)
             .find(|&(_, (ox, oy))| i16::from(ox) == dx && i16::from(oy) == dy)
             .map(|(d, _)| d)
+    }
+}
+
+/// A side of a room, where its exits are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Side {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+impl Side {
+    pub const ALL: [Self; 4] = [Self::Top, Self::Right, Self::Bottom, Self::Left];
+
+    /// The offset of the room across this side, for `RoomName::checked_add`: x grows to the east and
+    /// y to the south, as in tile coordinates.
+    pub const fn room_offset(self) -> (i32, i32) {
+        match self {
+            Self::Top => (0, -1),
+            Self::Right => (1, 0),
+            Self::Bottom => (0, 1),
+            Self::Left => (-1, 0),
+        }
     }
 }
 
@@ -207,6 +269,37 @@ mod tests {
             // An edge tile has fewer than 8 neighbours inside the room, an inner tile has 8.
             assert_eq!(t.is_edge(), t.neighbors().count() < 8, "{t:?}");
         }
+    }
+
+    /// Uses: ROOM_SIZE. Every edge tile but the 4 corners is on one side, ROOM_SIZE - 2 per side;
+    /// `across` is the mirrored tile on the opposite side with the other coordinate kept (V151), and
+    /// crossing back returns the same tile.
+    #[test]
+    fn edge_tiles_have_a_side_and_a_tile_across() {
+        let last = ROOM_SIZE - 1;
+        for side in Side::ALL {
+            let on_side = every_tile().filter(|t| t.side() == Some(side)).count();
+            assert_eq!(on_side, usize::from(ROOM_SIZE - 2), "{side:?}");
+        }
+        for t in every_tile() {
+            let corner = (t.x() == 0 || t.x() == last) && (t.y() == 0 || t.y() == last);
+            assert_eq!(t.side().is_some(), t.is_edge() && !corner, "{t:?}");
+            let Some(side) = t.side() else {
+                assert_eq!(t.across(), None, "{t:?}");
+                continue;
+            };
+            let a = t.across().expect("across");
+            assert_eq!(a.across(), Some(t), "{t:?}");
+            let (dx, dy) = side.room_offset();
+            // The landing tile is on the opposite side, so the offset back is the negation.
+            assert_eq!(a.side().map(Side::room_offset), Some((-dx, -dy)), "{t:?}");
+            match side {
+                Side::Top | Side::Bottom => assert_eq!(a.x(), t.x()),
+                Side::Left | Side::Right => assert_eq!(a.y(), t.y()),
+            }
+        }
+        assert_eq!(Tile::new(last, 7).and_then(Tile::across), Tile::new(0, 7));
+        assert_eq!(Tile::new(7, 0).and_then(Tile::across), Tile::new(7, last));
     }
 
     #[test]

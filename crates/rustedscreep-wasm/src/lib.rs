@@ -24,6 +24,7 @@ mod logging;
 mod movement;
 mod persist;
 mod profiler;
+mod route;
 mod scheduler;
 mod snapshot;
 
@@ -204,14 +205,25 @@ pub fn movement_summary() -> String {
         .unwrap_or_else(|_| String::from("rustedscreep movement: state unavailable"))
 }
 
-/// Exported to JS as `moveTo`, for `rustedscreep.moveTo(room, x, y, range)`: from the next tick, every
-/// own creep in `room` without a request of its own walks to within `range` (1 when omitted) of
-/// (x, y), until all of them are in range on one tick. With no room it cancels the order.
+/// Exported to JS as `moveTo`, for `rustedscreep.moveTo(room, x, y, range, from)`: from the next tick,
+/// every own creep in `from` (`room` when omitted) without a request of its own walks to within
+/// `range` (1 when omitted) of (x, y) in `room`, across rooms if need be (P2.2), until all of them
+/// are in range on one tick. With no room it cancels the order.
 #[wasm_bindgen(js_name = "moveTo")]
-pub fn move_to(room: Option<String>, x: Option<u32>, y: Option<u32>, range: Option<u32>) -> String {
+pub fn move_to(
+    room: Option<String>,
+    x: Option<u32>,
+    y: Option<u32>,
+    range: Option<u32>,
+    from: Option<String>,
+) -> String {
     STATE
         .try_with(|cell| match cell.try_borrow_mut() {
-            Ok(mut state) => state.movement.set_order(room.as_deref(), x, y, range),
+            Ok(mut state) => {
+                state
+                    .movement
+                    .set_order(room.as_deref(), (x, y, range), from.as_deref())
+            }
             Err(_) => String::from("rustedscreep moveTo: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep moveTo: state unavailable"))
