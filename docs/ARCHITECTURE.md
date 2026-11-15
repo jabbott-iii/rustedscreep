@@ -65,8 +65,11 @@ Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and o
    probation) and to the act counters (`ActLog::record_structure`, billed on OK, V34); a throw is a fault under job `spawn act` and a
    warning with the JS error's message; an OK logs one info line ("accepted": the processor may still drop the order, V173; the
    console's request stands again when no creep of the order's identity is in the next snapshot). A successful call makes the
-   engine read `Memory` and write `Memory.creeps[name]` (V172; ADR-018, proposed); with a `Memory` that does not parse every such
-   call throws instead (V172; ADR-019, proposed). The bot's code does not touch `Memory`. No orders, no call.
+   engine read `Memory` and write `Memory.creeps[name]` (V181); the step then deletes that entry, 8 JS calls, so the end-of-tick
+   save never stores it (ADR-018, V180). With a raw `Memory` that does not parse every such call throws instead (V181): the step
+   resets the raw string to `{}` with `RawMemory.set` (kept by the end-of-tick save, V180), warns, notifies once per global,
+   releases the spawn so it tries again next tick, and calls none of the tick's other orders (ADR-019). These are the tick path's
+   only `Memory` writes; it never reads `Memory` for state. No orders, no call.
 8. The persistence output step (P1.9; while the tick runs the Standard tier): dirty records are written (the config record after a
    console change, P1.10) and the active set is issued when the manager asks; see section 5. Then the fault reports queued this tick
    (jobs' and the act step's) go out through `log::warn!` (`logging.rs`: `log` macros and a minimal logger that prints with
@@ -157,7 +160,7 @@ pattern, repeat cap, `EnergyBudget::Capacity` to wait for the room's capacity or
 priority); `close` keeps the rooms with a request and a ready spawn as the Critical `spawn` job's units; `plan_room` gives the room's
 ready spawns, in id order with those on probation last, its requests in priority order, keeping the energy left over the orders because the runtime checks
 each call against the same tick-start `energyAvailable` and the processor silently drops a second order the first one starved
-(V172, V173); a request that must wait for energy stops the room, so nothing below it spends the energy; one with no body that
+(V181, V173); a request that must wait for energy stops the room, so nothing below it spends the energy; one with no body that
 fits the room's capacity (a repeat above it, or no repeat allowed) is skipped whatever its budget, so it never blocks the room. `record` holds a spawn after a refused call, then keeps it on probation until a call of its own is accepted. The snapshot gained `RoomEnergy` per room, `Spawns` (handle,
 structure row, busy) and the creep identity column; `ActLog::record_structure` counts a structure's call. rustedscreep-wasm's
 `spawn.rs` binds `spawnCreep`, runs the job, issues the orders (§1 step 7a) and answers `rustedscreep.spawner()` and
@@ -289,7 +292,9 @@ Current state (P1.10; the manager and the frame are P1.9, ADR-004):
   until no own creep carries it: at least `CREEP_LIFE_TIME` + `MAX_CREEP_SIZE` × `CREEP_SPAWN_TIME` ticks after the last old-form
   order (the life clock starts when the creep leaves the spawn, V170), longer while a spawn's exits are blocked, unbounded once
   creeps are renewed. A name that does not parse gives no identity, never an error. `spawnCreep` itself writes
-  `Memory.creeps[name]` (V172); ADR-018 (proposed) decides what to do with those entries.
+  `Memory.creeps[name]` (V181), and the act step deletes each such entry in the same tick (ADR-018), so `Memory` does not grow
+  with the creeps spawned. A raw `Memory` that does not parse is reset to `{}` when it makes a spawn order throw (ADR-019, V180):
+  its content, the loader's record included, is lost (it was unreadable).
 
 ## 6. Failure handling
 _P1._ Error isolation boundaries, loader recovery (ADR-003), reset behavior, respawn, shard travel, missing Memory.

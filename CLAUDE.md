@@ -68,7 +68,7 @@ The live server's constants are the ground truth for that server. At init, the b
 - Persistence:
   - Rust statics are lost on a global reset and must rebuild cheaply.
   - Persist only what must survive a reset. Use a versioned compact binary format in RawMemory segments, written only when dirty.
-  - Keep the tick path off `Memory`.
+  - Keep the tick path off `Memory`: never read it for state. The only writes undo `spawnCreep`'s `Memory.creeps[name]` entry and reset a `Memory` that does not parse (ADR-018, ADR-019).
   - Missing or corrupt data triggers a rebuild, never a crash.
 
 ## Commands (P1 created most of these; the API tools come in P2, ADR-017; update this table if they change)
@@ -80,7 +80,7 @@ The live server's constants are the ground truth for that server. At init, the b
 | Benches (native only) | `cargo bench -p rustedscreep-core` |
 | Install the pinned wasm-opt (binaryen version_133) into `.tools/` | `npm run setup:binaryen` |
 | Release build (wasm + wasm-opt + Rollup to `dist/`); a trap-test or profiler variant | `npm run build` / `npm run build -- --features trap-test` (or `profiler`) |
-| Trap recovery in the sandbox (10 traps, both ADR-003 modes) | `node js/tools/trap-sim.mjs` |
+| Trap recovery in the sandbox (10 traps, both ADR-003 modes; one trap after a repaired `Memory`) | `node js/tools/trap-sim.mjs` |
 | Act layer in the sandbox (the `act-test` build's scripted intents) | `node js/tools/act-sim.mjs` |
 | Profiler in the sandbox (the `profiler` build over six windows, stats segment and write failures) | `node js/tools/profiler-sim.mjs` |
 | Persistence in the sandbox (the plain build's self-test: round trips, corrupt segments, console overrides, the save cap) | `node js/tools/persist-sim.mjs` |
@@ -88,7 +88,7 @@ The live server's constants are the ground truth for that server. At init, the b
 | Constants self-check in the sandbox (the plain build against the engine fixture: read path, drift, the line cap, no constants, low bucket) | `node js/tools/consts-sim.mjs` |
 | Movement in the sandbox (the plain build: terrain and scan cadence, a console move order with engine-checked moves) | `node js/tools/move-sim.mjs` |
 | Inter-room routes in the sandbox (the plain build with a PathFinder model: a cross-room order, room callback answers, a search that throws) | `node js/tools/route-sim.mjs` |
-| Spawn path in the sandbox (the plain build with two spawns: a console request, energy waits, a refused call's hold, the body and name passed, a dropped order re-armed) | `node js/tools/spawn-sim.mjs` |
+| Spawn path in the sandbox (the plain build with two spawns: a console request, energy waits, a refused call's hold, the body and name passed, a dropped order re-armed, the `Memory` entry delete and reset of ADR-018 and ADR-019) | `node js/tools/spawn-sim.mjs` |
 | Regenerate the engine-constants fixture from an engine's `lib/constants.js` | `node js/tools/consts-fixture.mjs <path> <version>` |
 | Tool tests (Node) / sizes and upload budget | `npm run test` / `npm run size` |
 | Full gate (same as `/check`) | `npm run check` |

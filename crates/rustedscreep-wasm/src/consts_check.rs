@@ -34,7 +34,7 @@ extern "C" {
     /// `globalThis`, the object that holds the game constants (V129); `None` if the name is
     /// undefined. The glue reads it as `typeof globalThis === 'undefined' ? undefined : globalThis`.
     #[wasm_bindgen(thread_local_v2, js_name = globalThis)]
-    static GLOBAL_THIS: Option<Object>;
+    pub(crate) static GLOBAL_THIS: Option<Object>;
 
     /// `Object.getOwnPropertyNames(obj)`. Local and `catch`: js-sys's binding has no `catch`, so a
     /// throw there would trap (V130).

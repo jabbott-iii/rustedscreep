@@ -19,7 +19,15 @@
 //   that order, and on the next tick the request stands again (one warning) and is spawned;
 // - the console's refusals (not a room name, an unknown role, a number), a request for a room with no own spawn (a
 //   note, counted as `no spawn`), and cancels; `rustedscreep.spawner()` reports the room, the totals, the last
-//   accepted call and failure and the own creeps by home and role; no fault, trap or halt.
+//   accepted call and failure and the own creeps by home and role;
+// - ADR-018: the harness's spawnCreep writes `Memory.creeps[name]` on every OK, as the engine's runtime does (V181),
+//   and the stored Memory string never holds one of them (the bot deletes each entry in the same tick, V180), while
+//   an entry another script wrote (seeded in Memory) stays;
+// - ADR-019: with the raw Memory set to a string that does not parse (from the console), the harness's spawnCreep
+//   throws as the engine's does on a null Memory (V181); the bot logs the message, resets the raw string to `{}`
+//   (RawMemory.set, kept by the end-of-tick save, V180), notifies once and spawns on the next tick; a later throw
+//   with a usable Memory resets nothing and holds the spawn; the two throws' fault lines are the only faults; no trap
+//   or halt.
 // npm run check runs it (row 18); standalone: node js/tools/spawn-sim.mjs [dir].
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
@@ -68,7 +76,22 @@ const NO_SPAWN_AT = CANCEL_AT + 1;
 const LAST_SUMMARY_AT = NO_SPAWN_AT + 1;
 const CANCEL2_AT = LAST_SUMMARY_AT + 1;
 const END_CANCEL_AT = CANCEL2_AT + 1;
-const TICKS = END_CANCEL_AT + 1;
+/** The stored Memory after the end of this tick holds every entry the bot did not delete so far. */
+const MEMORY_CHECK_AT = END_CANCEL_AT + 1;
+/** SpawnB, accepted at THIRD, is free again here; the last request and the corrupt Memory come just before. */
+const B_FREE2 = THIRD + SPAWN_TIME;
+const REQUEST_AT = B_FREE2 - 2;
+const CORRUPT_AT = B_FREE2 - 1;
+const THROWN = B_FREE2;
+const RESPAWNED = THROWN + 1;
+const FINAL_SUMMARY_AT = RESPAWNED;
+/** SpawnA, accepted at REARMED, is free again here; its next call throws with a usable Memory. */
+const OTHER_THROW = REARMED + SPAWN_TIME;
+const REQUEST2_AT = OTHER_THROW - 1;
+const HELD_AGAIN_AT = OTHER_THROW + 1;
+const TICKS = HELD_AGAIN_AT + 1;
+/** Memory at the start: another script's creep entry, which the bot must leave alone (ADR-018). */
+const SEEDED = { creeps: { Probe1: { keep: 1 } } };
 
 const ORDER_CMD = `rustedscreep.spawn("${ROOM}")`;
 const ROLE_CMD = `rustedscreep.spawn("${ROOM}", "worker")`;
@@ -78,6 +101,8 @@ const BAD_ROLE_CMD = `rustedscreep.spawn("${ROOM}", "hauler")`;
 const BAD_ARG_CMD = 'rustedscreep.spawn(5)';
 const CANCEL_CMD = 'rustedscreep.spawn()';
 const SUMMARY_CMD = 'rustedscreep.spawner()';
+const BAD_MEMORY = '{"oops":';
+const CORRUPT_CMD = `RawMemory.set('${BAD_MEMORY}')`;
 
 const pos = (x, y) => ({ x, y, roomName: ROOM, __packedPos: packPos(ROOM, x, y) });
 const id = (n) => `5bbcaa9099f9b0a0f7f4d${n.toString(16).padStart(3, '0')}`;
@@ -94,6 +119,10 @@ function makeWorld() {
     accepted: [],
     nextId: 100,
     errors: [],
+    /** [offset, name] of every `Memory.creeps` entry the harness's spawnCreep wrote. */
+    entries: [],
+    /** The sandbox global, for the tick's `Memory` (set by simulate's `setup`). */
+    context: null,
   };
   const spawn = (n, name, x) => ({ id: id(n), name, structureType: 'spawn', my: true, x, busyFrom: -1, busyUntil: -1 });
   // In Game.structures order: B (the higher id) first.
@@ -116,7 +145,20 @@ function sceneFor(state, offset) {
       spawnCreep(...args) {
         const [body, name] = args;
         state.calls.push({ offset, spawn: this.name, args: args.length, isArray: Array.isArray(body), body: Array.isArray(body) ? [...body] : body, name });
+        // A failure that has nothing to do with Memory (ADR-019 must not reset a usable Memory for it).
+        if (offset === OTHER_THROW) throw new RangeError('scripted failure');
         const r = state.returns.shift() ?? 0;
+        if (r === 0) {
+          // The runtime's success path (structures.js L1122-1130, V181): it reads Memory.creeps, which throws on a
+          // null Memory before anything is recorded, and writes the creep's entry.
+          const mem = state.context.Memory;
+          if (mem === null) throw new TypeError("Cannot read properties of null (reading 'creeps')");
+          if (mem.creeps === undefined) mem.creeps = {};
+          if (mem.creeps && typeof mem.creeps === 'object') {
+            mem.creeps[name] = mem.creeps[name] || {};
+            state.entries.push([offset, name]);
+          }
+        }
         // At DROP_AT the processor drops the accepted order: no charge, no creep, the spawn stays free (V173).
         if (r === 0 && offset !== DROP_AT) state.accepted.push({ offset, spawn: s, body: [...body], name });
         return r;
@@ -152,33 +194,47 @@ function advance(state, offset) {
       c.y = 26;
     }
   }
-  if (offset === FILL_AT || offset === REFILL_AT || offset === REFILL2_AT) state.energy = CAPACITY;
+  if ([FILL_AT, REFILL_AT, REFILL2_AT, CORRUPT_AT, REQUEST2_AT].includes(offset)) state.energy = CAPACITY;
 }
 
 const COMMANDS = {
   [ORDER_AT]: ORDER_CMD, [AGAIN_AT]: ROLE_CMD, [BAD_ROOM_AT]: BAD_ROOM_CMD, [BAD_ROLE_AT]: BAD_ROLE_CMD,
   [BAD_ARG_AT]: BAD_ARG_CMD, [HELD_SUMMARY_AT]: SUMMARY_CMD, [SUMMARY_AT]: SUMMARY_CMD, [LATE_AT]: ORDER_CMD,
   [SETUP_AT]: ORDER_CMD, [CANCEL_AT]: CANCEL_CMD, [NO_SPAWN_AT]: NO_SPAWN_CMD, [LAST_SUMMARY_AT]: SUMMARY_CMD,
-  [CANCEL2_AT]: CANCEL_CMD, [END_CANCEL_AT]: CANCEL_CMD,
+  [CANCEL2_AT]: CANCEL_CMD, [END_CANCEL_AT]: CANCEL_CMD, [REQUEST_AT]: ORDER_CMD, [CORRUPT_AT]: CORRUPT_CMD,
+  [FINAL_SUMMARY_AT]: SUMMARY_CMD, [REQUEST2_AT]: ORDER_CMD, [HELD_AGAIN_AT]: SUMMARY_CMD,
 };
 
 export function spawnSim(dir = join(ROOT, 'dist')) {
   const state = makeWorld();
+  let memoryAtCheck = null;
   const world = simulate(dir, {
     ticks: TICKS,
+    memoryJson: JSON.stringify(SEEDED),
+    setup: (context) => {
+      state.context = context;
+    },
     scene: (offset) => sceneFor(state, offset),
     command: (w) => {
       const offset = w.ticksRun;
       advance(state, offset);
+      // What the end of tick MEMORY_CHECK_AT - 1 stored (this tick's save comes after the command).
+      if (offset === MEMORY_CHECK_AT) memoryAtCheck = w.memoryJson;
       return COMMANDS[offset] ?? null;
     },
   });
   const problems = [...state.errors];
-  const warn = world.logs.filter((l) => l.includes('fault') || l.includes('[error]') || l.includes('trapped'));
+  const thrownFaults = [THROWN, OTHER_THROW].map((o) => `rustedscreep fault at tick ${T0 + o}: job spawn act unit `);
+  const expectedFault = (l) => thrownFaults.some((p) => l.startsWith(p));
+  const warn = world.logs.filter((l) => (l.includes('fault') && !expectedFault(l)) || l.includes('[error]') || l.includes('trapped'));
   problems.push(...warn.map((l) => `log: ${l}`));
+  const faults = world.logs.filter(expectedFault);
+  if (faults.length !== 2 || !faults.every((f) => f.endsWith(': the spawnCreep call threw'))) problems.push(`spawn act faults ${JSON.stringify(faults)}, expected two "the spawnCreep call threw"`);
   if (world.halts) problems.push(`${world.halts} halt(s)`);
-  if (Object.keys(COMMANDS).length !== 14) problems.push('two commands share a tick');
+  if (Object.keys(COMMANDS).length !== 19) problems.push('two commands share a tick');
+  if (!(RESPAWNED < REQUEST2_AT && OTHER_THROW < RESPAWNED + SPAWN_TIME)) problems.push('the scenario lost its timing: SpawnA must free while SpawnB is busy');
   if (!(A_READY === QUIET && B_FREE < THIRD)) problems.push('the scenario lost its timing: SpawnA must become ready on the quiet tick');
+  if (!(MEMORY_CHECK_AT < REQUEST_AT && B_FREE2 < REARMED + SPAWN_TIME)) problems.push('the scenario lost its timing: SpawnB must free before SpawnA for the Memory phase');
 
   // The calls: the lower id refused; the other spawn the next tick, and again once it is free and the room full (the
   // lower id still held); nothing on the quiet tick; the third request to the lower id (on probation), dropped by
@@ -189,6 +245,9 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
     { offset: THIRD, spawn: 'SpawnB', name: nameAt(THIRD) },
     { offset: DROP_AT, spawn: 'SpawnA', name: nameAt(DROP_AT) },
     { offset: REARMED, spawn: 'SpawnA', name: nameAt(REARMED) },
+    { offset: THROWN, spawn: 'SpawnB', name: nameAt(THROWN) },
+    { offset: RESPAWNED, spawn: 'SpawnB', name: nameAt(RESPAWNED) },
+    { offset: OTHER_THROW, spawn: 'SpawnA', name: nameAt(OTHER_THROW) },
   ];
   const got = state.calls.map((c) => ({ offset: c.offset, spawn: c.spawn, name: c.name }));
   if (JSON.stringify(got) !== JSON.stringify(want)) problems.push(`spawnCreep calls ${JSON.stringify(got)}, expected ${JSON.stringify(want)}`);
@@ -211,7 +270,7 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
   const reply = (cmd) => commandResults(world, cmd);
   const accepted = reply(ORDER_CMD).concat(reply(ROLE_CMD));
   const acceptedPrefix = `rustedscreep spawn: from the next tick, a spawn of ${ROOM} spawns one worker`;
-  if (accepted.length !== 4 || !accepted.every((r) => r.startsWith(acceptedPrefix) && !r.includes('no own spawn'))) {
+  if (accepted.length !== 6 || !accepted.every((r) => r.startsWith(acceptedPrefix) && !r.includes('no own spawn'))) {
     problems.push(`spawn replies: ${JSON.stringify(accepted)}`);
   }
   const expectReply = (cmd, part) => {
@@ -230,7 +289,7 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
 
   // Log lines: one per accepted call, and one warning when the dropped order's creep did not appear.
   const lines = world.logs.filter((l) => l.startsWith('rustedscreep spawn: w') && l.includes(' accepted ('));
-  const wantLines = [FIRST + 1, THIRD, DROP_AT, REARMED].map((o) => `rustedscreep spawn: ${nameAt(o)} accepted (${BODY.length} parts, ${BODY_COST} energy, ${SPAWN_TIME} ticks), the console's request`);
+  const wantLines = [FIRST + 1, THIRD, DROP_AT, REARMED, RESPAWNED].map((o) => `rustedscreep spawn: ${nameAt(o)} accepted (${BODY.length} parts, ${BODY_COST} energy, ${SPAWN_TIME} ticks), the console's request`);
   if (JSON.stringify(lines) !== JSON.stringify(wantLines)) problems.push(`accepted log lines ${JSON.stringify(lines)}, expected ${JSON.stringify(wantLines)}`);
   const rearm = world.logs.filter((l) => l.includes('was accepted but is not in Game.creeps'));
   const wantRearm = `rustedscreep spawn: ${nameAt(DROP_AT)} was accepted but is not in Game.creeps; the console's request stands again`;
@@ -263,12 +322,55 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
       `| own creeps: ${ROOM} worker 3, other names 1`,
     ],
   ];
+  wantParts.push([
+    `rustedscreep spawner at tick ${T0 + RESPAWNED}:`,
+    '| requests 1, orders 1 (ok 1, failed 0)',
+    `since boot: ticks ${RESPAWNED}, orders 7, ok 5, failed 2`,
+    `| last accepted ${event(RESPAWNED, 'ok')}`,
+    `| last failure ${event(THROWN, 'threw')}`,
+    '| console request: none | Memory resets 1 |',
+    // The tick's own creep is in Game.creeps from the next tick.
+    `| own creeps: ${ROOM} worker 3, other names 1`,
+  ]);
+  wantParts.push([
+    `rustedscreep spawner at tick ${T0 + HELD_AGAIN_AT}: ${ROOM} energy ${CAPACITY}/${CAPACITY}, spawns idle 0 busy 1 held 1`,
+    '| requests 1, orders 0 (ok 0, failed 0), waiting 0, unfit 0, no spawn 0, held 1 |',
+    `since boot: ticks ${HELD_AGAIN_AT}, orders 8, ok 5, failed 3`,
+    `| last failure ${event(OTHER_THROW, 'threw')}`,
+    `| console request: ${ROOM} worker | Memory resets 1 |`,
+  ]);
   if (summaries.length !== wantParts.length) problems.push(`${summaries.length} spawner summaries, expected ${wantParts.length}`);
   else {
     wantParts.forEach((parts, i) => {
       for (const p of parts) if (!summaries[i].includes(p)) problems.push(`spawner summary ${i + 1} lacks "${p}": ${summaries[i]}`);
     });
   }
+
+  // ADR-018: the harness wrote an entry on every OK with a usable Memory (the dropped order included: the runtime
+  // writes it before the processor runs); none reached a stored string.
+  const wantEntries = [FIRST + 1, THIRD, DROP_AT, REARMED, RESPAWNED];
+  if (JSON.stringify(state.entries.map(([o]) => o)) !== JSON.stringify(wantEntries)) problems.push(`Memory.creeps entries written at ${JSON.stringify(state.entries.map(([o]) => o))}, expected ${JSON.stringify(wantEntries)}`);
+  // Before the reset only the seeded entry is stored; after it (which dropped the seed with the rest) nothing.
+  for (const [label, text, want] of [['before the corruption', memoryAtCheck, SEEDED.creeps], ['at the end', world.memoryJson, {}]]) {
+    let mem = null;
+    try {
+      mem = JSON.parse(text);
+    } catch {
+      problems.push(`stored Memory ${label} does not parse: ${text}`);
+      continue;
+    }
+    if (JSON.stringify(mem?.creeps) !== JSON.stringify(want)) problems.push(`stored Memory.creeps ${label}: ${JSON.stringify(mem?.creeps)}, expected ${JSON.stringify(want)}`);
+  }
+  // ADR-019: the corrupt string from the console, then the bot's reset, both stored; one notification; the warnings.
+  const sets = JSON.stringify(world.rawSets ?? []);
+  if (sets !== JSON.stringify([[CORRUPT_AT, BAD_MEMORY], [THROWN, '{}']])) problems.push(`RawMemory.set calls ${sets}`);
+  const notices = world.notifies.filter((n) => n.includes('Memory was null'));
+  if (notices.length !== 1 || !notices[0].includes('reset to {}')) problems.push(`Memory notifications ${JSON.stringify(notices)}, expected one`);
+  const threw = world.logs.filter((l) => l.includes(`rustedscreep spawn: spawnCreep for ${nameAt(THROWN)} threw: Cannot read properties of null (reading 'creeps')`));
+  const otherThrew = world.logs.filter((l) => l.includes(`rustedscreep spawn: spawnCreep for ${nameAt(OTHER_THROW)} threw: scripted failure`));
+  if (otherThrew.length !== 1) problems.push(`${otherThrew.length} warnings for the throw with a usable Memory, expected 1`);
+  const resetLines = world.logs.filter((l) => l.includes('rustedscreep spawn: Memory is null (its raw string did not parse, or was JSON null), so spawnCreep threw; the raw Memory is reset to {} (ADR-019, reset 1 of this global)'));
+  if (threw.length !== 1 || resetLines.length !== 1) problems.push(`throw and reset warnings: ${threw.length} and ${resetLines.length}, expected 1 and 1`);
 
   if (problems.length) throw new Error(`spawn-sim:\n  ${problems.slice(0, 20).join('\n  ')}`);
   return { calls: state.calls.length, summary: summaries[1] };

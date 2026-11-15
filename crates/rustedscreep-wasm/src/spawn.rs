@@ -17,20 +17,30 @@
 //! OK means the order was recorded, not that a creep will exist: the processor can still drop it
 //! silently (a spawn beyond a just-lowered RCL's count, energy another player drained first, V173).
 //! Jobs ask again every tick; the console's request is cleared on OK and stands again if no creep
-//! of the order's identity is in the next snapshot. A successful call also writes
-//! `Memory.creeps[name]` (V172), which costs that tick a `Memory` parse and stringify and leaves
-//! an entry per creep (ADR-018, proposed); with a `Memory` that does not parse, every call that
-//! passes its checks throws instead (V172, ADR-019, proposed), which this logs with the error's
-//! message and holds the spawn. Nothing here reads `Memory`.
+//! of the order's identity is in the next snapshot.
+//!
+//! `Memory` (ADR-018, ADR-019): a successful call reads `Memory` (its parse and the end-of-tick
+//! stringify fall on that tick) and writes `Memory.creeps[name]` (V181); this then deletes that
+//! entry, so it never reaches the stored string (V180). With a null `Memory` (a raw string that
+//! does not parse, or JSON null), every call that passes its checks throws (V181): this logs the
+//! error's message, resets the raw
+//! string to `{}` (`RawMemory.set`, which the end-of-tick save keeps, V180), notifies once per
+//! global and releases the spawn, which tries again on the next tick; the tick's other orders are
+//! not called (each would throw). Nothing here reads `Memory` for state.
 //!
 //! JS calls per tick: none without orders; per order one `spawnCreep` (its glue decodes the body
 //! slice and the name string, then calls back `__wbindgen_free` for the slice, which the call's
-//! ABI encoding allocates in wasm, V178), and on OK one log line (a `String` from the logger). So
-//! an order tick allocates once per order for the body, plus the line on OK and a hold on a first
+//! ABI encoding allocates in wasm, V178), and on OK the entry's delete (8 calls: two key strings,
+//! two `Reflect.get`, two object checks, the name and `Reflect.deleteProperty`) and one log line
+//! (a `String` from the logger). A throw adds the message read (an object check, the key string,
+//! `Reflect.get`, the string copy), the `Memory` check (the key string, `Reflect.get`, a null check)
+//! and, on a null `Memory`, `RawMemory.set` and once per global `Game.notify`, with warning lines.
+//! So an order tick allocates once per order for the body, plus the line on OK and a hold on a first
 //! refusal; a tick without orders allocates nothing.
 
 use std::fmt::Write as _;
 
+use js_sys::{Object, Reflect};
 use rustedscreep_core::config::{SchedulerConfig, SpawnConfig};
 use rustedscreep_core::intents::{ActLog, Outcome, error_name};
 use rustedscreep_core::scheduler::{
@@ -44,18 +54,33 @@ use rustedscreep_core::spawning::{
 use screeps::{Part, RoomName};
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
+use crate::consts_check::GLOBAL_THIS;
 use crate::snapshot::JsWorld;
 
 #[wasm_bindgen]
 extern "C" {
-    /// A spawn, for `spawnCreep` (engine structures.js L1063-1217, V171, V172).
+    /// A spawn, for `spawnCreep` (engine structures.js L1063-1217, V171, V181).
     type SpawnActor;
 
     /// `spawnCreep(body, name)` without options. The body crosses as one slice of part indices that
     /// the glue maps to strings (V178).
     #[wasm_bindgen(method, catch, js_name = spawnCreep)]
     fn spawn_creep(this: &SpawnActor, body: &[Part], name: &str) -> Result<f64, JsValue>;
+
+    /// `RawMemory.set(value)`: stores the raw `Memory` string; throws on a non-string or above
+    /// 2 MB (driver runtime.js L108-120, V180).
+    #[wasm_bindgen(js_namespace = RawMemory, js_name = set, catch)]
+    fn raw_memory_set(value: &str) -> Result<(), JsValue>;
+
+    /// `Game.notify(message)`.
+    #[wasm_bindgen(js_namespace = Game, js_name = notify, catch)]
+    fn game_notify(message: &str) -> Result<(), JsValue>;
 }
+
+/// What the one notification per global says when `Memory` was reset (ADR-019).
+const MEMORY_RESET_NOTICE: &str = "rustedscreep: Memory was null (its raw string did not parse, or \
+     was JSON null), so spawnCreep threw; the raw Memory was reset to {} so spawning can go on \
+     (ADR-019)";
 
 /// Spawning is Critical (CLAUDE.md): it runs whenever the tick runs.
 const JOB: Job = Job {
@@ -90,6 +115,10 @@ pub struct SpawnGlue {
     console_index: Option<u32>,
     /// The console request a spawn accepted, with the identity its creep must show next tick.
     accepted: Option<(ConsoleRequest, Identity, CreepName)>,
+    /// Whether this global already notified a `Memory` reset (ADR-019).
+    memory_notified: bool,
+    /// `Memory` resets since the global started (ADR-019).
+    memory_resets: u32,
 }
 
 impl SpawnGlue {
@@ -171,19 +200,31 @@ impl SpawnGlue {
             let call = spawn
                 .unchecked_ref::<SpawnActor>()
                 .spawn_creep(order.body.parts(), order.name.as_str());
+            let mut reset = false;
             let outcome = match call {
                 Ok(value) => Outcome::from_return(value),
                 Err(e) => {
                     let slot = order.spawn.slot();
                     fault(sched, cfg, snapshot, "the spawnCreep call threw", slot);
-                    // At most once per spawn per hold: the throw holds the spawn.
+                    // At most once per spawn per hold (the throw holds the spawn), except after an
+                    // ADR-019 reset, which releases it.
                     log_threw(&e, &order.name);
+                    // ADR-019: a null `Memory` makes every call throw (V181); reset it.
+                    reset = memory_is_null() && self.reset_memory();
                     Outcome::Threw
                 }
             };
             log.record_structure(outcome);
             self.spawner.record(index, outcome, spawn_cfg);
+            if reset {
+                // Repaired: the spawn tries again next tick. The tick's other orders would throw
+                // the same way (`Memory` stays null for the tick), so they are not called.
+                self.spawner.release(order.spawn);
+                break;
+            }
             if outcome == Outcome::Ok {
+                // ADR-018: the engine's `Memory.creeps[name]` entry goes before the tick's save.
+                forget_entry(order.name.as_str());
                 let console = self.console_index == Some(order.request);
                 if console && let Some(request) = self.console.take() {
                     self.accepted = Some((request, order.identity, order.name));
@@ -193,6 +234,26 @@ impl SpawnGlue {
                 }
             }
         }
+    }
+
+    /// ADR-019: sets the raw `Memory` to `{}`, which the end-of-tick save keeps while the tick's
+    /// `Memory` is null (V180); logs it, and notifies once per global. False if the set threw.
+    fn reset_memory(&mut self) -> bool {
+        if raw_memory_set("{}").is_err() {
+            log::warn!("rustedscreep spawn: Memory is null, and RawMemory.set threw");
+            return false;
+        }
+        self.memory_resets = self.memory_resets.saturating_add(1);
+        log::warn!(
+            "rustedscreep spawn: Memory is null (its raw string did not parse, or was JSON null), so \
+             spawnCreep threw; the raw Memory is reset to {{}} (ADR-019, reset {} of this global)",
+            self.memory_resets
+        );
+        if !self.memory_notified {
+            self.memory_notified = true;
+            let _ = game_notify(MEMORY_RESET_NOTICE);
+        }
+        true
     }
 
     /// For `rustedscreep.spawn(room, role)`: from the next tick, a spawn of `room` spawns one creep
@@ -316,6 +377,7 @@ impl SpawnGlue {
             }
             None => text.push_str(" | console request: none"),
         }
+        let _ = write!(text, " | Memory resets {}", self.memory_resets);
         text.push_str(" | own creeps:");
         let mut counts: Vec<(RoomName, Role, u32)> = Vec::new();
         let mut unnamed = 0u32;
@@ -388,7 +450,37 @@ fn log_accepted(name: &CreepName, body: &Body, console: bool) {
     );
 }
 
-/// The JS error's message, so a throw such as the one from an unusable `Memory` (V172) shows its
+/// The `Memory` global as it stands this tick: the engine's getter parses on first access and then
+/// holds the result as a plain value for the tick (V181), so after a `spawnCreep` call this reads
+/// no new parse. `None` when `globalThis` or the read is unavailable.
+fn memory_global() -> Option<JsValue> {
+    let global = GLOBAL_THIS.with(Option::clone)?;
+    Reflect::get(&global, &JsValue::from_str("Memory")).ok()
+}
+
+/// Whether this tick's `Memory` is null: its raw string did not parse, or was JSON null (the
+/// getter's `__proto__` assignment throws on null in its strict code, game.js L485-490; V181).
+fn memory_is_null() -> bool {
+    memory_global().is_some_and(|m| m.is_null())
+}
+
+/// ADR-018: deletes `Memory.creeps[name]`, the entry an accepted `spawnCreep` wrote (V181), so the
+/// end-of-tick save does not store it (V180). Nothing when `Memory` or `Memory.creeps` is not an
+/// object; a throw is ignored (the entry stays, as before ADR-018).
+fn forget_entry(name: &str) {
+    let Some(memory) = memory_global().filter(JsValue::is_object) else {
+        return;
+    };
+    let Some(creeps) = Reflect::get(&memory, &JsValue::from_str("creeps"))
+        .ok()
+        .filter(JsValue::is_object)
+    else {
+        return;
+    };
+    let _ = Reflect::delete_property(creeps.unchecked_ref::<Object>(), &JsValue::from_str(name));
+}
+
+/// The JS error's message, so a throw such as the one from an unusable `Memory` (V181) shows its
 /// cause; read as a plain value (a non-string message is left out).
 #[cold]
 #[inline(never)]
@@ -396,10 +488,15 @@ fn log_threw(e: &JsValue, name: &CreepName) {
     if !log::log_enabled!(log::Level::Warn) {
         return;
     }
-    let message = e
-        .dyn_ref::<js_sys::Error>()
-        .and_then(|err| JsValue::from(err.message()).as_string())
-        .unwrap_or_default();
+    // `message` through Reflect, not `instanceof Error`, so an error from another realm shows too.
+    let message = if e.is_object() {
+        Reflect::get(e, &JsValue::from_str("message"))
+            .ok()
+            .and_then(|m| m.as_string())
+            .unwrap_or_default()
+    } else {
+        e.as_string().unwrap_or_default()
+    };
     log::warn!(
         "rustedscreep spawn: spawnCreep for {} threw: {message}",
         name.as_str()

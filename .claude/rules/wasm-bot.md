@@ -22,7 +22,9 @@ paths:
 - Count intents per tick in the profiler. The intent count is the main CPU cost to minimize.
 
 ## Memory and persistence
-- Never touch `Memory` (`screeps::memory`) in the tick path. The wrapper JSON-parses on first access each tick.
+- Never touch `Memory` (`screeps::memory`) in the tick path. The wrapper JSON-parses on first access each tick. The two exceptions (ADR-018,
+  ADR-019) live in `spawn.rs`: after an accepted `spawnCreep` (which already parsed it), delete that name's `Memory.creeps` entry; after a
+  `spawnCreep` that threw on a null `Memory`, reset the raw string to `{}`.
 - Persist only what must survive a reset, in RawMemory segments. Each segment carries a versioned header (magic, format version,
   length, checksum). Write only when dirty. Request segments ahead of use (verify how long activation takes).
 - A decode failure or version mismatch triggers a rebuild from game state, logged once. Never panic.

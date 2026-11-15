@@ -32,6 +32,8 @@ let memoryUnusableNotified = false;
 /**
  * The loader's record in Memory, repaired if malformed. Screeps sets Memory to null when its raw string is
  * not valid JSON (V96); then the loader keeps its record in the heap and avoids halting, which would lose it.
+ * Once Memory is an object again (the bot resets one that did not parse, ADR-019), the heap record moves back
+ * into it, so this global's incidents carry on and halting is allowed again.
  */
 function loaderMemory(): LoaderMemory {
   const mem: unknown = Memory;
@@ -46,6 +48,11 @@ function loaderMemory(): LoaderMemory {
     return heapRecord;
   }
   const record = mem as Record<string, unknown>;
+  if (heapRecord !== undefined) {
+    record[MEMORY_KEY] = heapRecord;
+    heapRecord = undefined;
+    memoryUnusableNotified = false;
+  }
   const repaired = sanitizeLoaderMemory(record[MEMORY_KEY], CONFIG.trapTestMax);
   record[MEMORY_KEY] = repaired;
   return repaired;

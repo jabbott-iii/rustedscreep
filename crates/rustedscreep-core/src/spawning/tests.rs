@@ -640,3 +640,22 @@ fn the_shortest_hold_lasts_one_tick() {
     assert!(sp.on_probation(h));
     assert_eq!(sp.orders().len(), 1, "back the tick after");
 }
+
+/// A released spawn takes orders on the next tick, with no hold and no probation.
+#[test]
+fn a_released_spawn_takes_orders_at_once() {
+    let unit = unit_cost(&WORKER_PATTERN);
+    let spawns = [spawn(1, "W1N1", 20), spawn(2, "W1N1", 30)];
+    let req = worker("W1N1", EnergyBudget::Available, 1);
+    let mut sp = Spawner::default();
+    let mut snap = snap_at(T0, &[("W1N1", energy(unit, unit))], &spawns);
+    plan(&mut sp, &snap, &[req]);
+    let h1 = handle(&snap, 1);
+    sp.record(0, Outcome::Threw, &SPAWN_MMO);
+    assert!(sp.is_held(h1));
+    sp.release(h1);
+    assert!(!sp.is_held(h1) && !sp.on_probation(h1));
+    fill(&mut snap, T0 + 1, &[("W1N1", energy(unit, unit))], &spawns);
+    plan(&mut sp, &snap, &[req]);
+    assert_eq!(sp.orders()[0].spawn, h1, "first by id again");
+}

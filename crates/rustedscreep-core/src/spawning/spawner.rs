@@ -411,6 +411,13 @@ impl Spawner {
         }
     }
 
+    /// Drops the spawn's hold and probation, so it takes orders again from the next tick: the
+    /// cause of its refusal was repaired (rustedscreep-wasm resets a `Memory` that does not parse,
+    /// ADR-019).
+    pub fn release(&mut self, spawn: StructureHandle) {
+        self.holds.retain(|h| h.spawn != spawn);
+    }
+
     /// The request at `index` in this tick's requests.
     pub fn request_at(&self, index: u32) -> Option<&SpawnRequest> {
         self.requests.get(index as usize)

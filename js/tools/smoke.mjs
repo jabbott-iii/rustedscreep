@@ -64,7 +64,10 @@ export function saveSegments(segments, world, offset) {
  * the active set stored in the world (one never written loads as '', V117); `setActiveSegments` checks
  * like the driver (an array of at most 10 ids, each parseInt'ed into 0 to 99; a bad id throws after the
  * ids before it are kept, V118), the last call of a tick wins, and `endTick` makes it the world's set for
- * the next tick, across globals. Calls are recorded in `world.activeCalls` as [offset, ids].
+ * the next tick, across globals. Calls are recorded in `world.activeCalls` as [offset, ids]. `set` stores the
+ * raw Memory string like the driver (V180: it throws on a non-string or above 2 MB); `simulate` then saves that
+ * string at the end of a tick that did not halt, instead of stringifying the tick's Memory. Calls go to
+ * `world.rawSets` as [offset, value].
  */
 export function driverRawMemory(offset, world) {
   world.activeSegments ??= [];
@@ -72,6 +75,7 @@ export function driverRawMemory(offset, world) {
   const segments = Object.create(null);
   for (const id of world.activeSegments) segments[id] = world.segments[id] ?? '';
   let next = null;
+  let memorySet;
   return {
     segments,
     setActiveSegments(ids) {
@@ -84,6 +88,17 @@ export function driverRawMemory(offset, world) {
         next.push(id);
       }
       world.activeCalls.push([offset, [...next]]);
+    },
+    set(value) {
+      if (typeof value !== 'string') throw new Error('Raw memory value is not a string');
+      if (value.length > 2 * 1024 * 1024) throw new Error('Raw memory length exceeded 2 MB limit');
+      world.rawSets ??= [];
+      world.rawSets.push([offset, value]);
+      memorySet = value;
+    },
+    /** The string the last `set` of the tick stored, if any (the end-of-tick save keeps it). */
+    get memorySet() {
+      return memorySet;
     },
     endTick() {
       if (next !== null) world.activeSegments = next;
@@ -187,6 +202,7 @@ export function simulate(dir, {
           enumerable: true,
         },
       } : {}),
+      ...(typeof raw.set === 'function' ? { set: { value: (v) => raw.set(v), enumerable: true } } : {}),
     });
     context.Game = {
       ...scene(offset),
@@ -223,7 +239,11 @@ export function simulate(dir, {
     if (halted) {
       ctx = null; // halt: this tick's Memory and segments are discarded, and the next tick starts a new global
     } else {
-      if (memory !== null) world.memoryJson = JSON.stringify(memory); // a null Memory is not saved, so the raw string stays
+      // The driver stringifies the parsed Memory unless it is null; a RawMemory.set deletes the parse (V180), so the
+      // string it set is kept.
+      const rawSet = raw?.memorySet;
+      if (rawSet !== undefined) world.memoryJson = rawSet;
+      else if (memory !== null) world.memoryJson = JSON.stringify(memory);
       saveSegments(raw?.segments, world, offset);
       raw?.endTick?.();
     }
