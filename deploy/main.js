@@ -365,6 +365,91 @@ function loop$1() {
 }
 
 /**
+ * Exported to JS as `moveTo`, for `rustedscreep.moveTo(room, x, y, range, from)`: from the next tick,
+ * every own creep in `from` (`room` when omitted) without a request of its own walks to within
+ * `range` (1 when omitted) of (x, y) in `room`, across rooms if need be (P2.2), until all of them
+ * are in range on one tick. With no room it cancels the order.
+ * @param {string | null} [room]
+ * @param {number | null} [x]
+ * @param {number | null} [y]
+ * @param {number | null} [range]
+ * @param {string | null} [from]
+ * @returns {string}
+ */
+function moveTo(room, x, y, range, from) {
+    let deferred6_0;
+    let deferred6_1;
+    try {
+        const val3 = +(isLikeNone(x) ? Number.MAX_SAFE_INTEGER : (x) >>> 0);
+        const val4 = +(isLikeNone(y) ? Number.MAX_SAFE_INTEGER : (y) >>> 0);
+        const val5 = +(isLikeNone(range) ? Number.MAX_SAFE_INTEGER : (range) >>> 0);
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = isLikeNone(room) ? 0 : passStringToWasm0(room, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = isLikeNone(from) ? 0 : passStringToWasm0(from, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        let ret;
+        __wbg_call_guard();
+        ret = wasm.moveTo(ptr0, len0, val3, val4, val5, ptr1, len1);
+        deferred6_0 = ret[0];
+        deferred6_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        __wbg_call_guard();
+        wasm.__wbindgen_free(deferred6_0, deferred6_1, 1);
+    }
+}
+
+/**
+ * Exported to JS as `movementSummary`, for the `rustedscreep.movement()` console command: one line
+ * with the rooms, grid versions, cached fields, this tick's and the global's movement counters, and
+ * the console's move order.
+ * @returns {string}
+ */
+function movementSummary() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        let ret;
+        __wbg_call_guard();
+        ret = wasm.movementSummary();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        __wbg_call_guard();
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
+ * Exported to JS as `openingSummary`, for the `rustedscreep.opening()` console command: one line
+ * with each owned room's workers and tasks, its plan, its spawn request and its watchdog (P2.4).
+ * @returns {string}
+ */
+function openingSummary() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        let ret;
+        __wbg_call_guard();
+        ret = wasm.openingSummary();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        __wbg_call_guard();
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * Exported to JS as `persistSummary`, for the `rustedscreep.persist()` console command: one line
  * with the active set, wanted loads, dirty records, the counts since boot and the self-test.
  * @returns {string}
@@ -497,6 +582,63 @@ function snapshotSummary() {
 }
 
 /**
+ * Exported to JS as `spawn`, for `rustedscreep.spawn(room, role)`: from the next tick, a spawn of
+ * `room` spawns one creep of `role` (worker when omitted) sized to the room's capacity, once the
+ * room holds its cost (P2.3). With no room it cancels the request.
+ * @param {string | null} [room]
+ * @param {string | null} [role]
+ * @returns {string}
+ */
+function spawn(room, role) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = isLikeNone(room) ? 0 : passStringToWasm0(room, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = isLikeNone(role) ? 0 : passStringToWasm0(role, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        let ret;
+        __wbg_call_guard();
+        ret = wasm.spawn(ptr0, len0, ptr1, len1);
+        deferred3_0 = ret[0];
+        deferred3_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        __wbg_call_guard();
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * Exported to JS as `spawnerSummary`, for the `rustedscreep.spawner()` console command: one line
+ * with each spawn room's energy and spawns, the last tick's requests and orders, totals since boot,
+ * the last spawn and failure, the console's request and the own creeps by home and role.
+ * @returns {string}
+ */
+function spawnerSummary() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        let ret;
+        __wbg_call_guard();
+        ret = wasm.spawnerSummary();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        __wbg_call_guard();
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * Debug export for the loader's trap-recovery test (ADR-003; the P1 gate forces 10 traps in a row).
  * With `npm run build -- --features trap-test` it panics; otherwise it does nothing. It exists in every
  * build so the loader can import it statically, and the loader calls it only in a trap-test build.
@@ -532,14 +674,29 @@ function __wbg_get_imports() {
         __wbg___wbindgen_throw_4c88d8bf264fd984: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
+        __wbg__wbg_cb_unref_09736879a3f67559: function(arg0) {
+            arg0._wbg_cb_unref();
+        },
+        __wbg_amount_e891929ae63d07d1: function(arg0) {
+            const ret = arg0.amount;
+            return ret;
+        },
         __wbg_bucket_fad1c4c5f46e674f: function() {
             const ret = Game.cpu.bucket;
             return ret;
         },
+        __wbg_build_5a86f33d001e3538: function() { return handleError(function (arg0, arg1) {
+            const ret = arg0.build(arg1);
+            return ret;
+        }, arguments); },
         __wbg_controller_fb0c168695740499: function(arg0) {
             const ret = arg0.controller;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
+        __wbg_createConstructionSite_a90a513098a438f4: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = arg0.createConstructionSite(arg1, arg2, __wbindgen_enum_StructureType[arg3]);
+            return ret;
+        }, arguments); },
         __wbg_create_8853e9d4d0f625e5: function(arg0) {
             const ret = Object.create(arg0);
             return ret;
@@ -548,10 +705,30 @@ function __wbg_get_imports() {
             const ret = Game.creeps;
             return ret;
         },
+        __wbg_deleteProperty_3ad7a085da623822: function() { return handleError(function (arg0, arg1) {
+            const ret = Reflect.deleteProperty(arg0, arg1);
+            return ret;
+        }, arguments); },
         __wbg_drop_2117aa4480fb3f7d: function() { return handleError(function (arg0, arg1, arg2) {
             const ret = arg0.drop(__wbindgen_enum_ResourceType[arg1], arg2 === Number.MAX_SAFE_INTEGER ? undefined : arg2);
             return ret;
         }, arguments); },
+        __wbg_energy_6bb0be1610992c84: function(arg0) {
+            const ret = arg0.energy;
+            return ret;
+        },
+        __wbg_energy_available_7d2c7245f8b19c79: function(arg0) {
+            const ret = arg0.energyAvailable;
+            return ret;
+        },
+        __wbg_energy_capacity_2cb98ecd36af0e40: function(arg0) {
+            const ret = arg0.energyCapacity;
+            return ret;
+        },
+        __wbg_energy_capacity_available_c5825c98a78c1863: function(arg0) {
+            const ret = arg0.energyCapacityAvailable;
+            return ret;
+        },
         __wbg_error_757e9472f8410341: function(arg0, arg1) {
             let deferred0_0;
             let deferred0_1;
@@ -564,9 +741,25 @@ function __wbg_get_imports() {
                 wasm.__wbindgen_free(deferred0_0, deferred0_1, 1);
             }
         },
+        __wbg_fatigue_internal_63028d146a4ca98f: function(arg0) {
+            const ret = arg0.fatigue;
+            return ret;
+        },
         __wbg_find_6531a7369afdae09: function(arg0, arg1) {
             const ret = arg0.find(arg1);
             return ret;
+        },
+        __wbg_find_bb0244b6161efd15: function(arg0, arg1, arg2) {
+            const ret = arg0.find(arg1, arg2);
+            return ret;
+        },
+        __wbg_getCapacity_58e91c34604e6503: function(arg0, arg1) {
+            const ret = arg0.getCapacity(__wbindgen_enum_ResourceType[arg1]);
+            return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
+        __wbg_getFreeCapacity_a033aac3fd423cb8: function(arg0, arg1) {
+            const ret = arg0.getFreeCapacity(__wbindgen_enum_ResourceType[arg1]);
+            return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >> 0;
         },
         __wbg_getOwnPropertyDescriptor_3a5a5757a1ebc308: function() { return handleError(function (arg0, arg1) {
             const ret = Object.getOwnPropertyDescriptor(arg0, arg1);
@@ -576,6 +769,22 @@ function __wbg_get_imports() {
             const ret = Object.getOwnPropertyNames(arg0);
             return ret;
         }, arguments); },
+        __wbg_getRawBuffer_195f4148d30ef151: function() { return handleError(function (arg0) {
+            const ret = arg0.getRawBuffer();
+            return ret;
+        }, arguments); },
+        __wbg_getRoomStatus_85aa0bdab6980593: function() { return handleError(function (arg0) {
+            const ret = Game.map.getRoomStatus(arg0);
+            return ret;
+        }, arguments); },
+        __wbg_getTerrain_6f901cc94969eb1f: function() { return handleError(function (arg0) {
+            const ret = arg0.getTerrain();
+            return ret;
+        }, arguments); },
+        __wbg_getUsedCapacity_8be193d2eb4b368d: function(arg0, arg1) {
+            const ret = arg0.getUsedCapacity(__wbindgen_enum_ResourceType[arg1]);
+            return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
         __wbg_getUsed_34824cf35c877f8d: function() {
             const ret = Game.cpu.getUsed();
             return ret;
@@ -588,6 +797,14 @@ function __wbg_get_imports() {
             const ret = arg0[arg1 >>> 0];
             return ret;
         },
+        __wbg_get_unchecked_e6325ad374eff861: function(arg0, arg1) {
+            const ret = arg0[arg1 >>> 0];
+            return ret;
+        },
+        __wbg_harvest_17d3aea7d5ff6b27: function() { return handleError(function (arg0, arg1) {
+            const ret = arg0.harvest(arg1);
+            return ret;
+        }, arguments); },
         __wbg_heal_d2bc1a58d75e2495: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.heal(arg1);
             return ret;
@@ -600,6 +817,18 @@ function __wbg_get_imports() {
             const ret = arg0.id;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
+        __wbg_id_value_79b68e0ce3be3c73: function(arg0) {
+            const ret = arg0.id;
+            return ret;
+        },
+        __wbg_incomplete_9f9b741506ab9af7: function(arg0) {
+            const ret = arg0.incomplete;
+            return ret;
+        },
+        __wbg_is_public_value_6e13bdae71ccf1e6: function(arg0) {
+            const ret = arg0.isPublic;
+            return isLikeNone(ret) ? 0xFFFFFF : ret ? 1 : 0;
+        },
         __wbg_js_pos_41efd72dc63bca14: function(arg0) {
             const ret = arg0.pos;
             return ret;
@@ -608,6 +837,10 @@ function __wbg_get_imports() {
             const ret = Object.keys(arg0);
             return ret;
         }, arguments); },
+        __wbg_length_186163212ffe79c3: function(arg0) {
+            const ret = arg0.length;
+            return ret;
+        },
         __wbg_length_b03a0fabb109b1e9: function(arg0) {
             const ret = arg0.length;
             return ret;
@@ -623,6 +856,12 @@ function __wbg_get_imports() {
         __wbg_log_d37c9bc0bff17576: function(arg0, arg1) {
             console.log(getStringFromWasm0(arg0, arg1));
         },
+        __wbg_max_ops_d19592e3ba612469: function(arg0, arg1) {
+            arg0.maxOps = arg1 >>> 0;
+        },
+        __wbg_max_rooms_664b8b593d1663b5: function(arg0, arg1) {
+            arg0.maxRooms = arg1;
+        },
         __wbg_move_a08b29fe96a5d874: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.move(arg1);
             return ret;
@@ -632,6 +871,10 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbg_my_internal_5b06f7a23c65ba5c: function(arg0) {
+            const ret = arg0.my;
+            return isLikeNone(ret) ? 0xFFFFFF : ret ? 1 : 0;
+        },
+        __wbg_my_value_0d570eed41450015: function(arg0) {
             const ret = arg0.my;
             return isLikeNone(ret) ? 0xFFFFFF : ret ? 1 : 0;
         },
@@ -647,9 +890,54 @@ function __wbg_get_imports() {
             const ret = new Error();
             return ret;
         },
+        __wbg_new_cd4348290afae586: function() {
+            const ret = new Object();
+            return ret;
+        },
+        __wbg_new_from_slice_b8daf545a41c6aa0: function(arg0, arg1) {
+            const ret = new Uint8Array(getArrayU8FromWasm0(arg0, arg1));
+            return ret;
+        },
+        __wbg_notify_b0fdf1c28cd8b667: function() { return handleError(function (arg0, arg1) {
+            Game.notify(getStringFromWasm0(arg0, arg1));
+        }, arguments); },
+        __wbg_ops_ea9b5651a796f698: function(arg0) {
+            const ret = arg0.ops;
+            return ret;
+        },
+        __wbg_packed_3bb90a95d7bf1c16: function(arg0) {
+            const ret = arg0.__packedPos;
+            return ret;
+        },
         __wbg_packed_pos_272b8eb5eff3b13b: function(arg0) {
             const ret = arg0.__packedPos;
             return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
+        __wbg_path_6241a46dd6269a4c: function(arg0) {
+            const ret = arg0.path;
+            return ret;
+        },
+        __wbg_pickup_effef9519f3c3c7d: function() { return handleError(function (arg0, arg1) {
+            const ret = arg0.pickup(arg1);
+            return ret;
+        }, arguments); },
+        __wbg_plain_cost_161242c6d041507b: function(arg0, arg1) {
+            arg0.plainCost = arg1;
+        },
+        __wbg_progress_72f0c05204157c60: function(arg0) {
+            const ret = arg0.progress;
+            return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
+        __wbg_progress_internal_c817d53483c2fe6c: function(arg0) {
+            const ret = arg0.progress;
+            return ret;
+        },
+        __wbg_progress_total_internal_a458567645824308: function(arg0) {
+            const ret = arg0.progressTotal;
+            return ret;
+        },
+        __wbg_prototypesetcall_13162965d1fe7aa3: function(arg0, arg1, arg2) {
+            Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), arg2);
         },
         __wbg_pull_d97b426d6b5ad5d7: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.pull(arg1);
@@ -667,12 +955,23 @@ function __wbg_get_imports() {
             const ret = arg0.repair(arg1);
             return ret;
         }, arguments); },
+        __wbg_resource_type_396cb78ee223f30d: function(arg0) {
+            const ret = arg0.resourceType;
+            return (__wbindgen_enum_ResourceType.indexOf(ret) + 1 || 109) - 1;
+        },
+        __wbg_room_callback_9a0c29bd82ef4976: function(arg0, arg1) {
+            arg0.roomCallback = arg1;
+        },
         __wbg_rooms_fb611d081330a50f: function() {
             const ret = Game.rooms;
             return ret;
         },
         __wbg_say_576bba1bc1eefbc2: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg0.say(getStringFromWasm0(arg1, arg2), arg3 !== 0);
+            return ret;
+        }, arguments); },
+        __wbg_search_866389dc642268b1: function() { return handleError(function (arg0, arg1, arg2) {
+            const ret = PathFinder.search(arg0, arg1, arg2);
             return ret;
         }, arguments); },
         __wbg_segments_5ca117c1aa86a9a6: function() { return handleError(function () {
@@ -686,8 +985,36 @@ function __wbg_get_imports() {
             const ret = Reflect.set(arg0, arg1, arg2);
             return ret;
         }, arguments); },
+        __wbg_set_a2f2575eb59fc9af: function() { return handleError(function (arg0, arg1) {
+            RawMemory.set(getStringFromWasm0(arg0, arg1));
+        }, arguments); },
+        __wbg_set_bits_14e2245e9f55d663: function(arg0, arg1) {
+            arg0._bits = arg1;
+        },
         __wbg_set_packed_dc4761bfc068bd46: function(arg0, arg1) {
             arg0.__packedPos = arg1 >>> 0;
+        },
+        __wbg_set_pos_0242bafae46ade05: function(arg0, arg1) {
+            arg0.pos = arg1;
+        },
+        __wbg_set_range_38aca89a65a1a1de: function(arg0, arg1) {
+            arg0.range = arg1 >>> 0;
+        },
+        __wbg_spawnCreep_115fb91e4a4a16ad: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4) {
+            const v0 = [];
+            let p0 = arg1;
+            p0 = p0 >>> 0;
+            const view0 = getDataViewMemory0();
+            for (const end0 = p0 + arg2 * 4; p0 < end0; p0 += 4) {
+                v0.push(__wbindgen_enum_Part[view0.getInt32(p0 + 0, true)]);
+            }
+            wasm.__wbindgen_free(arg1, arg2 * 4, 4);
+            const ret = arg0.spawnCreep(v0, getStringFromWasm0(arg3, arg4));
+            return ret;
+        }, arguments); },
+        __wbg_spawning_e75e1cef272b29c0: function(arg0) {
+            const ret = arg0.spawning;
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
         __wbg_spawning_internal_070a7d93e78a1d5d: function(arg0) {
             const ret = arg0.spawning;
@@ -700,12 +1027,24 @@ function __wbg_get_imports() {
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 1, len1, true);
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 0, ptr1, true);
         },
+        __wbg_static_accessor_COST_MATRIX_PROTOTYPE_37be23abc40663c8: function() {
+            const ret = PathFinder.CostMatrix.prototype;
+            return ret;
+        },
         __wbg_static_accessor_GLOBAL_THIS_2b9a0b79f3f7b8ee: function() {
             const ret = typeof globalThis === 'undefined' ? undefined : globalThis;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
         __wbg_static_accessor_ROOM_POSITION_PROTOTYPE_a3e59f2133c00861: function() {
             const ret = RoomPosition.prototype;
+            return ret;
+        },
+        __wbg_store_internal_b93d8e18a4a73d36: function(arg0) {
+            const ret = arg0.store;
+            return ret;
+        },
+        __wbg_store_of_788d6b4f5985190e: function(arg0) {
+            const ret = arg0.store;
             return ret;
         },
         __wbg_stringify_0a0fbf2ef722380a: function() { return handleError(function (arg0) {
@@ -716,13 +1055,24 @@ function __wbg_get_imports() {
             const ret = arg0.structureType;
             return (__wbindgen_enum_StructureType.indexOf(ret) + 1 || 22) - 1;
         },
+        __wbg_structure_type_internal_2fe3feaa2f58acae: function(arg0) {
+            const ret = arg0.structureType;
+            return (__wbindgen_enum_StructureType.indexOf(ret) + 1 || 22) - 1;
+        },
         __wbg_structures_object_25bbcb126ca3b768: function() {
             const ret = Game.structures;
             return ret;
         },
+        __wbg_swamp_cost_32780161b36344b0: function(arg0, arg1) {
+            arg0.swampCost = arg1;
+        },
         __wbg_tickLimit_6b84f325cef2976d: function() {
             const ret = Game.cpu.tickLimit;
             return ret;
+        },
+        __wbg_ticks_to_downgrade_b676132f27fbfc30: function(arg0) {
+            const ret = arg0.ticksToDowngrade;
+            return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
         },
         __wbg_time_a0ddfc3f3fde445c: function() {
             const ret = Game.time;
@@ -736,6 +1086,10 @@ function __wbg_get_imports() {
             const ret = arg0.upgradeController(arg1);
             return ret;
         }, arguments); },
+        __wbg_upgrade_blocked_11da7f0f81e340d5: function(arg0) {
+            const ret = arg0.upgradeBlocked;
+            return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
         __wbg_values_01b79ec198898dfb: function(arg0) {
             const ret = Object.values(arg0);
             return ret;
@@ -744,12 +1098,17 @@ function __wbg_get_imports() {
             const ret = arg0.withdraw(arg1, __wbindgen_enum_ResourceType[arg2], arg3 === Number.MAX_SAFE_INTEGER ? undefined : arg3);
             return ret;
         }, arguments); },
-        __wbindgen_generic_0000000000000001: function(arg0) {
+        __wbindgen_generic_0000000000000001: function(arg0, arg1) {
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("string")], shim_idx: 16, ret: Externref, inner_ret: Some(Externref) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_66fc74bf8055cade___convert__closures_____invoke___wasm_bindgen_66fc74bf8055cade___JsValue__wasm_bindgen_66fc74bf8055cade___JsValue__true_);
+            return ret;
+        },
+        __wbindgen_generic_0000000000000002: function(arg0) {
             // Cast intrinsic for `F64 -> Externref`.
             const ret = arg0;
             return ret;
         },
-        __wbindgen_generic_0000000000000002: function(arg0, arg1) {
+        __wbindgen_generic_0000000000000003: function(arg0, arg1) {
             // Cast intrinsic for `Ref(String) -> Externref`.
             const ret = getStringFromWasm0(arg0, arg1);
             return ret;
@@ -775,6 +1134,15 @@ function __wbg_call_guard() {
         return;
     }
 }
+function wasm_bindgen_66fc74bf8055cade___convert__closures_____invoke___wasm_bindgen_66fc74bf8055cade___JsValue__wasm_bindgen_66fc74bf8055cade___JsValue__true_(arg0, arg1, arg2) {
+    let ret;
+    __wbg_call_guard();
+    ret = wasm.wasm_bindgen_66fc74bf8055cade___convert__closures_____invoke___wasm_bindgen_66fc74bf8055cade___JsValue__wasm_bindgen_66fc74bf8055cade___JsValue__true_(arg0, arg1, arg2);
+    return ret;
+}
+
+
+const __wbindgen_enum_Part = ["move", "work", "carry", "attack", "ranged_attack", "tough", "heal", "claim"];
 
 
 const __wbindgen_enum_ResourceType = ["energy", "power", "H", "O", "U", "L", "K", "Z", "X", "G", "silicon", "metal", "biomass", "mist", "OH", "ZK", "UL", "UH", "UO", "KH", "KO", "LH", "LO", "ZH", "ZO", "GH", "GO", "UH2O", "UHO2", "KH2O", "KHO2", "LH2O", "LHO2", "ZH2O", "ZHO2", "GH2O", "GHO2", "XUH2O", "XUHO2", "XKH2O", "XKHO2", "XLH2O", "XLHO2", "XZH2O", "XZHO2", "XGH2O", "XGHO2", "ops", "utrium_bar", "lemergium_bar", "zynthium_bar", "keanium_bar", "ghodium_melt", "oxidant", "reductant", "purifier", "battery", "composite", "crystal", "liquid", "wire", "switch", "transistor", "microchip", "circuit", "device", "cell", "phlegm", "tissue", "muscle", "organoid", "organism", "alloy", "tube", "fixtures", "frame", "hydraulics", "machine", "condensate", "concentrate", "extract", "spirit", "emanation", "essence", "score", "symbol_aleph", "symbol_beth", "symbol_gimmel", "symbol_daleth", "symbol_he", "symbol_waw", "symbol_zayin", "symbol_heth", "symbol_teth", "symbol_yodh", "symbol_kaph", "symbol_lamedh", "symbol_mem", "symbol_nun", "symbol_samekh", "symbol_ayin", "symbol_pe", "symbol_tsade", "symbol_qoph", "symbol_res", "symbol_sim", "symbol_taw", "T"];
@@ -794,6 +1162,19 @@ function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();
     wasm.__wbindgen_externrefs.set(idx, obj);
     return idx;
+}
+
+const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(state => {
+    if (state.instance === __wbg_instance_id) {
+        wasm.__wbindgen_destroy_closure(state.a, state.b);
+    }
+});
+
+function getArrayU8FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
 }
 
 let cachedDataViewMemory0 = null;
@@ -828,6 +1209,38 @@ function handleError(f, args) {
 
 function isLikeNone(x) {
     return x === undefined || x === null;
+}
+
+function makeMutClosure(arg0, arg1, f) {
+    const state = { a: arg0, b: arg1, cnt: 1, instance: __wbg_instance_id };
+    const real = (...args) => {
+
+        if (state.instance !== __wbg_instance_id) {
+            throw new Error('Cannot invoke closure from previous WASM instance');
+        }
+
+        // First up with a closure we increment the internal reference
+        // count. This ensures that the Rust closure environment won't
+        // be deallocated while we're invoking it.
+        state.cnt++;
+        const a = state.a;
+        state.a = 0;
+        try {
+            return f(a, state.b, ...args);
+        } finally {
+            state.a = a;
+            real._wbg_cb_unref();
+        }
+    };
+    real._wbg_cb_unref = () => {
+        if (--state.cnt === 0) {
+            wasm.__wbindgen_destroy_closure(state.a, state.b);
+            state.a = 0;
+            CLOSURE_DTORS.unregister(state);
+        }
+    };
+    CLOSURE_DTORS.register(real, state, state);
+    return real;
 }
 
 function passStringToWasm0(arg, malloc, realloc) {
@@ -1490,6 +1903,53 @@ class Loader {
     consts() {
         return this.summary('constsSummary', 'consts summary');
     }
+    /** Console command `rustedscreep.movement()`: the wasm's movement summary (rooms, grids, fields, counters, order). */
+    movement() {
+        return this.summary('movementSummary', 'movement summary');
+    }
+    /**
+     * Console command `rustedscreep.moveTo(room, x, y, range, from)`: own creeps in `from` (`room` when omitted) walk
+     * to within `range` (1 when omitted) of (x, y) in `room`, across rooms if need be, until all are in range;
+     * `rustedscreep.moveTo()` cancels. Only room name strings and whole numbers from 0 to 49 reach the wasm.
+     */
+    moveTo(room, x, y, range, from) {
+        const call = this.glue.moveTo;
+        if (!call)
+            return 'rustedscreep: this build has no moveTo export';
+        if (room === undefined && x === undefined && y === undefined && range === undefined && from === undefined) {
+            return this.guarded('moveTo', 'move order', () => call());
+        }
+        const coord = (v) => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 49;
+        const fromOk = from === undefined || typeof from === 'string';
+        if (typeof room !== 'string' || !coord(x) || !coord(y) || !(range === undefined || coord(range)) || !fromOk) {
+            return 'rustedscreep: give a room name and x, y (and a range) from 0 to 49, and optionally the room the creeps start in, for example rustedscreep.moveTo("W1N1", 25, 25, 1) or rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1"); rustedscreep.moveTo() cancels';
+        }
+        return this.guarded('moveTo', 'move order', () => call(room, x, y, range, from));
+    }
+    /** Console command `rustedscreep.spawner()`: the wasm's spawn path summary (rooms, requests, orders, creeps). */
+    spawner() {
+        return this.summary('spawnerSummary', 'spawner summary');
+    }
+    /** Console command `rustedscreep.opening()`: the wasm's opening summary (workers, tasks, plan, watchdogs). */
+    opening() {
+        return this.summary('openingSummary', 'opening summary');
+    }
+    /**
+     * Console command `rustedscreep.spawn(room, role)`: a spawn of `room` spawns one creep of `role` (worker when
+     * omitted) sized to the room's capacity, once the room holds its cost; `rustedscreep.spawn()` cancels. Only
+     * strings reach the wasm, which checks the room name and the role.
+     */
+    spawn(room, role) {
+        const call = this.glue.spawn;
+        if (!call)
+            return 'rustedscreep: this build has no spawn export';
+        if (room === undefined && role === undefined)
+            return this.guarded('spawn', 'spawn request', () => call());
+        if (typeof room !== 'string' || !(role === undefined || typeof role === 'string')) {
+            return 'rustedscreep: give a room name and optionally a role, for example rustedscreep.spawn("W1N1") or rustedscreep.spawn("W1N1", "worker"); rustedscreep.spawn() cancels';
+        }
+        return this.guarded('spawn', 'spawn request', () => call(room, role));
+    }
     /** Calls a wasm summary export for a console command (see `guarded`). */
     summary(name, noun) {
         const call = this.glue[name];
@@ -1529,8 +1989,8 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"adc063a42b07-dirty-313f60b0","wasmCrc32":"313f60b0","features":[]});
-const CONFIG = ({"bootBucketMin":1500,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
+const BUILD = ({"id":"83dbcc549b05-eab3fade","wasmCrc32":"eab3fade","features":[]});
+const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;
 const MEMORY_KEY = 'rustedscreepLoader';
@@ -1541,6 +2001,8 @@ let memoryUnusableNotified = false;
 /**
  * The loader's record in Memory, repaired if malformed. Screeps sets Memory to null when its raw string is
  * not valid JSON (V96); then the loader keeps its record in the heap and avoids halting, which would lose it.
+ * Once Memory is an object again (the bot resets one that did not parse, ADR-019), the heap record moves back
+ * into it, so this global's incidents carry on and halting is allowed again.
  */
 function loaderMemory() {
     const mem = Memory;
@@ -1555,6 +2017,11 @@ function loaderMemory() {
         return heapRecord;
     }
     const record = mem;
+    if (heapRecord !== undefined) {
+        record[MEMORY_KEY] = heapRecord;
+        heapRecord = undefined;
+        memoryUnusableNotified = false;
+    }
     const repaired = sanitizeLoaderMemory(record[MEMORY_KEY], CONFIG.trapTestMax);
     record[MEMORY_KEY] = repaired;
     return repaired;
@@ -1604,6 +2071,11 @@ const glue = {
     configUnset: configUnset,
     configReset: configReset,
     constsSummary: constsSummary,
+    movementSummary: movementSummary,
+    moveTo: moveTo,
+    spawnerSummary: spawnerSummary,
+    spawn: spawn,
+    openingSummary: openingSummary,
 };
 const loader = new Loader(env, glue, CONFIG, BUILD);
 const routedError = (...args) => {
@@ -1632,7 +2104,10 @@ function routeConsole() {
 // `rustedscreep.scheduler()`, `rustedscreep.act()`, `rustedscreep.profiler()`, `rustedscreep.say("hi")`,
 // `rustedscreep.persist()`, `rustedscreep.persistTest()`, `rustedscreep.config()`,
 // `rustedscreep.configSet("log.level", "debug")`, `rustedscreep.configUnset("log.level")`,
-// `rustedscreep.configReset()` or `rustedscreep.consts()`.
+// `rustedscreep.configReset()`, `rustedscreep.consts()`, `rustedscreep.movement()`,
+// `rustedscreep.moveTo("W1N1", 25, 25, 1)` (from another room: `rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1")`;
+// `rustedscreep.moveTo()` cancels), `rustedscreep.spawner()` or `rustedscreep.spawn("W1N1", "worker")`
+// (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`.
 g.rustedscreep = {
     trapTest: (n = 1) => loader.scheduleTraps(Number(n)),
     status: () => loader.status(),
@@ -1648,6 +2123,11 @@ g.rustedscreep = {
     configUnset: (key) => loader.configUnset(key),
     configReset: () => loader.configReset(),
     consts: () => loader.consts(),
+    movement: () => loader.movement(),
+    moveTo: (room, x, y, range, from) => loader.moveTo(room, x, y, range, from),
+    spawner: () => loader.spawner(),
+    spawn: (room, role) => loader.spawn(room, role),
+    opening: () => loader.opening(),
 };
 function loop() {
     try {
