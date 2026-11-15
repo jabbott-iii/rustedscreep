@@ -89,7 +89,7 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
   - The CRC is the one the loader and tools already use (js/src/crc32.ts, js/tools/lib/crc32.mjs), so a JS tool can check a frame.
   - Payload layouts belong to their owners and are versioned by `schema`; option (c), a shared varint writer, waits for the first owner that needs one.
   - The 15-bit option stays open: a new encoding letter, the inline-JS crossing, and a live round trip of every code unit on the MMO first.
-  - The live round trip on the MMO (the P1 gate) is `rustedscreep.persistTest()` (TEST_PLAN §8).
+  - The live round trip on the MMO (the P1 gate) is `rustedscreep.persistTest()` (TEST_PLAN §8). It passed on shard3 on 2026-11-14: a full segment (76781 bytes in 102400 units) written and read back intact, at 0.79 CPU to encode, 5.77 to write (cold), 0.31 to read and 1.14 to decode (V144).
 
 ## ADR-005 Constants source for native tests: Accepted (2026-11-13)
 - Context: pure crates must test natively, and constants should come from the API (SPEC §0).
