@@ -86,12 +86,29 @@ impl ActLog {
 
     /// Records one call's outcome.
     pub fn record(&mut self, action: CreepAction, outcome: Outcome) {
+        self.count(!action.is_free(), outcome);
+        if outcome != Outcome::Ok {
+            self.last_failure = Some(Failure {
+                time: self.time,
+                action,
+                outcome,
+            });
+        }
+    }
+
+    /// Records a structure's call (P2.3: `spawnCreep`), billed on OK like every method outside the
+    /// driver's free ones (V34). Its failures are kept by the spawn path, not here.
+    pub fn record_structure(&mut self, outcome: Outcome) {
+        self.count(true, outcome);
+    }
+
+    fn count(&mut self, billable: bool, outcome: Outcome) {
         let s = &mut self.issues;
         s.issued = s.issued.saturating_add(1);
         match outcome {
             Outcome::Ok => {
                 s.ok = s.ok.saturating_add(1);
-                if !action.is_free() {
+                if billable {
                     s.billed = s.billed.saturating_add(1);
                 }
             }
@@ -102,13 +119,6 @@ impl ActLog {
             }
             Outcome::Unknown => s.unknown = s.unknown.saturating_add(1),
             Outcome::Threw => s.threw = s.threw.saturating_add(1),
-        }
-        if outcome != Outcome::Ok {
-            self.last_failure = Some(Failure {
-                time: self.time,
-                action,
-                outcome,
-            });
         }
     }
 
@@ -168,6 +178,25 @@ impl ActLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A structure's call counts like a creep's non-free method, and leaves the last creep failure.
+    #[test]
+    fn structure_calls_are_counted_and_billed() {
+        use rustedscreep_consts::ErrorCode;
+        let mut log = ActLog::default();
+        log.begin(7);
+        log.record(CreepAction::Move, Outcome::Failed(ErrorCode::Tired));
+        log.record_structure(Outcome::Ok);
+        log.record_structure(Outcome::Failed(ErrorCode::Busy));
+        log.record_structure(Outcome::Threw);
+        let i = log.issues();
+        assert_eq!((i.issued, i.ok, i.billed, i.threw), (4, 1, 1, 1));
+        assert_eq!(i.failed(ErrorCode::Busy), 1);
+        assert_eq!(
+            log.last_failure().map(|f| f.action),
+            Some(CreepAction::Move)
+        );
+    }
 
     /// Uses: rustedscreep_consts::INTENT_CPU_COST. OK calls of non-free methods are what the engine
     /// bills (V34); refusals, unknown returns and throws are counted apart, and the last of them is

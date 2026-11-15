@@ -6,6 +6,7 @@ use rustedscreep_consts::{Position, ROOM_SIZE, RoomName, StructureType};
 
 use super::SkipReason;
 use super::intern::{Handle, Interner, ObjectKey};
+use crate::spawning::Identity;
 
 /// Marker for creep handles.
 #[derive(Debug)]
@@ -71,25 +72,49 @@ impl Controller {
     }
 }
 
+/// A room's spawn energy: `Room.energyAvailable` and `energyCapacityAvailable`, the sums over the
+/// bot's spawns and extensions that are not off (V175). Read for owned rooms only; 0 elsewhere.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoomEnergy {
+    /// Unit: energy.
+    pub available: u32,
+    /// Unit: energy.
+    pub capacity: u32,
+}
+
 /// Visible rooms (`Game.rooms`). Rooms are keyed by name, so they need no handles.
 #[derive(Default)]
 pub struct Rooms {
     name: Vec<RoomName>,
     controller: Vec<Controller>,
+    energy: Vec<RoomEnergy>,
 }
 
 impl Rooms {
     pub(super) fn begin(&mut self) {
         self.name.clear();
         self.controller.clear();
+        self.energy.clear();
     }
 
-    /// Adds a room and returns its row.
+    /// Adds a room and returns its row. Its energy is 0 until [`Self::set_energy`].
     pub fn push(&mut self, name: RoomName, controller: Controller) -> usize {
         let row = self.name.len();
         self.name.push(name);
         self.controller.push(controller);
+        self.energy.push(RoomEnergy::default());
         row
+    }
+
+    /// Sets the spawn energy of the room at `row` (P2.3); nothing for a row that does not exist.
+    pub fn set_energy(&mut self, row: usize, energy: RoomEnergy) {
+        if let Some(e) = self.energy.get_mut(row) {
+            *e = energy;
+        }
+    }
+
+    pub fn energy(&self) -> &[RoomEnergy] {
+        &self.energy
     }
 
     pub fn len(&self) -> usize {
@@ -138,12 +163,14 @@ pub struct CreepRow {
 /// Visible creeps: the bot's own (`Game.creeps`) and hostile ones in visible rooms.
 #[derive(Default)]
 pub struct Creeps {
-    ids: Interner<CreepClass, ()>,
+    /// The static data is the identity its name gave an own creep, read once per handle (P2.3).
+    ids: Interner<CreepClass, Option<Identity>>,
     handle: Vec<CreepHandle>,
     pos: Vec<Position>,
     my: Vec<bool>,
     spawning: Vec<bool>,
     fatigue: Vec<u32>,
+    identity: Vec<Option<Identity>>,
 }
 
 impl Creeps {
@@ -154,21 +181,35 @@ impl Creeps {
         self.my.clear();
         self.spawning.clear();
         self.fatigue.clear();
+        self.identity.clear();
     }
 
     pub(super) fn finish(&mut self) -> u32 {
         self.ids.end_pass()
     }
 
-    /// Adds a creep and returns its handle. On an error nothing is added.
+    /// Adds a creep with no identity and returns its handle. On an error nothing is added.
     pub fn push(&mut self, key: ObjectKey, row: CreepRow) -> Result<CreepHandle, SkipReason> {
+        self.push_named(key, row, || None)
+    }
+
+    /// Adds a creep and returns its handle; `identity` runs only when the creep has no live handle
+    /// yet, so an own creep's name is read and parsed once in its life (and once more after a
+    /// global reset). On an error nothing is added.
+    pub fn push_named(
+        &mut self,
+        key: ObjectKey,
+        row: CreepRow,
+        identity: impl FnOnce() -> Option<Identity>,
+    ) -> Result<CreepHandle, SkipReason> {
         let index = u32::try_from(self.handle.len()).map_err(|_| SkipReason::SlotsExhausted)?;
-        let (handle, ()) = self.ids.mark(key, index, || Ok(()))?;
+        let (handle, &id) = self.ids.mark(key, index, || Ok(identity()))?;
         self.handle.push(handle);
         self.pos.push(row.pos);
         self.my.push(row.my);
         self.spawning.push(row.spawning);
         self.fatigue.push(row.fatigue);
+        self.identity.push(id);
         Ok(handle)
     }
 
@@ -215,6 +256,12 @@ impl Creeps {
         &self.fatigue
     }
 
+    /// What each creep's name says (P2.3): `None` for hostile creeps and own creeps whose name does
+    /// not parse (`spawning::CreepName`).
+    pub fn identities(&self) -> &[Option<Identity>] {
+        &self.identity
+    }
+
     /// Creeps first seen this tick.
     pub fn added(&self) -> u32 {
         self.ids.added()
@@ -228,6 +275,52 @@ impl Creeps {
     /// Live handles.
     pub fn live(&self) -> usize {
         self.ids.live()
+    }
+}
+
+/// The bot's own spawns this tick (P2.3), one row per spawn in `Game.structures`, each with its
+/// row in [`Structures`] and whether it is spawning (`StructureSpawn.spawning` not null at the
+/// start of the tick, the state `spawnCreep` checks for `ERR_BUSY`, V171, V175).
+#[derive(Default)]
+pub struct Spawns {
+    structure: Vec<StructureHandle>,
+    row: Vec<u32>,
+    busy: Vec<bool>,
+}
+
+impl Spawns {
+    pub(super) fn begin(&mut self) {
+        self.structure.clear();
+        self.row.clear();
+        self.busy.clear();
+    }
+
+    /// Adds a spawn: its handle, its row in this tick's [`Structures`], and whether it is busy.
+    pub fn push(&mut self, structure: StructureHandle, row: u32, busy: bool) {
+        self.structure.push(structure);
+        self.row.push(row);
+        self.busy.push(busy);
+    }
+
+    pub fn len(&self) -> usize {
+        self.structure.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.structure.is_empty()
+    }
+
+    pub fn handles(&self) -> &[StructureHandle] {
+        &self.structure
+    }
+
+    /// Each spawn's row in this tick's [`Structures`] columns.
+    pub fn rows(&self) -> &[u32] {
+        &self.row
+    }
+
+    pub fn busy(&self) -> &[bool] {
+        &self.busy
     }
 }
 
@@ -604,5 +697,95 @@ mod tests {
         structures.finish();
         assert_eq!(cached_reads, 0);
         assert_eq!(structures.positions(), [at(5).pos]);
+    }
+
+    /// An own creep's name is read once per handle (P2.3): again only after the handle is
+    /// released; a creep pushed without a name has no identity, and a failed push reads nothing.
+    #[test]
+    fn creep_identities_are_read_once_per_handle() {
+        use crate::spawning::{Identity, Role};
+        let id = Identity {
+            role: Role::Worker,
+            home: room("W1N1"),
+            serial: 7,
+        };
+        let row = CreepRow {
+            pos: pos(10, 10, "W1N1"),
+            my: true,
+            spawning: true,
+            fatigue: 0,
+        };
+        let mut creeps = Creeps::default();
+        let mut reads = 0;
+        for _ in 0..3 {
+            creeps.begin();
+            creeps
+                .push_named(ObjectKey(1), row, || {
+                    reads += 1;
+                    Some(id)
+                })
+                .expect("own");
+            creeps
+                .push(ObjectKey(2), CreepRow { my: false, ..row })
+                .expect("hostile");
+            let dup = creeps.push_named(ObjectKey(1), row, || {
+                reads += 1;
+                None
+            });
+            assert_eq!(dup, Err(SkipReason::Duplicate));
+            creeps.finish();
+            assert_eq!(creeps.identities(), [Some(id), None]);
+        }
+        assert_eq!(reads, 1, "read once while the handle lives");
+        creeps.begin();
+        creeps.finish();
+        creeps.begin();
+        creeps
+            .push_named(ObjectKey(1), row, || {
+                reads += 1;
+                None
+            })
+            .expect("again");
+        creeps.finish();
+        assert_eq!(reads, 2, "read again for a new handle");
+        assert_eq!(creeps.identities(), [None]);
+    }
+
+    #[test]
+    fn room_energy_is_zero_until_set_and_resets_each_tick() {
+        let mut rooms = Rooms::default();
+        rooms.begin();
+        let a = rooms.push(room("W1N1"), Controller::Mine { level: 2 });
+        let b = rooms.push(room("W2N1"), Controller::Neutral);
+        let e = RoomEnergy {
+            available: 250,
+            capacity: 550,
+        };
+        rooms.set_energy(a, e);
+        rooms.set_energy(9, e);
+        assert_eq!(rooms.energy(), [e, RoomEnergy::default()]);
+        assert_eq!(rooms.energy().get(b), Some(&RoomEnergy::default()));
+        rooms.begin();
+        assert!(rooms.energy().is_empty());
+    }
+
+    #[test]
+    fn spawn_rows_stay_aligned_and_reset_each_tick() {
+        let mut structures = Structures::default();
+        structures.begin();
+        let st = StructureStatic {
+            kind: StructureType::Spawn,
+            pos: pos(25, 25, "W1N1"),
+        };
+        let h = structures.push(ObjectKey(1), || Ok(st)).expect("spawn");
+        let mut spawns = Spawns::default();
+        spawns.begin();
+        spawns.push(h, 0, true);
+        assert_eq!(
+            (spawns.len(), spawns.handles(), spawns.rows(), spawns.busy()),
+            (1, &[h][..], &[0][..], &[true][..])
+        );
+        spawns.begin();
+        assert!(spawns.is_empty());
     }
 }

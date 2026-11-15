@@ -24,3 +24,4 @@ pub mod persist;
 pub mod profiler;
 pub mod scheduler;
 pub mod snapshot;
+pub mod spawning;

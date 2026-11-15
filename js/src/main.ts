@@ -9,7 +9,7 @@ import {
   loop as wasmLoop, moveTo as wasmMoveTo, movementSummary as wasmMovementSummary,
   persistSummary as wasmPersistSummary, persistTest as wasmPersistTest, profilerSummary as wasmProfilerSummary,
   queueSay as wasmQueueSay, schedulerSummary as wasmSchedulerSummary, snapshotSummary as wasmSnapshotSummary,
-  trapTest as wasmTrapTest,
+  spawn as wasmSpawn, spawnerSummary as wasmSpawnerSummary, trapTest as wasmTrapTest,
 } from '../pkg/rustedscreep_wasm.js';
 import { type BuildInfo, type Env, type Glue, Loader, type LoaderConfig, type LoaderMemory, sanitizeLoaderMemory } from './loader.js';
 
@@ -99,6 +99,8 @@ const glue: Glue = {
   constsSummary: wasmConstsSummary,
   movementSummary: wasmMovementSummary,
   moveTo: wasmMoveTo,
+  spawnerSummary: wasmSpawnerSummary,
+  spawn: wasmSpawn,
 };
 
 const loader = new Loader(env, glue, CONFIG, BUILD);
@@ -129,9 +131,10 @@ function routeConsole(): void {
 // `rustedscreep.scheduler()`, `rustedscreep.act()`, `rustedscreep.profiler()`, `rustedscreep.say("hi")`,
 // `rustedscreep.persist()`, `rustedscreep.persistTest()`, `rustedscreep.config()`,
 // `rustedscreep.configSet("log.level", "debug")`, `rustedscreep.configUnset("log.level")`,
-// `rustedscreep.configReset()`, `rustedscreep.consts()`, `rustedscreep.movement()` or
+// `rustedscreep.configReset()`, `rustedscreep.consts()`, `rustedscreep.movement()`,
 // `rustedscreep.moveTo("W1N1", 25, 25, 1)` (from another room: `rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1")`;
-// `rustedscreep.moveTo()` cancels).
+// `rustedscreep.moveTo()` cancels), `rustedscreep.spawner()` or `rustedscreep.spawn("W1N1", "worker")`
+// (`rustedscreep.spawn()` cancels).
 g.rustedscreep = {
   trapTest: (n: unknown = 1) => loader.scheduleTraps(Number(n)),
   status: () => loader.status(),
@@ -150,6 +153,8 @@ g.rustedscreep = {
   movement: () => loader.movement(),
   moveTo: (room?: unknown, x?: unknown, y?: unknown, range?: unknown, from?: unknown) =>
     loader.moveTo(room, x, y, range, from),
+  spawner: () => loader.spawner(),
+  spawn: (room?: unknown, role?: unknown) => loader.spawn(room, role),
 };
 
 export function loop(): void {

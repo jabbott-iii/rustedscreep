@@ -82,6 +82,7 @@ const ROWS = [
   ['15 Constants self-check (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'consts-sim.mjs')], true],
   ['16 Movement (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'move-sim.mjs')], true],
   ['17 Routes (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'route-sim.mjs')], true],
+  ['18 Spawn path (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'spawn-sim.mjs')], true],
 ];
 
 function main() {

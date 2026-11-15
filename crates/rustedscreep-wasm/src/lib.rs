@@ -27,6 +27,7 @@ mod profiler;
 mod route;
 mod scheduler;
 mod snapshot;
+mod spawn;
 
 use std::cell::RefCell;
 
@@ -47,6 +48,8 @@ struct State {
     act: act::Act,
     /// Movement (P2.1): grids, fields, detours, traffic, the console's move order.
     movement: movement::MovementGlue,
+    /// The minimal spawn path (P2.3): requests, the plan, the orders and the console's request.
+    spawn: spawn::SpawnGlue,
     persist: persist::Persist,
     /// The constants self-check, once per global (P1.11).
     consts: consts_check::ConstsCheck,
@@ -96,6 +99,7 @@ pub fn game_loop() {
                     scheduler: sched,
                     act,
                     movement,
+                    spawn,
                     persist,
                     consts,
                     profiler: prof,
@@ -110,9 +114,12 @@ pub fn game_loop() {
                 snapshot::log_skips(skip_log, snapshot, cfg.log.skip_window_ticks);
                 probe.snapshot();
                 act.begin(snapshot);
+                spawn.begin(snapshot);
                 let mut tick = sched.begin(&snapshot.tick, &cfg.scheduler, scheduler::GameClock);
                 // Critical: the rooms movement needs before anything in them can move, first.
                 movement.read_first(&mut tick, snapshot, js, &cfg.movement);
+                // Critical: the spawn plan, after the Critical jobs that request creeps (P2.3).
+                spawn.plan(&mut tick, snapshot);
                 // Critical, then Standard, then Optional jobs run here and queue intents (P2 onward).
                 // The persistence loads are a Standard job; Critical jobs will run before them (P2).
                 persist.load(&mut tick, snapshot.tick.time, runtime);
@@ -133,6 +140,15 @@ pub fn game_loop() {
                 // After the decide step: the scheduler reads the CPU clock no more (scheduler docs); the
                 // profiler's readings from here on measure the act step outside the budget. The
                 // `TickCpu` held `&mut Scheduler` until `finish`, so `act::issue` cannot run earlier.
+                // Spawn orders go first, so the processor charges them before any creep intent.
+                spawn.issue(
+                    snapshot,
+                    js,
+                    act.log_mut(),
+                    sched,
+                    &cfg.scheduler,
+                    &cfg.spawn,
+                );
                 act::issue(act, snapshot, js, sched, &cfg.scheduler);
                 movement.after_act(snapshot, act.refused_moves(), &cfg.movement);
                 probe.act();
@@ -227,6 +243,32 @@ pub fn move_to(
             Err(_) => String::from("rustedscreep moveTo: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep moveTo: state unavailable"))
+}
+
+/// Exported to JS as `spawnerSummary`, for the `rustedscreep.spawner()` console command: one line
+/// with each spawn room's energy and spawns, the last tick's requests and orders, totals since boot,
+/// the last spawn and failure, the console's request and the own creeps by home and role.
+#[wasm_bindgen(js_name = "spawnerSummary")]
+pub fn spawner_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state.spawn.summary(&state.snapshot),
+            Err(_) => String::from("rustedscreep spawner: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep spawner: state unavailable"))
+}
+
+/// Exported to JS as `spawn`, for `rustedscreep.spawn(room, role)`: from the next tick, a spawn of
+/// `room` spawns one creep of `role` (worker when omitted) sized to the room's capacity, once the
+/// room holds its cost (P2.3). With no room it cancels the request.
+#[wasm_bindgen(js_name = "spawn")]
+pub fn spawn_request(room: Option<String>, role: Option<String>) -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow_mut() {
+            Ok(mut state) => state.spawn.set_console(room.as_deref(), role.as_deref()),
+            Err(_) => String::from("rustedscreep spawn: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep spawn: state unavailable"))
 }
 
 /// Exported to JS as `profilerSummary`, for the `rustedscreep.profiler()` console command: one line

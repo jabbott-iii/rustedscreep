@@ -28,6 +28,7 @@ Run these in order. Do not stop at the first failure, because the user wants the
 | 15 | Constants self-check (sandbox) | run by `npm run check` (`js/tools/consts-sim.mjs`): the plain build against the engine fixture: the read path, drift, the line cap, no constants, a low bucket |
 | 16 | Movement (sandbox) | run by `npm run check` (`js/tools/move-sim.mjs`): the plain build in a room whose wall gaps hold walkable and blocking ramparts, a wall and a site: terrain read once, scans at the interval, a console move order walked with engine-valid moves only and through the walkable gaps only, the order ending, a second one cancelled |
 | 17 | Routes (sandbox) | run by `npm run check` (`js/tools/route-sim.mjs`): the plain build in four rooms with a PathFinder model: a console order from another room walked across two room edges on one search, the novice room blocked by the room callback, the bot's grid as the CostMatrix, a search that throws caught and cached |
+| 18 | Spawn path (sandbox) | run by `npm run check` (`js/tools/spawn-sim.mjs`): the plain build in a room with two spawns: no call without a request or energy, the lower id first, the body as one part array and the encoded name, a refused call holding its spawn while the other takes the request, no clock read while no request can be served, a cleared request after OK, a dropped order's request standing again, the console's replies and the spawner summaries |
 
 `npm run check` runs all of these at once (`js/tools/check.mjs`). Still report each row separately.
 

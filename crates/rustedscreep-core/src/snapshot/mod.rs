@@ -7,8 +7,9 @@
 //! that were not pushed. The rows stay valid until the next `begin`. A failed read skips that one
 //! object, is counted in [`Snapshot::skipped`], and the tick goes on.
 //!
-//! What it holds so far: identity, location and structure type. Later modules add the columns they
-//! consume, so no tick reads data that nothing uses. Row order is the engine's object order, which
+//! What it holds so far: identity, location and structure type; fatigue (P2.1); room energy, own
+//! spawns and own creeps' name identities (P2.3). Later modules add the columns they consume, so
+//! no tick reads data that nothing uses. Row order is the engine's object order, which
 //! is deterministic for the same input but not guaranteed stable across ticks (VERIFICATION_LOG
 //! V102), so a decision that needs a stable order sorts by id (`key_of`), which also survives a
 //! global reset; handle order follows when objects were first seen.
@@ -21,8 +22,9 @@ mod tick;
 pub use intern::{Handle, Interner, ObjectKey};
 pub use room_name::parse_room_name;
 pub use tables::{
-    Controller, CreepClass, CreepHandle, CreepRow, Creeps, Rooms, StructureClass, StructureHandle,
-    StructureStatic, Structures, known_structure_type, position_from_packed,
+    Controller, CreepClass, CreepHandle, CreepRow, Creeps, RoomEnergy, Rooms, Spawns,
+    StructureClass, StructureHandle, StructureStatic, Structures, known_structure_type,
+    position_from_packed,
 };
 pub use tick::TickContext;
 
@@ -172,6 +174,8 @@ pub struct Snapshot {
     pub rooms: Rooms,
     pub creeps: Creeps,
     pub structures: Structures,
+    /// The bot's spawns (P2.3), a view over `structures`.
+    pub spawns: Spawns,
     pub skipped: SkipCounts,
 }
 
@@ -182,6 +186,7 @@ impl Snapshot {
         self.rooms.begin();
         self.creeps.begin();
         self.structures.begin();
+        self.spawns.begin();
         self.skipped = SkipCounts::default();
     }
 

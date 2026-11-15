@@ -15,17 +15,21 @@
 //! - each of `Game.creeps`, `Game.rooms`, `Game.structures`: 3 (the getter, `Object.values`,
 //!   `length`), plus one `Array.get` per element, counted below;
 //! - own creep: 7 (`get`, `id`, the id string copy, `pos`, `__packedPos`, `spawning`, and
-//!   `fatigue` unless it is spawning; the last since P2.1, V160);
+//!   `fatigue` unless it is spawning; the last since P2.1, V160), plus on the tick its handle is
+//!   new `name` and the name copy (P2.3; its identity, `spawning::CreepName`);
 //! - room: 8 with a controller (`get`, `name`, the name copy, `controller`, `my`, `level`, `find`,
-//!   `length`), 6 without; hostile creep: 5 (`get`, `id`, the id copy, `pos`, `__packedPos`;
-//!   hostile results never include spawning creeps, V101);
+//!   `length`), 6 without, plus `energyAvailable` and `energyCapacityAvailable` when the bot owns
+//!   it (P2.3, V175); hostile creep: 5 (`get`, `id`, the id copy, `pos`, `__packedPos`; hostile
+//!   results never include spawning creeps, V101);
 //! - structure: 3 (`get`, `id`, the id copy), plus on the tick it is first seen `structureType`,
 //!   and `pos` and `__packedPos` when the type is known (again every tick while that read fails).
 //!   With `cache.structure_static` off (the naive baseline, P1.10) those three are read every tick.
+//!   A spawn adds `spawning` (P2.3, V175); while it is spawning the `Spawning` object comes back
+//!   through an `Option` (below), and dropping it runs in wasm (V100).
 //!
 //! Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and one
 //! `__externref_table_alloc` (with a JS `Table.set`) per object returned through an `Option`: every
-//! creep's `id` and a room's `controller` when it has one.
+//! creep's `id`, a room's `controller` when it has one, and a busy spawn's `Spawning` (P2.3).
 //!
 //! The id and name copies are separate calls (`__wbindgen_string_get`) because that call is the
 //! type check: a getter typed `-> Option<String>` would save one call per object but traps on a
@@ -39,12 +43,14 @@ use std::fmt::Write as _;
 use js_sys::{Array, Object};
 use rustedscreep_core::config::CacheConfig;
 use rustedscreep_core::snapshot::{
-    Controller, CreepRow, ObjectKey, SkipCounts, SkipLog, SkipReason, SkipReport, Snapshot,
-    StructureStatic, TickContext, known_structure_type, parse_room_name, position_from_packed,
+    Controller, CreepRow, ObjectKey, RoomEnergy, SkipCounts, SkipLog, SkipReason, SkipReport,
+    Snapshot, StructureStatic, TickContext, known_structure_type, parse_room_name,
+    position_from_packed,
 };
+use rustedscreep_core::spawning::{CreepName, Identity};
 use screeps::{
     Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Position, Room, RoomObject,
-    Structure, find, game,
+    Structure, StructureSpawn, StructureType, find, game,
 };
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
@@ -151,6 +157,15 @@ fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room) {
         // `my` is undefined or null on an unowned controller; the crate maps that to false (V101).
         Some(c) => Controller::from_parts(c.my(), c.level()),
     };
+    // Plain u32 getters (V177); only the bot's rooms have spawn energy to plan with.
+    let energy = if matches!(controller, Controller::Mine { .. }) {
+        RoomEnergy {
+            available: room.energy_available(),
+            capacity: room.energy_capacity_available(),
+        }
+    } else {
+        RoomEnergy::default()
+    };
     // A creep is in one room and each room is listed once, so no hostile is pushed twice.
     let hostiles = room
         .unchecked_ref::<Findable>()
@@ -158,7 +173,8 @@ fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room) {
     for index in 0..hostiles.length() {
         push_creep(snapshot, js, hostiles.get(index).unchecked_into(), false);
     }
-    snapshot.rooms.push(name, controller);
+    let row = snapshot.rooms.push(name, controller);
+    snapshot.rooms.set_energy(row, energy);
     js.rooms.push(room);
 }
 
@@ -169,20 +185,30 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
         let spawning = my && creep.spawning();
         // Movement needs it only for own creeps that can move (V160); others read as 0.
         let fatigue = if my && !spawning { creep.fatigue() } else { 0 };
-        snapshot.creeps.push(
-            key,
-            CreepRow {
-                pos,
-                my,
-                spawning,
-                fatigue,
-            },
-        )
+        let row = CreepRow {
+            pos,
+            my,
+            spawning,
+            fatigue,
+        };
+        if my {
+            // The name is read only when the creep's handle is new (P2.3).
+            snapshot.creeps.push_named(key, row, || identity_of(&creep))
+        } else {
+            snapshot.creeps.push(key, row)
+        }
     });
     match pushed {
         Ok(_) => js.creeps.push(creep),
         Err(reason) => snapshot.skipped.record(reason),
     }
+}
+
+/// What an own creep's name says, read as a plain value (`Creep::name` panics on a non-string,
+/// V177) and parsed in core; `None` for a name the bot did not give.
+fn identity_of(creep: &Creep) -> Option<Identity> {
+    let name = creep.unchecked_ref::<Named>().name_value().as_string()?;
+    CreepName::parse(name.as_bytes())
 }
 
 fn push_structure(snapshot: &mut Snapshot, js: &mut JsWorld, structure: Structure) {
@@ -197,7 +223,19 @@ fn push_structure(snapshot: &mut Snapshot, js: &mut JsWorld, structure: Structur
         })
     });
     match pushed {
-        Ok(_) => js.structures.push(structure),
+        Ok(handle) => {
+            let structures = &snapshot.structures;
+            if structures.kinds().last() == Some(&StructureType::Spawn) {
+                // Null when idle (V175); the crate's getter maps null and undefined to None (V177).
+                let busy = structure
+                    .unchecked_ref::<StructureSpawn>()
+                    .spawning()
+                    .is_some();
+                let row = u32::try_from(structures.len().saturating_sub(1)).unwrap_or(u32::MAX);
+                snapshot.spawns.push(handle, row, busy);
+            }
+            js.structures.push(structure);
+        }
         Err(reason) => snapshot.skipped.record(reason),
     }
 }

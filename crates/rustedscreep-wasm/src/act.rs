@@ -134,6 +134,11 @@ impl Act {
         self.log.issues()
     }
 
+    /// This tick's call counters, for the spawn orders issued before the creep intents (P2.3).
+    pub fn log_mut(&mut self) -> &mut ActLog {
+        &mut self.log
+    }
+
     /// For the `rustedscreep.say(text)` console command: every own creep says `text` (cut to what
     /// the engine shows) on the next tick, visible only to the bot's owner.
     pub fn request_say(&mut self, text: &str) -> String {

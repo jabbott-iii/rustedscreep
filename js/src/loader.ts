@@ -69,6 +69,13 @@ export interface Glue {
    * every argument undefined it cancels the order. Returns the outcome (P2 movement).
    */
   moveTo?: (room?: string, x?: number, y?: number, range?: number, from?: string) => string;
+  /** One line about the spawn path: spawn rooms, the last tick's requests and orders, totals, creeps by role (P2 spawn). */
+  spawnerSummary?: () => string;
+  /**
+   * Sets the console's spawn request: a spawn of `room` spawns one creep of `role` (worker when undefined). With
+   * every argument undefined it cancels the request. Returns the outcome (P2 spawn).
+   */
+  spawn?: (room?: string, role?: string) => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -591,11 +598,31 @@ export class Loader {
     return this.guarded('moveTo', 'move order', () => call(room, x, y, range, from));
   }
 
+  /** Console command `rustedscreep.spawner()`: the wasm's spawn path summary (rooms, requests, orders, creeps). */
+  spawner(): string {
+    return this.summary('spawnerSummary', 'spawner summary');
+  }
+
+  /**
+   * Console command `rustedscreep.spawn(room, role)`: a spawn of `room` spawns one creep of `role` (worker when
+   * omitted) sized to the room's capacity, once the room holds its cost; `rustedscreep.spawn()` cancels. Only
+   * strings reach the wasm, which checks the room name and the role.
+   */
+  spawn(room?: unknown, role?: unknown): string {
+    const call = this.glue.spawn;
+    if (!call) return 'rustedscreep: this build has no spawn export';
+    if (room === undefined && role === undefined) return this.guarded('spawn', 'spawn request', () => call());
+    if (typeof room !== 'string' || !(role === undefined || typeof role === 'string')) {
+      return 'rustedscreep: give a room name and optionally a role, for example rustedscreep.spawn("W1N1") or rustedscreep.spawn("W1N1", "worker"); rustedscreep.spawn() cancels';
+    }
+    return this.guarded('spawn', 'spawn request', () => call(room, role));
+  }
+
   /** Calls a wasm summary export for a console command (see `guarded`). */
   private summary(
     name:
       | 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary' | 'persistSummary' | 'configSummary'
-      | 'constsSummary' | 'movementSummary',
+      | 'constsSummary' | 'movementSummary' | 'spawnerSummary',
     noun: string,
   ): string {
     const call = this.glue[name];

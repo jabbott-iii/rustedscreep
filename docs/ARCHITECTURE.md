@@ -6,22 +6,26 @@ Claude Code fills each section in as its phase lands. Keep it factual: describe 
 _P1._ A diagram plus a step list: loader → `loop` → tick context → snapshot → caches → scheduler tiers → decisions →
 intent buffer (no-op filtering, pipeline check) → act → persistence flush → profiler flush. Include JS crossings per step.
 
-Current state (P2.2; P1 plus movement, in room and between rooms): loader → `loop` (rustedscreep-wasm `game_loop`) → a copy of the config in force (`config::Runtime`, the active profile with the runtime overrides; the whole tick runs on it, so a record that loads during the decide step applies from the next tick, except the log level and the flush's segment limits) → snapshot → movement's tick start (step 5a) → the rate-limited skipped-object log (`SkipLog`, at most one line per `log.skip_window_ticks`) → the intent buffer opened for it → scheduler tick (the decide step: movement's room reads, a Critical job (P2.1), the persistence loads, a Standard step job (P1.9), movement's rescans and the console's move order, Standard (P2.1), then the constants self-check, an Optional step job that runs once per global (P1.11), then movement's traffic resolution; no game job yet, so only the console's `say` and `moveTo` queue intents) → act step (and the refused moves back to movement) → fault log → profiler record. A build with the `profiler` feature (step 9) reads the clock around these steps; without it the profiler compiles out. The snapshot
+Current state (P2.3; P1 plus movement, in room and between rooms, and the minimal spawn path): loader → `loop` (rustedscreep-wasm `game_loop`) → a copy of the config in force (`config::Runtime`, the active profile with the runtime overrides; the whole tick runs on it, so a record that loads during the decide step applies from the next tick, except the log level and the flush's segment limits) → snapshot → movement's tick start (step 5a) → the rate-limited skipped-object log (`SkipLog`, at most one line per `log.skip_window_ticks`) → the intent buffer and the spawner opened for it (the console's spawn request queued) → scheduler tick (the decide step: movement's room reads, a Critical job (P2.1), the spawn plan, a Critical job with one unit per room that has a request and a ready spawn (not spawning, not held), none on a tick with nothing asked or with every spawn of each asking room busy or held (a room waiting for energy with a ready spawn is planned every tick) (P2.3), the persistence loads, a Standard step job (P1.9), movement's rescans and the console's move order, Standard (P2.1), then the constants self-check, an Optional step job that runs once per global (P1.11), then movement's traffic resolution; no game job yet, so only the console's `say`, `moveTo` and `spawn` queue intents) → act step (the spawn orders first, step 7a, then the creep intents, and the refused moves back to movement) → fault log → profiler record. A build with the `profiler` feature (step 9) reads the clock around these steps; without it the profiler compiles out. The snapshot
 (`rustedscreep-wasm/src/snapshot.rs` filling `rustedscreep_core::snapshot::Snapshot`) makes one pass, in this order:
 1. Tick context: `Game.time`, `Game.cpu.limit`, `tickLimit`, `bucket` (4 JS calls), sanitized by `TickContext::from_raw`.
 2. `Game.creeps` (own creeps, spawning ones included; V101): 3 calls for the collection (getter, `Object.values`, `length`),
    then per creep 7 (`Array.get`, `id`, the id string copy, `pos`, `__packedPos`, `spawning`, and `fatigue` unless it is spawning,
-   P2.1, V160).
+   P2.1, V160), plus `name` and its copy on the tick the creep's handle is new: its identity (role, home, serial) parsed in core
+   (`spawning::CreepName`, P2.3), kept as the handle's static data.
 3. `Game.rooms`: 3 calls, then per room 8 with a controller (`get`, `name`, the name copy, `controller`, `my`, `level`, `find`,
-   `length`) or 6 without; per hostile 5 (`get`, `id`, the id copy, `pos`, `__packedPos`; hostile results never include spawning
-   creeps, V101).
+   `length`) or 6 without, plus `energyAvailable` and `energyCapacityAvailable` for an owned room (P2.3, V175); per hostile 5 (`get`,
+   `id`, the id copy, `pos`, `__packedPos`; hostile results never include spawning creeps, V101).
    The name is parsed from its bytes (`snapshot::parse_room_name`, the crate's `RoomName::from_str` semantics without its str
    slicing, which costs 8139 bytes of release wasm; V114).
 4. `Game.structures` (own structures; V101): 3 calls, then per structure 3 (`get`, `id`, the id copy), plus on the tick it is
    first seen `structureType`, and `pos` and `__packedPos` when the type is known (again every tick while that read fails). With
-   `cache.structure_static` off (the naive baseline, P1.10) those three are read on every tick.
+   `cache.structure_static` off (the naive baseline, P1.10) those three are read on every tick. Each spawn adds `spawning` (null when
+   idle, V175); a busy spawn's `Spawning` comes back through an `Option` (below; its drop runs in wasm, V100). Each spawn gets a row
+   in `Snapshot::spawns` (P2.3).
 Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and one `__externref_table_alloc` (with a JS
-`Table.set`) per object returned through an `Option` (every creep's `id`, a room's `controller` when present).
+`Table.set`) per object returned through an `Option` (every creep's `id`, a room's `controller` when present, a busy spawn's
+`Spawning`, P2.3).
 5. `finish`: handles of objects the pass did not push are released.
 5a. Movement's tick (P2.1, `rustedscreep-wasm/src/movement.rs` over `rustedscreep_core::movement`): `Movement::begin` (no JS
    call) notes the rooms with own creeps and the owned ones, checks last tick's moves (a creep not on the tile it was moved toward
@@ -52,6 +56,17 @@ Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and o
    classified (OK, a known `ErrorCode`, or unknown), and a throw is a fault under job `act` (unit: the actor's handle slot),
    rate-limited with the scheduler's, after which the next issue runs. `rustedscreep.act()` prints the last tick's counts and the
    totals since boot. The buffer issues only a creep's last push of a method, with no fallback to an earlier push if that call fails.
+7a. Spawn orders (P2.3, `rustedscreep-wasm/src/spawn.rs` over `rustedscreep_core::spawning`), in the act step before the creep
+   intents: the processor takes a user's objects in the order of each one's first recorded intent (V179), so the spawn is charged
+   before any of the bot's own creeps acts (another user's intents may still come first). One `spawnCreep(body, name)` per order on
+   this tick's JS spawn, the body one slice of part indices that the glue maps to strings and frees with a `__wbindgen_free` callback
+   (V178), bound locally with `catch` and an `f64` return (the crate's binding unwraps the code and converts each part with its own
+   call, V177). Each outcome goes to the spawner (anything but OK holds the spawn for the next `spawn.hold_ticks` ticks, then
+   probation) and to the act counters (`ActLog::record_structure`, billed on OK, V34); a throw is a fault under job `spawn act` and a
+   warning with the JS error's message; an OK logs one info line ("accepted": the processor may still drop the order, V173; the
+   console's request stands again when no creep of the order's identity is in the next snapshot). A successful call makes the
+   engine read `Memory` and write `Memory.creeps[name]` (V172; ADR-018, proposed); with a `Memory` that does not parse every such
+   call throws instead (V172; ADR-019, proposed). The bot's code does not touch `Memory`. No orders, no call.
 8. The persistence output step (P1.9; while the tick runs the Standard tier): dirty records are written (the config record after a
    console change, P1.10) and the active set is issued when the manager asks; see section 5. Then the fault reports queued this tick
    (jobs' and the act step's) go out through `log::warn!` (`logging.rs`: `log` macros and a minimal logger that prints with
@@ -133,6 +148,22 @@ step's refused moves back (`act.rs` collects them); the intent buffer refuses a 
 (`Rejected::Tired`, V108, V160). The scheduler's `Commit::heavy` lets a unit end its batch so the slicer reads the clock right
 after it.
 
+Spawn path (P2.3; the P5 global queue replaces the planner): `rustedscreep_core::spawning` is pure. `Body` is 1 to `MAX_CREEP_SIZE`
+known parts with its cost (`BODYPART_COST`) and spawn time (`CREEP_SPAWN_TIME` per part, V170); `Body::scaled` is the largest body of
+whole repeats of a pattern within an energy amount, a repeat cap and the size cap (the P3 body solver replaces it). `CreepName`
+encodes and parses a creep's identity (`Role`, home room, serial from `Game.time` and the order's index in its tick, so names never
+repeat, V171, V176): the bot's only creep state, read once per creep (§3). `Spawner` takes the tick's `SpawnRequest`s (home, role,
+pattern, repeat cap, `EnergyBudget::Capacity` to wait for the room's capacity or `Available` to spawn what the room holds now, and a
+priority); `close` keeps the rooms with a request and a ready spawn as the Critical `spawn` job's units; `plan_room` gives the room's
+ready spawns, in id order with those on probation last, its requests in priority order, keeping the energy left over the orders because the runtime checks
+each call against the same tick-start `energyAvailable` and the processor silently drops a second order the first one starved
+(V172, V173); a request that must wait for energy stops the room, so nothing below it spends the energy; one with no body that
+fits the room's capacity (a repeat above it, or no repeat allowed) is skipped whatever its budget, so it never blocks the room. `record` holds a spawn after a refused call, then keeps it on probation until a call of its own is accepted. The snapshot gained `RoomEnergy` per room, `Spawns` (handle,
+structure row, busy) and the creep identity column; `ActLog::record_structure` counts a structure's call. rustedscreep-wasm's
+`spawn.rs` binds `spawnCreep`, runs the job, issues the orders (§1 step 7a) and answers `rustedscreep.spawner()` and
+`rustedscreep.spawn(room, role)` (a request repeated each tick until a spawn's call for it returns OK, and again if its creep does
+not appear on the next tick).
+
 Constants self-check (P1.11): `rustedscreep_core::consts_check` is pure. A `Globals` source gives the server's names, then one
 value's JSON text per step; `Check::step` reads them all, checks that at least one anchor constant (`OK`, `WORK`, `CREEP_LIFE_TIME`) was seen (otherwise the global holds no game constants and the check fails),
 then compares 15 groups (scalars, enum families by prefix, sets, tables entry by entry) with `rustedscreep_consts`, through a strict
@@ -173,6 +204,8 @@ _P1 onward._
 | Avoided edge tiles (P2.2) | room and tile | edge tiles a path stepped onto and back into the room from, learned when that cost a creep its way | the requesting job's tier | `movement.route_ttl_ticks` after they were learned; a global reset | `route_ttl_ticks` | 12 B per tile | none: it is learned state |
 | Closed rooms (P2.2) | room name | rooms an own creep could not cross into (a refused transfer), and until when | the snapshot step (`Movement::begin`) | `movement.route_ttl_ticks` after the last refusal; a global reset | `route_ttl_ticks` | 8 B per room | none: it is learned state |
 | PathFinder matrices and room statuses (P2.2, rustedscreep-wasm route.rs) | room name | each grid as PathFinder bytes (2500 B, avoided edge tiles at 255; a room with avoided tiles and no grid gets the unknown-room matrix with them) with its version and a fingerprint of its avoided tiles and the JS CostMatrix made from it; `Game.map.getRoomStatus` per room and the tick read; one shared CostMatrix for rooms without a grid | in a route search (the requesting job's tier; a target room that is closed or of another status fails before PathFinder runs) | a grid's new version or a change in its avoided tiles (copied again, the CostMatrix remade on use), the room leaving movement's rooms; a status `route_ttl_ticks` old (read again); at most `route_cache_size` statuses (the oldest out); a global reset | statuses: `route_ttl_ticks` | about 2.5 KB of wasm memory and 2.5 KB of JS memory per room with a grid | none |
+| Creep identity (P2.3) | creep handle (the interner's static data) | role, home room and serial parsed from an own creep's name (`spawning::CreepName`), or none | Critical (snapshot), read only when the handle is new | the handle being released (the creep died or left `Game.creeps`); a global reset reads every name once | none | 24 B per slot | none |
+| Spawn holds (P2.3) | spawn handle | the tick from which a spawn whose call the game refused may take an order again; after it, the spawn is on probation (it takes orders after the room's other ready spawns) | the act step | an accepted call of its own (ends the probation), the spawn's handle being released, or a global reset (fails open: one refused call) | held for `hold_ticks`, then probation until an accepted call | 12 B per refused spawn | none: it is learned state |
 | Fault log (P1.6) | one per global | fault totals, the current window's counts, up to `fault_reports_per_window` queued reports, up to 4 names of jobs whose faults were held back, the last fault | every tick (scheduler) | its window closing `fault_window_ticks` ticks after it opened, or `Game.time` falling before its start; a global reset clears it | the window | under 1 KB | none |
 
 ## 4. CPU tiers and budget
@@ -250,6 +283,13 @@ Current state (P1.10; the manager and the frame are P1.9, ADR-004):
   console (`RawMemory.segments[97] = ""`) leaves the next global with no overrides, without the bot.
 - The driver re-saves every segment loaded on a tick (V119), so each load costs a save key on its tick; the manager keeps one key
   free for segment 99 in a `profiler` build.
+- Creep names (P2.3) are persisted state outside RawMemory: a creep keeps the name a build gave it for its whole life, across
+  global resets and deploys, and it is the bot's only creep state (`rustedscreep_core::spawning` name docs: the role's letter, the
+  home room, `-`, the serial in base 36). A role's letter is never changed or reused; a format change keeps parsing the old one
+  until no own creep carries it: at least `CREEP_LIFE_TIME` + `MAX_CREEP_SIZE` × `CREEP_SPAWN_TIME` ticks after the last old-form
+  order (the life clock starts when the creep leaves the spawn, V170), longer while a spawn's exits are blocked, unbounded once
+  creeps are renewed. A name that does not parse gives no identity, never an error. `spawnCreep` itself writes
+  `Memory.creeps[name]` (V172); ADR-018 (proposed) decides what to do with those entries.
 
 ## 6. Failure handling
 _P1._ Error isolation boundaries, loader recovery (ADR-003), reset behavior, respawn, shard travel, missing Memory.

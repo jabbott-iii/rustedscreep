@@ -33,3 +33,11 @@ pub const MEMORY_SEGMENT_SAVE_LIMIT: u32 = 10;
 /// `VALID_ROOM_NAME_COORDINATES`), the same layout as the engine's `__packedPos` (VERIFICATION_LOG
 /// V103, V114). Last verified: 2026-11-14.
 pub const HALF_WORLD_SIZE: i32 = 128;
+
+/// Longest creep name `StructureSpawn.spawnCreep` accepts, in UTF-16 code units (`name.length`):
+/// a longer one returns `ERR_INVALID_ARGS`. The runtime checks no character set.
+///
+/// Source: screeps/engine `src/game/structures.js` at a90d26f
+/// (<https://github.com/screeps/engine/blob/a90d26fc9eb943147799e65d0bf9d4d0d79a2722/src/game/structures.js#L1065-L1071>),
+/// VERIFICATION_LOG V171. Last verified: 2026-11-15.
+pub const CREEP_NAME_MAX_LENGTH: usize = 100;

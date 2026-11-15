@@ -346,6 +346,18 @@ pub const MOVEMENT_MMO: MovementConfig = MovementConfig {
     route_cache_size: 64,
 };
 
+/// Spawn path thresholds (ROADMAP P2, the minimal spawn path); `docs/TUNING.md` gives the
+/// rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpawnConfig {
+    /// A spawn whose `spawnCreep` call the game refused (or that threw) takes no order for this
+    /// long, so another spawn of its room can take the request. Unit: ticks.
+    pub hold_ticks: u32,
+}
+
+/// Spawn path values for the official MMO.
+pub const SPAWN_MMO: SpawnConfig = SpawnConfig { hold_ticks: 20 };
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,6 +369,7 @@ pub struct Config {
     pub log: LogConfig,
     pub cache: CacheConfig,
     pub movement: MovementConfig,
+    pub spawn: SpawnConfig,
 }
 
 /// A server profile: a name and its values.
@@ -377,6 +390,7 @@ pub const MMO: Profile = Profile {
         log: LOG_MMO,
         cache: CACHE_MMO,
         movement: MOVEMENT_MMO,
+        spawn: SPAWN_MMO,
     },
 };
 
@@ -537,7 +551,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 51;
+pub const FIELD_COUNT: usize = 52;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -743,6 +757,7 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     ),
     number!(movement, "MovementConfig", route_retry_ticks, 1, 5000, true),
     number!(movement, "MovementConfig", route_cache_size, 4, 1024, true),
+    number!(spawn, "SpawnConfig", hold_ticks, 1, 1500, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -927,8 +942,10 @@ mod tests {
             log: _,
             cache: _,
             movement: _,
+            spawn: _,
         } = MMO.config;
-        let expected: [(&str, &[&str]); 7] = [
+        let SpawnConfig { hold_ticks: _ } = SPAWN_MMO;
+        let expected: [(&str, &[&str]); 8] = [
             (
                 "loader",
                 &[
@@ -1000,6 +1017,7 @@ mod tests {
                     "route_cache_size",
                 ],
             ),
+            ("spawn", &["hold_ticks"]),
         ];
         let mut total = 0;
         for (group, names) in expected {
