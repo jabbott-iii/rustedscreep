@@ -14,11 +14,17 @@ pub enum CreepClass {}
 /// Marker for structure handles.
 #[derive(Debug)]
 pub enum StructureClass {}
+/// Marker for room-object handles (P2.4).
+#[derive(Debug)]
+pub enum ObjectClass {}
 
 /// A creep's handle: stable while the creep is in the snapshot on consecutive ticks.
 pub type CreepHandle = Handle<CreepClass>;
 /// A structure's handle: stable while the structure is in the snapshot on consecutive ticks.
 pub type StructureHandle = Handle<StructureClass>;
+/// A room object's handle (a source, an own site, a pile, a tombstone, a ruin or a container; P2.4):
+/// stable while the object is in the snapshot on consecutive ticks.
+pub type ObjectHandle = Handle<ObjectClass>;
 
 /// Decodes a `RoomPosition.__packedPos` value, or `None` when x or y is outside the room.
 ///
@@ -82,12 +88,25 @@ pub struct RoomEnergy {
     pub capacity: u32,
 }
 
+/// An owned controller's progress and timers (P2.4), read for owned rooms only; all 0 (and not
+/// blocked) elsewhere.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControllerState {
+    /// `progress`. Unit: energy.
+    pub progress: u32,
+    /// `ticksToDowngrade`. Unit: ticks.
+    pub downgrade_ticks: u32,
+    /// `upgradeBlocked` is set: `upgradeController` is refused until it ends.
+    pub upgrade_blocked: bool,
+}
+
 /// Visible rooms (`Game.rooms`). Rooms are keyed by name, so they need no handles.
 #[derive(Default)]
 pub struct Rooms {
     name: Vec<RoomName>,
     controller: Vec<Controller>,
     energy: Vec<RoomEnergy>,
+    state: Vec<ControllerState>,
 }
 
 impl Rooms {
@@ -95,15 +114,29 @@ impl Rooms {
         self.name.clear();
         self.controller.clear();
         self.energy.clear();
+        self.state.clear();
     }
 
-    /// Adds a room and returns its row. Its energy is 0 until [`Self::set_energy`].
+    /// Adds a room and returns its row. Its energy and controller state are 0 until
+    /// [`Self::set_energy`] and [`Self::set_controller_state`].
     pub fn push(&mut self, name: RoomName, controller: Controller) -> usize {
         let row = self.name.len();
         self.name.push(name);
         self.controller.push(controller);
         self.energy.push(RoomEnergy::default());
+        self.state.push(ControllerState::default());
         row
+    }
+
+    /// Sets the controller state of the room at `row` (P2.4); nothing for a row that does not exist.
+    pub fn set_controller_state(&mut self, row: usize, state: ControllerState) {
+        if let Some(s) = self.state.get_mut(row) {
+            *s = state;
+        }
+    }
+
+    pub fn controller_states(&self) -> &[ControllerState] {
+        &self.state
     }
 
     /// Sets the spawn energy of the room at `row` (P2.3); nothing for a row that does not exist.
@@ -160,6 +193,22 @@ pub struct CreepRow {
     pub fatigue: u32,
 }
 
+/// What an own creep carries (P2.4): read for own creeps that are not spawning; 0 otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CreepStore {
+    /// Energy in the store. Unit: energy.
+    pub energy: u32,
+    /// The store's capacity for energy, as `store.getCapacity(RESOURCE_ENERGY)` gives it. Unit: energy.
+    pub capacity: u32,
+}
+
+impl CreepStore {
+    /// Room left for energy (0 when the store holds more than its capacity).
+    pub const fn free(self) -> u32 {
+        self.capacity.saturating_sub(self.energy)
+    }
+}
+
 /// Visible creeps: the bot's own (`Game.creeps`) and hostile ones in visible rooms.
 #[derive(Default)]
 pub struct Creeps {
@@ -171,6 +220,7 @@ pub struct Creeps {
     spawning: Vec<bool>,
     fatigue: Vec<u32>,
     identity: Vec<Option<Identity>>,
+    store: Vec<CreepStore>,
 }
 
 impl Creeps {
@@ -182,6 +232,7 @@ impl Creeps {
         self.spawning.clear();
         self.fatigue.clear();
         self.identity.clear();
+        self.store.clear();
     }
 
     pub(super) fn finish(&mut self) -> u32 {
@@ -210,7 +261,20 @@ impl Creeps {
         self.spawning.push(row.spawning);
         self.fatigue.push(row.fatigue);
         self.identity.push(id);
+        self.store.push(CreepStore::default());
         Ok(handle)
+    }
+
+    /// Sets the store of the creep at `row` (P2.4); nothing for a row that does not exist.
+    pub fn set_store(&mut self, row: usize, store: CreepStore) {
+        if let Some(s) = self.store.get_mut(row) {
+            *s = store;
+        }
+    }
+
+    /// What each creep carries (P2.4): 0 for hostile and spawning creeps.
+    pub fn stores(&self) -> &[CreepStore] {
+        &self.store
     }
 
     pub fn len(&self) -> usize {
@@ -339,6 +403,7 @@ pub struct Structures {
     handle: Vec<StructureHandle>,
     kind: Vec<StructureType>,
     pos: Vec<Position>,
+    free_energy: Vec<u32>,
     /// The static-data cache is off (`CacheConfig::structure_static` false): read every push.
     reread_static: bool,
 }
@@ -349,6 +414,7 @@ impl Structures {
         self.handle.clear();
         self.kind.clear();
         self.pos.clear();
+        self.free_energy.clear();
     }
 
     pub(super) fn finish(&mut self) -> u32 {
@@ -380,7 +446,21 @@ impl Structures {
         self.handle.push(handle);
         self.kind.push(data.kind);
         self.pos.push(data.pos);
+        self.free_energy.push(0);
         Ok(handle)
+    }
+
+    /// Sets the room for energy of the structure at `row` (P2.4); nothing for a row that does not exist.
+    pub fn set_free_energy(&mut self, row: usize, free: u32) {
+        if let Some(f) = self.free_energy.get_mut(row) {
+            *f = free;
+        }
+    }
+
+    /// Room for energy per structure (P2.4), as `store.getFreeCapacity(RESOURCE_ENERGY)` gives it,
+    /// read for spawns and extensions in a room that is not full; 0 (full, or not read) otherwise.
+    pub fn free_energy(&self) -> &[u32] {
+        &self.free_energy
     }
 
     pub fn len(&self) -> usize {
@@ -424,6 +504,154 @@ impl Structures {
     }
 
     /// Handles released at the end of this tick's pass (structures that were gone).
+    pub fn released(&self) -> u32 {
+        self.ids.released()
+    }
+
+    /// Live handles.
+    pub fn live(&self) -> usize {
+        self.ids.live()
+    }
+}
+
+/// What a [`RoomObjects`] row is (P2.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectKind {
+    /// A source: `amount` is its `energy`, `total` its `energyCapacity`.
+    Source,
+    /// An own construction site of this structure type: `amount` is its `progress`, `total` its
+    /// `progressTotal`.
+    Site(StructureType),
+    /// A dropped pile of energy: `amount` is its `amount`.
+    Energy,
+    /// A dropped pile of another resource: `amount` is its `amount` (nothing uses it yet).
+    OtherResource,
+    /// A tombstone: `amount` is the energy in its store.
+    Tombstone,
+    /// A ruin: `amount` is the energy in its store.
+    Ruin,
+    /// A container (it has no owner, so `Game.structures` leaves it out): `amount` is the energy in
+    /// its store.
+    Container,
+}
+
+impl ObjectKind {
+    /// Whether the energy in it can be taken: `pickup` for a pile, `withdraw` for the rest.
+    pub const fn holds_energy(self) -> bool {
+        matches!(
+            self,
+            Self::Energy | Self::Tombstone | Self::Ruin | Self::Container
+        )
+    }
+}
+
+/// What never changes for a room object: read from JS once, when the object is first seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectStatic {
+    pub kind: ObjectKind,
+    pub pos: Position,
+}
+
+/// What changes for a room object, read every tick (see [`ObjectKind`] for what each holds).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObjectRow {
+    pub amount: u32,
+    pub total: u32,
+}
+
+/// Room objects the opening works with (P2.4), read in the bot's owned rooms: sources, own
+/// construction sites, dropped resources, tombstones, ruins and containers.
+#[derive(Default)]
+pub struct RoomObjects {
+    ids: Interner<ObjectClass, ObjectStatic>,
+    handle: Vec<ObjectHandle>,
+    kind: Vec<ObjectKind>,
+    pos: Vec<Position>,
+    amount: Vec<u32>,
+    total: Vec<u32>,
+}
+
+impl RoomObjects {
+    pub(super) fn begin(&mut self) {
+        self.ids.begin_pass();
+        self.handle.clear();
+        self.kind.clear();
+        self.pos.clear();
+        self.amount.clear();
+        self.total.clear();
+    }
+
+    pub(super) fn finish(&mut self) -> u32 {
+        self.ids.end_pass()
+    }
+
+    /// Adds an object and returns its handle. `read_static` runs only when the id is new; on any
+    /// error nothing is added, so an object whose static read fails is read again next tick.
+    pub fn push(
+        &mut self,
+        key: ObjectKey,
+        read_static: impl FnOnce() -> Result<ObjectStatic, SkipReason>,
+        row: ObjectRow,
+    ) -> Result<ObjectHandle, SkipReason> {
+        let index = u32::try_from(self.handle.len()).map_err(|_| SkipReason::SlotsExhausted)?;
+        let (handle, &data) = self.ids.mark(key, index, read_static)?;
+        self.handle.push(handle);
+        self.kind.push(data.kind);
+        self.pos.push(data.pos);
+        self.amount.push(row.amount);
+        self.total.push(row.total);
+        Ok(handle)
+    }
+
+    pub fn len(&self) -> usize {
+        self.handle.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.handle.is_empty()
+    }
+
+    /// The handle's row in this tick's columns, if the object is in this tick's snapshot.
+    pub fn row_of(&self, handle: ObjectHandle) -> Option<usize> {
+        usize::try_from(self.ids.row(handle)?).ok()
+    }
+
+    /// The live handle of an object id, if the object was in the last snapshot.
+    pub fn handle_of(&self, key: ObjectKey) -> Option<ObjectHandle> {
+        self.ids.get(key)
+    }
+
+    /// The id of a live object handle, for a stable order (rows follow the engine's order, V102).
+    pub fn key_of(&self, handle: ObjectHandle) -> Option<ObjectKey> {
+        self.ids.key(handle)
+    }
+
+    pub fn handles(&self) -> &[ObjectHandle] {
+        &self.handle
+    }
+
+    pub fn kinds(&self) -> &[ObjectKind] {
+        &self.kind
+    }
+
+    pub fn positions(&self) -> &[Position] {
+        &self.pos
+    }
+
+    pub fn amounts(&self) -> &[u32] {
+        &self.amount
+    }
+
+    pub fn totals(&self) -> &[u32] {
+        &self.total
+    }
+
+    /// Objects first seen this tick.
+    pub fn added(&self) -> u32 {
+        self.ids.added()
+    }
+
+    /// Handles released at the end of this tick's pass (objects that were gone).
     pub fn released(&self) -> u32 {
         self.ids.released()
     }

@@ -17,10 +17,13 @@
 //   PathFinder (V165): the bot catches it (no trap, no fault), the creeps hold, each creep searches once and keeps its
 //   failure (a failure is never shared: it says nothing about another creep's tile), and `rustedscreep.movement()`
 //   counts the searches that threw.
+// The P2.4 opening reads the owned W1N1 every loop (its finds, the controller's getters, the creeps' stores; engine-
+// shaped here, V189, V196, V199) but stays inert: W1N1 has no source and the creeps no bot worker name, and with no
+// spawn there its extension placement (ADR-020) has nothing to place around, so no createConstructionSite call.
 // npm run check runs it (row 17); standalone: node js/tools/route-sim.mjs [dir].
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
-import { packPos } from './lib/world.mjs';
+import { CARRY_CAPACITY, findFiltered, makeStore, packPos } from './lib/world.mjs';
 import { commandResults, simulate } from './smoke.mjs';
 
 // @screeps/common 2.16.0 constants (the fixture the constants self-check reads).
@@ -77,8 +80,13 @@ const TERRAIN = {
   W2N2: terrain(['S', 'E', 'W']), // the west edge leads to W3N2, which has no terrain data
 };
 const STATUS = { W1N2: 'novice' };
+/** CONTROLLER_LEVELS[2] and CONTROLLER_DOWNGRADE[2] (@screeps/common 2.16.0). */
+const PROGRESS_TOTAL_2 = 45000;
+const DOWNGRADE_2 = 10000;
 const controller = {
   id: id(1), structureType: 'controller', my: true, level: 2, pos: { x: 40, y: 40, roomName: HOME, __packedPos: packPos(HOME, 40, 40) },
+  // The getters of an owned controller (V189): no progress yet, the level's total, a full downgrade timer.
+  progress: 0, progressTotal: PROGRESS_TOTAL_2, ticksToDowngrade: DOWNGRADE_2,
 };
 
 function blocked(room, x, y) {
@@ -224,6 +232,7 @@ function sceneFor(state, offset) {
   const own = state.creeps.map((c) => ({
     id: c.id, name: c.name, my: true, spawning: false, fatigue: 0, owner: { username: 'bot' },
     pos: { x: c.x, y: c.y, roomName: c.room, __packedPos: packPos(c.room, c.x, c.y) },
+    store: makeStore({}, { capacity: CARRY_CAPACITY }),
     move(direction) {
       state.calls.push([offset, c.name, 'move', direction]);
       state.pending.push([c, direction]);
@@ -237,8 +246,8 @@ function sceneFor(state, offset) {
     rooms[name] = {
       name,
       controller: name === HOME ? controller : undefined,
-      find(type) {
-        return type === FIND.STRUCTURES && name === HOME ? [controller] : [];
+      find(type, opts) {
+        return findFiltered(type === FIND.STRUCTURES && name === HOME ? [controller] : [], opts);
       },
       getTerrain() { return { getRawBuffer: () => TERRAIN[name].slice() }; },
     };
@@ -338,6 +347,8 @@ export function routeSim(dir = join(ROOT, 'dist')) {
   problems.push(...warn.map((l) => `log: ${l}`));
   if (world.halts) problems.push(`${world.halts} halt(s)`);
   if (state.refused.length) problems.push(`transfers refused or left on an edge: ${JSON.stringify(state.refused.slice(0, 4))}`);
+  const opening = world.logs.filter((l) => l.startsWith('rustedscreep opening:'));
+  if (opening.length) problems.push(`opening lines (it should stay inert): ${opening.join(' / ')}`);
 
   // The route: W1N1, then the swamp of W2N1, then W2N2; never the novice W1N2.
   for (const c of state.creeps) {

@@ -16,16 +16,21 @@
 //!   `length`), plus one `Array.get` per element, counted below;
 //! - own creep: 7 (`get`, `id`, the id string copy, `pos`, `__packedPos`, `spawning`, and
 //!   `fatigue` unless it is spawning; the last since P2.1, V160), plus on the tick its handle is
-//!   new `name` and the name copy (P2.3; its identity, `spawning::CreepName`);
+//!   new `name` and the name copy (P2.3; its identity, `spawning::CreepName`); unless it is
+//!   spawning, `store`, `getUsedCapacity` and `getCapacity` for energy (P2.4, V196, V197);
 //! - room: 8 with a controller (`get`, `name`, the name copy, `controller`, `my`, `level`, `find`,
 //!   `length`), 6 without, plus `energyAvailable` and `energyCapacityAvailable` when the bot owns
-//!   it (P2.3, V175); hostile creep: 5 (`get`, `id`, the id copy, `pos`, `__packedPos`; hostile
-//!   results never include spawning creeps, V101);
+//!   it (P2.3, V175), and for an owned room its controller's 3 progress and timer getters and its
+//!   room objects (P2.4, `push_objects`: 6 `find` calls and their `length`s, then per object `get`,
+//!   `id`, the id copy, its amount, and on the tick it is first seen its position and type);
+//!   hostile creep: 5 (`get`, `id`, the id copy, `pos`, `__packedPos`; hostile results never
+//!   include spawning creeps, V101);
 //! - structure: 3 (`get`, `id`, the id copy), plus on the tick it is first seen `structureType`,
 //!   and `pos` and `__packedPos` when the type is known (again every tick while that read fails).
 //!   With `cache.structure_static` off (the naive baseline, P1.10) those three are read every tick.
 //!   A spawn adds `spawning` (P2.3, V175); while it is spawning the `Spawning` object comes back
-//!   through an `Option` (below), and dropping it runs in wasm (V100).
+//!   through an `Option` (below), and dropping it runs in wasm (V100). A spawn or an extension in a
+//!   room that is not full adds `store` and `getFreeCapacity` for energy (P2.4, V196).
 //!
 //! Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and one
 //! `__externref_table_alloc` (with a JS `Table.set`) per object returned through an `Option`: every
@@ -40,17 +45,18 @@
 
 use std::fmt::Write as _;
 
-use js_sys::{Array, Object};
+use js_sys::{Array, Object, Reflect};
 use rustedscreep_core::config::CacheConfig;
 use rustedscreep_core::snapshot::{
-    Controller, CreepRow, ObjectKey, RoomEnergy, SkipCounts, SkipLog, SkipReason, SkipReport,
-    Snapshot, StructureStatic, TickContext, known_structure_type, parse_room_name,
-    position_from_packed,
+    Controller, ControllerState, CreepRow, CreepStore, ObjectKey, ObjectKind, ObjectRow,
+    ObjectStatic, RoomEnergy, SkipCounts, SkipLog, SkipReason, SkipReport, Snapshot,
+    StructureStatic, TickContext, known_structure_type, parse_room_name, position_from_packed,
 };
 use rustedscreep_core::spawning::{CreepName, Identity};
 use screeps::{
-    Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Position, Room, RoomObject,
-    Structure, StructureSpawn, StructureType, find, game,
+    ConstructionSite, Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Position,
+    Resource, ResourceType, Room, RoomObject, Source, Store, Structure, StructureController,
+    StructureSpawn, StructureType, find, game,
 };
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
@@ -88,6 +94,23 @@ extern "C" {
     /// 0, which is the valid position (0, 0) in W127N127).
     #[wasm_bindgen(method, getter = __packedPos)]
     fn packed_pos(this: &Packed) -> Option<u32>;
+
+    /// `room.find(type, opts)`: the engine applies `opts.filter` to its cached list (V199).
+    #[wasm_bindgen(method, js_name = find)]
+    fn find_filtered(this: &Findable, ty: find::Find, opts: &JsValue) -> Array;
+
+    /// Any object with a `store` (creeps, spawns, extensions, containers, tombstones, ruins), for
+    /// its `Store` without a typed cast (P2.4, V196).
+    type Stored;
+
+    #[wasm_bindgen(method, getter = store)]
+    fn store_of(this: &Stored) -> Store;
+
+    /// Any object with an `id`, read as a plain value (sources, sites, piles, tombstones, ruins).
+    type WithId;
+
+    #[wasm_bindgen(method, getter = id)]
+    fn id_value(this: &WithId) -> JsValue;
 }
 
 /// This tick's JS objects, index-aligned with the snapshot's rows. They are stale after this tick
@@ -97,6 +120,11 @@ pub struct JsWorld {
     pub rooms: Vec<Room>,
     pub creeps: Vec<Creep>,
     pub structures: Vec<Structure>,
+    /// Sources, own sites, piles, tombstones, ruins and containers of owned rooms (P2.4).
+    pub objects: Vec<RoomObject>,
+    /// `{filter: {structureType: "container"}}`, built once per global: a plain object, not a
+    /// game object, so it stays valid across ticks.
+    container_filter: Option<JsValue>,
 }
 
 impl JsWorld {
@@ -104,6 +132,7 @@ impl JsWorld {
         self.rooms.clear();
         self.creeps.clear();
         self.structures.clear();
+        self.objects.clear();
     }
 
     /// Whether every table has exactly one JS object per row (the act layer relies on it).
@@ -111,6 +140,20 @@ impl JsWorld {
         self.rooms.len() == snapshot.rooms.len()
             && self.creeps.len() == snapshot.creeps.len()
             && self.structures.len() == snapshot.structures.len()
+            && self.objects.len() == snapshot.objects.len()
+    }
+
+    /// The container filter, built on first use (2 objects and 2 `Reflect.set` calls).
+    fn container_filter(&mut self) -> &JsValue {
+        self.container_filter.get_or_insert_with(|| {
+            let inner = Object::new();
+            let opts = Object::new();
+            // A fresh plain object never refuses a property; a failure leaves the filter empty,
+            // which `find` reads as no filter, so only the type check below drops non-containers.
+            let _ = Reflect::set(&inner, &"structureType".into(), &"container".into());
+            let _ = Reflect::set(&opts, &"filter".into(), &inner);
+            opts.into()
+        })
     }
 }
 
@@ -152,7 +195,8 @@ fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room) {
         snapshot.skipped.record(SkipReason::BadRoomName);
         return;
     };
-    let controller = match room.controller() {
+    let controller_object = room.controller();
+    let controller = match controller_object.as_ref() {
         None => Controller::Absent,
         // `my` is undefined or null on an unowned controller; the crate maps that to false (V101).
         Some(c) => Controller::from_parts(c.my(), c.level()),
@@ -175,7 +219,143 @@ fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room) {
     }
     let row = snapshot.rooms.push(name, controller);
     snapshot.rooms.set_energy(row, energy);
+    if matches!(controller, Controller::Mine { .. }) {
+        if let (Some(c), Controller::Mine { level }) = (controller_object.as_ref(), controller) {
+            snapshot
+                .rooms
+                .set_controller_state(row, controller_state(c, level));
+        }
+        push_objects(snapshot, js, room.unchecked_ref::<Findable>());
+    }
     js.rooms.push(room);
+}
+
+/// An owned controller's progress and timers (P2.4): 3 calls, each `Option` from the crate's
+/// getters (an undefined `upgradeBlocked` is `None`, V189). `ticksToDowngrade` is undefined until
+/// the processor first sets the timer (a controller just claimed, V189): that reads as the full
+/// timer the processor sets, `CONTROLLER_DOWNGRADE[level] + 1`, so the downgrade guard does not
+/// fire on it.
+fn controller_state(c: &StructureController, level: u8) -> ControllerState {
+    ControllerState {
+        progress: c.progress().unwrap_or(0),
+        downgrade_ticks: c.ticks_to_downgrade().unwrap_or_else(|| {
+            screeps::constants::controller_downgrade(level)
+                .map_or(u32::MAX, |t| t.saturating_add(1))
+        }),
+        upgrade_blocked: c.upgrade_blocked().is_some_and(|t| t > 0),
+    }
+}
+
+/// The room objects of an owned room (P2.4): 6 `find` calls with their `length`s (sources, own
+/// sites, dropped resources, tombstones, ruins, and containers through the engine's filter, V199),
+/// then per object `get`, `id` and the id copy, its position and type on the tick it is first seen
+/// (the static data), and its amount: a source's `energy` and `energyCapacity`, a site's
+/// `progress` and `progressTotal`, a pile's `amount`, a tombstone's, ruin's or container's `store`
+/// and `getUsedCapacity("energy")` (V184, V190, V196, V199).
+fn push_objects(snapshot: &mut Snapshot, js: &mut JsWorld, finder: &Findable) {
+    let list = finder.find_array(find::SOURCES.find_code());
+    for i in 0..list.length() {
+        let source: Source = list.get(i).unchecked_into();
+        let row = ObjectRow {
+            amount: source.energy(),
+            total: source.energy_capacity(),
+        };
+        push_object(snapshot, js, source.into(), |_| Ok(ObjectKind::Source), row);
+    }
+    let list = finder.find_array(find::MY_CONSTRUCTION_SITES.find_code());
+    for i in 0..list.length() {
+        let site: ConstructionSite = list.get(i).unchecked_into();
+        let row = ObjectRow {
+            amount: site.progress(),
+            total: site.progress_total(),
+        };
+        let kind = |o: &RoomObject| {
+            known_structure_type(o.unchecked_ref::<ConstructionSite>().structure_type())
+                .map(ObjectKind::Site)
+                .ok_or(SkipReason::UnknownStructureType)
+        };
+        push_object(snapshot, js, site.into(), kind, row);
+    }
+    let list = finder.find_array(find::DROPPED_RESOURCES.find_code());
+    for i in 0..list.length() {
+        let pile: Resource = list.get(i).unchecked_into();
+        let row = ObjectRow {
+            amount: pile.amount(),
+            total: 0,
+        };
+        let kind = |o: &RoomObject| {
+            Ok(
+                if o.unchecked_ref::<Resource>().resource_type() == ResourceType::Energy {
+                    ObjectKind::Energy
+                } else {
+                    ObjectKind::OtherResource
+                },
+            )
+        };
+        push_object(snapshot, js, pile.into(), kind, row);
+    }
+    let stored = [
+        (
+            finder.find_array(find::TOMBSTONES.find_code()),
+            ObjectKind::Tombstone,
+        ),
+        (finder.find_array(find::RUINS.find_code()), ObjectKind::Ruin),
+        (
+            finder.find_filtered(find::STRUCTURES.find_code(), js.container_filter()),
+            ObjectKind::Container,
+        ),
+    ];
+    for (list, kind) in stored {
+        for i in 0..list.length() {
+            let object: RoomObject = list.get(i).unchecked_into();
+            let row = ObjectRow {
+                amount: energy_in(object.unchecked_ref()),
+                total: 0,
+            };
+            let check = |o: &RoomObject| {
+                // The filter came back empty-handed if building it failed: check the type.
+                if kind == ObjectKind::Container
+                    && o.unchecked_ref::<Structure>().structure_type() != StructureType::Container
+                {
+                    return Err(SkipReason::UnknownStructureType);
+                }
+                Ok(kind)
+            };
+            push_object(snapshot, js, object, check, row);
+        }
+    }
+}
+
+/// Energy in a store (`getUsedCapacity("energy")`: a number, 0 when none; V196).
+fn energy_in(object: &Stored) -> u32 {
+    object
+        .store_of()
+        .get_used_capacity(Some(ResourceType::Energy))
+}
+
+fn push_object(
+    snapshot: &mut Snapshot,
+    js: &mut JsWorld,
+    object: RoomObject,
+    kind: impl FnOnce(&RoomObject) -> Result<ObjectKind, SkipReason>,
+    row: ObjectRow,
+) {
+    let pushed = key_of(Some(object.unchecked_ref::<WithId>().id_value())).and_then(|key| {
+        snapshot.objects.push(
+            key,
+            || {
+                Ok(ObjectStatic {
+                    kind: kind(&object)?,
+                    pos: position_of(&object)?,
+                })
+            },
+            row,
+        )
+    });
+    match pushed {
+        Ok(_) => js.objects.push(object),
+        Err(reason) => snapshot.skipped.record(reason),
+    }
 }
 
 fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool) {
@@ -193,7 +373,24 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
         };
         if my {
             // The name is read only when the creep's handle is new (P2.3).
-            snapshot.creeps.push_named(key, row, || identity_of(&creep))
+            let handle = snapshot
+                .creeps
+                .push_named(key, row, || identity_of(&creep))?;
+            if !spawning {
+                // P2.4: `store`, `getUsedCapacity` and `getCapacity` for energy; a creep with no
+                // active CARRY part has a capacity of null, read as 0 (V196, V197).
+                let store = creep.store();
+                let energy = ResourceType::Energy;
+                let row = snapshot.creeps.len().saturating_sub(1);
+                snapshot.creeps.set_store(
+                    row,
+                    CreepStore {
+                        energy: store.get_used_capacity(Some(energy)),
+                        capacity: store.get_capacity(Some(energy)),
+                    },
+                );
+            }
+            Ok(handle)
         } else {
             snapshot.creeps.push(key, row)
         }
@@ -224,8 +421,13 @@ fn push_structure(snapshot: &mut Snapshot, js: &mut JsWorld, structure: Structur
     });
     match pushed {
         Ok(handle) => {
+            let row = snapshot.structures.len().saturating_sub(1);
+            let kind = snapshot.structures.kinds().last().copied();
+            if matches!(kind, Some(StructureType::Spawn | StructureType::Extension)) {
+                read_free_energy(snapshot, &structure, row);
+            }
             let structures = &snapshot.structures;
-            if structures.kinds().last() == Some(&StructureType::Spawn) {
+            if kind == Some(StructureType::Spawn) {
                 // Null when idle (V175); the crate's getter maps null and undefined to None (V177).
                 let busy = structure
                     .unchecked_ref::<StructureSpawn>()
@@ -238,6 +440,29 @@ fn push_structure(snapshot: &mut Snapshot, js: &mut JsWorld, structure: Structur
         }
         Err(reason) => snapshot.skipped.record(reason),
     }
+}
+
+/// A spawn's or extension's room for energy (P2.4), only while its room is not full: `store` and
+/// `getFreeCapacity("energy")` (V196). A full room's are all 0, which the snapshot leaves them at.
+fn read_free_energy(snapshot: &mut Snapshot, structure: &Structure, row: usize) {
+    let Some(&pos) = snapshot.structures.positions().get(row) else {
+        return;
+    };
+    let rooms = &snapshot.rooms;
+    let full = rooms
+        .row_of(pos.room_name())
+        .and_then(|r| rooms.energy().get(r))
+        .is_none_or(|e| e.available >= e.capacity);
+    if full {
+        return;
+    }
+    let free = structure
+        .unchecked_ref::<Stored>()
+        .store_of()
+        .get_free_capacity(Some(ResourceType::Energy));
+    snapshot
+        .structures
+        .set_free_energy(row, u32::try_from(free).unwrap_or(0));
 }
 
 /// The object's id as an [`ObjectKey`]. `JsValue::as_string` returns `None` for a non-string

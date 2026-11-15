@@ -45,6 +45,10 @@ pub enum EnergyBudget {
     /// What the room holds now (`energyAvailable` less this tick's earlier orders): spawn at once
     /// with the largest body that fits, waiting only for one repeat of the pattern. For recovery.
     Available,
+    /// At most this much (and at most the capacity): the largest body within it, waiting until the
+    /// room holds its cost. For a room that cannot fill its whole capacity (P2.4's wait fallback
+    /// asks for the most the room was seen holding). Unit: energy.
+    UpTo(u32),
 }
 
 /// One creep a job wants spawned this tick. Requests last one tick: a job asks again each tick
@@ -340,6 +344,11 @@ impl Spawner {
                 let body = match req.budget {
                     EnergyBudget::Capacity => Some(at_capacity),
                     EnergyBudget::Available => Body::scaled(req.pattern, left, req.max_repeats),
+                    // Below one repeat it is the smallest body, as for `Available`.
+                    EnergyBudget::UpTo(cap) => {
+                        Body::scaled(req.pattern, cap.min(energy.capacity), req.max_repeats)
+                            .or_else(|| Body::new(req.pattern))
+                    }
                 };
                 let Some(body) = body.filter(|b| b.cost() <= left) else {
                     self.stats.waiting = self.stats.waiting.saturating_add(1);

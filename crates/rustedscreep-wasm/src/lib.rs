@@ -22,6 +22,7 @@ mod config;
 mod consts_check;
 mod logging;
 mod movement;
+mod opening;
 mod persist;
 mod profiler;
 mod route;
@@ -50,6 +51,8 @@ struct State {
     movement: movement::MovementGlue,
     /// The minimal spawn path (P2.3): requests, the plan, the orders and the console's request.
     spawn: spawn::SpawnGlue,
+    /// The RCL1–3 opening (P2.4): workers, their spawn requests, recovery and the watchdogs.
+    opening: opening::OpeningGlue,
     persist: persist::Persist,
     /// The constants self-check, once per global (P1.11).
     consts: consts_check::ConstsCheck,
@@ -100,6 +103,7 @@ pub fn game_loop() {
                     act,
                     movement,
                     spawn,
+                    opening,
                     persist,
                     consts,
                     profiler: prof,
@@ -115,14 +119,31 @@ pub fn game_loop() {
                 probe.snapshot();
                 act.begin(snapshot);
                 spawn.begin(snapshot);
+                opening.begin(snapshot, &mut movement.core);
                 let mut tick = sched.begin(&snapshot.tick, &cfg.scheduler, scheduler::GameClock);
                 // Critical: the rooms movement needs before anything in them can move, first.
                 movement.read_first(&mut tick, snapshot, js, &cfg.movement);
-                // Critical: the spawn plan, after the Critical jobs that request creeps (P2.3).
+                // Critical: the opening's workers and spawn requests (P2.4), then the spawn plan,
+                // after the Critical jobs that request creeps (P2.3).
+                opening.plan(
+                    &mut tick,
+                    snapshot,
+                    &mut movement.core,
+                    spawn.spawner_mut(),
+                    &mut act.buffer,
+                    &cfg.opening,
+                    &cfg.movement,
+                );
                 spawn.plan(&mut tick, snapshot);
-                // Critical, then Standard, then Optional jobs run here and queue intents (P2 onward).
-                // The persistence loads are a Standard job; Critical jobs will run before them (P2).
+                // Standard: the persistence loads, then the opening's building and upgrading.
                 persist.load(&mut tick, snapshot.tick.time, runtime);
+                opening.work(
+                    &mut tick,
+                    snapshot,
+                    &mut movement.core,
+                    &mut act.buffer,
+                    &cfg.movement,
+                );
                 // Standard: the periodic room rescans, then the console's move order.
                 movement.rescan(&mut tick, snapshot, js, &cfg.movement);
                 movement.run_console(&mut tick, snapshot, &cfg.movement);
@@ -130,12 +151,21 @@ pub fn game_loop() {
                 // the config in force after the loads (on a global's second loop the record loads in
                 // this same step, and the check usually completes in it).
                 consts.run(&mut tick, snapshot.tick.time, &runtime.get().log);
+                // Optional: the interim extension placement (ADR-020), after the self-check.
+                opening.place(
+                    &mut tick,
+                    snapshot,
+                    &mut movement.core,
+                    &cfg.opening,
+                    &cfg.movement,
+                );
                 act.queue_console_say(snapshot, tick.commit());
                 #[cfg(feature = "act-test")]
                 act_test.queue(&mut act.buffer, snapshot, tick.commit());
                 // After every job: the traffic manager turns the tick's move requests into moves.
                 movement.resolve(&mut tick, snapshot, &mut act.buffer, &cfg.movement);
                 tick.finish();
+                opening.log_events();
                 probe.decide();
                 // After the decide step: the scheduler reads the CPU clock no more (scheduler docs); the
                 // profiler's readings from here on measure the act step outside the budget. The
@@ -149,6 +179,8 @@ pub fn game_loop() {
                     &cfg.scheduler,
                     &cfg.spawn,
                 );
+                // Then the extension sites the placement picked (ADR-020), then the creep intents.
+                opening.issue_sites(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
                 act::issue(act, snapshot, js, sched, &cfg.scheduler);
                 movement.after_act(snapshot, act.refused_moves(), &cfg.movement);
                 probe.act();
@@ -269,6 +301,18 @@ pub fn spawn_request(room: Option<String>, role: Option<String>) -> String {
             Err(_) => String::from("rustedscreep spawn: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep spawn: state unavailable"))
+}
+
+/// Exported to JS as `openingSummary`, for the `rustedscreep.opening()` console command: one line
+/// with each owned room's workers and tasks, its plan, its spawn request and its watchdog (P2.4).
+#[wasm_bindgen(js_name = "openingSummary")]
+pub fn opening_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state.opening.summary(&state.snapshot),
+            Err(_) => String::from("rustedscreep opening: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep opening: state unavailable"))
 }
 
 /// Exported to JS as `profilerSummary`, for the `rustedscreep.profiler()` console command: one line

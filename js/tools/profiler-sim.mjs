@@ -9,7 +9,11 @@
 //   except the global's second loop, which reads the config record (P1.10) with two more clock samples, the
 //   loops the constants self-check (P1.11) runs in, which read the clock up to 64 more times, and every
 //   movement.scan_interval_ticks-th loop after the first, whose rescan of the owned W1N1 (P2.1, a Standard job
-//   of one unit) reads it twice more;
+//   of one unit) reads it twice more; every loop also reads it four times for the P2.4 opening's two jobs (one unit
+//   each for W1N1, which has no source, so the opening stays inert), and from the second loop twice more for its
+//   Optional extension placement (ADR-020), whose createConstructionSite calls (the fake room places nothing, so
+//   each pick is given up after APPEAR_TICKS and the next made, LOST_MAX times, then none for the global) count in
+//   the first window's calls and billed;
 // - a say's two calls appear in the first window's calls and act counters, counted as calls made (the act
 //   layer's `issued`) even though the game refuses one of them;
 // - each failure the binding guards against (no RawMemory, a segments value that is not an object, a set
@@ -31,6 +35,9 @@ import { sceneAt } from './lib/world.mjs';
 /** PROFILER_MMO (config.rs): window length, kept windows and segment id. */
 const WINDOW = 1000;
 const SEGMENT = '99';
+/** economy::placement: APPEAR_TICKS and LOST_MAX (crates/rustedscreep-core/src/economy/placement.rs). */
+const APPEAR_TICKS = 10;
+const LOST_MAX = 3;
 /** INTENT_CPU_COST × tick_reserve_pct / (100 − tick_reserve_pct) in µCPU, with 0.2 and SCHEDULER_MMO's 10. */
 const CALL_BOUND = Math.floor((0.2 * 1e6 * 10) / 90);
 const T0 = 50000000;
@@ -60,7 +67,11 @@ function rawMemoryAt(offset, world) {
   return f ? f.raw() : driverRawMemory(offset, world);
 }
 
-/** What rustedscreep.profiler() must show at these offsets. */
+/**
+ * What rustedscreep.profiler() must show at these offsets. By SAY_AT + 1 the window holds the say's two calls and the
+ * extension placement's first createConstructionSite (offset 2 or 3, billed, V203): 3 calls in 2 ticks, 1 billed
+ * (were 2 calls in 1 tick, none billed, before ADR-020).
+ */
 const EXPECTED = {
   1: [
     `rustedscreep profiler at tick ${T0 + 1}: loops 1 in this global | open window 0/${WINDOW} loops (empty)`,
@@ -68,8 +79,8 @@ const EXPECTED = {
   ],
   [SAY_AT + 1]: [
     `loops ${SAY_AT + 1} in this global | open window ${SAY_AT}/${WINDOW} loops from tick ${T0 + 2}: `,
-    '; calls total 2 (max 2); billed total 0 (max 0)',
-    ' CPU over 2 calls in 1 ticks (bound 0.0222)',
+    '; calls total 3 (max 2); billed total 1 (max 1)',
+    ' CPU over 3 calls in 2 ticks (bound 0.0222)',
     `last loop at tick ${T0 + SAY_AT + 1}: `,
     ', calls 2, billed 0 | windows closed 0',
   ],
@@ -84,8 +95,8 @@ const EXPECTED = {
   ],
 };
 
-/** Checks the parsed segment written when window 2 closed. */
-function checkSegment(seg, problems) {
+/** Checks the parsed segment written when window 2 closed. `siteCalls` holds the offsets of the createConstructionSite calls. */
+function checkSegment(seg, problems, siteCalls) {
   const want = {
     format: 'rustedscreep-profiler', v: 1, unit: '1e-6 CPU', written: T0 + closeAt(2), loops: closeAt(2),
     windowLoops: WINDOW, callBound: CALL_BOUND, flushes: 1, flushErrors: 0,
@@ -115,9 +126,11 @@ function checkSegment(seg, problems) {
     });
     const [calls, billed] = [w.stats[6], w.stats[7]];
     const says = i === 0 ? 2 : 0;
-    if (calls[1] !== says || billed[1] !== 0) problems.push(`window ${i + 1}: calls ${calls[1]}, billed ${billed[1]}`);
-    if (w.act.ticks !== (says ? 1 : 0) || w.act.calls !== says || !Number.isInteger(w.act.net)) {
-      problems.push(`window ${i + 1} act: ${JSON.stringify(w.act)}`);
+    // The window's site calls (ADR-020), each billed, on ticks of their own (none on the say's tick).
+    const sites = siteCalls.filter((o) => o > closeAt(i) && o <= closeAt(i + 1)).length;
+    if (calls[1] !== says + sites || billed[1] !== sites) problems.push(`window ${i + 1}: calls ${calls[1]}, billed ${billed[1]}, expected ${says + sites} and ${sites}`);
+    if (w.act.ticks !== (says ? 1 : 0) + sites || w.act.calls !== says + sites || !Number.isInteger(w.act.net)) {
+      problems.push(`window ${i + 1} act: ${JSON.stringify(w.act)}, expected ${(says ? 1 : 0) + sites} ticks, ${says + sites} calls`);
     }
   });
 }
@@ -169,11 +182,21 @@ export function profilerSim() {
   const dist = join(ROOT, 'target', 'profiler');
   build({ features: ['profiler'], dist });
   let says = 0;
-  const actions = { calls: { push() {} }, returns: { say: () => (says++ % 2 === 0 ? 0 : ERR_BUSY) } };
+  // The offsets of the extension placement's createConstructionSite calls (the scene's offset when each came).
+  const siteCalls = [];
+  let sceneOffset = 0;
+  const actions = {
+    calls: { push() {} },
+    returns: { say: () => (says++ % 2 === 0 ? 0 : ERR_BUSY) },
+    sites: { push: () => siteCalls.push(sceneOffset) },
+  };
   const world = simulate(dist, {
     ticks: TICKS,
     rawMemory: rawMemoryAt,
-    scene: (offset) => sceneAt(offset, actions),
+    scene: (offset) => {
+      sceneOffset = offset;
+      return sceneAt(offset, actions);
+    },
     command: (w) => {
       if (w.ticksRun === SAY_AT) return 'rustedscreep.say("hi")';
       return EXPECTED[w.ticksRun] ? 'rustedscreep.profiler()' : null;
@@ -193,6 +216,13 @@ export function profilerSim() {
   const constsLine = world.logs.find((l) => /^rustedscreep consts: (checked|\d+ finding\(s\)) at tick \d+ /.test(l));
   const constsLast = constsLine ? Number(/ at tick (\d+) /.exec(constsLine)[1]) - T0 : -1;
   if (constsLast < 2) problems.push(`constants self-check: no completion line (${constsLine ?? 'none'})`);
+  // The extension placement's calls: from the loop after the check (its last loop, or the next when it used up that
+  // loop's Optional cap: wall time), one APPEAR_TICKS (10) loops after the other until LOST_MAX (3) were never seen,
+  // then none (was one every 10 loops to the end before LOST_MAX).
+  const firstSite = siteCalls[0];
+  const wantSites = firstSite >= constsLast && firstSite <= constsLast + 1
+    ? Array.from({ length: LOST_MAX }, (_, k) => firstSite + APPEAR_TICKS * k) : [];
+  if (JSON.stringify(siteCalls) !== JSON.stringify(wantSites)) problems.push(`createConstructionSite at ${JSON.stringify(siteCalls.slice(0, 8))}, expected ${LOST_MAX} from offset ${constsLast} or ${constsLast + 1}, ${APPEAR_TICKS} apart`);
   world.loopCalls.forEach((c, offset) => {
     if (offset < 2) return; // the loader also reads the clock on the boot ticks and the first loop
     // The second loop reads the config record (P1.10) the first activated: one more RawMemory.segments
@@ -201,8 +231,12 @@ export function profilerSim() {
     // Movement (P2.1): the owned W1N1 (the Harvester's room) was first read on the first loop, so its
     // periodic rescan comes every SCAN_INTERVAL loops after it: one unit, a sample before and after.
     const rescan = offset > 1 && (offset - 1) % SCAN_INTERVAL === 0 ? 1 : 0;
+    // The opening (P2.4): its Critical and Standard jobs run one unit each for W1N1 on every loop, a sample before
+    // and after each (4 more than before P2.4), and its Optional placement job (ADR-020) one unit from the second
+    // loop (2 more).
+    const opening = 4 + (offset >= 2 ? 2 : 0);
     const reads = (closing.has(offset) && offset !== closeAt(noRawMemory.window) ? 1 : 0) + config;
-    const want = { getUsed: (closing.has(offset) ? 7 : 6) + 2 * config + 2 * rescan, segments: reads };
+    const want = { getUsed: (closing.has(offset) ? 7 : 6) + 2 * config + 2 * rescan + opening, segments: reads };
     const checking = offset <= constsLast;
     const usedOk = checking ? c.getUsed >= want.getUsed && c.getUsed <= want.getUsed + 64 : c.getUsed === want.getUsed;
     if (!usedOk || c.segments !== want.segments) {
@@ -228,7 +262,7 @@ export function profilerSim() {
   } catch (e) {
     problems.push(`segment 99 is not JSON: ${e.message}`);
   }
-  if (seg) checkSegment(seg, problems);
+  if (seg) checkSegment(seg, problems, siteCalls);
   keySim(dist, problems);
   const bad = world.logs.filter((l) => /incident|loader error|\[error\]|rustedscreep fault/.test(l));
   if (bad.length || world.halts || world.globals !== 1) problems.push(`unexpected trouble: ${bad.join(' / ')} (halts ${world.halts}, globals ${world.globals})`);

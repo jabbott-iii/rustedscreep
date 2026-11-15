@@ -19,20 +19,41 @@
 //   then `rustedscreep.moveTo()` has nothing to cancel, a second order is cancelled after one tick of moves,
 //   and no move is made after that; a bad room name is refused by the wasm;
 // - `rustedscreep.movement()` reports the room, its grid version, the scan count and the objects it holds.
+// The P2.4 opening reads the owned room every loop (its six finds, the source's energy, the site's progress, the
+// container's store: engine-shaped here, V184, V196, V199) but stays inert: no creep has a bot worker name, and the
+// room reports no energyAvailable or energyCapacityAvailable (read as 0, as before P2.4), so its plan has no worker
+// body and wants no worker: no spawn request, no worker intent, no watchdog line. The find counts below include its
+// finds; the find with a filter (containers) is its own and is checked apart from movement's scans. Its extension
+// placement (ADR-020: RCL2 allows 5, the room has one site) calls `room.createConstructionSite` from the second
+// loop; the harness records the call, returns OK and places nothing, so the bot gives up on each tile after
+// APPEAR_TICKS (10) and picks the next, LOST_MAX (3) times, then makes no more calls for the global: three calls,
+// each on a legal tile (V200 and the placement rules), and `rustedscreep.opening()` shows them never seen.
 // npm run check runs it (row 16); standalone: node js/tools/move-sim.mjs [dir].
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
-import { packPos } from './lib/world.mjs';
+import { CARRY_CAPACITY, findFiltered, makeStore, packPos } from './lib/world.mjs';
 import { commandResults, simulate } from './smoke.mjs';
 
 // @screeps/common 2.16.0 constants (the fixture the constants self-check reads).
-const FIND = { HOSTILE_CREEPS: 103, SOURCES: 105, STRUCTURES: 107, MY_CONSTRUCTION_SITES: 114, MINERALS: 116, DEPOSITS: 122 };
+const FIND = {
+  HOSTILE_CREEPS: 103, SOURCES: 105, DROPPED_RESOURCES: 106, STRUCTURES: 107, MY_CONSTRUCTION_SITES: 114, MINERALS: 116,
+  TOMBSTONES: 118, DEPOSITS: 122, RUINS: 123,
+};
+/** CONTROLLER_LEVELS[2], CONTROLLER_DOWNGRADE[2], SOURCE_ENERGY_CAPACITY, CONTAINER_CAPACITY, CONSTRUCTION_COST.extension. */
+const PROGRESS_TOTAL_2 = 45000;
+const DOWNGRADE_2 = 10000;
+const SOURCE_ENERGY_CAPACITY = 3000;
+const CONTAINER_CAPACITY = 2000;
+const EXTENSION_COST = 3000;
 const TERRAIN_MASK_WALL = 1;
 const TERRAIN_MASK_SWAMP = 2;
 /** The engine's offsetsByDirection (V155). */
 const OFFSETS = [null, [0, -1], [1, -1], [1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1]];
 /** MOVEMENT_MMO.scan_interval_ticks (crates/rustedscreep-core/src/config.rs). */
 const SCAN_INTERVAL = 50;
+/** economy::placement: APPEAR_TICKS and LOST_MAX (crates/rustedscreep-core/src/economy/placement.rs). */
+const APPEAR_TICKS = 10;
+const LOST_MAX = 3;
 const ROOM = 'W1N1';
 const T0 = 50000000;
 const ORDER_AT = 2;
@@ -46,6 +67,9 @@ const SECOND_CMD = `rustedscreep.moveTo("${ROOM}", ${SECOND.x}, ${SECOND.y}, ${S
 const CANCEL_CMD = 'rustedscreep.moveTo()';
 const BAD_ORDER_CMD = 'rustedscreep.moveTo("not a room", 1, 1)';
 const SUMMARY_AT = TICKS - 1;
+/** `rustedscreep.opening()`, once the second order is cancelled, on the loop before the movement summary. */
+const OPENING_AT = TICKS - 2;
+const OPENING_CMD = 'rustedscreep.opening()';
 
 const pos = (x, y) => ({ x, y, roomName: ROOM, __packedPos: packPos(ROOM, x, y) });
 const id = (n) => `5bbcaa9099f9b0a0f7f4c${n.toString(16).padStart(3, '0')}`;
@@ -73,7 +97,11 @@ const RAW = terrain();
 const isWall = (x, y) => (RAW[y * 50 + x] & TERRAIN_MASK_WALL) !== 0;
 
 /** The world's objects. Owned ones carry `my`; ramparts `isPublic`. */
-const controller = { id: id(1), structureType: 'controller', my: true, level: 2, pos: pos(40, 40) };
+const controller = {
+  id: id(1), structureType: 'controller', my: true, level: 2, pos: pos(40, 40),
+  // The getters of an owned controller (V189): no progress yet, the level's total, a full downgrade timer.
+  progress: 0, progressTotal: PROGRESS_TOTAL_2, ticksToDowngrade: DOWNGRADE_2,
+};
 const spawn = { id: id(2), structureType: 'spawn', my: true, name: 'Spawn1', pos: pos(8, 11) };
 const ownRampart = { id: id(3), structureType: 'rampart', my: true, isPublic: false, pos: pos(WALL_X, 15) };
 const publicRampart = { id: id(4), structureType: 'rampart', my: false, isPublic: true, pos: pos(WALL_X, 18) };
@@ -85,10 +113,10 @@ const STRUCTURES = [
   { id: id(5), structureType: 'constructedWall', pos: pos(WALL_X, 8) },
   { id: id(6), structureType: 'rampart', my: false, isPublic: false, pos: pos(WALL_X, 10) },
   ...Array.from({ length: 8 }, (_, i) => ({ id: id(10 + i), structureType: 'road', pos: pos(22 + i, 10) })),
-  { id: id(30), structureType: 'container', pos: pos(29, 12) },
+  { id: id(30), structureType: 'container', pos: pos(29, 12), store: makeStore({}, { capacity: CONTAINER_CAPACITY }) },
 ];
-const SITES = [{ id: id(40), structureType: 'extension', my: true, pos: pos(WALL_X, 12) }];
-const SOURCES = [{ id: id(50), pos: pos(31, 11) }];
+const SITES = [{ id: id(40), structureType: 'extension', my: true, progress: 0, progressTotal: EXTENSION_COST, pos: pos(WALL_X, 12) }];
+const SOURCES = [{ id: id(50), energy: SOURCE_ENERGY_CAPACITY, energyCapacity: SOURCE_ENERGY_CAPACITY, pos: pos(31, 11) }];
 const MINERALS = [{ id: id(51), pos: pos(31, 9) }];
 /**
  * What the bot's grid must hold for this world: blocking footprints for the controller, the spawn, the
@@ -122,12 +150,13 @@ function makeWorld() {
     { id: id(103), name: 'Tired', x: 9, y: 13, fatigue: 4 },
   ];
   const hostile = { id: id(200), name: 'Invader', x: 26, y: 20 };
-  return { creeps, hostile, pending: [], calls: [], errors: [], finds: [], terrainReads: [], crossed: new Set() };
+  return { creeps, hostile, pending: [], calls: [], errors: [], finds: [], filtered: [], sites: [], terrainReads: [], crossed: new Set() };
 }
 
 function sceneFor(state, offset) {
   const own = state.creeps.map((c) => ({
     id: c.id, name: c.name, my: true, spawning: false, fatigue: c.fatigue, owner: { username: 'bot' }, pos: pos(c.x, c.y),
+    store: makeStore({}, { capacity: CARRY_CAPACITY }),
     move(direction) {
       state.calls.push([offset, c.name, 'move', direction]);
       state.pending.push([c, direction]);
@@ -140,20 +169,25 @@ function sceneFor(state, offset) {
   const room = {
     name: ROOM,
     controller,
-    find(type) {
-      state.finds.push([offset, type]);
-      switch (type) {
-        case FIND.HOSTILE_CREEPS: return [hostile];
-        case FIND.STRUCTURES: return [...STRUCTURES];
-        case FIND.MY_CONSTRUCTION_SITES: return [...SITES];
-        case FIND.SOURCES: return [...SOURCES];
-        case FIND.MINERALS: return [...MINERALS];
-        default: return [];
-      }
+    find(type, opts) {
+      // A find with a filter (the opening's containers, P2.4) is recorded apart from the plain ones.
+      (opts?.filter ? state.filtered : state.finds).push([offset, type]);
+      const list = {
+        [FIND.HOSTILE_CREEPS]: [hostile],
+        [FIND.STRUCTURES]: STRUCTURES,
+        [FIND.MY_CONSTRUCTION_SITES]: SITES,
+        [FIND.SOURCES]: SOURCES,
+        [FIND.MINERALS]: MINERALS,
+      }[type] ?? [];
+      return findFiltered(list, opts);
     },
     getTerrain() {
       state.terrainReads.push(offset);
       return { getRawBuffer: () => RAW.slice() };
+    },
+    createConstructionSite(...args) {
+      state.sites.push([offset, ...args]);
+      return 0;
     },
   };
   return {
@@ -233,6 +267,7 @@ export function moveSim(dir = join(ROOT, 'dist')) {
         state.cancelledAt = offset;
         return CANCEL_CMD;
       }
+      if (phase === 'cancelled' && offset === OPENING_AT) return OPENING_CMD;
       return null;
     },
   });
@@ -244,13 +279,59 @@ export function moveSim(dir = join(ROOT, 'dist')) {
   // The room is owned, so its first read comes on the global's first loop: the terrain, sources and
   // minerals once, and the scan's finds then and one interval later (the Standard rescan).
   if (JSON.stringify(state.terrainReads) !== '[1]') problems.push(`terrain reads at offsets ${JSON.stringify(state.terrainReads)}, expected [1]`);
+  // P2.4: the opening finds the owned room's sources, own sites, piles, tombstones and ruins once per loop, from
+  // the first (offset 1), and its containers with a filter; before P2.4 sources and sites were found only by
+  // movement (sources [1], sites [1, 1 + SCAN_INTERVAL]) and the other three not at all.
+  const loops = Array.from({ length: TICKS - 1 }, (_, i) => i + 1);
+  const withOpening = (movement) => [...movement, ...loops].sort((a, b) => a - b);
   const wantFinds = [
-    [FIND.SOURCES, [1]], [FIND.MINERALS, [1]],
-    [FIND.STRUCTURES, [1, 1 + SCAN_INTERVAL]], [FIND.MY_CONSTRUCTION_SITES, [1, 1 + SCAN_INTERVAL]], [FIND.DEPOSITS, [1, 1 + SCAN_INTERVAL]],
+    [FIND.SOURCES, withOpening([1])], [FIND.MINERALS, [1]],
+    [FIND.STRUCTURES, [1, 1 + SCAN_INTERVAL]], [FIND.MY_CONSTRUCTION_SITES, withOpening([1, 1 + SCAN_INTERVAL])], [FIND.DEPOSITS, [1, 1 + SCAN_INTERVAL]],
+    [FIND.DROPPED_RESOURCES, loops], [FIND.TOMBSTONES, loops], [FIND.RUINS, loops],
   ];
   for (const [type, want] of wantFinds) {
     const at = state.finds.filter(([, t]) => t === type).map(([o]) => o);
     if (JSON.stringify(at) !== JSON.stringify(want)) problems.push(`find(${type}) at offsets ${JSON.stringify(at)}, expected ${JSON.stringify(want)}`);
+  }
+  const unknown = state.finds.filter(([, t]) => !Object.values(FIND).includes(t));
+  if (unknown.length) problems.push(`finds of other types: ${JSON.stringify(unknown.slice(0, 4))}`);
+  // The opening's containers: FIND_STRUCTURES with a filter, once per loop.
+  const filtered = state.filtered.map(([o, t]) => (t === FIND.STRUCTURES ? o : `type ${t} at ${o}`));
+  if (JSON.stringify(filtered) !== JSON.stringify(loops)) problems.push(`filtered finds ${JSON.stringify(filtered)}, expected find(${FIND.STRUCTURES}) at ${JSON.stringify(loops)}`);
+  // Inert: no watchdog line (a spawnCreep or work call would throw here, the creeps and the spawn have no such
+  // method, and show as a fault line above), and no refused site.
+  const opening = world.logs.filter((l) => l.startsWith('rustedscreep opening:'));
+  if (opening.length) problems.push(`opening lines: ${opening.join(' / ')}`);
+  // The extension placement (ADR-020): a call on the first loop the Optional job runs after the constants
+  // self-check (its last loop, or the next when the check used up that loop's Optional cap: wall time), then one
+  // APPEAR_TICKS (10) loops later until LOST_MAX (3) were never seen, and none after (was one every 10 loops to the
+  // end before LOST_MAX), each with x, y and "extension", on distinct legal tiles: inside the margin of 3, not a
+  // wall, not on a structure or a site, at range 2 or more from the spawn, not next to the source or the mineral,
+  // not within 3 of the controller.
+  const constsAt = Number(/^rustedscreep consts: checked at tick (\d+) /.exec(world.logs.find((l) => l.startsWith('rustedscreep consts: checked')) ?? '')?.[1]) - T0;
+  const firstSite = state.sites[0]?.[0];
+  const wantSites = firstSite >= constsAt && firstSite <= constsAt + 1
+    ? Array.from({ length: LOST_MAX }, (_, k) => firstSite + APPEAR_TICKS * k) : ['an offset near', constsAt];
+  if (JSON.stringify(state.sites.map(([o]) => o)) !== JSON.stringify(wantSites)) problems.push(`createConstructionSite at offsets ${JSON.stringify(state.sites.map(([o]) => o))}, expected ${JSON.stringify(wantSites)}`);
+  // The opening's summary: the room wants no worker (no energy capacity) and counts the three lost picks, each tile
+  // skipped for the global.
+  const openingSummary = commandResults(world, OPENING_CMD);
+  const openingParts = [
+    `rustedscreep opening at tick ${T0 + OPENING_AT}: ${ROOM}: workers 0 of 0 (working 0), no request, plan at capacity 0: `,
+    ` | extension sites: picked ${LOST_MAX}, placed ${LOST_MAX}, refused 0, never seen ${LOST_MAX}, tiles skipped ${LOST_MAX}`,
+  ];
+  if (openingSummary.length !== 1) problems.push(`${openingSummary.length} opening summaries, expected 1`);
+  else for (const p of openingParts) if (!openingSummary[0].includes(p)) problems.push(`opening summary lacks "${p}": ${openingSummary[0]}`);
+  const tiles = new Set();
+  for (const [o, x, y, type, ...rest] of state.sites) {
+    const here = (p) => p.x === x && p.y === y;
+    const near = (p, r) => Math.max(Math.abs(p.x - x), Math.abs(p.y - y)) <= r;
+    const why = rest.length || type !== 'extension' ? 'arguments' : x < 3 || y < 3 || x > 46 || y > 46 ? 'margin'
+      : isWall(x, y) ? 'wall' : STRUCTURES.some((st) => here(st.pos)) || SITES.some((st) => here(st.pos)) ? 'taken'
+        : near(spawn.pos, 1) ? 'next to the spawn' : [...SOURCES, ...MINERALS].some((st) => near(st.pos, 1)) ? 'next to a source or mineral'
+          : near(controller.pos, 3) ? 'within 3 of the controller' : tiles.has(`${x},${y}`) ? 'picked twice' : null;
+    if (why) problems.push(`offset ${o}: createConstructionSite(${x}, ${y}, ${type}${rest.length ? ', ...' : ''}): ${why}`);
+    tiles.add(`${x},${y}`);
   }
 
   // The route through the wall: only the own and the public rampart gaps, and both were used by someone or

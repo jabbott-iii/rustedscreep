@@ -199,6 +199,39 @@ fn a_capacity_request_waits_for_energy_and_blocks_lower_ones() {
     assert_eq!(sp.stats().waiting, 1, "the cheap one waits for one repeat");
 }
 
+/// Uses: BODYPART_COST (through the pattern's cost). `UpTo(cap)` sizes to whole repeats within the
+/// cap and the capacity and waits for that cost; below one repeat it is the one-repeat body.
+#[test]
+fn an_up_to_request_sizes_within_its_cap_and_waits_for_it() {
+    let unit = unit_cost(&WORKER_PATTERN);
+    let cap = 4 * unit;
+    for (limit, repeats) in [(3 * unit + unit / 2, 3), (9 * unit, 4), (unit / 2, 1)] {
+        let req = worker("W1N1", EnergyBudget::UpTo(limit), 1);
+        let cost = repeats * unit;
+        // One energy short: it waits.
+        let mut snap = snap_at(
+            T0,
+            &[("W1N1", energy(cost - 1, cap))],
+            &[spawn(1, "W1N1", 20)],
+        );
+        let mut sp = Spawner::default();
+        plan(&mut sp, &snap, &[req]);
+        assert!(sp.orders().is_empty(), "cap {limit}: {:?}", sp.orders());
+        assert_eq!(sp.stats().waiting, 1);
+        fill(
+            &mut snap,
+            T0 + 1,
+            &[("W1N1", energy(cost, cap))],
+            &[spawn(1, "W1N1", 20)],
+        );
+        plan(&mut sp, &snap, &[req]);
+        let [order] = sp.orders() else {
+            panic!("cap {limit}: one order: {:?}", sp.orders())
+        };
+        assert_eq!(order.body.cost(), cost, "cap {limit}");
+    }
+}
+
 #[test]
 fn spawns_of_one_room_share_its_energy() {
     let unit = unit_cost(&WORKER_PATTERN);

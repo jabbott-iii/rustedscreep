@@ -28,10 +28,17 @@
 //   (RawMemory.set, kept by the end-of-tick save, V180), notifies once and spawns on the next tick; a later throw
 //   with a usable Memory resets nothing and holds the spawn; the two throws' fault lines are the only faults; no trap
 //   or halt.
+// The P2.4 opening reads the room every loop (its finds, the controller's getters, the creeps' stores and, while the
+// room is not full, the spawns' free energy; engine-shaped here, V189, V196, V199) but stays inert: the room has no
+// source, so its plan wants no worker and requests none, and the console's workers (bot worker names) gather nothing
+// and make way, with no intent; no watchdog line. Its extension placement (ADR-020: RCL2 allows 5, the room has
+// none) calls `room.createConstructionSite` from the second loop; the harness records it, returns OK and places
+// nothing, so the bot gives up on each tile after APPEAR_TICKS (10) and picks the next, LOST_MAX (3) times, then
+// makes no more calls for the global: three calls.
 // npm run check runs it (row 18); standalone: node js/tools/spawn-sim.mjs [dir].
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
-import { packPos } from './lib/world.mjs';
+import { CARRY_CAPACITY, SPAWN_ENERGY_CAPACITY, findFiltered, makeStore, packPos } from './lib/world.mjs';
 import { commandResults, simulate } from './smoke.mjs';
 
 /** @screeps/common 2.16.0: BODYPART_COST, CREEP_SPAWN_TIME, ERR_RCL_NOT_ENOUGH (V131, V170, V171). */
@@ -47,6 +54,12 @@ const T0 = 50000000;
 const CAPACITY = 300 + 5 * 50;
 /** The worker body at that capacity: WORKER_PATTERN repeated in place, two times (400 energy). */
 const BODY = ['work', 'work', 'carry', 'carry', 'move', 'move'];
+/** CONTROLLER_LEVELS[2] and CONTROLLER_DOWNGRADE[2] (@screeps/common 2.16.0). */
+const PROGRESS_TOTAL_2 = 45000;
+const DOWNGRADE_2 = 10000;
+/** economy::placement: APPEAR_TICKS and LOST_MAX (crates/rustedscreep-core/src/economy/placement.rs). */
+const APPEAR_TICKS = 10;
+const LOST_MAX = 3;
 const BODY_COST = BODY.reduce((sum, p) => sum + COST[p], 0);
 const SPAWN_TIME = BODY.length * CREEP_SPAWN_TIME;
 
@@ -115,7 +128,7 @@ function makeWorld() {
     calls: [],
     /** Return values of the spawnCreep calls, in call order (OK once they run out). */
     returns: [ERR_RCL_NOT_ENOUGH],
-    creeps: [{ id: id(1), name: 'Probe1', x: 10, y: 10, spawning: false, fatigue: 0 }],
+    creeps: [{ id: id(1), name: 'Probe1', x: 10, y: 10, spawning: false, fatigue: 0, carry: 1 }],
     accepted: [],
     nextId: 100,
     errors: [],
@@ -123,6 +136,8 @@ function makeWorld() {
     entries: [],
     /** The sandbox global, for the tick's `Memory` (set by simulate's `setup`). */
     context: null,
+    /** [offset, ...arguments] of every `room.createConstructionSite` call (ADR-020). */
+    sites: [],
   };
   const spawn = (n, name, x) => ({ id: id(n), name, structureType: 'spawn', my: true, x, busyFrom: -1, busyUntil: -1 });
   // In Game.structures order: B (the higher id) first.
@@ -131,15 +146,24 @@ function makeWorld() {
 }
 
 function sceneFor(state, offset) {
+  // Every creep carries nothing (store, V196); its capacity is CARRY_CAPACITY per CARRY part of its body.
   const creeps = state.creeps.map((c) => ({
     id: c.id, name: c.name, my: true, spawning: c.spawning, fatigue: c.fatigue, pos: pos(c.x, c.y),
-    owner: { username: 'bot' },
+    owner: { username: 'bot' }, store: makeStore({}, { capacity: CARRY_CAPACITY * c.carry }),
   }));
-  const controller = { id: id(2), structureType: 'controller', my: true, level: 2, pos: pos(40, 40) };
+  // The getters of an owned controller (V189): no progress yet, the level's total, a full downgrade timer.
+  const controller = {
+    id: id(2), structureType: 'controller', my: true, level: 2, pos: pos(40, 40),
+    progress: 0, progressTotal: PROGRESS_TOTAL_2, ticksToDowngrade: DOWNGRADE_2,
+  };
+  // The room's energy as the spawns hold it: SpawnA (the lower id) first, up to SPAWN_ENERGY_CAPACITY each, the rest
+  // in extensions the harness does not list.
+  const held = (s) => Math.min(SPAWN_ENERGY_CAPACITY, Math.max(0, state.energy - (s.name === 'SpawnA' ? 0 : SPAWN_ENERGY_CAPACITY)));
   const spawns = state.spawns.map((s) => {
     const busy = offset >= s.busyFrom && offset < s.busyUntil;
     return {
       id: s.id, name: s.name, structureType: 'spawn', my: true, pos: pos(s.x, 25),
+      store: makeStore({ energy: held(s) }, { resourceCapacity: { energy: SPAWN_ENERGY_CAPACITY } }),
       // Null when idle, a Spawning object while busy (V175).
       spawning: busy ? { name: s.creep, needTime: SPAWN_TIME, remainingTime: s.busyUntil - offset } : null,
       spawnCreep(...args) {
@@ -167,8 +191,12 @@ function sceneFor(state, offset) {
   });
   const room = {
     name: ROOM, controller, energyAvailable: state.energy, energyCapacityAvailable: CAPACITY,
-    find: () => [],
+    find: (type, opts) => findFiltered([], opts),
     getTerrain: () => ({ getRawBuffer: () => new Uint8Array(2500) }),
+    createConstructionSite(...args) {
+      state.sites.push([offset, ...args]);
+      return 0;
+    },
   };
   return {
     creeps: Object.fromEntries(creeps.map((c) => [c.name, c])),
@@ -186,7 +214,8 @@ function advance(state, offset) {
     a.spawn.busyFrom = offset + 1;
     a.spawn.busyUntil = offset + SPAWN_TIME;
     a.spawn.creep = a.name;
-    state.creeps.push({ id: id(state.nextId++), name: a.name, x: a.spawn.x, y: 25, spawning: true, fatigue: 0, leaves: offset + SPAWN_TIME });
+    const carry = a.body.filter((p) => p === 'carry').length;
+    state.creeps.push({ id: id(state.nextId++), name: a.name, x: a.spawn.x, y: 25, spawning: true, fatigue: 0, carry, leaves: offset + SPAWN_TIME });
   }
   for (const c of state.creeps) {
     if (c.spawning && c.leaves === offset + 1) {
@@ -256,14 +285,37 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
     if (!c.isArray || JSON.stringify(c.body) !== JSON.stringify(BODY)) problems.push(`offset ${c.offset}: body ${JSON.stringify(c.body)}, expected ${JSON.stringify(BODY)}`);
   }
   // No request can be served while SpawnA is held and SpawnB busy, nor on the quiet tick (no request), nor once both
-  // are busy again: no spawn job runs, so the plain build reads no clock in its loop (the constants self-check is done
-  // by then; movement's next rescan is 50 ticks after the first).
+  // are busy again: no spawn job runs, so the plain build reads the clock in its loop only for the P2.4 opening's
+  // three jobs, one unit each for W1N1 with a sample before and after (6: the Critical and Standard jobs, and the
+  // Optional extension placement of ADR-020; was 0 before P2.4; the constants self-check is done by then;
+  // movement's next rescan is 50 ticks after the first).
+  const OPENING_SAMPLES = 6;
   const idle = [];
   for (let o = AGAIN_AT + 1; o < B_FREE; o++) idle.push(o);
   idle.push(QUIET, REARMED + 1);
   for (const o of idle) {
     const used = world.loopCalls[o]?.getUsed;
-    if (used !== 0) problems.push(`offset ${o}: ${used} getUsed calls with no request to serve, expected 0`);
+    if (used !== OPENING_SAMPLES) problems.push(`offset ${o}: ${used} getUsed calls with no request to serve, expected ${OPENING_SAMPLES}`);
+  }
+  const opening = world.logs.filter((l) => l.startsWith('rustedscreep opening:'));
+  if (opening.length) problems.push(`opening lines (it should stay inert): ${opening.join(' / ')}`);
+  // The extension placement: a call on the first loop the Optional job runs after the constants self-check (its
+  // last loop, or the next when the check used up that loop's Optional cap: wall time), then one APPEAR_TICKS (10)
+  // loops later until LOST_MAX (3) were never seen, and none after (was one every 10 loops to the end before
+  // LOST_MAX), each with x, y and "extension", on distinct tiles inside the margin of 3 and at range 2 or more from
+  // both spawns.
+  const constsAt = Number(/^rustedscreep consts: checked at tick (\d+) /.exec(world.logs.find((l) => l.startsWith('rustedscreep consts: checked')) ?? '')?.[1]) - T0;
+  const firstSite = state.sites[0]?.[0];
+  const wantSites = firstSite >= constsAt && firstSite <= constsAt + 1
+    ? Array.from({ length: LOST_MAX }, (_, k) => firstSite + APPEAR_TICKS * k) : ['an offset near', constsAt];
+  if (JSON.stringify(state.sites.map(([o]) => o)) !== JSON.stringify(wantSites)) problems.push(`createConstructionSite at offsets ${JSON.stringify(state.sites.map(([o]) => o))}, expected ${JSON.stringify(wantSites)}`);
+  const tiles = new Set();
+  for (const [o, x, y, type, ...rest] of state.sites) {
+    const nearSpawn = state.spawns.some((sp) => Math.max(Math.abs(sp.x - x), Math.abs(25 - y)) <= 1);
+    if (rest.length || type !== 'extension' || x < 3 || y < 3 || x > 46 || y > 46 || nearSpawn || tiles.has(`${x},${y}`)) {
+      problems.push(`offset ${o}: createConstructionSite(${[x, y, type, ...rest].join(', ')}) is not a legal new extension tile`);
+    }
+    tiles.add(`${x},${y}`);
   }
 
   // Console replies.

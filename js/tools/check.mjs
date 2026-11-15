@@ -83,6 +83,7 @@ const ROWS = [
   ['16 Movement (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'move-sim.mjs')], true],
   ['17 Routes (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'route-sim.mjs')], true],
   ['18 Spawn path (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'spawn-sim.mjs')], true],
+  ['19 Opening (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'opening-sim.mjs')], true],
 ];
 
 function main() {

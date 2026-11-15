@@ -103,27 +103,30 @@ function expectedCalls(offset) {
 // a move by it. Odd ticks: 10 calls, 3 skipped, 6 OK (heal, drop, move, say, rangedHeal, b's move), 5 billed
 // (say is free, V34), full 1, not enough 1, unknown 1 (upgradeController), threw 1 (pull). Even ticks: b's
 // rangedHeal fails (not in range), so b's repair is called and OK: 11 calls, 2 skipped, 6 OK, 5 billed,
-// 3 failed. The all-throw tick: 13 calls, all thrown, none skipped.
+// 3 failed. The all-throw tick: 13 calls, all thrown, none skipped. Since boot the counts also hold the opening's one
+// createConstructionSite call (ADR-020: W1N1 at RCL2 has one extension, the far one, of the 5 it allows), on the loop
+// after the constants self-check (offset 2): issued, ok and billed each one more than before ADR-020 from offset 3 on
+// (V203; the fake room places nothing, so the next pick waits 10 loops, past this run).
 const ACT_EXPECTED = {
   3: [
     'rustedscreep act at tick 50000003: queued 14 (replaced 1), refused 6, not mine 1, spawning 1, ' +
       'spawning target 1, wrong target 1, not in range 1, zero amount 1 | blocked 3 | issued 10: ok 6 (billed 5), ' +
       'failed 2, not enough 1, full 1, unknown 1, threw 1, missing 0 | since boot: ticks 3, queued 42, refused 13, ' +
-      'blocked 8, issued 31, ok 18, billed 15, failed 7, unknown 3, threw 3, missing 0 | last failure at tick ' +
+      'blocked 8, issued 32, ok 19, billed 16, failed 7, unknown 3, threw 3, missing 0 | last failure at tick ' +
       '50000003: pull threw',
   ],
   4: [
     'rustedscreep act at tick 50000004: queued 14 (replaced 1), refused 7, gone actor 1, spawning 1, gone target 1, ' +
       'spawning target 1, wrong target 1, not in range 1, zero amount 1 | blocked 2 | issued 11: ok 6 (billed 5), ' +
       'failed 3, not enough 1, full 1, not in range 1, unknown 1, threw 1, missing 0 | since boot: ticks 4, ' +
-      'queued 56, refused 20, blocked 10, issued 42, ok 24, billed 20, failed 10, unknown 4, threw 4, missing 0 | ' +
+      'queued 56, refused 20, blocked 10, issued 43, ok 25, billed 21, failed 10, unknown 4, threw 4, missing 0 | ' +
       'last failure at tick 50000004: rangedHeal not in range',
   ],
   6: [
     'rustedscreep act at tick 50000006: queued 14 (replaced 1), refused 8, gone actor 1, not mine 1, spawning 1, ' +
       'gone target 1, spawning target 1, wrong target 1, not in range 1, zero amount 1 | blocked 0 | issued 13: ' +
       'ok 0 (billed 0), failed 0, unknown 0, threw 13, missing 0 | since boot: ticks 6, queued 84, refused 35, ' +
-      'blocked 13, issued 65, ok 30, billed 25, failed 12, unknown 5, threw 18, missing 0 | last failure at tick ' +
+      'blocked 13, issued 66, ok 31, billed 26, failed 12, unknown 5, threw 18, missing 0 | last failure at tick ' +
       '50000006: move threw',
   ],
 };

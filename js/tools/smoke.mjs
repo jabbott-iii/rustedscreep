@@ -282,19 +282,22 @@ export const CONFIG_SEGMENT = 97;
  * What `rustedscreep.scheduler()` must report after the loops at these offsets. The fake world has CPU limit
  * 20, tickLimit 500 and bucket 10000, so with SCHEDULER_MMO (crates/rustedscreep-core/src/config.rs) the
  * ceiling is 500 × (100 − 10) / 100 = 450 and the Optional cap 20 + (10000 − 9000) / 100 = 30. The first loop
- * of a global runs no Optional work (warm-up); its jobs are movement's first read of the owned room (P2.1) and
- * the persistence load's one step, the config record's look-up (P1.10), each sampling the clock twice, and the
- * constants self-check (P1.11), an Optional job, is a tier-off skip. The check runs from the second loop (see
- * CONSTS_DONE).
+ * of a global runs no Optional work (warm-up); its jobs are movement's first read of the owned room (P2.1), the
+ * opening's two jobs for that room (P2.4: `opening`, Critical, and `opening work`, Standard) and the persistence
+ * load's one step, the config record's look-up (P1.10), each sampling the clock twice, and the two Optional jobs,
+ * the constants self-check (P1.11) and the opening's extension placement (ADR-020), are tier-off skips. Both run
+ * from the second loop (see CONSTS_DONE and PLACEMENT_SAMPLES).
  */
 const SCHEDULER_EXPECTED = {
   1: [
     'rustedscreep scheduler at tick 50000001 (loop 0 of this global): cpu limit 20, tickLimit 500, bucket 10000',
     'ceiling 450.0; critical on; standard on (cap 450.0); optional off (warm-up)',
-    // Two jobs of one unit each, two samples each: movement's first read of the owned W1N1, where the
-    // Harvester is (P2.1, a Critical job), and the persistence load job's one step, the config
-    // segment's look-up (P1.10).
-    'samples 4 (bad 0), units 2, budget stops 0, tier-off skips 1, out of order 0, faults 0',
+    // Four jobs of one unit each, two samples each: movement's first read of the owned W1N1, where the
+    // Harvester is (P2.1, a Critical job), the opening's two jobs for W1N1 (P2.4, Critical and Standard: was
+    // samples 4, units 2 before them), and the persistence load job's one step, the config segment's
+    // look-up (P1.10). Tier-off skips 2 (was 1 before ADR-020): the constants self-check and the extension
+    // placement.
+    'samples 8 (bad 0), units 4, budget stops 0, tier-off skips 2, out of order 0, faults 0',
     'faults since boot 0 (this window 0)',
   ],
   4: ['(loop 3 of this global)', 'optional on (cap 30.0)', ' | clock now '],
@@ -313,14 +316,16 @@ const CONSTS_DONE = new RegExp(
 
 /**
  * At offset PROFILER_AT, `rustedscreep.profiler()`. A build without the profiler says so; a profiler build
- * shows 8 loops (offsets 1 to 8), the cold loop at the first, a window of the other 7, and the say's two
- * calls (offset 7) with no billed intent (say is free, V34).
+ * shows 8 loops (offsets 1 to 8), the cold loop at the first, a window of the other 7, the say's two calls
+ * (offset 7) with no billed intent (say is free, V34), and the extension placement's createConstructionSite call
+ * (SITE_CALL, offset 2 or 3), billed as one intent (V203): 3 calls in 2 ticks, 1 billed (were 2 calls in 1 tick
+ * and none billed before ADR-020).
  */
 const PROFILER_AT = 8;
 const PROFILER_EXPECTED = [
   'rustedscreep profiler at tick 50000008: loops 8 in this global | open window 7/1000 loops from tick 50000002: ',
-  '; calls total 2 (max 2); billed total 0 (max 0) | act per call ',
-  ' CPU over 2 calls in 1 ticks (bound 0.0222)',
+  '; calls total 3 (max 2); billed total 1 (max 1) | act per call ',
+  ' CPU over 3 calls in 2 ticks (bound 0.0222)',
   ' | last loop at tick 50000008: ',
   ' | windows closed 0 (kept 0) | segment 99: writes 0, failed 0 | cold loop at tick 50000001: start ',
 ];
@@ -336,15 +341,27 @@ const BAD_SAY_CMD = 'rustedscreep.say(42)';
  * What `rustedscreep.act()` must report at offset SAY_AT + 1, after the loop that issued the say: the two own
  * creeps that are not spawning say it (one call each, free, so billed 0, V34), the spawning builder is refused
  * before any call, and the Invader in W1N1 is not asked (the say goes to own creeps only). The loops ran at
- * offsets 1 to 7, so 7 ticks since boot. One more loop runs after it, which must call nothing.
+ * offsets 1 to 7, so 7 ticks since boot. One more loop runs after it, which must call nothing. Since boot it also
+ * counts the extension placement's one createConstructionSite call (ADR-020, see SITE_CALL): issued 3, ok 3 and
+ * billed 1 (V203; were 2, 2 and 0 before ADR-020).
  */
 const ACT_EXPECTED = {
   7: [
     'rustedscreep act at tick 50000007: queued 2 (replaced 0), refused 1, spawning 1 | blocked 0 | ' +
       'issued 2: ok 2 (billed 0), failed 0, unknown 0, threw 0, missing 0 | since boot: ticks 7, queued 2, ' +
-      'refused 1, blocked 0, issued 2, ok 2, billed 0, failed 0, unknown 0, threw 0, missing 0',
+      'refused 1, blocked 0, issued 3, ok 3, billed 1, failed 0, unknown 0, threw 0, missing 0',
   ],
 };
+
+/**
+ * The extension placement (ADR-020) in the smoke world: W1N1 at RCL2 allows CONTROLLER_STRUCTURES.extension[2] = 5
+ * and has none, so the Optional job picks the first tile of Spawn1's parity at range 2 (SPAWN_CLEAR), nearest by
+ * path and then by tile index: (23, 23) for the spawn at (25, 25). The fake room places nothing, so the next pick
+ * waits APPEAR_TICKS (10) loops, past this run: one call. It comes on the first loop the placement job runs, after
+ * the constants self-check in the Optional tier: the check's last loop, or the next when the check used up that
+ * loop's Optional cap (the sandbox clock is wall time).
+ */
+const SITE_CALL = ['W1N1', 23, 23, 'extension'];
 
 /** The results of `cmd` in tick order: each command's result is logged right after it. */
 export function commandResults(world, cmd) {
@@ -372,6 +389,7 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [], wasmForm = 'bin
   // An act-test build queues scripted intents every tick, so its act path is checked by act-sim.mjs instead.
   const checkAct = !features.includes('act-test');
   const calls = [];
+  const sites = [];
   const world = simulate(dir, {
     ticks: 9,
     wasmForm,
@@ -386,6 +404,7 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [], wasmForm = 'bin
     },
     scene: (offset) => sceneAt(offset, {
       calls: { push: (call) => calls.push([offset, ...call]) },
+      sites: { push: (call) => sites.push([offset, ...call]) },
     }),
   });
   const summaries = checkResults(world, 'rustedscreep.snapshot()', SNAPSHOT_EXPECTED, 'snapshot');
@@ -430,16 +449,24 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [], wasmForm = 'bin
   // touches the segments. The constants self-check runs from offset 2 (the first loop that allows Optional work)
   // until it is done, with a sample before its job and the slicer's samples (one per batch: about 30 for the whole
   // check, how many depends on the measured cost per step; js/tools/consts-sim.mjs checks that every reading is a
-  // scheduler sample); after that it reads no clock.
-  const perLoop = features.includes('profiler') ? 6 : 0;
+  // scheduler sample); after that it reads no clock but the opening's (P2.4): its two jobs run one unit each for
+  // the owned W1N1 on every loop, a sample before and after each, so 4 per loop (was 0 before P2.4), and from the
+  // second loop the extension placement's Optional job (ADR-020), one unit for W1N1, two more (was 0 before it).
+  const OPENING_SAMPLES = 4;
+  const PLACEMENT_SAMPLES = 2;
+  const perLoop = (features.includes('profiler') ? 6 : 0) + OPENING_SAMPLES;
   const constsLines = world.logs.filter((l) => l.startsWith('rustedscreep consts:'));
   const constsDone = constsLines.length === 1 ? CONSTS_DONE.exec(constsLines[0]) : null;
   if (!constsDone) throw new Error(`constants self-check: expected one line matching ${CONSTS_DONE}, got ${constsLines.join(' / ') || 'none'}`);
   const constsLast = Number(constsDone[1]) - 50000000;
   const constsTicks = Number(constsDone[2]);
   if (constsTicks < 1 || constsTicks > constsLast - 1) throw new Error(`constants self-check: ${constsTicks} tick(s) from offset 2 to ${constsLast}`);
+  const siteAt = sites[0]?.[0];
+  if (sites.length !== 1 || JSON.stringify(sites[0].slice(1)) !== JSON.stringify(SITE_CALL) || siteAt < constsLast || siteAt > constsLast + 1) {
+    throw new Error(`createConstructionSite calls ${JSON.stringify(sites)}, expected one ${JSON.stringify(SITE_CALL)} at offset ${constsLast} or ${constsLast + 1}`);
+  }
   world.loopCalls.forEach((c, offset) => {
-    const wantUsed = perLoop + (offset === 2 ? 2 : 0);
+    const wantUsed = perLoop + (offset >= 2 ? PLACEMENT_SAMPLES : 0) + (offset === 2 ? 2 : 0);
     const checking = offset >= 2 && offset <= constsLast;
     if (checking && (c.getUsed < wantUsed || c.getUsed > wantUsed + 64)) throw new Error(`offset ${offset}: ${c.getUsed} getUsed calls in loop, expected ${wantUsed} to ${wantUsed + 64} with the constants self-check`);
     if (offset >= 2 && !checking && c.getUsed !== wantUsed) throw new Error(`offset ${offset}: ${c.getUsed} getUsed calls in loop, expected ${wantUsed}`);

@@ -358,6 +358,50 @@ pub struct SpawnConfig {
 /// Spawn path values for the official MMO.
 pub const SPAWN_MMO: SpawnConfig = SpawnConfig { hold_ticks: 20 };
 
+/// RCL1–3 opening thresholds (ROADMAP P2.4): worker counts, recovery, scavenging, the downgrade
+/// guard and the stall watchdog; `docs/TUNING.md` gives the rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpeningConfig {
+    /// Most workers per owned room, whatever its sources could keep busy: each costs about one
+    /// work intent and one move a tick. Unit: creeps.
+    pub max_workers: u32,
+    /// Fewer workers than this that can work and new ones spawn with the energy the room holds,
+    /// not its full capacity; the recovery after a zero-creep room ends at this count. At most
+    /// `max_workers`. Unit: creeps.
+    pub min_workers: u32,
+    /// A worker request that waited this long, with no new worker, for the room to hold its
+    /// full-capacity body caps the room's bodies at the most energy it held meanwhile, until the
+    /// room is seen full. Unit: ticks.
+    pub wait_ticks: u32,
+    /// The least energy in a pile, tombstone, ruin or container that a gathering worker fetches
+    /// (less when its store needs less). Unit: energy.
+    pub scavenge_min: u32,
+    /// Below this `ticksToDowngrade` one worker upgrades before building and upgrading by the
+    /// others, until its store is empty; the guard ends `CONTROLLER_DOWNGRADE_RESTORE` above it.
+    /// Unit: ticks.
+    pub downgrade_guard_ticks: u32,
+    /// Workers that upgrade while others build, once filling the spawns is covered. Unit: creeps.
+    pub min_upgraders: u32,
+    /// A room whose controller progress, sources' energy (harvesting) and construction progress all
+    /// stood still this long while it had workers is reported and planned again. Unit: ticks.
+    pub stall_ticks: u32,
+    /// Places extension sites as the level allows (ADR-020's interim pattern) in the Optional
+    /// tier. Off, the opening builds only sites placed by hand.
+    pub place_extensions: bool,
+}
+
+/// Opening values for the official MMO.
+pub const OPENING_MMO: OpeningConfig = OpeningConfig {
+    max_workers: 20,
+    min_workers: 2,
+    wait_ticks: 300,
+    scavenge_min: 50,
+    downgrade_guard_ticks: 4000,
+    min_upgraders: 1,
+    stall_ticks: 1500,
+    place_extensions: true,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -370,6 +414,7 @@ pub struct Config {
     pub cache: CacheConfig,
     pub movement: MovementConfig,
     pub spawn: SpawnConfig,
+    pub opening: OpeningConfig,
 }
 
 /// A server profile: a name and its values.
@@ -391,6 +436,7 @@ pub const MMO: Profile = Profile {
         cache: CACHE_MMO,
         movement: MOVEMENT_MMO,
         spawn: SPAWN_MMO,
+        opening: OPENING_MMO,
     },
 };
 
@@ -551,7 +597,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 52;
+pub const FIELD_COUNT: usize = 60;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -758,6 +804,21 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(movement, "MovementConfig", route_retry_ticks, 1, 5000, true),
     number!(movement, "MovementConfig", route_cache_size, 4, 1024, true),
     number!(spawn, "SpawnConfig", hold_ticks, 1, 1500, true),
+    number!(opening, "OpeningConfig", max_workers, 1, 50, true),
+    number!(opening, "OpeningConfig", min_workers, 1, 10, true),
+    number!(opening, "OpeningConfig", wait_ticks, 50, 3000, true),
+    number!(opening, "OpeningConfig", scavenge_min, 1, 1000, true),
+    number!(
+        opening,
+        "OpeningConfig",
+        downgrade_guard_ticks,
+        100,
+        20_000,
+        true
+    ),
+    number!(opening, "OpeningConfig", min_upgraders, 0, 10, true),
+    number!(opening, "OpeningConfig", stall_ticks, 100, 20_000, true),
+    flag!(opening, "OpeningConfig", place_extensions, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -783,7 +844,7 @@ pub struct Rule {
 /// `CPU_TICK_LIMIT_MAX`: Standard switches on from the bucket at the start of the tick, and one tick
 /// is billed about tickLimit at most (the scheduler stops every tier at the ceiling and the reserve
 /// covers the rest), so a Standard tick leaves the bucket at or above the boot gate (TUNING.md).
-pub static RULES: [Rule; 7] = [
+pub static RULES: [Rule; 8] = [
     Rule {
         keys: ["loader.backoff_base_ticks", "loader.backoff_max_ticks"],
         text: "loader.backoff_base_ticks must be at most loader.backoff_max_ticks",
@@ -819,6 +880,11 @@ pub static RULES: [Rule; 7] = [
         keys: ["profiler.stats_segment", "persist.config_segment"],
         text: "profiler.stats_segment and persist.config_segment must differ",
         holds: |c| c.profiler.stats_segment != c.persist.config_segment,
+    },
+    Rule {
+        keys: ["opening.min_workers", "opening.max_workers"],
+        text: "opening.min_workers must be at most opening.max_workers",
+        holds: |c| c.opening.min_workers <= c.opening.max_workers,
     },
     Rule {
         keys: ["persist.self_test_segment", "persist.config_segment"],
@@ -943,9 +1009,20 @@ mod tests {
             cache: _,
             movement: _,
             spawn: _,
+            opening: _,
         } = MMO.config;
         let SpawnConfig { hold_ticks: _ } = SPAWN_MMO;
-        let expected: [(&str, &[&str]); 8] = [
+        let OpeningConfig {
+            max_workers: _,
+            min_workers: _,
+            wait_ticks: _,
+            scavenge_min: _,
+            downgrade_guard_ticks: _,
+            min_upgraders: _,
+            stall_ticks: _,
+            place_extensions: _,
+        } = OPENING_MMO;
+        let expected: [(&str, &[&str]); 9] = [
             (
                 "loader",
                 &[
@@ -1018,6 +1095,19 @@ mod tests {
                 ],
             ),
             ("spawn", &["hold_ticks"]),
+            (
+                "opening",
+                &[
+                    "max_workers",
+                    "min_workers",
+                    "wait_ticks",
+                    "scavenge_min",
+                    "downgrade_guard_ticks",
+                    "min_upgraders",
+                    "stall_ticks",
+                    "place_extensions",
+                ],
+            ),
         ];
         let mut total = 0;
         for (group, names) in expected {

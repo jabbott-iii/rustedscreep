@@ -99,7 +99,7 @@ Modules:
   when blocked, and a traffic manager (swap, shove, priority). `move(direction)` is issued from Rust.
   Inter-room routes use PathFinder with cached results.
 - Minimal spawn path, which the P5 queue replaces.
-- RCL1–3 opening, zero-creep recovery, and deadlock watchdogs (for example no harvester, or energy stuck in containers).
+- RCL1–3 opening, zero-creep recovery, and deadlock watchdogs (for example no harvester, or energy stuck in containers), with interim extension placement from RCL2 until P4 (ADR-020).
 - API tools (from P1 module 3, ADR-017), after the Node 22 or 24 upgrade (VERIFICATION_LOG V11): npm scripts `deploy` (an API upload),
   `console` (the server console into `logs/`) and `stats` (segment 99 in the profiler's format v1). The gate's live captures use them.
 
@@ -132,7 +132,7 @@ Modules:
 Modules:
 - Terrain corpus fixtures (≥ 30 rooms exported from MMO maps) in `crates/rustedscreep-core/tests/fixtures/`.
 - Candidates: a stamp/bunker planner, and distance transform with min-cut ramparts. Benchmark both, then decide ADR-007.
-- Placement of extensions, towers, labs, storage, terminal, links, roads, and ramparts. Incremental site placement per RCL, cached, with periodic verification.
+- Placement of extensions, towers, labs, storage, terminal, links, roads, and ramparts. Incremental site placement per RCL, cached, with periodic verification. It keeps or replaces the interim extensions P2 placed (ADR-020) and takes over from `opening.place_extensions`.
 
 **Gate:**
 - The planner is deterministic and valid on the whole corpus: counts per RCL come from constants, and every structure is reachable.

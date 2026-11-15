@@ -155,6 +155,12 @@ impl SpawnGlue {
         });
     }
 
+    /// The spawner, for the jobs that request creeps (the opening, P2.4) between [`Self::begin`]
+    /// and [`Self::plan`].
+    pub fn spawner_mut(&mut self) -> &mut Spawner {
+        &mut self.spawner
+    }
+
     /// The Critical `spawn` job: one unit per room with a request and a ready spawn, so a tick with
     /// nothing asked, or with every spawn of each asking room busy or held, runs no job and reads no
     /// clock. Requests come from the jobs that ran before it (Critical jobs earlier in the tick; the

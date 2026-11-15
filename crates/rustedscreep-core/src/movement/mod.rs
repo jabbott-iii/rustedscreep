@@ -1485,6 +1485,37 @@ impl Movement {
         })
     }
 
+    /// The cost grid of `room` and its version, for planners that measure paths on it (the P2.4
+    /// opening sizes its workers from distances on it). It is built first when it is out of date
+    /// (a heavy unit, [`Commit::heavy`]), as for a request. `None` until the room's terrain and a
+    /// scan have been read: [`Self::request`] asks for them, so a caller retries a tick later.
+    pub fn room_grid(
+        &mut self,
+        room: RoomName,
+        cfg: &MovementConfig,
+        commit: &mut Commit,
+    ) -> Option<(&CostGrid, u32)> {
+        let ri = self.room_index(room)?;
+        let builds = self.tick.grids_built;
+        if !self.ensure_grid(ri, cfg) {
+            return None;
+        }
+        if self.tick.grids_built != builds {
+            commit.heavy();
+        }
+        let r = self.rooms.get(ri)?;
+        r.grid.as_ref().map(|g| (g, r.version))
+    }
+
+    /// The tiles of `room`'s sources and minerals, read with its terrain (none before that), for
+    /// planners that keep their neighbours free (P2.4's extension placement).
+    pub fn room_statics(&self, room: RoomName) -> impl Iterator<Item = Tile> + '_ {
+        self.room_index(room)
+            .and_then(|i| self.rooms.get(i))
+            .into_iter()
+            .flat_map(|r| r.statics.iter().map(|&(t, _)| t))
+    }
+
     /// Cached flow fields.
     pub fn fields(&self) -> &FieldCache {
         &self.fields

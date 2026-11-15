@@ -6,7 +6,7 @@ import { textCodecSource } from './text-polyfill.js';
 import {
   __wbg_reset_state, actSummary as wasmActSummary, configReset as wasmConfigReset, configSet as wasmConfigSet,
   configSummary as wasmConfigSummary, configUnset as wasmConfigUnset, constsSummary as wasmConstsSummary, initSync,
-  loop as wasmLoop, moveTo as wasmMoveTo, movementSummary as wasmMovementSummary,
+  loop as wasmLoop, moveTo as wasmMoveTo, movementSummary as wasmMovementSummary, openingSummary as wasmOpeningSummary,
   persistSummary as wasmPersistSummary, persistTest as wasmPersistTest, profilerSummary as wasmProfilerSummary,
   queueSay as wasmQueueSay, schedulerSummary as wasmSchedulerSummary, snapshotSummary as wasmSnapshotSummary,
   spawn as wasmSpawn, spawnerSummary as wasmSpawnerSummary, trapTest as wasmTrapTest,
@@ -108,6 +108,7 @@ const glue: Glue = {
   moveTo: wasmMoveTo,
   spawnerSummary: wasmSpawnerSummary,
   spawn: wasmSpawn,
+  openingSummary: wasmOpeningSummary,
 };
 
 const loader = new Loader(env, glue, CONFIG, BUILD);
@@ -141,7 +142,7 @@ function routeConsole(): void {
 // `rustedscreep.configReset()`, `rustedscreep.consts()`, `rustedscreep.movement()`,
 // `rustedscreep.moveTo("W1N1", 25, 25, 1)` (from another room: `rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1")`;
 // `rustedscreep.moveTo()` cancels), `rustedscreep.spawner()` or `rustedscreep.spawn("W1N1", "worker")`
-// (`rustedscreep.spawn()` cancels).
+// (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`.
 g.rustedscreep = {
   trapTest: (n: unknown = 1) => loader.scheduleTraps(Number(n)),
   status: () => loader.status(),
@@ -162,6 +163,7 @@ g.rustedscreep = {
     loader.moveTo(room, x, y, range, from),
   spawner: () => loader.spawner(),
   spawn: (room?: unknown, role?: unknown) => loader.spawn(room, role),
+  opening: () => loader.opening(),
 };
 
 export function loop(): void {

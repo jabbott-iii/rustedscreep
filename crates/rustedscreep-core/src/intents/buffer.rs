@@ -34,7 +34,7 @@ use super::log::ActLog;
 use super::outcome::Outcome;
 use super::table::{ActionSet, CreepAction, PRIORITY_ORDER};
 use crate::scheduler::Commit;
-use crate::snapshot::{CreepHandle, Snapshot, StructureHandle};
+use crate::snapshot::{CreepHandle, ObjectHandle, ObjectKind, Snapshot, StructureHandle};
 
 /// The length the engine shows a `say` message at, in UTF-16 code units (the API's
 /// `CREEP_SAY_MAX_LENGTH`; the processor's `substring(0, 10)`, V109).
@@ -94,6 +94,8 @@ impl std::fmt::Debug for SayText {
 pub enum Target {
     Creep(CreepHandle),
     Structure(StructureHandle),
+    /// A source, own site, pile, tombstone, ruin or container (P2.4).
+    Object(ObjectHandle),
 }
 
 /// A target resolved to its row in this tick's snapshot, where rustedscreep-wasm finds its JS object.
@@ -101,11 +103,13 @@ pub enum Target {
 pub enum TargetRow {
     Creep(u32),
     Structure(u32),
+    Object(u32),
 }
 
 /// One creep intent with its arguments. The variants are the creep methods whose targets this
-/// build's snapshot can name; harvest, build and pickup arrive with their target tables (P2), and
-/// attacks with the ally check every attack intent needs (P7, P10).
+/// build's snapshot can name; harvest, build, pickup and withdraw from a room object came with the
+/// room-object table (P2.4), and attacks come with the ally check every attack intent needs (P7,
+/// P10).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CreepIntent {
     /// `drop(resource, amount)`; `None` drops all of it.
@@ -124,6 +128,25 @@ pub enum CreepIntent {
         target: StructureHandle,
         resource: ResourceType,
         amount: Option<u32>,
+    },
+    /// `withdraw(target, resource, amount)` from a tombstone, ruin or container (P2.4). It shares
+    /// the `withdraw` slot with [`CreepIntent::Withdraw`]: the last push of either is issued.
+    WithdrawObject {
+        target: ObjectHandle,
+        resource: ResourceType,
+        amount: Option<u32>,
+    },
+    /// `harvest(source)` (P2.4).
+    Harvest {
+        target: ObjectHandle,
+    },
+    /// `build(site)` on an own construction site (P2.4).
+    Build {
+        target: ObjectHandle,
+    },
+    /// `pickup(resource)` of a dropped pile (P2.4).
+    Pickup {
+        target: ObjectHandle,
     },
     Heal {
         target: CreepHandle,
@@ -165,7 +188,10 @@ impl CreepIntent {
         match self {
             Self::Drop { .. } => CreepAction::Drop,
             Self::Transfer { .. } => CreepAction::Transfer,
-            Self::Withdraw { .. } => CreepAction::Withdraw,
+            Self::Withdraw { .. } | Self::WithdrawObject { .. } => CreepAction::Withdraw,
+            Self::Harvest { .. } => CreepAction::Harvest,
+            Self::Build { .. } => CreepAction::Build,
+            Self::Pickup { .. } => CreepAction::Pickup,
             Self::Heal { .. } => CreepAction::Heal,
             Self::RangedHeal { .. } => CreepAction::RangedHeal,
             Self::Move { .. } | Self::MoveToward { .. } => CreepAction::Move,
@@ -181,7 +207,8 @@ impl CreepIntent {
         match *self {
             Self::Drop { amount, .. }
             | Self::Transfer { amount, .. }
-            | Self::Withdraw { amount, .. } => amount,
+            | Self::Withdraw { amount, .. }
+            | Self::WithdrawObject { amount, .. } => amount,
             _ => None,
         }
     }
@@ -196,6 +223,10 @@ impl CreepIntent {
             | Self::RangedHeal { target }
             | Self::Pull { target }
             | Self::MoveToward { target } => Some(Target::Creep(target)),
+            Self::WithdrawObject { target, .. }
+            | Self::Harvest { target }
+            | Self::Build { target }
+            | Self::Pickup { target } => Some(Target::Object(target)),
             Self::Drop { .. } | Self::Move { .. } | Self::Say { .. } => None,
         }
     }
@@ -206,12 +237,16 @@ impl CreepIntent {
         match self {
             Self::Transfer { .. }
             | Self::Withdraw { .. }
+            | Self::WithdrawObject { .. }
+            | Self::Harvest { .. }
+            | Self::Pickup { .. }
             | Self::Heal { .. }
             | Self::Pull { .. }
             | Self::MoveToward { .. } => Some(1),
-            Self::RangedHeal { .. } | Self::Repair { .. } | Self::UpgradeController { .. } => {
-                Some(3)
-            }
+            Self::RangedHeal { .. }
+            | Self::Repair { .. }
+            | Self::UpgradeController { .. }
+            | Self::Build { .. } => Some(3),
             Self::Drop { .. } | Self::Move { .. } | Self::Say { .. } => None,
         }
     }
@@ -244,7 +279,9 @@ pub enum Rejected {
     /// a nuker or a power bank (`ERR_INVALID_TARGET`; `transfer` of energy to a controller would
     /// instead record an `upgradeController` intent); for `repair` a type without a
     /// `CONSTRUCTION_COST` (billed, skipped); for `upgradeController` anything but a controller
-    /// (V108, V109, V113).
+    /// (V108, V109, V113). Among room objects (P2.4): `harvest` only a source, `build` only a site,
+    /// `pickup` only a pile, `withdraw` only a tombstone, ruin or container, and `transfer` only a
+    /// container.
     WrongTarget,
     /// The target is farther than the method's range or in another room (`ERR_NOT_IN_RANGE`, V108,
     /// V113).
@@ -470,6 +507,16 @@ impl IntentBuffer {
                 let at = st.positions().get(t).copied();
                 (Some(TargetRow::Structure(row_u32(t)?)), at)
             }
+            Some(Target::Object(h)) => {
+                let objects = &snap.objects;
+                let t = objects.row_of(h).ok_or(Rejected::GoneTarget)?;
+                let kind = objects.kinds().get(t).copied();
+                if !kind.is_some_and(|k| accepts_object(intent, k)) {
+                    return Err(Rejected::WrongTarget);
+                }
+                let at = objects.positions().get(t).copied();
+                (Some(TargetRow::Object(row_u32(t)?)), at)
+            }
         };
         if let (Some(range), Some(at)) = (intent.range(), at) {
             let from = creeps.positions().get(row).copied();
@@ -597,6 +644,24 @@ const fn accepts(intent: &CreepIntent, kind: StructureType) -> bool {
     }
 }
 
+/// Whether `intent`'s method can act on a room object of kind `kind` (P2.4; see
+/// [`Rejected::WrongTarget`]).
+const fn accepts_object(intent: &CreepIntent, kind: ObjectKind) -> bool {
+    match intent {
+        CreepIntent::Harvest { .. } => matches!(kind, ObjectKind::Source),
+        CreepIntent::Build { .. } => matches!(kind, ObjectKind::Site(_)),
+        CreepIntent::Pickup { .. } => {
+            matches!(kind, ObjectKind::Energy | ObjectKind::OtherResource)
+        }
+        CreepIntent::WithdrawObject { .. } => matches!(
+            kind,
+            ObjectKind::Tombstone | ObjectKind::Ruin | ObjectKind::Container
+        ),
+        CreepIntent::Transfer { .. } => matches!(kind, ObjectKind::Container),
+        _ => false,
+    }
+}
+
 /// A row as stored in an [`Issue`]. Rows index vectors, so they fit long before this could fail.
 fn row_u32(row: usize) -> Result<u32, Rejected> {
     u32::try_from(row).map_err(|_| Rejected::GoneTarget)
@@ -605,7 +670,9 @@ fn row_u32(row: usize) -> Result<u32, Rejected> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::{CreepRow, ObjectKey, SkipReason, StructureStatic, TickContext};
+    use crate::snapshot::{
+        CreepRow, ObjectKey, ObjectRow, ObjectStatic, SkipReason, StructureStatic, TickContext,
+    };
     use rustedscreep_consts::{ErrorCode, INTENT_CPU_COST, RoomCoordinate, RoomName};
 
     fn pos_in(room: &str, x: u8, y: u8) -> Position {
@@ -629,6 +696,10 @@ mod tests {
     /// - spawn (10,9) and nuker (11,9), each next to a and b; controller (10,13), 3 from a; observer
     ///   (9,9), next to a; power bank (11,11); extension (30,30), far from everyone; gone: a tower
     ///   seen on the previous tick only.
+    /// - Room objects (P2.4): source (9,11), next to a; extension site (12,12), 2 from a and b;
+    ///   energy pile (10,11), next to a and b; another resource's pile (1,10), next to c; tombstone
+    ///   (12,9), next to b; ruin (8,10), 2 from a; container (12,11), next to b; gone: a pile seen on
+    ///   the previous tick only.
     struct World {
         snap: Snapshot,
         a: CreepHandle,
@@ -645,6 +716,8 @@ mod tests {
         power_bank: StructureHandle,
         far: StructureHandle,
         gone_structure: StructureHandle,
+        objects: [(ObjectHandle, Position, ObjectKind); 7],
+        gone_object: ObjectHandle,
     }
 
     fn creep(at: Position, my: bool, spawning: bool) -> CreepRow {
@@ -675,6 +748,15 @@ mod tests {
             .structures
             .push(ObjectKey(13), building(StructureType::Tower, pos(9, 11)))
             .expect("tower");
+        let thing = |kind, at| move || Ok(ObjectStatic { kind, pos: at });
+        let row = ObjectRow {
+            amount: 7,
+            total: 0,
+        };
+        let gone_object = snap
+            .objects
+            .push(ObjectKey(27), thing(ObjectKind::Energy, pos(10, 12)), row)
+            .expect("gone pile");
         snap.finish();
         snap.begin(TickContext::from_raw(101, 20, 500.0, 10_000));
         let cr = &mut snap.creeps;
@@ -707,9 +789,26 @@ mod tests {
         let observer = put(14, StructureType::Observer, pos(9, 9));
         let power_bank = put(15, StructureType::PowerBank, pos(11, 11));
         let far = put(16, StructureType::Extension, pos(30, 30));
+        let objects = [
+            (20, ObjectKind::Source, pos(9, 11)),
+            (21, ObjectKind::Site(StructureType::Extension), pos(12, 12)),
+            (22, ObjectKind::Energy, pos(10, 11)),
+            (23, ObjectKind::OtherResource, pos(1, 10)),
+            (24, ObjectKind::Tombstone, pos(12, 9)),
+            (25, ObjectKind::Ruin, pos(8, 10)),
+            (26, ObjectKind::Container, pos(12, 11)),
+        ]
+        .map(|(key, kind, at)| {
+            let h = snap
+                .objects
+                .push(ObjectKey(key), thing(kind, at), row)
+                .expect("object");
+            (h, at, kind)
+        });
         snap.finish();
         assert_eq!(snap.creeps.row_of(gone_creep), None);
         assert_eq!(snap.structures.row_of(gone_structure), None);
+        assert_eq!(snap.objects.row_of(gone_object), None);
         World {
             snap,
             a,
@@ -726,6 +825,8 @@ mod tests {
             power_bank,
             far,
             gone_structure,
+            objects,
+            gone_object,
         }
     }
 
@@ -1351,6 +1452,37 @@ mod tests {
                 };
                 (Some(at), range)
             }
+            CreepIntent::Transfer {
+                target: Target::Object(target),
+                ..
+            }
+            | CreepIntent::WithdrawObject { target, .. }
+            | CreepIntent::Harvest { target }
+            | CreepIntent::Build { target }
+            | CreepIntent::Pickup { target } => {
+                let Some(&(_, at, kind)) = w.objects.iter().find(|o| o.0 == target) else {
+                    return Err(Rejected::GoneTarget);
+                };
+                let ok = match intent {
+                    CreepIntent::Transfer { .. } => kind == ObjectKind::Container,
+                    CreepIntent::WithdrawObject { .. } => matches!(
+                        kind,
+                        ObjectKind::Tombstone | ObjectKind::Ruin | ObjectKind::Container
+                    ),
+                    CreepIntent::Harvest { .. } => kind == ObjectKind::Source,
+                    CreepIntent::Build { .. } => matches!(kind, ObjectKind::Site(_)),
+                    _ => matches!(kind, ObjectKind::Energy | ObjectKind::OtherResource),
+                };
+                if !ok {
+                    return Err(Rejected::WrongTarget);
+                }
+                let range = if matches!(intent, CreepIntent::Build { .. }) {
+                    3
+                } else {
+                    1
+                };
+                (Some(at), range)
+            }
             CreepIntent::Drop { .. } | CreepIntent::Move { .. } | CreepIntent::Say { .. } => {
                 (None, 0)
             }
@@ -1381,12 +1513,24 @@ mod tests {
             w.far,
             w.gone_structure,
         ];
+        let mut things: Vec<ObjectHandle> = w.objects.iter().map(|o| o.0).collect();
+        things.push(w.gone_object);
         let random_intent = |rng: &mut Lcg| -> CreepIntent {
             let c = creeps[rng.next(creeps.len())];
             let st = structures[rng.next(structures.len())];
+            let o = things[rng.next(things.len())];
             let amount = [None, Some(0), Some(7)][rng.next(3)];
             let d = [Direction::Top, Direction::Left, Direction::BottomRight][rng.next(3)];
-            match rng.next(12) {
+            match rng.next(17) {
+                12 => CreepIntent::Harvest { target: o },
+                13 => CreepIntent::Build { target: o },
+                14 => CreepIntent::Pickup { target: o },
+                15 => CreepIntent::WithdrawObject {
+                    target: o,
+                    resource: ResourceType::Energy,
+                    amount,
+                },
+                16 => energy(Target::Object(o), amount),
                 0 => mv(d),
                 1 => CreepIntent::MoveToward { target: c },
                 2 => CreepIntent::Heal { target: c },
@@ -1413,6 +1557,9 @@ mod tests {
                 Target::Creep(h) => TargetRow::Creep(row_of_creep(h)),
                 Target::Structure(h) => TargetRow::Structure(
                     u32::try_from(w.snap.structures.row_of(h).expect("row")).expect("u32"),
+                ),
+                Target::Object(h) => TargetRow::Object(
+                    u32::try_from(w.snap.objects.row_of(h).expect("row")).expect("u32"),
                 ),
             })
         };

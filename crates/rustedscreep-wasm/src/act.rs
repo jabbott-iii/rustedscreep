@@ -78,6 +78,18 @@ extern "C" {
 
     #[wasm_bindgen(method, catch, js_name = pull)]
     fn pull(this: &Actor, target: &JsValue) -> Result<f64, JsValue>;
+
+    /// `harvest(source)` (P2.4, V182).
+    #[wasm_bindgen(method, catch, js_name = harvest)]
+    fn harvest(this: &Actor, target: &JsValue) -> Result<f64, JsValue>;
+
+    /// `build(site)` (P2.4, V185).
+    #[wasm_bindgen(method, catch, js_name = build)]
+    fn build(this: &Actor, target: &JsValue) -> Result<f64, JsValue>;
+
+    /// `pickup(resource)` (P2.4, V190).
+    #[wasm_bindgen(method, catch, js_name = pickup)]
+    fn pickup(this: &Actor, target: &JsValue) -> Result<f64, JsValue>;
 }
 
 /// The job name act faults are logged under.
@@ -237,6 +249,7 @@ fn call(actor: &Actor, issue: &Issue, js: &JsWorld) -> Option<Result<f64, JsValu
         match issue.target? {
             TargetRow::Creep(row) => js.creeps.get(row as usize).map(AsRef::as_ref),
             TargetRow::Structure(row) => js.structures.get(row as usize).map(AsRef::as_ref),
+            TargetRow::Object(row) => js.objects.get(row as usize).map(AsRef::as_ref),
         }
     };
     Some(match issue.intent {
@@ -249,7 +262,13 @@ fn call(actor: &Actor, issue: &Issue, js: &JsWorld) -> Option<Result<f64, JsValu
         } => actor.transfer(target()?, resource, amount),
         CreepIntent::Withdraw {
             resource, amount, ..
+        }
+        | CreepIntent::WithdrawObject {
+            resource, amount, ..
         } => actor.withdraw(target()?, resource, amount),
+        CreepIntent::Harvest { .. } => actor.harvest(target()?),
+        CreepIntent::Build { .. } => actor.build(target()?),
+        CreepIntent::Pickup { .. } => actor.pickup(target()?),
         CreepIntent::Heal { .. } => actor.heal(target()?),
         CreepIntent::RangedHeal { .. } => actor.ranged_heal(target()?),
         CreepIntent::Repair { .. } => actor.repair(target()?),
@@ -266,7 +285,12 @@ const fn threw(intent: &CreepIntent) -> &'static str {
         CreepIntent::Say { .. } => "the say call threw",
         CreepIntent::Drop { .. } => "the drop call threw",
         CreepIntent::Transfer { .. } => "the transfer call threw",
-        CreepIntent::Withdraw { .. } => "the withdraw call threw",
+        CreepIntent::Withdraw { .. } | CreepIntent::WithdrawObject { .. } => {
+            "the withdraw call threw"
+        }
+        CreepIntent::Harvest { .. } => "the harvest call threw",
+        CreepIntent::Build { .. } => "the build call threw",
+        CreepIntent::Pickup { .. } => "the pickup call threw",
         CreepIntent::Heal { .. } => "the heal call threw",
         CreepIntent::RangedHeal { .. } => "the rangedHeal call threw",
         CreepIntent::Repair { .. } => "the repair call threw",
