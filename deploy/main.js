@@ -929,6 +929,73 @@ function initSync(module) {
     return __wbg_finalize_init(instance, module);
 }
 
+// Base64 (RFC 4648 section 4, the standard alphabet, padded) to bytes, for the wasm text module the GitHub link
+// delivers (ADR-015: the link uploads files as text, so the wasm travels as base64 in a .js module, V137). Plain JS:
+// TextDecoder is undefined on the MMO (V72), and atob and Buffer were never probed there (V95). Strict: a length
+// that is not a multiple of 4, any character outside the alphabet, or a misplaced '=' throws. Non-canonical
+// trailing bits are not refused; they do not change the bytes, and the loader's CRC-32 covers the content.
+const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+const PAD = 61; // '='
+const INVALID = 255;
+let table$1;
+/** The value of every ASCII code in ALPHABET, INVALID for the rest. */
+function lookup() {
+    if (table$1)
+        return table$1;
+    const t = new Uint8Array(128).fill(INVALID);
+    for (let i = 0; i < 64; i++)
+        t[ALPHABET.charCodeAt(i)] = i;
+    table$1 = t;
+    return t;
+}
+/** The bytes that padded standard base64 `text` encodes; throws a TypeError for anything else. */
+function decodeBase64(text) {
+    const n = text.length;
+    if (n % 4 !== 0)
+        throw new TypeError(`base64 text of ${n} characters is not a multiple of 4`);
+    const pad = n === 0 || text.charCodeAt(n - 1) !== PAD ? 0 : text.charCodeAt(n - 2) === PAD ? 2 : 1;
+    const out = new Uint8Array((n / 4) * 3 - pad);
+    const t = lookup();
+    const full = pad ? n - 4 : n;
+    let o = 0;
+    for (let i = 0; i < full; i += 4) {
+        const c0 = text.charCodeAt(i);
+        const c1 = text.charCodeAt(i + 1);
+        const c2 = text.charCodeAt(i + 2);
+        const c3 = text.charCodeAt(i + 3);
+        // Codes above 127 are outside the table; testing their OR first keeps every lookup in bounds.
+        if ((c0 | c1 | c2 | c3) > 127)
+            throw new TypeError(`not base64 at character ${i}`);
+        const a = t[c0];
+        const b = t[c1];
+        const c = t[c2];
+        const d = t[c3];
+        if ((a | b | c | d) > 63)
+            throw new TypeError(`not base64 at character ${i}`);
+        out[o++] = (a << 2) | (b >> 4);
+        out[o++] = ((b & 15) << 4) | (c >> 2);
+        out[o++] = ((c & 3) << 6) | d;
+    }
+    if (pad) {
+        // The last quantum: two characters and "==" (one byte), or three and "=" (two bytes).
+        const i = n - 4;
+        const c0 = text.charCodeAt(i);
+        const c1 = text.charCodeAt(i + 1);
+        const c2 = pad === 1 ? text.charCodeAt(i + 2) : 65; // 'A' = 0
+        if ((c0 | c1 | c2) > 127)
+            throw new TypeError(`not base64 at character ${i}`);
+        const a = t[c0];
+        const b = t[c1];
+        const c = t[c2];
+        if ((a | b | c) > 63)
+            throw new TypeError(`not base64 at character ${i}`);
+        out[o++] = (a << 2) | (b >> 4);
+        if (pad === 1)
+            out[o] = ((b & 15) << 4) | (c >> 2);
+    }
+    return out;
+}
+
 // CRC-32 (ISO-HDLC, the zlib/PNG CRC): the same algorithm as js/tools/lib/crc32.mjs, so the boot log
 // can be compared with what npm run stage reports for the .wasm (VERIFICATION_LOG V77). A tool test checks
 // that both give the same value on the same bytes.
@@ -1002,8 +1069,20 @@ function typeTag(value) {
     const ctor = value !== null && typeof value === 'object' ? value.constructor?.name : undefined;
     return ctor && ctor !== tag ? `${tag}(${ctor})` : tag;
 }
-/** The bytes of a binary module, whatever view require() returned (V31: never trust instanceof). */
+/**
+ * The wasm's bytes, whatever require() returned: a binary module's view or ArrayBuffer (an API upload, the private
+ * server, the sandbox; V31: never trust instanceof), or the base64 string the text module exports (the GitHub link,
+ * ADR-015).
+ */
 function toBytes(value) {
+    if (typeof value === 'string') {
+        try {
+            return decodeBase64(value);
+        }
+        catch (e) {
+            throw new TypeError(`require('${WASM_MODULE}') returned a String that is not base64 (${message(e)})`);
+        }
+    }
     if (ArrayBuffer.isView(value))
         return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     if (Object.prototype.toString.call(value) === '[object ArrayBuffer]')
@@ -1108,7 +1187,8 @@ class Loader {
         let tag;
         try {
             const raw = this.env.requireModule(WASM_MODULE);
-            tag = typeTag(raw);
+            // The boot line shows which delivery ran: a binary module's type, or the text module's base64 (ADR-015).
+            tag = typeof raw === 'string' ? `String(base64, ${raw.length} chars)` : typeTag(raw);
             bytes = toBytes(raw);
         }
         catch (e) {
@@ -1449,7 +1529,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"45a1c255438e-313f60b0","wasmCrc32":"313f60b0","features":[]});
+const BUILD = ({"id":"cc9257287416-dirty-313f60b0","wasmCrc32":"313f60b0","features":[]});
 const CONFIG = ({"bootBucketMin":1500,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;
@@ -1501,7 +1581,8 @@ const env = {
         const kind = (name) => typeof g[name];
         return `TextDecoder ${textCodecSource.TextDecoder}, TextEncoder ${textCodecSource.TextEncoder}, ` +
             `fetch ${kind('fetch')}, document ${kind('document')}, URL ${kind('URL')}, ` +
-            `console.error ${nativeConsole?.error ?? '?'}, console.warn ${nativeConsole?.warn ?? '?'}`;
+            `console.error ${nativeConsole?.error ?? '?'}, console.warn ${nativeConsole?.warn ?? '?'}, ` +
+            `atob ${kind('atob')}, Buffer ${kind('Buffer')}`;
     },
 };
 const glue = {

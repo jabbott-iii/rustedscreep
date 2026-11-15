@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { WASM_MODULE } from './lib/common.mjs';
+import { wasmModuleText } from './lib/wasm-text.mjs';
 import { UPLOAD_BUDGET, measure } from './size.mjs';
 
 function fakeBuild(wasmBytes) {
@@ -11,6 +12,7 @@ function fakeBuild(wasmBytes) {
   writeFileSync(join(dir, 'build-info.json'), JSON.stringify({ buildId: 'test' }));
   writeFileSync(join(dir, 'main.js'), 'exports.loop = function loop() {};\n');
   writeFileSync(join(dir, `${WASM_MODULE}.wasm`), Buffer.alloc(wasmBytes));
+  writeFileSync(join(dir, `${WASM_MODULE}.js`), wasmModuleText(Buffer.alloc(wasmBytes)));
   return dir;
 }
 
@@ -34,5 +36,21 @@ test('a small build is within budget and its sizes are reported', () => {
     assert.equal(m.withinBudget, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The text module (ADR-015) wraps the same base64 in `module.exports = "...";\n` instead of {"binary":"..."}: 13
+// characters more, whatever the size.
+test('the text-module upload is 13 characters larger than the binary one, and the larger one is checked', () => {
+  for (const n of [0, 1000, 230513]) {
+    const dir = fakeBuild(n);
+    try {
+      const m = measure(dir);
+      assert.equal(m.uploadTextChars - m.uploadBinaryChars, 13, `n=${n}`);
+      assert.equal(m.uploadChars, m.uploadTextChars);
+      assert.equal(m.wasmTextBytes, Buffer.byteLength(wasmModuleText(Buffer.alloc(n))));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });

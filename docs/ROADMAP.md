@@ -46,7 +46,7 @@ Modules:
    release profile at the root (`opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip="debuginfo"` (VERIFICATION_LOG D7), per SPEC §1 and ADR-002).
    Toolchain pinned in `rust-toolchain.toml`. Clippy no-panic denies at the crate roots.
 2. `rustedscreep-consts`: the facade over the API constants, `extra.rs` with sources and dates, and constant-derived tests.
-3. Build: wasm build (ADR-001) + `wasm-opt` (flags from ADR-002) + a Rollup bundle of the TypeScript loader compiled by `tsc` to ES2022, no Babel (ADR-008), into `dist/`. npm scripts: `build`, `check`, `stage` (runs the release build and copies `main.js` and the `.wasm` into the tracked `deploy/` folder for the GitHub link, or into `--out <dir>` for tests and dry runs; reports sizes, a `.wasm` byte hash and a build ID; ADR-012),
+3. Build: wasm build (ADR-001) + `wasm-opt` (flags from ADR-002) + a Rollup bundle of the TypeScript loader compiled by `tsc` to ES2022, no Babel (ADR-008), into `dist/`. npm scripts: `build`, `check`, `stage` (runs the release build and copies `main.js` and the wasm into the tracked `deploy/` folder for the GitHub link, the wasm as a base64 text module `rustedscreep_wasm.js` since the link uploads files as text (ADR-015), or into `--out <dir>` for tests and dry runs; reports sizes, a byte hash of the wasm and a build ID; ADR-012),
    `size`, `deploy`, `console`, `stats`. The user creates `.screeps.yaml` (format: VERIFICATION_LOG V93); the repo has no example file (the user removed it on 2026-11-14).
 4. Loader (`js/src/main.ts`):
    - Boot gated on bucket, with compile and instantiate spread across ticks.

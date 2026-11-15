@@ -4,7 +4,8 @@
 // the `url` module are assumed absent (V95, unverified), so the build bans them as a safe default.
 import { parseAst } from 'rollup/parseAst';
 
-const BANNED_IDENTIFIERS = new Set(['fetch', 'document', 'pathToFileURL', 'URL']);
+// atob, btoa and Buffer were never probed on the MMO (V95); the wasm text module's decoder is plain JS (ADR-015).
+const BANNED_IDENTIFIERS = new Set(['fetch', 'document', 'pathToFileURL', 'URL', 'atob', 'btoa', 'Buffer']);
 
 /** Visits every node except the names of non-computed properties (`a.fetch`, `{ URL: 1 }`), which are not globals. */
 function walk(node, visit) {

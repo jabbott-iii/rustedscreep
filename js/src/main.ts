@@ -73,7 +73,8 @@ const env: Env = {
     const kind = (name: string) => typeof g[name];
     return `TextDecoder ${textCodecSource.TextDecoder}, TextEncoder ${textCodecSource.TextEncoder}, ` +
       `fetch ${kind('fetch')}, document ${kind('document')}, URL ${kind('URL')}, ` +
-      `console.error ${nativeConsole?.error ?? '?'}, console.warn ${nativeConsole?.warn ?? '?'}`;
+      `console.error ${nativeConsole?.error ?? '?'}, console.warn ${nativeConsole?.warn ?? '?'}, ` +
+      `atob ${kind('atob')}, Buffer ${kind('Buffer')}`;
   },
 };
 

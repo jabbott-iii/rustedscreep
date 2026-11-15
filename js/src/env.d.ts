@@ -2,7 +2,10 @@
 // and TextEncoder are undefined on the MMO (VERIFICATION_LOG V72), fetch and document are assumed absent
 // (V95), and DOM types would hide that. Extend this file only with globals the runtime is known to provide.
 
-/** CommonJS require: for a binary module it returns the module's bytes (V31); a missing one throws (V96). */
+/**
+ * CommonJS require: for a binary module it returns the module's bytes (V31); for a text module, its module.exports
+ * (the wasm text module exports a base64 string, ADR-015); a missing one throws (V96).
+ */
 declare function require(module: string): unknown;
 
 /** Rebuilt before every tick, with only log among the methods the loader uses (V96). */

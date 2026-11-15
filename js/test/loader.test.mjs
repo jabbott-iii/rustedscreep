@@ -18,10 +18,14 @@ const CONFIG = {
 };
 const WASM = Uint8Array.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x80, 0xff]);
 
-function harness({ config = {}, glue = {}, bucket = 10000, wasm = WASM, compileThrows = false } = {}) {
+/**
+ * `wasm` is the build's bytes (its CRC goes into the build info); `moduleValue` is what require('rustedscreep_wasm')
+ * returns, the bytes by default (a binary module) or, for the GitHub link's text module, a base64 string (ADR-015).
+ */
+function harness({ config = {}, glue = {}, bucket = 10000, wasm = WASM, moduleValue = wasm, compileThrows = false } = {}) {
   const h = {
     time: 1000, bucket, cpu: 0, halts: 0, notifies: [], logs: [], memoryReads: 0, mem: null,
-    initCount: 0, loops: 0, loopThrows: false, resets: 0, resetThrows: false,
+    initCount: 0, loops: 0, loopThrows: false, resets: 0, resetThrows: false, compiles: 0,
   };
   const env = {
     time: () => h.time,
@@ -35,10 +39,12 @@ function harness({ config = {}, glue = {}, bucket = 10000, wasm = WASM, compileT
     notify: (m) => h.notifies.push(m),
     log: (m) => h.logs.push(m),
     requireModule: (name) => {
-      if (name === 'rustedscreep_wasm') return wasm;
+      if (name === 'rustedscreep_wasm') return moduleValue;
       throw new Error(`Unknown module '${name}'`);
     },
     compile: (bytes) => {
+      h.compiles++;
+      h.compiledBytes = Array.from(bytes);
       if (compileThrows) throw new Error('CompileError: bad');
       return { compiledFrom: bytes.length };
     },
@@ -329,11 +335,47 @@ test('steady-state ticks of a normal build never read Memory', () => {
   assert.equal(h.memoryReads, reads);
 });
 
-test('toBytes accepts views and ArrayBuffers and rejects anything else', () => {
+test('toBytes accepts views, ArrayBuffers and base64 strings, and rejects anything else', () => {
   const buf = Buffer.from([1, 2, 3, 4]);
   assert.deepEqual(Array.from(toBytes(buf.subarray(1, 3))), [2, 3]);
   assert.deepEqual(Array.from(toBytes(new Uint8Array([5]).buffer)), [5]);
-  assert.throws(() => toBytes('not bytes'), /returned String, not bytes/);
+  // The GitHub link's text module exports the wasm as base64 (ADR-015).
+  assert.deepEqual(Array.from(toBytes('AQID')), [1, 2, 3]);
+  assert.throws(() => toBytes('not bytes'), /returned a String that is not base64 \(TypeError: /);
+  assert.throws(() => toBytes(42), /returned Number, not bytes/);
+});
+
+test('a base64 string module boots like the binary one, and the boot line names it', () => {
+  const h = harness({ moduleValue: Buffer.from(WASM).toString('base64') });
+  h.tick();
+  assert.equal(h.loader.phase, 'compiled');
+  assert.deepEqual(h.compiledBytes, Array.from(WASM));
+  const boot = h.logs.find((l) => l.startsWith('rustedscreep boot:'));
+  assert.match(boot, /\| wasm String\(base64, 16 chars\) 10 B crc32 [0-9a-f]{8} \(stage [0-9a-f]{8}: match\) \|/);
+  h.tick();
+  assert.equal(h.loops, 1);
+  assert.equal(h.notifies.length, 0);
+});
+
+test('a string that is not base64 is a load incident and is never compiled', () => {
+  for (const bad of ['abc', 'AA=A', 'AAA-', 'AAAA\n', 'not bytes']) {
+    const h = harness({ moduleValue: bad });
+    h.tick(3);
+    assert.equal(h.compiles, 0, JSON.stringify(bad));
+    assert.ok(h.logs.some((l) => /incident: load/.test(l) && /not base64|multiple of 4/.test(l)), `${JSON.stringify(bad)}: ${h.logs.join(' / ')}`);
+    assert.ok(h.mem.streak >= 1);
+  }
+});
+
+test('a base64 string that decodes to other bytes is a CRC-32 MISMATCH and is notified once', () => {
+  const good = Buffer.from(WASM).toString('base64');
+  // Change one character inside the alphabet: still base64, other bytes.
+  const corrupt = `${good[0] === 'A' ? 'B' : 'A'}${good.slice(1)}`;
+  const h = harness({ moduleValue: corrupt });
+  h.tick();
+  const boot = h.logs.find((l) => l.startsWith('rustedscreep boot:'));
+  assert.match(boot, /: MISMATCH\)/);
+  assert.equal(h.notifies.filter((n) => /does not match the build's/.test(n)).length, 1);
 });
 
 test('the snapshot command calls the wasm only while it is ready, and reports a missing export', () => {

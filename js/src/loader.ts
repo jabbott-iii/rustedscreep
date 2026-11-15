@@ -1,6 +1,7 @@
 // The loader's boot, run and recovery state machine (ADR-003). Every Screeps global it needs comes in
 // through `Env` and the wasm through `Glue`, so js/test/loader.test.mjs can drive it natively; main.ts
 // wires it to the real runtime. No game logic lives here.
+import { decodeBase64 } from './base64.js';
 import { crc32Hex } from './crc32.js';
 
 /** Loader thresholds, injected at build time from rustedscreep-core's config.rs (LOADER_MMO). */
@@ -149,8 +150,19 @@ function typeTag(value: unknown): string {
   return ctor && ctor !== tag ? `${tag}(${ctor})` : tag;
 }
 
-/** The bytes of a binary module, whatever view require() returned (V31: never trust instanceof). */
+/**
+ * The wasm's bytes, whatever require() returned: a binary module's view or ArrayBuffer (an API upload, the private
+ * server, the sandbox; V31: never trust instanceof), or the base64 string the text module exports (the GitHub link,
+ * ADR-015).
+ */
 export function toBytes(value: unknown): Uint8Array {
+  if (typeof value === 'string') {
+    try {
+      return decodeBase64(value);
+    } catch (e) {
+      throw new TypeError(`require('${WASM_MODULE}') returned a String that is not base64 (${message(e)})`);
+    }
+  }
   if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
   if (Object.prototype.toString.call(value) === '[object ArrayBuffer]') return new Uint8Array(value as ArrayBuffer);
   throw new TypeError(`require('${WASM_MODULE}') returned ${typeTag(value)}, not bytes`);
@@ -253,7 +265,8 @@ export class Loader {
     let tag: string;
     try {
       const raw = this.env.requireModule(WASM_MODULE);
-      tag = typeTag(raw);
+      // The boot line shows which delivery ran: a binary module's type, or the text module's base64 (ADR-015).
+      tag = typeof raw === 'string' ? `String(base64, ${raw.length} chars)` : typeTag(raw);
       bytes = toBytes(raw);
     } catch (e) {
       this.incident('load', message(e));

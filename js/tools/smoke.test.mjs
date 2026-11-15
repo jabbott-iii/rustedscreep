@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { WASM_MODULE } from './lib/common.mjs';
+import { wasmModuleText } from './lib/wasm-text.mjs';
 import { saveSegments, simulate } from './smoke.mjs';
 
 // The smallest valid wasm module: magic number and version 1 (WebAssembly core spec, binary format).
@@ -97,4 +98,31 @@ test('the segment save keeps the driver\'s limits: 10 keys, ids 0-99, strings of
   const none = segmentWorld();
   for (const v of [undefined, null, 42]) saveSegments(v, none, 0);
   assert.deepEqual(none, segmentWorld(), 'no segments object, nothing to save');
+});
+
+test('a text module is evaluated like the driver, once per global, and require returns its exports (ADR-015)', () => {
+  const world = withBundle(
+    "exports.loop = function () { const r = require('rustedscreep_wasm'); console.log(typeof r + ' ' + r.length + ' ' + (r === require('rustedscreep_wasm'))); };",
+    (dir) => {
+      writeFileSync(join(dir, `${WASM_MODULE}.js`), wasmModuleText(EMPTY_WASM));
+      return simulate(dir, { ticks: 2, wasmForm: 'base64' });
+    },
+  );
+  // 8 bytes are 12 base64 characters.
+  assert.deepEqual(world.logs, ['string 12 true', 'string 12 true']);
+});
+
+test('the base64 form without the text module reproduces the live Unknown module error (V136)', () => {
+  assert.throws(
+    () => withBundle("exports.loop = function () { require('rustedscreep_wasm'); };", (dir) => simulate(dir, { ticks: 1, wasmForm: 'base64' })),
+    /Unknown module 'rustedscreep_wasm'/,
+  );
+});
+
+test('the sandbox has no atob, btoa or Buffer, as assumed for the MMO (V95)', () => {
+  const world = withBundle(
+    "exports.loop = function () { console.log([typeof atob, typeof btoa, typeof Buffer].join(' ')); };",
+    (dir) => simulate(dir, { ticks: 1 }),
+  );
+  assert.deepEqual(world.logs, ['undefined undefined undefined']);
 });

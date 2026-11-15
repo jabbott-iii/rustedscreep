@@ -6,16 +6,19 @@
 // in the world, applies on the next tick and survives globals; V116 to V120), and every key of
 // RawMemory.segments is saved at the end of the tick with the driver's checks (V41, V85). TextDecoder and TextEncoder are absent (V72), and so are fetch, URL and document
 // (assumed, V95). npm run build runs the plain smoke test; npm run check also runs a trap-test build
-// through 10 forced traps. Standalone: node js/tools/smoke.mjs [dir].
-import { readFileSync } from 'node:fs';
+// through 10 forced traps. npm run build runs the smoke test twice, with the wasm as a binary module and as the base64
+// text module the GitHub link delivers (ADR-015). Standalone: node js/tools/smoke.mjs [dir] [binary|base64].
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import vm from 'node:vm';
 import { FIXTURE_DIR, parseFixture } from './consts-fixture.mjs';
 import { ROOT, WASM_MODULE, fail, isMain } from './lib/common.mjs';
+import { wasmModuleText } from './lib/wasm-text.mjs';
 import { sceneAt } from './lib/world.mjs';
 
-const ABSENT_GLOBALS = ['TextDecoder', 'TextEncoder', 'fetch', 'URL', 'document'];
+// atob, btoa and Buffer were never probed on the MMO (V95), so the sandbox has none and the loader needs none.
+const ABSENT_GLOBALS = ['TextDecoder', 'TextEncoder', 'fetch', 'URL', 'document', 'atob', 'btoa', 'Buffer'];
 
 /**
  * The engine's game constants as [name, JSON text] pairs: @screeps/common 2.16.0 lib/constants.js, the fixture the
@@ -100,13 +103,20 @@ export function driverRawMemory(offset, world) {
  * in console commands or the end-of-tick save. `constants` ([name, JSON text] pairs, the engine's by default) are
  * set on the global at the start of every tick, as the engine does (V129); `[]` gives a global without them.
  * `setup(context, world)` runs once per new global, before the bundle is evaluated (to instrument the realm).
+ * `wasmForm` is how require('rustedscreep_wasm') answers: 'binary', the module's bytes (an API upload, V31), or
+ * 'base64', the text module the GitHub link delivers (ADR-015), read from `${dir}/rustedscreep_wasm.js` (or made from
+ * `wasmBytes`) and evaluated in the driver's module wrapper once per global (V138); without the file it throws
+ * "Unknown module", as the live link did with only the .wasm (V136).
  */
 export function simulate(dir, {
   ticks = 6, bucket = 10000, command = null, until = null, memoryJson = '{}', withHalt = true, wasmBytes = null,
-  scene = sceneAt, rawMemory = driverRawMemory, constants = ENGINE_CONSTANTS, setup = null,
+  scene = sceneAt, rawMemory = driverRawMemory, constants = ENGINE_CONSTANTS, setup = null, wasmForm = 'binary',
 } = {}) {
+  if (wasmForm !== 'binary' && wasmForm !== 'base64') throw new Error(`unknown wasm form ${wasmForm}`);
   const code = readFileSync(join(dir, 'main.js'), 'utf8');
-  const bytes = wasmBytes ?? readFileSync(join(dir, `${WASM_MODULE}.wasm`));
+  const textPath = join(dir, `${WASM_MODULE}.js`);
+  const bytes = wasmForm === 'binary' ? (wasmBytes ?? readFileSync(join(dir, `${WASM_MODULE}.wasm`))) : null;
+  const wasmText = wasmForm === 'base64' ? (wasmBytes ? wasmModuleText(wasmBytes) : existsSync(textPath) ? readFileSync(textPath, 'utf8') : null) : null;
   const world = {
     time: 50000000, memoryJson, logs: [], notifies: [], halts: 0, globals: 0, ticksRun: 0,
     segments: {}, segmentSaves: [], segmentErrors: [], loopCalls: [],
@@ -119,9 +129,22 @@ export function simulate(dir, {
     const context = vm.createContext({ module, exports: module.exports });
     vm.runInContext('globalThis.global = globalThis;', context);
     const Uint8 = vm.runInContext('Uint8Array', context);
+    // The engine caches a module's exports per global (engine game.js:551-594), and the driver evaluates a text
+    // module as (function __module(module,exports){ <code> })(__module, __module.exports) (V138).
+    const cache = new Map();
     context.require = (name) => {
-      if (name === WASM_MODULE) return new Uint8(bytes);
-      throw new Error(`Unknown module '${name}'`);
+      if (cache.has(name)) return cache.get(name);
+      let value;
+      if (name === WASM_MODULE && wasmForm === 'binary') value = new Uint8(bytes);
+      else if (name === WASM_MODULE && wasmText !== null) {
+        const __module = vm.runInContext('({ exports: {} })', context);
+        context.__module = __module;
+        vm.runInContext(`(function __module(module,exports){ ${wasmText}\n})(__module, __module.exports)`, context, { filename: `${WASM_MODULE}.js` });
+        delete context.__module;
+        value = __module.exports;
+      } else throw new Error(`Unknown module '${name}'`);
+      cache.set(name, value);
+      return value;
     };
     for (const g of ABSENT_GLOBALS) {
       if (vm.runInContext(`typeof ${g}`, context) !== 'undefined') throw new Error(`the sandbox exposes ${g}`);
@@ -322,12 +345,13 @@ export function checkResults(world, cmd, expectedByOffset, label) {
  * snapshot and scheduler summaries of the fake world match SNAPSHOT_EXPECTED and SCHEDULER_EXPECTED, and a
  * console say reaches exactly the right creeps through the act layer (ACT_EXPECTED).
  */
-export function smoke(dir = join(ROOT, 'dist'), { features = [] } = {}) {
+export function smoke(dir = join(ROOT, 'dist'), { features = [], wasmForm = 'binary' } = {}) {
   // An act-test build queues scripted intents every tick, so its act path is checked by act-sim.mjs instead.
   const checkAct = !features.includes('act-test');
   const calls = [];
   const world = simulate(dir, {
     ticks: 9,
+    wasmForm,
     command: (w) => {
       if (SNAPSHOT_EXPECTED[w.ticksRun]) return 'rustedscreep.snapshot()';
       if (SCHEDULER_EXPECTED[w.ticksRun]) return 'rustedscreep.scheduler()';
@@ -412,6 +436,10 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [] } = {}) {
   const boot = world.logs.find((l) => l.startsWith('rustedscreep boot:'));
   if (!boot) throw new Error(`no boot log; logs: ${world.logs.join(' / ')}`);
   if (!boot.includes(': match)')) throw new Error(`the boot log does not report a matching CRC-32: ${boot}`);
+  // The boot line names the delivery that ran: the text module's base64 (ADR-015) or a binary module's bytes.
+  const form = wasmForm === 'base64' ? / \| wasm String\(base64, \d+ chars\) \d+ B crc32 / : / \| wasm Uint8Array \d+ B crc32 /;
+  if (!form.test(boot)) throw new Error(`the boot log does not show the ${wasmForm} wasm module: ${boot}`);
+  if (!boot.includes(', atob undefined, Buffer undefined')) throw new Error(`the boot log does not report atob and Buffer: ${boot}`);
   const booted = world.logs.findIndex((l) => l.startsWith('rustedscreep booted in'));
   if (booted < 0) throw new Error(`the bundle never finished booting; logs: ${world.logs.join(' / ')}`);
   const bad = world.logs.filter((l) => /incident|loader error|\[error\]/.test(l));
@@ -421,7 +449,7 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [] } = {}) {
 
 if (isMain(import.meta.url)) {
   try {
-    const result = smoke(process.argv[2]);
+    const result = smoke(process.argv[2], { wasmForm: process.argv[3] ?? 'binary' });
     console.log(`${result.ticks} ticks ran`);
     for (const l of result.logs) console.log(`  ${l}`);
   } catch (e) {

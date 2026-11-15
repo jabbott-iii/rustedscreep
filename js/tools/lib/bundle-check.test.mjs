@@ -14,6 +14,10 @@ test('real uses of banned globals are reported', () => {
   assert.deepEqual(bundleProblems(`fetch('x');${OK_TAIL}`, 'rustedscreep_wasm'), ['fetch']);
   assert.deepEqual(bundleProblems(`const u = new URL('a');${OK_TAIL}`, 'rustedscreep_wasm'), ['URL']);
   assert.deepEqual(bundleProblems(`const c = document.currentScript;${OK_TAIL}`, 'rustedscreep_wasm'), ['document']);
+  // Never probed on the MMO (V95); the wasm text module's decoder is plain JS (ADR-015).
+  assert.deepEqual(bundleProblems(`atob('AA==');${OK_TAIL}`, 'rustedscreep_wasm'), ['atob']);
+  assert.deepEqual(bundleProblems(`const b = Buffer.from('AA==', 'base64');${OK_TAIL}`, 'rustedscreep_wasm'), ['Buffer']);
+  assert.deepEqual(bundleProblems(`const g = globalThis; g['Buffer']; g.atob;${OK_TAIL}`, 'rustedscreep_wasm'), []);
 });
 
 test("Rollup's CJS import.meta.url shim and other requires are reported", () => {

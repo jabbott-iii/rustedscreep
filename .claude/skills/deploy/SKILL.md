@@ -30,7 +30,9 @@ disable-model-invocation: true
    sizes. A feature build stays live until a plain build replaces it, so remind the user to stage a plain build when the measurement or
    test is done.
 7. Tell the user that committing and pushing (any push to `main`) deploys `deploy/` to the live `default` branch. Also say that an open
-   Steam client will offer to replace its local mirror: decline, and never edit files in the mirror. Never commit or push. Stop here.
+   Steam client will offer to replace its local mirror: decline, and never edit files in the mirror. If the live build logged incidents
+   (STATUS), say that its backoff streak in `Memory.rustedscreepLoader` carries over: once `rustedscreep.status()` shows the staged build ID,
+   the user runs `delete Memory.rustedscreepLoader` in the console (earlier, the old build rebuilds it; ADR-015). Never commit or push. Stop here.
 8. Only after the user confirms the push: offer the capture in step 12, check that the running code logs the staged build ID (with its
    `+<feature>` suffixes) before using any capture as evidence, and record "deployed" in STATUS with the features and the observations.
 

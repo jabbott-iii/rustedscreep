@@ -1,7 +1,8 @@
 // Release build (ADR-001, ADR-002, ADR-008): cargo build for wasm32, then the wasm-bindgen CLI at the
 // exact Cargo.lock version (--target web), then the pinned wasm-opt -O4, then tsc and Rollup, then a
-// smoke run in a Screeps-like sandbox. Output: dist/main.js, dist/rustedscreep_wasm.wasm and
-// dist/build-info.json. Usage: npm run build [-- --features trap-test,profiler].
+// smoke run in a Screeps-like sandbox, with the wasm as a binary module and as the base64 text module the
+// GitHub link delivers (ADR-015). Output: dist/main.js, dist/rustedscreep_wasm.wasm, dist/rustedscreep_wasm.js (the
+// .wasm as base64) and dist/build-info.json. Usage: npm run build [-- --features trap-test,profiler].
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -10,6 +11,7 @@ import {
 } from './lib/common.mjs';
 import { bundleProblems } from './lib/bundle-check.mjs';
 import { crc32Hex } from './lib/crc32.mjs';
+import { wasmModuleBytes, wasmModuleText } from './lib/wasm-text.mjs';
 import { smoke } from './smoke.mjs';
 
 export const DIST = join(ROOT, 'dist');
@@ -131,6 +133,10 @@ export function build({ features = [], dist = DIST, loaderOverrides = {} } = {})
   mustRun('wasm-opt', tools.wasmOpt, [join(PKG, `${WASM_MODULE}_bg.wasm`), '-O4', '-o', distWasm]);
   const wasmBytes = readFileSync(distWasm);
   const wasmCrc = crc32Hex(wasmBytes);
+  // The text module the GitHub link can carry (ADR-015), checked to decode to the exact .wasm.
+  const wasmText = wasmModuleText(wasmBytes);
+  if (!wasmModuleBytes(wasmText).equals(wasmBytes)) fail('the wasm text module does not decode to the .wasm');
+  writeFileSync(join(dist, `${WASM_MODULE}.js`), wasmText);
   const overrideTag = Object.keys(loaderOverrides).length ? `+override(${Object.entries(loaderOverrides).map(([k, v]) => `${k}=${v}`).join(',')})` : '';
   const buildId = `${gitDescription()}-${wasmCrc}${features.map((f) => `+${f}`).join('')}${overrideTag}`;
   const buildValue = { id: buildId, wasmCrc32: wasmCrc, features };
@@ -150,11 +156,13 @@ export function build({ features = [], dist = DIST, loaderOverrides = {} } = {})
   if (!mainText.includes(JSON.stringify(buildId))) fail('dist/main.js does not contain the build ID');
 
   step('smoke test (Screeps-like sandbox)');
-  try {
-    const result = smoke(dist, { features });
-    console.log(`${result.ticks} ticks ran; booted on tick ${result.bootedAt}; ${result.logs.length} log line(s)`);
-  } catch (e) {
-    fail(`bundle smoke test failed: ${e.message}`);
+  for (const wasmForm of ['binary', 'base64']) {
+    try {
+      const result = smoke(dist, { features, wasmForm });
+      console.log(`${wasmForm}: ${result.ticks} ticks ran; booted on tick ${result.bootedAt}; ${result.logs.length} log line(s)`);
+    } catch (e) {
+      fail(`bundle smoke test (${wasmForm} wasm module) failed: ${e.message}`);
+    }
   }
 
   const mainBytes = Buffer.from(mainText, 'utf8');
@@ -171,7 +179,10 @@ export function build({ features = [], dist = DIST, loaderOverrides = {} } = {})
     },
     modules: {
       main: { file: 'main.js', bytes: mainBytes.length, sha256: sha256(mainBytes) },
-      [WASM_MODULE]: { file: `${WASM_MODULE}.wasm`, bytes: wasmBytes.length, sha256: sha256(wasmBytes), crc32: wasmCrc },
+      [WASM_MODULE]: {
+        file: `${WASM_MODULE}.wasm`, bytes: wasmBytes.length, sha256: sha256(wasmBytes), crc32: wasmCrc,
+        text: { file: `${WASM_MODULE}.js`, bytes: Buffer.byteLength(wasmText), sha256: sha256(Buffer.from(wasmText)) },
+      },
     },
   };
   writeFileSync(join(dist, 'build-info.json'), `${JSON.stringify(info, null, 2)}\n`);
@@ -180,6 +191,7 @@ export function build({ features = [], dist = DIST, loaderOverrides = {} } = {})
   console.log(`build ${buildId}`);
   console.log(`  main.js             ${mainBytes.length} bytes`);
   console.log(`  ${WASM_MODULE}.wasm  ${wasmBytes.length} bytes, crc32 ${wasmCrc}, sha256 ${info.modules[WASM_MODULE].sha256}`);
+  console.log(`  ${WASM_MODULE}.js    ${Buffer.byteLength(wasmText)} bytes (the .wasm as base64, ADR-015)`);
   return info;
 }
 
