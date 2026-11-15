@@ -26,7 +26,7 @@ paths:
   The starter uses option 2 because of wasm-bindgen issue #3130.
 - Never crash-loop. Back off after repeated failures, send one notification per incident, and keep the bot recoverable without human action.
 - Measure the cold-start cost (compile + instantiate + first tick) on each target server. Set the bucket boot gate from that
-  measurement and record it in TUNING.md. The starter's 1500 is only a starting point.
+  measurement and record it in TUNING.md. The starter's 1500 was only a starting point; the MMO gate is 480 since the P1 gate (V150).
 
 ## Bundle
 - Transpile to the JS level the probe measured on the server (ADR-008): `tsc` to ES2022 on the MMO (VERIFICATION_LOG V72), with no Babel. The optional tracks re-probe their own servers (PS1, SE1).

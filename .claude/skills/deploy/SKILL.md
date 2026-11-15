@@ -40,9 +40,9 @@ disable-model-invocation: true
 9. For the `mmo` fallback, first confirm that the user has unlinked the GitHub integration (or pointed it at a folder that is never
    pushed). Otherwise the next push overwrites the API upload. Do not run `npm run stage`.
 10. Run `npm run deploy -- --server <server> --dryrun` and report what would be uploaded (module names and sizes). `--features` reaches this
-    path only once the deploy tool (STATUS item 3b) takes it; until then, say so and stop if features were requested.
+    path only once the deploy tool (P2, ADR-017) takes it; until then, say so and stop if features were requested.
 11. Unless `--dryrun` was requested, run `npm run deploy -- --server <server>` (the permission prompt applies).
 12. For any server (an official one only once step 1 is satisfied), offer to capture the first minutes with
     `npm run console -- --server <server>` and `npm run stats -- --server <server>` into `logs/`. Then report boot ticks, cold-start CPU,
-    errors, and the bucket trend. On the MMO this capture is the evidence for core gates such as P1.
+    errors, and the bucket trend. On the MMO this capture is the evidence for core gates from P2 on (P1's evidence was the user's console output, ADR-017).
 13. Record the deploy in `docs/STATUS.md`: server, features, wasm size, bundle size, and the observations made.

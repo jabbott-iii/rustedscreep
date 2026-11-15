@@ -6,7 +6,7 @@ Claude Code fills each section in as its phase lands. Keep it factual: describe 
 _P1._ A diagram plus a step list: loader → `loop` → tick context → snapshot → caches → scheduler tiers → decisions →
 intent buffer (no-op filtering, pipeline check) → act → persistence flush → profiler flush. Include JS crossings per step.
 
-Current state (P1.10): loader → `loop` (rustedscreep-wasm `game_loop`) → a copy of the config in force (`config::Runtime`, the active profile with the runtime overrides; the whole tick runs on it, so a record that loads during the decide step applies from the next tick, except the log level and the flush's segment limits) → snapshot → the rate-limited skipped-object log (`SkipLog`, at most one line per `log.skip_window_ticks`) → the intent buffer opened for it → scheduler tick (the decide step: no job until P2; until then only the console's `say` queues intents) → act step → fault log → profiler record. A build with the `profiler` feature (step 9) reads the clock around these steps; without it the profiler compiles out. The snapshot
+Current state (end of P1): loader → `loop` (rustedscreep-wasm `game_loop`) → a copy of the config in force (`config::Runtime`, the active profile with the runtime overrides; the whole tick runs on it, so a record that loads during the decide step applies from the next tick, except the log level and the flush's segment limits) → snapshot → the rate-limited skipped-object log (`SkipLog`, at most one line per `log.skip_window_ticks`) → the intent buffer opened for it → scheduler tick (the decide step: the persistence loads, a Standard step job (P1.9), then the constants self-check, an Optional step job that runs once per global (P1.11); no game job until P2, so only the console's `say` queues intents) → act step → fault log → profiler record. A build with the `profiler` feature (step 9) reads the clock around these steps; without it the profiler compiles out. The snapshot
 (`rustedscreep-wasm/src/snapshot.rs` filling `rustedscreep_core::snapshot::Snapshot`) makes one pass, in this order:
 1. Tick context: `Game.time`, `Game.cpu.limit`, `tickLimit`, `bucket` (4 JS calls), sanitized by `TickContext::from_raw`.
 2. `Game.creeps` (own creeps, spawning ones included; V101): 3 calls for the collection (getter, `Object.values`, `length`),
@@ -23,7 +23,7 @@ Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and o
 `Table.set`) per object returned through an `Option` (every creep's `id`, a room's `controller` when present).
 5. `finish`: handles of objects the pass did not push are released.
 6. Scheduler (P1.6, `rustedscreep-wasm/src/scheduler.rs` over `rustedscreep_core::scheduler`): `Scheduler::begin` turns the
-   snapshot's tick context into the tick's budget (no JS call, §4). No job runs under it until P2. Ending the tick records it for
+   snapshot's tick context into the tick's budget (no JS call, §4). Until P2 its only jobs are the persistence loads (P1.9) and the constants self-check (P1.11). Ending the tick records it for
    `rustedscreep.scheduler()`, whose per-tick `faults` counts job faults only (act faults come later, step 7, and show in the
    fault totals and lines). A time-sliced job adds one `Game.cpu.getUsed()` per clock sample.
 7. Act (P1.7, `rustedscreep-wasm/src/act.rs` over `rustedscreep_core::intents`): during the decide step, jobs push intents by creep
@@ -92,7 +92,22 @@ check in P7 and P10, structure actors such as `spawnCreep` in P2) and its gated 
 and the counters `ActLog`. rustedscreep-wasm's `act.rs` binds the eleven methods and makes the calls; `act_test.rs` (feature
 `act-test`, refused by `npm run stage` for deploy/) is a scripted producer for the sandbox test.
 
-js/ (P1.3): `js/src/main.ts` is a build-pipeline placeholder until the loader lands (P1 module 4). `js/tools/` holds the build
+Constants self-check (P1.11): `rustedscreep_core::consts_check` is pure. A `Globals` source gives the server's names, then one
+value's JSON text per step; `Check::step` reads them all, checks that at least one anchor constant (`OK`, `WORK`, `CREEP_LIFE_TIME`) was seen (otherwise the global holds no game constants and the check fails),
+then compares 15 groups (scalars, enum families by prefix, sets, tables entry by entry) with `rustedscreep_consts`, through a strict
+JSON reader with exact numbers on Clinger's fast path (no float parser in the wasm). `KNOWN` names each known difference with its
+reason; findings are capped (`MAX_FINDINGS`). rustedscreep-wasm's `consts_check.rs` calls `Object.getOwnPropertyNames(globalThis)` once
+and reads each upper-case name's value through its property descriptor and `JSON.stringify` (local `catch` bindings; no getter
+runs). A value with no JSON text is a finding (unreadable); a throw from the descriptor read fails the check. It is time-sliced as an Optional step job under that tier's cap, once per global. It logs one completion line
+(info, or a warning with up to `log.consts_findings` finding lines); `rustedscreep.consts()` shows the phase, findings and known
+differences. The native test runs it against engine common 2.16.0 (`tests/fixtures/constants-common-2.16.0.tsv`).
+
+js/ (P1.3, P1.4): `js/src/main.ts` wires the loader (`js/src/loader.ts`) to the game's `loop` and the `rustedscreep.*` console
+commands. The loader boots once the bucket reaches `LoaderConfig::boot_bucket_min` (480, set at the P1 gate from the MMO cold start,
+VERIFICATION_LOG V150). On the first boot tick it requires the wasm, which arrives through the GitHub link as a base64 text module
+(`rustedscreep_wasm.js`, decoded in plain JS by `js/src/base64.ts`, ADR-015) or as a binary module through the API, checks its
+CRC-32 against the build's, logs the boot line and compiles it; on the next tick (`boot_split_ticks`) it instantiates and runs the
+first loop. Recovery is in section 6. `js/tools/` holds the build
 (cargo → wasm-bindgen `--target web` → `wasm-opt -O4` → tsc → Rollup CJS into `dist/`), stage (into `deploy/` for the GitHub link),
 size, check, smoke (the bundle in a Screeps-like sandbox, run at the end of every build) and setup-binaryen. Generated files go to the git-ignored `js/pkg/`,
 `js/build/` and `dist/`.
@@ -117,8 +132,8 @@ Current state (P1.6, `rustedscreep_core::scheduler`; values from `SCHEDULER_MMO`
 - Tiers: Critical (spawning, defense, harvesting), Standard (hauling, upgrading, building, offense operations), Optional (planning,
   market, scouting, visuals, pixels, offense planning). A job declares its tier as a constant `Job { name, tier }`. A tick runs every
   subsystem's Critical jobs before any Standard job, and those before any Optional job: the tiers share one ceiling, so this order
-  across subsystems is what gives Critical its priority, and `TickStats::out_of_order` counts breaches. No job exists yet; P2 adds
-  the first ones.
+  across subsystems is what gives Critical its priority, and `TickStats::out_of_order` counts breaches. Until P2 the only jobs are the persistence loads
+  (Standard) and the constants self-check (Optional); P2 adds the first game jobs.
 - Budget (`Budget::compute`, once per tick from the snapshot's tick context, no JS call). Every cap is a level of the whole tick's CPU
   (the latest `getUsed` reading plus committed CPU), and a tier runs while the tick is below its cap:
   - ceiling = tickLimit × (100 − `tick_reserve_pct`) / 100, 450 at tickLimit 500. Every tier stops there, Critical included
@@ -126,7 +141,7 @@ Current state (P1.6, `rustedscreep_core::scheduler`; values from `SCHEDULER_MMO`
     (V106). A killed tick is an aborted tick that the loader recovers from with a global reset (ADR-003), and while the bucket is
     below 500 − limit, tickLimit is bucket + limit, so a tick that runs past it without being killed is billed into a negative
     bucket and the next tick is skipped (V37).
-  - Standard: on while bucket ≥ `standard_bucket_min` (2000, above the loader's 1500 boot gate), capped at the ceiling.
+  - Standard: on while bucket ≥ `standard_bucket_min` (2000; at least the loader's 480 boot gate plus `CPU_TICK_LIMIT_MAX`), capped at the ceiling.
   - Optional: on while bucket ≥ `optional_bucket_min` (3000) and the global has run `optional_warmup_loops` (1) loops, so the first
     tick after a reset never runs it. Cap = min(ceiling, limit + (bucket − `bucket_target`) / `surplus_spread_ticks`), off when not
     above 0.
@@ -135,7 +150,7 @@ Current state (P1.6, `rustedscreep_core::scheduler`; values from `SCHEDULER_MMO`
   refills; above it the surplus is spent at a rate that falls with it (about `surplus_spread_ticks` ticks). The cap is checked
   during the decide step, so the work after it, the slicer's overshoot and ceil billing (V106) come on top, and under heavy
   Optional demand the bucket settles slightly below the target. At the free tier's limit of 20: below 2000 only Critical runs; up
-  to 7000 Critical and Standard; above that Optional too, with a cap of 20 at 9000 and 30 at 10000. Standard's gate is the
+  to 7000 Critical and Standard; above that Optional too, with a cap of 20 at 9000 and 30 at 10000. Standard's gate is at least the
   loader's boot gate plus `CPU_TICK_LIMIT_MAX`, so one Standard tick cannot take the bucket below the level a reset needs to boot.
 - Time slicing (`TickCpu`): `run_units` runs a job's units round robin from a saved cursor (units must come in a stable order,
   by handle or id, V102); `run_steps` runs resumable steps of heavy work. The clock is read when a job starts (unless the tick is
@@ -157,7 +172,7 @@ Current state (P1.6, `rustedscreep_core::scheduler`; values from `SCHEDULER_MMO`
   job for the tick. rustedscreep-wasm prints the reports with `log::warn!` (P1.10).
 - All of it lives in the heap. A global reset fails open: cursors restart, every item is awake, Optional is in warm-up.
 - Not yet: per-tier and per-job CPU accounting (P2, once jobs exist: from `TickCpu`'s samples at job start and after each batch, with no
-  extra `getUsed` calls, likely as stats segment format v2; P1.8's profiler has one `decide` span over every tier), the first jobs (P2).
+  extra `getUsed` calls, likely as stats segment format v2; P1.8's profiler has one `decide` span over every tier), the first game jobs (P2).
 - Every threshold above can be overridden at runtime under its key (`scheduler.<field>`, P1.10; TUNING.md's runtime-key column):
   the value is clamped to its safe range, and a change that breaks a rule (Standard gate ≥ boot gate + `CPU_TICK_LIMIT_MAX`, Standard
   ≤ Optional ≤ target) is refused. A change applies from the next tick.
@@ -198,7 +213,8 @@ recorded, like the engine's own throw paths (V108). A return value that is not a
 recorded. An issue whose JS object is missing is a fault, counted as missing, and makes no call. None of these traps.
 
 Loader (P1.4, js/src/loader.ts): any throw from the wasm, or a tick that ended inside it (the `running` flag still set), poisons
-the instance. The loader records the incident in `Memory.rustedscreepLoader` on that tick and recovers on the next: `Game.cpu.halt()`
+the instance. The boot tick (require, decode, CRC-32, compile) runs outside that flag, so a boot tick the server kills is not an
+incident and is retried whenever the bucket reaches the boot gate; the gate (480) gives that tick the full tickLimit (V150). The loader records the incident in `Memory.rustedscreepLoader` on that tick and recovers on the next: `Game.cpu.halt()`
 by default (a global reset and a recompile), or `__wbg_reset_state` (a new instance from the cached module) in reinstantiate mode or
 when the server has no halt. Compile and load failures do not halt; they back off. From the third consecutive incident the next
 boot waits, doubling up to a cap (the streak is kept in Memory), so a crash loop cannot drain the bucket, and the bot retries

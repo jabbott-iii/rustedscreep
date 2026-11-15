@@ -71,7 +71,7 @@ The live server's constants are the ground truth for that server. At init, the b
   - Keep the tick path off `Memory`.
   - Missing or corrupt data triggers a rebuild, never a crash.
 
-## Commands (P1 creates these; update this table if they change)
+## Commands (P1 created most of these; the API tools come in P2, ADR-017; update this table if they change)
 | Purpose | Command |
 |---|---|
 | Native tests (pure logic) | `cargo test -p rustedscreep-core -p rustedscreep-consts` |
@@ -90,8 +90,8 @@ The live server's constants are the ground truth for that server. At init, the b
 | Tool tests (Node) / sizes and upload budget | `npm run test` / `npm run size` |
 | Full gate (same as `/check`) | `npm run check` |
 | Stage the MMO deploy folder for the GitHub link (ask first; the user pushes) | `npm run stage` (`-- --out <dir>` for a dry run, `-- --features trap-test` for the gate's recovery test, `-- --features profiler` for the live CPU measurements) |
-| Deploy through the API (ask first; private, season, or the ADR-012 fallback; not written yet, needs Node 22/24) | `npm run deploy -- --server <name> [--dryrun]` |
-| Capture console / profiler stats to `logs/` (not written yet, needs Node 22/24) | `npm run console -- --server <name>` / `npm run stats -- --server <name>` |
+| Deploy through the API (ask first; private, season, or the ADR-012 fallback; not written yet: P2, ADR-017; needs Node 22/24) | `npm run deploy -- --server <name> [--dryrun]` |
+| Capture console / profiler stats to `logs/` (not written yet: P2, ADR-017; needs Node 22/24) | `npm run console -- --server <name>` / `npm run stats -- --server <name>` |
 
 ## Workflow
 - Start with `/kickoff` (P0). Then run `/module` repeatedly. With no argument it takes the next item in STATUS and ROADMAP. Close each phase with `/phase-gate <P#|PS#|SE#>`.

@@ -66,7 +66,9 @@ pub struct LoaderConfig {
 
 /// Loader values for the official MMO.
 pub const LOADER_MMO: LoaderConfig = LoaderConfig {
-    boot_bucket_min: 1500,
+    // CPU_TICK_LIMIT_MAX − the free-tier limit of 20 (V35): from here every boot tick gets the full
+    // tickLimit (V37). Set at the P1 gate from the MMO cold start (V149, V150; TUNING.md).
+    boot_bucket_min: 480,
     boot_split_ticks: true,
     recovery_mode: RecoveryMode::Halt,
     backoff_window_ticks: 1000,
@@ -1039,6 +1041,19 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    /// Uses: rustedscreep_consts::CPU_TICK_LIMIT_MAX. tickLimit = min(CPU_TICK_LIMIT_MAX, bucket + limit)
+    /// (V37), and the free-tier limit is 20 (V35). The first boot tick (require, decode, CRC-32,
+    /// compile) runs outside the loader's `running` flag, so a kill there is no incident: the gate gives
+    /// that tick the full tickLimit, and any higher gate would only defer the boot (V150).
+    #[test]
+    fn boot_gate_is_the_lowest_bucket_with_the_full_tick_limit() {
+        let limit = 20;
+        let tick_limit = |bucket: u32| CPU_TICK_LIMIT_MAX.min(bucket + limit);
+        let gate = LOADER_MMO.boot_bucket_min;
+        assert_eq!(tick_limit(gate), CPU_TICK_LIMIT_MAX);
+        assert!(tick_limit(gate - 1) < CPU_TICK_LIMIT_MAX);
     }
 
     /// Uses: rustedscreep_consts::CPU_BUCKET_MAX. A boot gate above the bucket's maximum would never open.

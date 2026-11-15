@@ -13,7 +13,8 @@ No core gate needs a private server or a Seasonal server.
 Evidence conventions:
 - **Live run:** the bot running on the official MMO under the user's account, with the result captured through `npm run console` and
   `npm run stats` into `logs/`. A deploy to the MMO is a push of the staged `deploy/` folder through the GitHub link (ADR-012). Claude stages it
-  only when the user names `mmo`, and the user pushes.
+  only when the user names `mmo`, and the user pushes. P1 exception (ADR-017): P1's live checks rest on the user's console output,
+  recorded in STATUS.md and VERIFICATION_LOG.md, since the capture tools moved to P2.
 - **Native scenario test:** a pure-Rust test in `rustedscreep-core` that drives a decision module (bootstrap recovery, combat sim,
   formations, offense state machines, breaker solver) through a scripted situation, with expectations derived from constants.
   Scripted in-game scenarios belong to the private-server track.
@@ -47,7 +48,7 @@ Modules:
    Toolchain pinned in `rust-toolchain.toml`. Clippy no-panic denies at the crate roots.
 2. `rustedscreep-consts`: the facade over the API constants, `extra.rs` with sources and dates, and constant-derived tests.
 3. Build: wasm build (ADR-001) + `wasm-opt` (flags from ADR-002) + a Rollup bundle of the TypeScript loader compiled by `tsc` to ES2022, no Babel (ADR-008), into `dist/`. npm scripts: `build`, `check`, `stage` (runs the release build and copies `main.js` and the wasm into the tracked `deploy/` folder for the GitHub link, the wasm as a base64 text module `rustedscreep_wasm.js` since the link uploads files as text (ADR-015), or into `--out <dir>` for tests and dry runs; reports sizes, a byte hash of the wasm and a build ID; ADR-012),
-   `size`, `deploy`, `console`, `stats`. The user creates `.screeps.yaml` (format: VERIFICATION_LOG V93); the repo has no example file (the user removed it on 2026-11-14).
+   `size`. The API tools `deploy`, `console` and `stats` moved to P2 (ADR-017). The user creates `.screeps.yaml` (format: VERIFICATION_LOG V93); the repo has no example file (the user removed it on 2026-11-14).
 4. Loader (`js/src/main.ts`):
    - Boot gated on bucket, with compile and instantiate spread across ticks.
    - Calls `loop`.
@@ -80,7 +81,8 @@ a day on the MMO. Run the P1 live checks shortly before P2 is ready, or respawn 
 **Gate:**
 - `/check` is all green.
 - The wasm loads on the official MMO.
-- `trap-test` on the MMO shows recovery within the ADR-003 bound, and the bot never bricks: 10 forced traps in a row recover.
+- `trap-test` on the MMO shows recovery within the ADR-003 bound (in halt mode, the loop runs again on the third tick after a trap),
+  and the bot never bricks: 10 forced traps in a row recover.
 - Cold-start cost (compile + instantiate + first tick) is measured on the MMO, and the boot gate is set from it.
 - Empty-bot CPU per tick: moved to the P2 gate (ADR-016), where the profiler build reports the fixed per-tick cost beside P2's jobs.
 - The persistence round-trip test passes natively, including the corrupt-segment test, and one live round trip on the MMO succeeds.
@@ -88,7 +90,8 @@ a day on the MMO. Run the P1 live checks shortly before P2 is ready, or respawn 
 - The GitHub-link deploy path is verified with the first checked build, staged by `/deploy mmo` and pushed by the user (V77): the
   wasm hash the loader logs in game equals the one `npm run stage` reported, the sentinel module shows the deletion behavior, the
   push-to-first-run delay is recorded, and a docs-only push shows whether an identical re-sync reloads the code. If the hashes differ,
-  ADR-012's fallback is in place.
+  ADR-012's fallback is in place. (ADR-015 amends this: the first checked build's `.wasm` could not travel through the link, V136, V137;
+  the path was verified with the first build in the base64 text-module form, whose hash matched, V140, V145.)
 
 ## P2 Bootstrap (SPEC §3.1) and movement core
 Modules:
@@ -97,6 +100,8 @@ Modules:
   Inter-room routes use PathFinder with cached results.
 - Minimal spawn path, which the P5 queue replaces.
 - RCL1–3 opening, zero-creep recovery, and deadlock watchdogs (for example no harvester, or energy stuck in containers).
+- API tools (from P1 module 3, ADR-017), after the Node 22 or 24 upgrade (VERIFICATION_LOG V11): npm scripts `deploy` (an API upload),
+  `console` (the server console into `logs/`) and `stats` (segment 99 in the profiler's format v1). The gate's live captures use them.
 
 **Gate:**
 - The user's fresh MMO room reaches RCL3 with no manual action. Record the tick count.
