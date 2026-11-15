@@ -79,6 +79,7 @@ const ROWS = [
   ['12 Profiler (sandbox, profiler build)', 'node', [join(ROOT, 'js', 'tools', 'profiler-sim.mjs')], true],
   ['13 Persistence (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'persist-sim.mjs')], true],
   ['14 Runtime config (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'config-sim.mjs')], true],
+  ['15 Constants self-check (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'consts-sim.mjs')], true],
 ];
 
 function main() {

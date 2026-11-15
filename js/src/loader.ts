@@ -59,6 +59,8 @@ export interface Glue {
   configUnset?: (key: string) => string;
   /** Removes every config override; returns the outcome (P1 module 10). */
   configReset?: () => string;
+  /** One line about the constants self-check: its phase, counts, findings and known differences (P1 module 11). */
+  constsSummary?: () => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -540,9 +542,16 @@ export class Loader {
     return this.guarded('configReset', 'config change', call);
   }
 
+  /** Console command `rustedscreep.consts()`: the wasm's constants self-check (phase, counts, findings). */
+  consts(): string {
+    return this.summary('constsSummary', 'consts summary');
+  }
+
   /** Calls a wasm summary export for a console command (see `guarded`). */
   private summary(
-    name: 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary' | 'persistSummary' | 'configSummary',
+    name:
+      | 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary' | 'persistSummary' | 'configSummary'
+      | 'constsSummary',
     noun: string,
   ): string {
     const call = this.glue[name];

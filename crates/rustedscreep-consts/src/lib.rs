@@ -6,6 +6,11 @@
 //!   re-exported at this crate's root, so code writes `rustedscreep_consts::NAME`. The `find` and
 //!   `look` modules and the `FindConstant` and `LookConstant` traits are hidden, because they carry
 //!   JS game-object types (`LookResult::Creep(Creep)`, find constants with `Item = Creep`; V89).
+//!   The numeric `Find` enum (the `FIND_*` codes) is re-exported by name: it is a plain value with no
+//!   JS type in it (the `FindConstant` impls belong to the typed find constants, `RoomObject` and
+//!   `Exit`, which stay hidden). The constants self-check compares it with the server's `FIND_*`
+//!   (P1.11). Upstream marks `Find` `#[doc(hidden)]` (find.rs:28-37, public because wasm-bindgen
+//!   needs it), so re-check it on a crate bump (VERIFICATION_LOG V131).
 //! - The pure `screeps::local` types are re-exported by name (below). `ObjectId` (its resolve
 //!   methods call JS) and `LodashFilter` are left out as JS-backed. `RawObjectId` is pure but left
 //!   out by policy: core works with interned `u32` handles, and the wasm crate names it directly.
@@ -78,6 +83,10 @@ mod look {}
 trait FindConstant {}
 #[allow(dead_code, hidden_glob_reexports)]
 trait LookConstant {}
+
+/// The `FIND_*` codes as plain values (`Find::HostileCreeps as u16` is 103). The `find` module and
+/// its typed find constants stay hidden.
+pub use screeps::constants::find::Find;
 
 pub use screeps::local::{
     LocalCostMatrix, LocalRoomTerrain, OffsetOutOfBoundsError, OutOfBoundsError, Position,

@@ -6,7 +6,8 @@
 // - the first two writes reach segment 99 with the driver's save rules (one key, a string under the size
 //   limit), and the segment parses as JSON with the documented layout (crates/rustedscreep-core/src/profiler/text.rs);
 // - the loop makes six getUsed calls, seven when it closes a window, and reads RawMemory.segments only then,
-//   except the global's second loop, which reads the config record (P1.10) with two more clock samples;
+//   except the global's second loop, which reads the config record (P1.10) with two more clock samples, and
+//   the loops the constants self-check (P1.11) runs in, which read the clock up to 64 more times;
 // - a say's two calls appear in the first window's calls and act counters, counted as calls made (the act
 //   layer's `issued`) even though the game refuses one of them;
 // - each failure the binding guards against (no RawMemory, a segments value that is not an object, a set
@@ -182,6 +183,11 @@ export function profilerSim() {
   if (says !== 2) problems.push(`say calls: ${says}, expected 2`);
   const closing = new Set(Array.from({ length: WINDOWS }, (_, k) => closeAt(k + 1)));
   const noRawMemory = FAILURES.find((f) => f.raw() === undefined);
+  // The constants self-check (P1.11) runs from the second loop until its line, with a sample before its job and
+  // the slicer's (one per batch, about 30 in all; consts-sim.mjs checks each is a scheduler sample); then none.
+  const constsLine = world.logs.find((l) => /^rustedscreep consts: (checked|\d+ finding\(s\)) at tick \d+ /.test(l));
+  const constsLast = constsLine ? Number(/ at tick (\d+) /.exec(constsLine)[1]) - T0 : -1;
+  if (constsLast < 2) problems.push(`constants self-check: no completion line (${constsLine ?? 'none'})`);
   world.loopCalls.forEach((c, offset) => {
     if (offset < 2) return; // the loader also reads the clock on the boot ticks and the first loop
     // The second loop reads the config record (P1.10) the first activated: one more RawMemory.segments
@@ -189,8 +195,11 @@ export function profilerSim() {
     const config = offset === 2 ? 1 : 0;
     const reads = (closing.has(offset) && offset !== closeAt(noRawMemory.window) ? 1 : 0) + config;
     const want = { getUsed: (closing.has(offset) ? 7 : 6) + 2 * config, segments: reads };
-    if (c.getUsed !== want.getUsed || c.segments !== want.segments) {
-      problems.push(`offset ${offset}: loop calls ${JSON.stringify(c)}, expected ${JSON.stringify(want)}`);
+    const checking = offset <= constsLast;
+    const usedOk = checking ? c.getUsed >= want.getUsed && c.getUsed <= want.getUsed + 64 : c.getUsed === want.getUsed;
+    if (!usedOk || c.segments !== want.segments) {
+      const note = checking ? ` (getUsed ${want.getUsed} to ${want.getUsed + 64} with the constants self-check)` : '';
+      problems.push(`offset ${offset}: loop calls ${JSON.stringify(c)}, expected ${JSON.stringify(want)}${note}`);
     }
   });
   const cold = world.logs.filter((l) => l.startsWith('rustedscreep profiler: first loop'));

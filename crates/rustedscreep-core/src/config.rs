@@ -233,12 +233,16 @@ pub struct LogConfig {
     /// The skipped-object log (`crate::snapshot::SkipLog`) prints at most one line per this many
     /// ticks, with the counts since the line before. Unit: ticks.
     pub skip_window_ticks: u32,
+    /// Findings of the constants self-check (P1.11) printed one per line when it completes, once per
+    /// global; the rest are counted in its summary line. Unit: lines.
+    pub consts_findings: u32,
 }
 
 /// Logging values for the official MMO.
 pub const LOG_MMO: LogConfig = LogConfig {
     level: LogLevel::Info,
     skip_window_ticks: 100,
+    consts_findings: 20,
 };
 
 /// Cache toggles. Each one off replaces its cache with a read every tick; all off is the naive
@@ -444,7 +448,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 30;
+pub const FIELD_COUNT: usize = 31;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -586,6 +590,14 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         },
     },
     number!(log, "LogConfig", skip_window_ticks, 10, 10_000, true),
+    number!(
+        log,
+        "LogConfig",
+        consts_findings,
+        0,
+        crate::consts_check::MAX_FINDINGS as u32,
+        true
+    ),
     flag!(cache, "CacheConfig", structure_static, true),
 ];
 
@@ -736,6 +748,7 @@ mod tests {
         let LogConfig {
             level: _,
             skip_window_ticks: _,
+            consts_findings: _,
         } = LOG_MMO;
         let CacheConfig {
             structure_static: _,
@@ -792,7 +805,7 @@ mod tests {
                     "config_segment",
                 ],
             ),
-            ("log", &["level", "skip_window_ticks"]),
+            ("log", &["level", "skip_window_ticks", "consts_findings"]),
             ("cache", &["structure_static"]),
         ];
         let mut total = 0;

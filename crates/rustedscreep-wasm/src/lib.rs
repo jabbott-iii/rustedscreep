@@ -19,6 +19,7 @@ mod act;
 #[cfg(feature = "act-test")]
 mod act_test;
 mod config;
+mod consts_check;
 mod logging;
 mod persist;
 mod profiler;
@@ -43,6 +44,8 @@ struct State {
     scheduler: Scheduler,
     act: act::Act,
     persist: persist::Persist,
+    /// The constants self-check, once per global (P1.11).
+    consts: consts_check::ConstsCheck,
     /// Zero-sized without the `profiler` feature.
     profiler: profiler::Profiler,
     #[cfg(feature = "act-test")]
@@ -89,6 +92,7 @@ pub fn game_loop() {
                     scheduler: sched,
                     act,
                     persist,
+                    consts,
                     profiler: prof,
                     #[cfg(feature = "act-test")]
                     act_test,
@@ -103,6 +107,10 @@ pub fn game_loop() {
                 // Critical, then Standard, then Optional jobs run here and queue intents (P2 onward).
                 // The persistence loads are a Standard job; Critical jobs will run before them (P2).
                 persist.load(&mut tick, snapshot.tick.time, runtime);
+                // The constants self-check is an Optional job, after every Standard one. It logs with
+                // the config in force after the loads (on a global's second loop the record loads in
+                // this same step, and the check usually completes in it).
+                consts.run(&mut tick, snapshot.tick.time, &runtime.get().log);
                 act.queue_console_say(snapshot, tick.commit());
                 #[cfg(feature = "act-test")]
                 act_test.queue(&mut act.buffer, snapshot, tick.commit());
@@ -210,6 +218,18 @@ pub fn persist_test(bytes: Option<u32>) -> String {
             Err(_) => String::from("rustedscreep persist self-test: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep persist self-test: state unavailable"))
+}
+
+/// Exported to JS as `constsSummary`, for the `rustedscreep.consts()` console command: one line with
+/// the constants self-check's phase and, once it is done, its counts, findings and known differences.
+#[wasm_bindgen(js_name = "constsSummary")]
+pub fn consts_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state.consts.summary(),
+            Err(_) => String::from("rustedscreep consts: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep consts: state unavailable"))
 }
 
 /// Exported to JS as `configSummary`, for the `rustedscreep.config()` console command: one line with

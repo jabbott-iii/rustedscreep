@@ -11,10 +11,19 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import vm from 'node:vm';
+import { FIXTURE_DIR, parseFixture } from './consts-fixture.mjs';
 import { ROOT, WASM_MODULE, fail, isMain } from './lib/common.mjs';
 import { sceneAt } from './lib/world.mjs';
 
 const ABSENT_GLOBALS = ['TextDecoder', 'TextEncoder', 'fetch', 'URL', 'document'];
+
+/**
+ * The engine's game constants as [name, JSON text] pairs: @screeps/common 2.16.0 lib/constants.js, the fixture the
+ * constants self-check's native test reads (js/tools/consts-fixture.mjs). The engine copies them onto the player's
+ * global object at the start of every tick as `_.extend(globals, JSON.parse(JSON.stringify(C)))` (V129); the
+ * sandbox does the same.
+ */
+export const ENGINE_CONSTANTS = parseFixture(readFileSync(join(FIXTURE_DIR, 'constants-common-2.16.0.tsv'), 'utf8'));
 
 /** Driver runtime.js at cf63d8a (V41, V85): segment ids 0-99, at most 10 saved per tick, 100 × 1024 UTF-16 units each. */
 const SEGMENT_IDS = 100;
@@ -88,11 +97,13 @@ export function driverRawMemory(offset, world) {
  * the saved segment strings by id, `segmentSaves` the ticks that saved any, and `segmentErrors` the saves
  * the driver would have thrown on. `loopCalls[offset]` counts what the bundle did inside that tick's loop
  * call (`getUsed` calls, `RawMemory.segments` reads and the id lists passed to `setActiveSegments`), not
- * in console commands or the end-of-tick save.
+ * in console commands or the end-of-tick save. `constants` ([name, JSON text] pairs, the engine's by default) are
+ * set on the global at the start of every tick, as the engine does (V129); `[]` gives a global without them.
+ * `setup(context, world)` runs once per new global, before the bundle is evaluated (to instrument the realm).
  */
 export function simulate(dir, {
   ticks = 6, bucket = 10000, command = null, until = null, memoryJson = '{}', withHalt = true, wasmBytes = null,
-  scene = sceneAt, rawMemory = driverRawMemory,
+  scene = sceneAt, rawMemory = driverRawMemory, constants = ENGINE_CONSTANTS, setup = null,
 } = {}) {
   const code = readFileSync(join(dir, 'main.js'), 'utf8');
   const bytes = wasmBytes ?? readFileSync(join(dir, `${WASM_MODULE}.wasm`));
@@ -115,6 +126,7 @@ export function simulate(dir, {
     for (const g of ABSENT_GLOBALS) {
       if (vm.runInContext(`typeof ${g}`, context) !== 'undefined') throw new Error(`the sandbox exposes ${g}`);
     }
+    setup?.(context, world);
     return { context, module, evaluated: false };
   }
 
@@ -135,6 +147,7 @@ export function simulate(dir, {
       logUnsafe: { value: (...a) => world.logs.push(a.map(String).join(' ')), writable: true, configurable: true },
     });
     context.Memory = memory;
+    for (const [name, json] of constants) context[name] = JSON.parse(json);
     const raw = rawMemory(offset, world);
     const calls = { getUsed: 0, segments: 0, setActive: [] };
     let inLoop = false;
@@ -227,18 +240,30 @@ export const CONFIG_SEGMENT = 97;
  * 20, tickLimit 500 and bucket 10000, so with SCHEDULER_MMO (crates/rustedscreep-core/src/config.rs) the
  * ceiling is 500 × (100 − 10) / 100 = 450 and the Optional cap 20 + (10000 − 9000) / 100 = 30. The first loop
  * of a global runs no Optional work (warm-up); its only job is the persistence load's one step, the config
- * record's look-up (P1.10), which samples the clock twice. Later loops run no job here.
+ * record's look-up (P1.10), which samples the clock twice, and the constants self-check (P1.11), an Optional job,
+ * is a tier-off skip. The check runs from the second loop (see CONSTS_DONE).
  */
 const SCHEDULER_EXPECTED = {
   1: [
     'rustedscreep scheduler at tick 50000001 (loop 0 of this global): cpu limit 20, tickLimit 500, bucket 10000',
     'ceiling 450.0; critical on; standard on (cap 450.0); optional off (warm-up)',
     // The persistence load job's one step: the first loop looks up the config segment (P1.10).
-    'samples 2 (bad 0), units 1, budget stops 0, tier-off skips 0, out of order 0, faults 0',
+    'samples 2 (bad 0), units 1, budget stops 0, tier-off skips 1, out of order 0, faults 0',
     'faults since boot 0 (this window 0)',
   ],
   4: ['(loop 3 of this global)', 'optional on (cap 30.0)', ' | clock now '],
 };
+
+/**
+ * The constants self-check's line against the engine's own constants (the sandbox sets the fixture on its global,
+ * ENGINE_CONSTANTS): every upper-case global read (the constants and the built-in JSON), no finding, and the
+ * documented differences counted (js/tools/consts-sim.mjs checks the findings and the JS calls in detail).
+ */
+const CONSTS_DONE = new RegExp(
+  `^rustedscreep consts: checked at tick (\\d+) \\((\\d+) tick\\(s\\), \\d+ µCPU\\): ${ENGINE_CONSTANTS.length + 1} server names, ` +
+    '\\d+ values compared: \\d+ match, 0 mismatched, 0 missing on the server, 0 not in the crate, 0 unreadable, ' +
+    '0 unknown constants; \\d+ known differences$',
+);
 
 /**
  * At offset PROFILER_AT, `rustedscreep.profiler()`. A build without the profiler says so; a profiler build
@@ -355,11 +380,22 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [] } = {}) {
   // the global's start: the first loop (offset 1) looks it up (one RawMemory.segments read, inside the
   // load job's one step) and activates it; the next loop reads it (one more read and the job's two clock
   // samples; a segment never written loads as '', no overrides) and clears the set. After that no loop
-  // touches the segments.
+  // touches the segments. The constants self-check runs from offset 2 (the first loop that allows Optional work)
+  // until it is done, with a sample before its job and the slicer's samples (one per batch: about 30 for the whole
+  // check, how many depends on the measured cost per step; js/tools/consts-sim.mjs checks that every reading is a
+  // scheduler sample); after that it reads no clock.
   const perLoop = features.includes('profiler') ? 6 : 0;
+  const constsLines = world.logs.filter((l) => l.startsWith('rustedscreep consts:'));
+  const constsDone = constsLines.length === 1 ? CONSTS_DONE.exec(constsLines[0]) : null;
+  if (!constsDone) throw new Error(`constants self-check: expected one line matching ${CONSTS_DONE}, got ${constsLines.join(' / ') || 'none'}`);
+  const constsLast = Number(constsDone[1]) - 50000000;
+  const constsTicks = Number(constsDone[2]);
+  if (constsTicks < 1 || constsTicks > constsLast - 1) throw new Error(`constants self-check: ${constsTicks} tick(s) from offset 2 to ${constsLast}`);
   world.loopCalls.forEach((c, offset) => {
     const wantUsed = perLoop + (offset === 2 ? 2 : 0);
-    if (offset >= 2 && c.getUsed !== wantUsed) throw new Error(`offset ${offset}: ${c.getUsed} getUsed calls in loop, expected ${wantUsed}`);
+    const checking = offset >= 2 && offset <= constsLast;
+    if (checking && (c.getUsed < wantUsed || c.getUsed > wantUsed + 64)) throw new Error(`offset ${offset}: ${c.getUsed} getUsed calls in loop, expected ${wantUsed} to ${wantUsed + 64} with the constants self-check`);
+    if (offset >= 2 && !checking && c.getUsed !== wantUsed) throw new Error(`offset ${offset}: ${c.getUsed} getUsed calls in loop, expected ${wantUsed}`);
     const wantReads = offset === 1 || offset === 2 ? 1 : 0;
     if (c.segments !== wantReads) throw new Error(`offset ${offset}: the loop read RawMemory.segments ${c.segments} time(s), expected ${wantReads}`);
     const wantActive = JSON.stringify({ 1: [[CONFIG_SEGMENT]], 2: [[]] }[offset] ?? []);

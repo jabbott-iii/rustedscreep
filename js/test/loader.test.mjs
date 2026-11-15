@@ -465,7 +465,7 @@ test('every console command refuses while the wasm is running, without calling i
   const h = harness({
     glue: {
       snapshotSummary: count, schedulerSummary: count, actSummary: count, queueSay: count, persistSummary: count, persistTest: count,
-      configSummary: count, configSet: count, configUnset: count, configReset: count,
+      configSummary: count, configSet: count, configUnset: count, configReset: count, constsSummary: count,
     },
   });
   h.tick(2);
@@ -481,6 +481,7 @@ test('every console command refuses while the wasm is running, without calling i
   assert.match(h.loader.configSet('log.level', 'debug'), /no config change while the loader is ready/);
   assert.match(h.loader.configUnset('log.level'), /no config change while the loader is ready/);
   assert.match(h.loader.configReset(), /no config change while the loader is ready/);
+  assert.match(h.loader.consts(), /no consts summary while the loader is ready/);
   assert.equal(calls, 0);
   h.loader.running = false;
   assert.equal(h.loader.act(), 'called');
@@ -505,6 +506,20 @@ test('the persist command shares the guard: missing export, idle, poisoned, and 
   assert.equal(bad.loader.phase, 'poisoned');
   bad.tick();
   assert.equal(bad.halts, 1);
+});
+
+test('the consts command shares the guard: missing export, idle, ready, and a throw poisons', () => {
+  const none = harness();
+  assert.match(none.loader.consts(), /no constsSummary export/);
+  let calls = 0;
+  const h = harness({ glue: { constsSummary: () => `consts ${++calls}` } });
+  assert.match(h.loader.consts(), /no consts summary while the loader is idle/);
+  h.tick(2);
+  assert.equal(h.loader.consts(), 'consts 1');
+  const bad = harness({ glue: { constsSummary: () => { throw new Error('RuntimeError: unreachable'); } } });
+  bad.tick(2);
+  assert.match(bad.loader.consts(), /constsSummary trapped; the loader recovers on the next tick/);
+  assert.equal(bad.loader.phase, 'poisoned');
 });
 
 test('the persistTest command passes a whole byte count or nothing, and refuses other values', () => {

@@ -17,6 +17,7 @@
 )]
 
 pub mod config;
+pub mod consts_check;
 pub mod intents;
 pub mod persist;
 pub mod profiler;
