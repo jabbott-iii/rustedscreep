@@ -82,7 +82,7 @@ a day on the MMO. Run the P1 live checks shortly before P2 is ready, or respawn 
 - The wasm loads on the official MMO.
 - `trap-test` on the MMO shows recovery within the ADR-003 bound, and the bot never bricks: 10 forced traps in a row recover.
 - Cold-start cost (compile + instantiate + first tick) is measured on the MMO, and the boot gate is set from it.
-- Empty-bot CPU per tick is measured on the MMO. This is the floor.
+- Empty-bot CPU per tick: moved to the P2 gate (ADR-016), where the profiler build reports the fixed per-tick cost beside P2's jobs.
 - The persistence round-trip test passes natively, including the corrupt-segment test, and one live round trip on the MMO succeeds.
 - Sizes are recorded.
 - The GitHub-link deploy path is verified with the first checked build, staged by `/deploy mmo` and pushed by the user (V77): the
@@ -104,6 +104,10 @@ Modules:
   logged. Deliberately killing the colony's creeps is a private-track scenario (PS3).
 - No deadlock over 20k live ticks.
 - CPU per tick is recorded against the naive baseline.
+- The profiler build's live check (P1.8, moved here from the P1 gate by ADR-016): a `profiler` build on the MMO logs its cold loop once, and at least
+  two closed 1000-loop windows are read from segment 99 (matched to the boot's `Game.time`). The floor, the fixed per-tick cost outside the jobs
+  (`start`, the snapshot and the act step's per-tick overhead, each less its own reading), is taken from a window after the first and recorded
+  beside the CPU per tick.
 
 ## P3 Economy (SPEC §3.2)
 Modules:

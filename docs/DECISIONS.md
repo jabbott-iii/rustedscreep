@@ -254,3 +254,15 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
   - The `rustedscreep_wasm.wasm` text module the first sync left on the account is not removed by the bot. Whether a later sync deletes it is unverified (V77); otherwise the user deletes it once in the in-game Script editor, since it counts toward the 2 MB code limit.
   - Each staged build commits a 307 KB text file (base64 deltas poorly in git), about 0.3 MB of repository growth per changed wasm.
 
+## ADR-016 The profiler's live check and the CPU floor move to the P2 gate: Accepted (2026-11-14)
+- Context: the P1 gate asks for "Empty-bot CPU per tick ... measured on the MMO", which is the profiler build's live check (P1.8, TEST_PLAN §8): two 1000-loop windows of a `profiler` build in segment 99, about 2000 ticks. The P1 bundle has no economy, so the user's RCL1 room E4N59 is never upgraded and is lost about 20000 ticks after its last upgrade (V71), whatever build runs. The profiler build was live from tick 84276781 (V147), and the user asked to move this test past the next phase so as not to lose room control.
+- Options:
+  - (a) Finish the two windows now (about 2 hours) and keep the P1 gate as written.
+  - (b) Move the profiler build's live check and the CPU floor to the P2 gate, measured with the P2 build.
+- Decision: (b), the user's decision on 2026-11-14: "move the profiler build test to p2 gate".
+- Consequences:
+  - The P1 gate no longer includes the empty-bot CPU floor. The rest of it stands: `/check` green, the wasm loads (done, V140), 10 forced traps recover (a `trap-test` build), cold-start cost measured and the boot gate set from it (three samples so far, V146), the persistence round trip natively and once live (done, V144), sizes recorded, and the GitHub-link path verified (done, V145).
+  - The P2 gate gains the profiler build's live check: the cold-loop line, a growing window with good readings, and at least two closed windows in segment 99 (matched to the boot's `Game.time`). With P2's jobs running there is no empty bot, so the floor is reported from the profiler's series as the fixed per-tick cost outside the jobs: `start`, the `snapshot` step and the act step's per-tick overhead (each less its own reading, about 0.0024 CPU per reading, V147), from a window after the first (which holds the once-per-global constants self-check). It is recorded beside P2's CPU per tick and the naive baseline.
+  - The profiler build now live gives nothing the P1 gate needs; the next deploy replaces it (a `trap-test` build for the P1 gate's recovery test, or a plain build). Its windows, if read before then, are kept as extra P1 data, not as the P2 evidence.
+  - TEST_PLAN §8 and STATUS say where the check now belongs.
+
