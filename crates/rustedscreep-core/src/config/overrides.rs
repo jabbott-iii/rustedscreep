@@ -14,8 +14,9 @@
 //!   next load rather than misread.
 //!
 //! [`Store`] holds the profile's values, the overrides and the result, which the tick reads as a
-//! plain struct: nothing here runs per tick. The effective config changes only when the console
-//! changes an override or the record loads.
+//! plain struct. The effective config changes only when the console changes an override, the record
+//! loads, or the naive guard ends a naive span ([`Store::naive_tick`], the one call per tick: a few
+//! comparisons, and work only on the tick it ends a span; ADR-022).
 
 use core::fmt::{self, Write as _};
 
@@ -355,6 +356,52 @@ impl Overrides {
     }
 }
 
+/// The cache toggles whose `false` override is the naive baseline (ROADMAP evidence conventions);
+/// the naive guard removes these overrides (ADR-022).
+pub const NAIVE_KEYS: [&str; 3] = [
+    "cache.structure_static",
+    "cache.movement_grid",
+    "cache.flow_fields",
+];
+
+/// Where the naive baseline stands (ADR-022).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Naive {
+    /// No override turns a cache off.
+    Off,
+    /// A console change turned a cache off; the span starts with the next loop that runs with it.
+    Pending,
+    /// The span's first loop was on tick `since`. For overrides a record brought into this global,
+    /// the tick that record was last written: normally the previous global's first naive loop (a
+    /// tick or so later if the save cap or a failed write held it back), but a later change written
+    /// during the span moves it (then the span ends later than `CacheConfig::naive_max_ticks` after
+    /// its true start). The loops between a global's start and the record's load run cached.
+    Since(u32),
+}
+
+/// Why the guard ended a naive span (ADR-022).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NaiveEnd {
+    /// It lasted `CacheConfig::naive_max_ticks`.
+    Length,
+    /// The bucket at the start of the tick (carried here) was below `CacheConfig::naive_stop_bucket`.
+    Bucket(u32),
+}
+
+/// A naive span the guard ended: every cache is on from the next loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NaiveStop {
+    /// The span's first tick ([`Naive::Since`]).
+    pub since: u32,
+    /// Its last tick: the loop that ended it.
+    pub last: u32,
+    /// Its length, `last - since + 1`. Unit: ticks.
+    pub ticks: u32,
+    pub why: NaiveEnd,
+    /// The cache overrides removed (those that turned a cache off).
+    pub removed: usize,
+}
+
 /// Where the stored record stands in this global.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Record {
@@ -399,6 +446,7 @@ pub struct Store {
     overrides: Overrides,
     config: Config,
     record: Record,
+    naive: Naive,
 }
 
 impl Store {
@@ -409,6 +457,7 @@ impl Store {
             overrides: Overrides::default(),
             config: base,
             record: Record::Loading,
+            naive: Naive::Off,
         }
     }
 
@@ -428,6 +477,87 @@ impl Store {
 
     pub fn record(&self) -> Record {
         self.record
+    }
+
+    /// Where the naive baseline stands.
+    pub fn naive(&self) -> Naive {
+        self.naive
+    }
+
+    /// Whether an override turns a cache off.
+    fn naive_overridden(&self) -> bool {
+        NAIVE_KEYS
+            .iter()
+            .any(|k| self.overrides.get(k) == Some(Value::Flag(false)))
+    }
+
+    /// After a change to the overrides: off if no override turns a cache off, else `start` for a
+    /// span that was off, and an existing span goes on (turning a second cache off keeps its start).
+    fn naive_changed(&mut self, start: Naive) {
+        self.naive = if !self.naive_overridden() {
+            Naive::Off
+        } else if self.naive == Naive::Off {
+            start
+        } else {
+            self.naive
+        };
+    }
+
+    /// The naive guard, once per loop after the act step (ADR-022). `ran` says the loop ran with a
+    /// cache off (`CacheConfig::naive` of the config it started with), so a loop on the profile's
+    /// values (the one that loaded a record, say) neither starts nor ends a span (its tick still
+    /// counts toward a running span's length, which is in ticks). A pending span starts on this
+    /// tick; a start later than `now` (a record from another clock) becomes `now`. When the span
+    /// has lasted `CacheConfig::naive_max_ticks`, or the bucket is below
+    /// `CacheConfig::naive_stop_bucket`, the overrides that turn a cache off are removed (every
+    /// cache is on from the next loop) and the stop is returned: the caller logs it and writes the
+    /// record. Only the length is reported when both hold. Other overrides stay.
+    #[inline]
+    pub fn naive_tick(&mut self, now: u32, bucket: u32, ran: bool) -> Option<NaiveStop> {
+        if !ran {
+            return None;
+        }
+        let since = match self.naive {
+            Naive::Off => return None,
+            Naive::Pending => now,
+            Naive::Since(s) => s.min(now),
+        };
+        self.naive = Naive::Since(since);
+        let ticks = now.saturating_sub(since).saturating_add(1);
+        let cache = &self.config.cache;
+        let why = if ticks >= cache.naive_max_ticks {
+            NaiveEnd::Length
+        } else if bucket < cache.naive_stop_bucket {
+            NaiveEnd::Bucket(bucket)
+        } else {
+            return None;
+        };
+        Some(self.naive_end(since, now, ticks, why))
+    }
+
+    /// The guard's rare part, kept out of the per-tick `loop` function: removes the overrides that
+    /// turn a cache off (no rule names a cache key, so a removal is never refused; a test checks
+    /// it) and reapplies the rest.
+    #[cold]
+    #[inline(never)]
+    fn naive_end(&mut self, since: u32, now: u32, ticks: u32, why: NaiveEnd) -> NaiveStop {
+        let mut removed = 0;
+        for key in NAIVE_KEYS {
+            if self.overrides.get(key) == Some(Value::Flag(false))
+                && self.overrides.unset(&self.base, key).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        self.config = self.overrides.apply(&self.base);
+        self.naive_changed(Naive::Off);
+        NaiveStop {
+            since,
+            last: now,
+            ticks,
+            why,
+            removed,
+        }
     }
 
     /// The record's load finished: its frame, or why there is none. Notes about refused or clamped
@@ -450,6 +580,7 @@ impl Store {
                 self.record = Record::Loaded {
                     written: f.header.written,
                 };
+                self.naive_changed(Naive::Since(f.header.written));
                 true
             }
             Err(LoadError::Decode(crate::persist::DecodeError::Empty)) => {
@@ -488,6 +619,7 @@ impl Store {
             .set(&self.base, key, text)
             .map_err(Refusal::Invalid)?;
         self.config = self.overrides.apply(&self.base);
+        self.naive_changed(Naive::Pending);
         Ok(change)
     }
 
@@ -499,6 +631,7 @@ impl Store {
             .unset(&self.base, key)
             .map_err(Refusal::Invalid)?;
         self.config = self.overrides.apply(&self.base);
+        self.naive_changed(Naive::Pending);
         Ok(previous)
     }
 
@@ -508,6 +641,7 @@ impl Store {
         let n = self.overrides.len();
         self.overrides.clear();
         self.config = self.base;
+        self.naive = Naive::Off;
         Ok(n)
     }
 
@@ -1010,5 +1144,245 @@ mod tests {
             Record::Failed(LoadError::Unavailable { tries: 3 })
         );
         assert!(Store::new(BASE).loaded(Err(LoadError::Decode(DecodeError::Empty)), &mut notes));
+    }
+
+    /// A store whose record loaded empty (no overrides), so console changes are accepted.
+    fn ready_store() -> Store {
+        let mut s = Store::new(BASE);
+        let mut notes = Vec::new();
+        assert!(s.loaded(Err(LoadError::Decode(DecodeError::Empty)), &mut notes));
+        s
+    }
+
+    fn naive_off(s: &mut Store, keys: &[&str]) {
+        for key in keys {
+            assert!(s.set(key, "false").is_ok(), "{key}");
+        }
+    }
+
+    /// Uses: CACHE_MMO.naive_max_ticks, CACHE_MMO.naive_stop_bucket (ADR-022). A span turned on by
+    /// the console starts on the first loop that runs it and ends on its `naive_max_ticks`-th tick
+    /// (a bucket at the stop level does not stop it); the three cache overrides go, every other one
+    /// stays, and the next loop starts no new span.
+    #[test]
+    fn naive_span_ends_after_its_length() {
+        let max = BASE.cache.naive_max_ticks;
+        let stop = BASE.cache.naive_stop_bucket;
+        let mut s = ready_store();
+        assert!(s.set("scheduler.tick_reserve_pct", "12").is_ok());
+        assert_eq!(s.naive(), Naive::Off);
+        naive_off(&mut s, &NAIVE_KEYS);
+        assert_eq!(s.naive(), Naive::Pending);
+        assert!(s.config().cache.naive());
+        let t0 = 84_302_207;
+        for t in t0..t0 + max - 1 {
+            assert_eq!(s.naive_tick(t, stop, true), None, "tick {t}");
+            assert_eq!(s.naive(), Naive::Since(t0));
+        }
+        let last = t0 + max - 1;
+        assert_eq!(
+            s.naive_tick(last, stop, true),
+            Some(NaiveStop {
+                since: t0,
+                last,
+                ticks: max,
+                why: NaiveEnd::Length,
+                removed: NAIVE_KEYS.len(),
+            })
+        );
+        assert_eq!(s.naive(), Naive::Off);
+        assert!(!s.config().cache.naive());
+        assert_eq!(s.overrides().len(), 1);
+        assert_eq!(s.config().scheduler.tick_reserve_pct, 12);
+        assert_eq!(s.naive_tick(last + 1, stop, false), None);
+        assert_eq!(s.naive_tick(last + 1, stop, true), None);
+    }
+
+    /// Uses: CACHE_MMO.naive_max_ticks, CACHE_MMO.naive_stop_bucket. A bucket below the stop
+    /// bucket ends the span at once with the bucket in the stop; a span at its length with a low
+    /// bucket reports its length.
+    #[test]
+    fn naive_span_ends_below_the_stop_bucket() {
+        let max = BASE.cache.naive_max_ticks;
+        let stop = BASE.cache.naive_stop_bucket;
+        assert!(stop > 0 && max > 2);
+        let mut s = ready_store();
+        naive_off(&mut s, &["cache.movement_grid"]);
+        assert_eq!(s.naive_tick(500, stop, true), None);
+        assert_eq!(
+            s.naive_tick(501, stop - 1, true),
+            Some(NaiveStop {
+                since: 500,
+                last: 501,
+                ticks: 2,
+                why: NaiveEnd::Bucket(stop - 1),
+                removed: 1,
+            })
+        );
+        assert!(!s.config().cache.naive());
+        assert!(s.overrides().is_empty());
+
+        naive_off(&mut s, &["cache.flow_fields"]);
+        assert_eq!(s.naive_tick(1000, stop, true), None);
+        let last = 1000 + max - 1;
+        assert_eq!(
+            s.naive_tick(last, 0, true).map(|x| (x.why, x.ticks)),
+            Some((NaiveEnd::Length, max))
+        );
+    }
+
+    /// A pending span waits for a loop that ran with a cache off; turning a second cache off keeps
+    /// the span's start, removing one of two keeps it, removing the last (or a reset) ends it; a
+    /// `true` override is not naive.
+    #[test]
+    fn naive_span_follows_the_overrides() {
+        let stop = BASE.cache.naive_stop_bucket;
+        let mut s = ready_store();
+        naive_off(&mut s, &["cache.structure_static"]);
+        assert_eq!(s.naive_tick(10, stop, false), None);
+        assert_eq!(s.naive(), Naive::Pending);
+        assert_eq!(s.naive_tick(11, stop, true), None);
+        assert_eq!(s.naive(), Naive::Since(11));
+        naive_off(&mut s, &["cache.flow_fields", "cache.structure_static"]);
+        assert_eq!(s.naive(), Naive::Since(11));
+        assert!(s.unset("cache.structure_static").is_ok());
+        assert_eq!(s.naive(), Naive::Since(11));
+        assert!(s.unset("cache.flow_fields").is_ok());
+        assert_eq!(s.naive(), Naive::Off);
+        assert_eq!(s.naive_tick(12, stop, true), None);
+
+        assert!(s.set("cache.movement_grid", "true").is_ok());
+        assert_eq!(s.naive(), Naive::Off);
+        naive_off(&mut s, &["cache.movement_grid"]);
+        assert_eq!(s.naive(), Naive::Pending);
+        assert_eq!(s.reset(), Ok(1));
+        assert_eq!(s.naive(), Naive::Off);
+        assert_eq!(s.naive_tick(13, 0, true), None);
+    }
+
+    /// Uses: CACHE_MMO.naive_max_ticks, CACHE_MMO.naive_stop_bucket. Overrides that a record brings
+    /// count from the record's write tick, so a span across a global reset still ends
+    /// `naive_max_ticks` after it began; the loop that loaded the record (on the profile's values)
+    /// counts nothing; a write tick later than now counts from now; a record that turns no cache off
+    /// starts nothing.
+    #[test]
+    fn naive_span_from_a_record_counts_from_its_write() {
+        let max = BASE.cache.naive_max_ticks;
+        let stop = BASE.cache.naive_stop_bucket;
+        let written = 70_000;
+        let mut s = Store::new(BASE);
+        let mut notes = Vec::new();
+        let text = frame_text(kind::CONFIG, SCHEMA, written, b"cache.flow_fields=false\n");
+        assert!(load(&mut s, &text, &mut notes));
+        assert_eq!(s.naive(), Naive::Since(written));
+        let resumed = written + max / 2;
+        assert_eq!(s.naive_tick(resumed, stop, false), None);
+        assert_eq!(s.naive_tick(resumed + 1, stop, true), None);
+        let last = written + max - 1;
+        assert_eq!(
+            s.naive_tick(last, stop, true)
+                .map(|x| (x.since, x.ticks, x.why)),
+            Some((written, max, NaiveEnd::Length))
+        );
+
+        let mut ahead = Store::new(BASE);
+        assert!(load(&mut ahead, &text, &mut notes));
+        assert_eq!(ahead.naive_tick(written - 5, stop, true), None);
+        assert_eq!(ahead.naive(), Naive::Since(written - 5));
+
+        let mut late = Store::new(BASE);
+        assert!(load(&mut late, &text, &mut notes));
+        let stopped = late.naive_tick(u32::MAX, stop, true).expect("long over");
+        assert_eq!((stopped.why, stopped.removed), (NaiveEnd::Length, 1));
+
+        let mut plain = Store::new(BASE);
+        let other = frame_text(kind::CONFIG, SCHEMA, written, b"cache.flow_fields=true\n");
+        assert!(load(&mut plain, &other, &mut notes));
+        assert_eq!(plain.naive(), Naive::Off);
+        assert!(notes.is_empty());
+    }
+
+    /// The span's length and stop bucket are runtime keys: a shorter length ends the span sooner,
+    /// and a lower stop bucket lets it run on at a bucket that would have ended it.
+    #[test]
+    fn naive_limits_are_overridable() {
+        let stop = BASE.cache.naive_stop_bucket;
+        let mut s = ready_store();
+        let short = 3;
+        assert!(s.set("cache.naive_max_ticks", &short.to_string()).is_ok());
+        naive_off(&mut s, &NAIVE_KEYS);
+        assert_eq!(s.naive_tick(20, stop, true), None);
+        assert_eq!(s.naive_tick(21, stop, true), None);
+        assert_eq!(s.naive_tick(22, stop, true).map(|x| x.ticks), Some(short));
+        let lower = stop / 2;
+        assert!(s.set("cache.naive_stop_bucket", &lower.to_string()).is_ok());
+        naive_off(&mut s, &["cache.structure_static"]);
+        assert_eq!(s.naive_tick(30, stop - 1, true), None);
+        assert_eq!(
+            s.naive_tick(31, lower - 1, true).map(|x| x.why),
+            Some(NaiveEnd::Bucket(lower - 1))
+        );
+    }
+
+    /// A loop on the profile's values (`ran` false) ends nothing even when a running span is past
+    /// its length or below the stop bucket; the next loop that runs naive ends it.
+    #[test]
+    fn a_cached_loop_ends_no_span() {
+        let max = BASE.cache.naive_max_ticks;
+        let stop = BASE.cache.naive_stop_bucket;
+        let written = 70_000;
+        let mut s = Store::new(BASE);
+        let mut notes = Vec::new();
+        let text = frame_text(kind::CONFIG, SCHEMA, written, b"cache.flow_fields=false\n");
+        assert!(load(&mut s, &text, &mut notes));
+        let t = written + max + 10;
+        assert_eq!(s.naive_tick(t, stop, false), None);
+        assert_eq!(s.naive_tick(t, 0, false), None);
+        assert_eq!(s.naive(), Naive::Since(written));
+        assert_eq!(
+            s.naive_tick(t + 1, stop, true).map(|x| (x.last, x.why)),
+            Some((t + 1, NaiveEnd::Length))
+        );
+    }
+
+    /// A stop removes only the overrides that turn a cache off: a `true` cache override beside a
+    /// `false` one stays, and only the removed one is counted.
+    #[test]
+    fn a_stop_keeps_true_cache_overrides() {
+        let stop = BASE.cache.naive_stop_bucket;
+        let mut s = ready_store();
+        assert!(s.set("cache.movement_grid", "true").is_ok());
+        naive_off(&mut s, &["cache.flow_fields"]);
+        assert_eq!(s.naive_tick(100, stop, true), None);
+        let stopped = s.naive_tick(101, 0, true).expect("bucket stop");
+        assert_eq!(stopped.removed, 1);
+        assert_eq!(
+            s.overrides().get("cache.movement_grid"),
+            Some(Value::Flag(true))
+        );
+        assert_eq!(s.overrides().get("cache.flow_fields"), None);
+    }
+
+    /// NAIVE_KEYS are exactly the cache flags (so the guard and `CacheConfig::naive` cannot drift
+    /// apart), each one off makes the config naive, and no rule names one (so removing it is never
+    /// refused and a stop cannot repeat every tick).
+    #[test]
+    fn naive_keys_are_the_cache_flags() {
+        let flags: Vec<&str> = FIELDS
+            .iter()
+            .filter(|f| f.key.starts_with("cache.") && matches!(f.kind, Kind::Flag))
+            .map(|f| f.key)
+            .collect();
+        assert_eq!(flags, NAIVE_KEYS);
+        for key in NAIVE_KEYS {
+            let mut c = BASE;
+            assert!((by_key(key).set)(&mut c, Value::Flag(false)), "{key}");
+            assert!(c.cache.naive(), "{key}");
+        }
+        assert!(
+            RULES
+                .iter()
+                .all(|r| r.keys.iter().all(|k| !NAIVE_KEYS.contains(k)))
+        );
     }
 }

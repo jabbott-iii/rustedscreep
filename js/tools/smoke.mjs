@@ -118,6 +118,7 @@ export function driverRawMemory(offset, world) {
  * in console commands or the end-of-tick save. `constants` ([name, JSON text] pairs, the engine's by default) are
  * set on the global at the start of every tick, as the engine does (V129); `[]` gives a global without them.
  * `setup(context, world)` runs once per new global, before the bundle is evaluated (to instrument the realm).
+ * `bucket` is Game.cpu.bucket: a number, or `bucket(offset)` for one per tick.
  * `wasmForm` is how require('rustedscreep_wasm') answers: 'binary', the module's bytes (an API upload, V31), or
  * 'base64', the text module the GitHub link delivers (ADR-015), read from `${dir}/rustedscreep_wasm.js` (or made from
  * `wasmBytes`) and evaluated in the driver's module wrapper once per global (V138); without the file it throws
@@ -208,7 +209,7 @@ export function simulate(dir, {
       ...scene(offset),
       time: world.time,
       cpu: {
-        bucket, limit: 20, tickLimit: 500,
+        bucket: typeof bucket === 'function' ? bucket(offset) : bucket, limit: 20, tickLimit: 500,
         getUsed: () => {
           if (inLoop) calls.getUsed += 1;
           return performance.now() - start;

@@ -184,6 +184,11 @@ pub fn game_loop() {
                 act::issue(act, snapshot, js, sched, &cfg.scheduler);
                 movement.after_act(snapshot, act.refused_moves(), &cfg.movement);
                 probe.act();
+                // The naive guard (ADR-022), whatever the tier: it may end a naive span, whose record
+                // the flush below writes when the tick runs the Standard tier.
+                if runtime.naive_tick(snapshot.tick.time, snapshot.tick.bucket, cfg.cache.naive()) {
+                    persist.config_changed();
+                }
                 let standard = sched
                     .last_tick()
                     .is_some_and(|r| r.budget.allows(Tier::Standard));

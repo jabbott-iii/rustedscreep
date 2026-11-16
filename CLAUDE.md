@@ -84,7 +84,7 @@ The live server's constants are the ground truth for that server. At init, the b
 | Act layer in the sandbox (the `act-test` build's scripted intents) | `node js/tools/act-sim.mjs` |
 | Profiler in the sandbox (the `profiler` build over six windows, stats segment and write failures) | `node js/tools/profiler-sim.mjs` |
 | Persistence in the sandbox (the plain build's self-test: round trips, corrupt segments, console overrides, the save cap) | `node js/tools/persist-sim.mjs` |
-| Runtime config in the sandbox (the plain build's overrides across four globals: refusals, clamps, the record, log level, naive toggle) | `node js/tools/config-sim.mjs` |
+| Runtime config in the sandbox (the plain build's overrides across four globals: refusals, clamps, the record, log level, naive toggle, the naive guard's two stops) | `node js/tools/config-sim.mjs` |
 | Constants self-check in the sandbox (the plain build against the engine fixture: read path, drift, the line cap, no constants, low bucket) | `node js/tools/consts-sim.mjs` |
 | Movement in the sandbox (the plain build: terrain and scan cadence, a console move order with engine-checked moves) | `node js/tools/move-sim.mjs` |
 | Inter-room routes in the sandbox (the plain build with a PathFinder model: a cross-room order, room callback answers, a search that throws) | `node js/tools/route-sim.mjs` |

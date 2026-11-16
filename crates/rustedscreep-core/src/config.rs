@@ -250,7 +250,9 @@ pub const LOG_MMO: LogConfig = LogConfig {
 };
 
 /// Cache toggles. Each one off replaces its cache with a read every tick; all off is the naive
-/// baseline that measures what the caches save (ROADMAP evidence conventions).
+/// baseline that measures what the caches save (ROADMAP evidence conventions). Only a runtime
+/// override turns one off (every profile keeps them on), and the bot removes such overrides itself
+/// after `naive_max_ticks` or below `naive_stop_bucket` (ADR-022, [`overrides::Store::naive_tick`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CacheConfig {
     /// Keep each structure's type and position from the tick it is first seen (P1.5); off, the
@@ -262,13 +264,35 @@ pub struct CacheConfig {
     /// Keep flow fields between requests (P2.1); off, every request builds its field again and
     /// nothing is kept. Unit: flag.
     pub flow_fields: bool,
+    /// Longest naive span (ADR-022): after this many ticks with a cache override off, counted from
+    /// the span's first loop, the bot removes those overrides itself. 1000 is one profiler window
+    /// (`ProfilerConfig::window_loops`), so a span set on a window's last tick fills the next
+    /// window exactly. Unit: ticks. Safe range 1 to 10000.
+    pub naive_max_ticks: u32,
+    /// The bucket below which a naive span ends at once (ADR-022). At the free tier's 20 CPU the
+    /// surplus formula turns Optional off at `bucket_target` − limit × `surplus_spread_ticks` (7000
+    /// with `SCHEDULER_MMO`), so 8000 ends a span while Optional work still runs (the config test
+    /// checks it); a lower override lets a span run on with Optional off. Unit: CPU. Safe range 0 to
+    /// `CPU_BUCKET_MAX` (10000).
+    pub naive_stop_bucket: u32,
 }
 
-/// Cache toggles for the official MMO: every cache on.
+impl CacheConfig {
+    /// Whether any cache is off: the tick runs (part of) the naive baseline.
+    #[inline]
+    pub fn naive(&self) -> bool {
+        !(self.structure_static && self.movement_grid && self.flow_fields)
+    }
+}
+
+/// Cache toggles for the official MMO: every cache on; a naive span lasts one profiler window at
+/// most and ends below bucket 8000.
 pub const CACHE_MMO: CacheConfig = CacheConfig {
     structure_static: true,
     movement_grid: true,
     flow_fields: true,
+    naive_max_ticks: 1000,
+    naive_stop_bucket: 8000,
 };
 
 /// Movement thresholds (ROADMAP P2, movement); `docs/TUNING.md` gives each one's rationale and safe
@@ -597,7 +621,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 60;
+pub const FIELD_COUNT: usize = 62;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -750,6 +774,8 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     flag!(cache, "CacheConfig", structure_static, true),
     flag!(cache, "CacheConfig", movement_grid, true),
     flag!(cache, "CacheConfig", flow_fields, true),
+    number!(cache, "CacheConfig", naive_max_ticks, 1, 10_000, true),
+    number!(cache, "CacheConfig", naive_stop_bucket, 0, 10_000, true),
     number!(movement, "MovementConfig", road_cost, 1, 25, true),
     number!(movement, "MovementConfig", plain_cost, 1, 25, true),
     number!(movement, "MovementConfig", swamp_cost, 1, 25, true),
@@ -979,6 +1005,8 @@ mod tests {
             structure_static: _,
             movement_grid: _,
             flow_fields: _,
+            naive_max_ticks: _,
+            naive_stop_bucket: _,
         } = CACHE_MMO;
         let MovementConfig {
             road_cost: _,
@@ -1069,7 +1097,13 @@ mod tests {
             ("log", &["level", "skip_window_ticks", "consts_findings"]),
             (
                 "cache",
-                &["structure_static", "movement_grid", "flow_fields"],
+                &[
+                    "structure_static",
+                    "movement_grid",
+                    "flow_fields",
+                    "naive_max_ticks",
+                    "naive_stop_bucket",
+                ],
             ),
             (
                 "movement",
@@ -1175,6 +1209,7 @@ mod tests {
             _ => panic!("{key} is not a number"),
         };
         assert_eq!(range("loader.boot_bucket_min"), (0, CPU_BUCKET_MAX));
+        assert_eq!(range("cache.naive_stop_bucket"), (0, CPU_BUCKET_MAX));
         for key in [
             "scheduler.standard_bucket_min",
             "scheduler.optional_bucket_min",
@@ -1387,6 +1422,51 @@ mod tests {
         );
         assert!((1..=32).contains(&c.history_windows));
         assert!(c.stats_segment < MEMORY_SEGMENT_COUNT);
+    }
+
+    /// Uses: PROFILER_MMO.window_loops, SCHEDULER_MMO (the Optional budget, `Budget::compute`),
+    /// rustedscreep_consts::CPU_TICK_LIMIT_MAX (ADR-022). Every profile runs with every cache on
+    /// (only an override turns one off, which the naive guard can remove); the `mmo` naive span
+    /// fills one profiler window; at its stop bucket, at the free tier's limit of 20 (V35) and after
+    /// the warm-up, the Optional tier still runs, so a span ends before Optional work stops.
+    #[test]
+    fn cache_values_are_coherent() {
+        for p in &PROFILES {
+            assert!(
+                !p.config.cache.naive(),
+                "{}: a profile keeps every cache on",
+                p.name
+            );
+        }
+        let c = CACHE_MMO;
+        assert_eq!(c.naive_max_ticks, PROFILER_MMO.window_loops);
+        let limit = 20;
+        let ctx = crate::snapshot::TickContext::from_raw(
+            1,
+            limit,
+            f64::from(CPU_TICK_LIMIT_MAX.min(c.naive_stop_bucket + limit)),
+            i32::try_from(c.naive_stop_bucket).expect("fits"),
+        );
+        let budget = crate::scheduler::Budget::compute(
+            &ctx,
+            &SCHEDULER_MMO,
+            SCHEDULER_MMO.optional_warmup_loops,
+        );
+        assert!(budget.allows(crate::scheduler::Tier::Optional));
+        for (s, m, f) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            let c = CacheConfig {
+                structure_static: s,
+                movement_grid: m,
+                flow_fields: f,
+                ..CACHE_MMO
+            };
+            assert!(c.naive(), "{s} {m} {f}");
+        }
     }
 
     /// Uses: rustedscreep_consts::{MEMORY_SEGMENT_ACTIVE_LIMIT, extra::MEMORY_SEGMENT_SAVE_LIMIT,

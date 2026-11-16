@@ -23,7 +23,7 @@ Evidence conventions:
   value of each optimization. Each cache gets a toggle. On the MMO it runs only in short, bucket-gated windows, because the free-tier
   limit is 20 CPU (VERIFICATION_LOG V35): optimized, naive and optimized windows alternate at a comparable colony state, and each window
   records its tick range, RCL, room count, creep count and intents. The window length and the bucket level that stops a window early
-  are TUNING values set in P2. They are the stated exception to the ≥ 1000-tick rule. Same-seed comparisons and the unmodified
+  are TUNING values set in P2 (`CacheConfig::naive_max_ticks` and `naive_stop_bucket`, which the bot enforces; ADR-022). They are the stated exception to the ≥ 1000-tick rule. Same-seed comparisons and the unmodified
   screeps-starter-rust bot are on the private-server track (PS2).
 - Never record an estimated number as measured.
 
