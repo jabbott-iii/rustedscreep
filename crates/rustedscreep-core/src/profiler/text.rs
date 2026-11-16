@@ -1,5 +1,5 @@
-//! The profiler's text: the stats segment for `npm run stats` and the console lines. Integers only,
-//! so no float formatting is linked into the wasm.
+//! The profiler's text: the stats segment (read in the console, TEST_PLAN §8) and the console
+//! lines. Integers only, so no float formatting is linked into the wasm.
 //!
 //! The stats segment is one JSON object in ASCII (so its length in UTF-16 units, which the driver
 //! limits, equals its byte length; V41), versioned by `v`:

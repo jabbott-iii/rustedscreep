@@ -25,7 +25,7 @@ Modules:
 
 ## SE2 Season profile and modules (builds on SE1)
 Modules:
-- A `season` server profile in `config.rs` and `docs/TUNING.md`, and a `season` server entry that the user adds to their `.screeps.yaml` (format: VERIFICATION_LOG V93).
+- A `season` server profile in `config.rs` and `docs/TUNING.md`, and the deploy and capture path for the Seasonal server, chosen here in an ADR (there are no API tools and `/deploy` stops for `season`, ADR-021; a `season` entry in `.screeps.yaml`, format V93, only if that path reads one).
 - Season-specific modules behind the season profile and the season cargo feature (the crate's, if one exists, otherwise our own).
   MMO modules are reused unchanged where the rules match.
 - Cold-start cost measured on the Seasonal server, and the `season` profile's boot gate set from it.

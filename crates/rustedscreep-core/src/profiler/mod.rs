@@ -1,7 +1,7 @@
 //! The CPU profiler (ROADMAP P1 module 8): sparse `Game.cpu.getUsed()` spans per subsystem, exact
-//! statistics per window of loops, and the stats segment that `npm run stats` reads. All pure Rust:
-//! rustedscreep-wasm takes the readings, only in a build with its `profiler` feature, and writes the
-//! segment. Without the feature none of this is linked into the wasm.
+//! statistics per window of loops, and the stats segment, read in the console (TEST_PLAN §8). All
+//! pure Rust: rustedscreep-wasm takes the readings, only in a build with its `profiler` feature,
+//! and writes the segment. Without the feature none of this is linked into the wasm.
 //!
 //! One loop, as rustedscreep-wasm drives it (six readings, each one JS call):
 //! 1. `start`, then `clock`, back to back as the loop's first statements. Every reading is the tick's

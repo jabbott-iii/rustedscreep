@@ -13,7 +13,8 @@ paths:
 - The loader may only: gate boot on bucket, compile and instantiate the wasm across ticks if needed, call the exported
   `loop`, detect and recover from traps, route `console.error` and notifications, and expose debug console commands.
   It contains **no game logic**.
-- Tools (Node, local only): `deploy`, `console` (stream the server console to `logs/`), `stats` (fetch the profiler/telemetry segment).
+- Tools (Node, local only, `js/tools/`): the build, `stage`, `size`, `check` and the sandbox sims. The API tools `deploy`, `console` and
+  `stats` were dropped (ADR-021).
 
 ## Recovery requirements (ADR-003)
 - Handle three failure modes:
@@ -35,5 +36,5 @@ paths:
 - If the probe shows `TextDecoder`/`TextEncoder` are missing, add the smallest polyfill the glue needs.
 
 ## Secrets
-- Deploy tools read `.screeps.yaml` at runtime. Never log, echo, or print its contents, and never write or commit it. Prefer
-  auth tokens over passwords for official servers. `.screeps.yaml` stays in `.gitignore`.
+- No tool reads `.screeps.yaml` (ADR-021). Never read, log, echo, or print its contents, and never write or commit it.
+  `.screeps.yaml` stays in `.gitignore`.

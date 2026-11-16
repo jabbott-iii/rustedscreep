@@ -31,7 +31,7 @@ function block(reason) {
 
 // 1. Credentials: the deploy config and token variables.
 if (/(^|[\s"'=/\\])\.screeps\.ya?ml\b/.test(cmd)) {
-  block('command references .screeps.yaml (deployment credentials). Deploy via `npm run deploy`, which reads it internally.');
+  block('command references .screeps.yaml (deployment credentials), which nothing in this repo reads (ADR-021).');
 }
 if (/\$\{?SCREEPS_(TOKEN|PASSWORD|AUTH)\w*/.test(cmd)) {
   block('command expands a Screeps credential environment variable.');

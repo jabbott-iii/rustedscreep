@@ -1,16 +1,17 @@
 ---
 name: deploy
-description: Deploy the bot to a named Screeps server profile. For `mmo`, stage a checked build in `deploy/` for the user to push through the GitHub link (ADR-012). For other servers, or the ADR-012 fallback, dry run and then upload through the API. Official servers only when the user names them in the current message.
+description: Deploy the bot to a named Screeps server. For `mmo`, stage a checked build in `deploy/` for the user to push through the GitHub link (ADR-012). Other servers, and ADR-012's fallback, have no deploy path (ADR-021). Official servers only when the user names them in the current message.
 argument-hint: "<server> [--dryrun] [--features <list>]"
 disable-model-invocation: true
 ---
 
 # /deploy $ARGUMENTS
 
-1. **Server.** `$ARGUMENTS` must name a profile. Official servers (`mmo`, `season`, `ptr`) require that the user's current message
+1. **Server.** `$ARGUMENTS` must name a server. Official servers (`mmo`, `season`, `ptr`) require that the user's current message
    explicitly asks to deploy there. Otherwise stop and ask. Remind the user that deploying to an official server's active branch replaces
-   the running code.
-2. **Never read or print `.screeps.yaml`.** If the profile is missing, ask the user to add it. Do not create the file yourself.
+   the running code. For any server other than `mmo`, or for `mmo` when the GitHub link has failed (ADR-012's fallback), say there is
+   no deploy path (ADR-021) and stop.
+2. **Never read or print `.screeps.yaml`.** No tool reads it (ADR-021); never create it.
 3. Run `/check`. If any check fails, stop and report. Deploy a failing build only if the user explicitly says so in this conversation,
    and state the risk.
    **Features.** `--features <list>` (comma-separated rustedscreep-wasm features, for example `profiler` or `trap-test`) stages that
@@ -33,16 +34,12 @@ disable-model-invocation: true
    Steam client will offer to replace its local mirror: decline, and never edit files in the mirror. If the live build logged incidents
    (STATUS), say that its backoff streak in `Memory.rustedscreepLoader` carries over: once `rustedscreep.status()` shows the staged build ID,
    the user runs `delete Memory.rustedscreepLoader` in the console (earlier, the old build rebuilds it; ADR-015). Never commit or push. Stop here.
-8. Only after the user confirms the push: offer the capture in step 12, check that the running code logs the staged build ID (with its
-   `+<feature>` suffixes) before using any capture as evidence, and record "deployed" in STATUS with the features and the observations.
+8. Only after the user confirms the push: ask for the console output of step 9, check that the running code logs the staged build ID
+   (with its `+<feature>` suffixes) before using any output as evidence, and record "deployed" in `docs/STATUS.md` with the server,
+   features, wasm and bundle sizes, and the observations.
 
-## Other servers, or the `mmo` API fallback (ADR-012)
-9. For the `mmo` fallback, first confirm that the user has unlinked the GitHub integration (or pointed it at a folder that is never
-   pushed). Otherwise the next push overwrites the API upload. Do not run `npm run stage`.
-10. Run `npm run deploy -- --server <server> --dryrun` and report what would be uploaded (module names and sizes). `--features` reaches this
-    path only once the deploy tool (P2, ADR-017) takes it; until then, say so and stop if features were requested.
-11. Unless `--dryrun` was requested, run `npm run deploy -- --server <server>` (the permission prompt applies).
-12. For any server (an official one only once step 1 is satisfied), offer to capture the first minutes with
-    `npm run console -- --server <server>` and `npm run stats -- --server <server>` into `logs/`. Then report boot ticks, cold-start CPU,
-    errors, and the bucket trend. On the MMO this capture is the evidence for core gates from P2 on (P1's evidence was the user's console output, ADR-017).
-13. Record the deploy in `docs/STATUS.md`: server, features, wasm size, bundle size, and the observations made.
+## Evidence after a deploy
+9. On the MMO the evidence for core gates is the user's console output (ADR-017, ADR-021). Ask for the boot line and the summaries the
+   checks need (`rustedscreep.status()`, `rustedscreep.scheduler()` and the module's own), then report boot ticks, cold-start CPU, errors
+   and the bucket. Record each observation with its `Game.time`. A deploy path for another server, or for the fallback, needs a new
+   decision (an ADR).

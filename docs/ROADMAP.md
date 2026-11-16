@@ -11,10 +11,10 @@ A gate passes only with evidence recorded in STATUS.md (`/phase-gate P#`). Every
 No core gate needs a private server or a Seasonal server.
 
 Evidence conventions:
-- **Live run:** the bot running on the official MMO under the user's account, with the result captured through `npm run console` and
-  `npm run stats` into `logs/`. A deploy to the MMO is a push of the staged `deploy/` folder through the GitHub link (ADR-012). Claude stages it
-  only when the user names `mmo`, and the user pushes. P1 exception (ADR-017): P1's live checks rest on the user's console output,
-  recorded in STATUS.md and VERIFICATION_LOG.md, since the capture tools moved to P2.
+- **Live run:** the bot running on the official MMO under the user's account, with the result taken from the user's console output
+  (the bot's log lines, the `rustedscreep.*` summaries and segment 99 read in the console), recorded in STATUS.md and VERIFICATION_LOG.md
+  (ADR-017 for P1, ADR-021 from P2 on; there are no API tools). A deploy to the MMO is a push of the staged `deploy/` folder through the
+  GitHub link (ADR-012). Claude stages it only when the user names `mmo`, and the user pushes.
 - **Native scenario test:** a pure-Rust test in `rustedscreep-core` that drives a decision module (bootstrap recovery, combat sim,
   formations, offense state machines, breaker solver) through a scripted situation, with expectations derived from constants.
   Scripted in-game scenarios belong to the private-server track.
@@ -48,7 +48,7 @@ Modules:
    Toolchain pinned in `rust-toolchain.toml`. Clippy no-panic denies at the crate roots.
 2. `rustedscreep-consts`: the facade over the API constants, `extra.rs` with sources and dates, and constant-derived tests.
 3. Build: wasm build (ADR-001) + `wasm-opt` (flags from ADR-002) + a Rollup bundle of the TypeScript loader compiled by `tsc` to ES2022, no Babel (ADR-008), into `dist/`. npm scripts: `build`, `check`, `stage` (runs the release build and copies `main.js` and the wasm into the tracked `deploy/` folder for the GitHub link, the wasm as a base64 text module `rustedscreep_wasm.js` since the link uploads files as text (ADR-015), or into `--out <dir>` for tests and dry runs; reports sizes, a byte hash of the wasm and a build ID; ADR-012),
-   `size`. The API tools `deploy`, `console` and `stats` moved to P2 (ADR-017). The user creates `.screeps.yaml` (format: VERIFICATION_LOG V93); the repo has no example file (the user removed it on 2026-11-14).
+   `size`. The API tools `deploy`, `console` and `stats` moved to P2 (ADR-017) and were then dropped (ADR-021), so no tool reads `.screeps.yaml` (format: VERIFICATION_LOG V93); the repo has no example file (the user removed it on 2026-11-14).
 4. Loader (`js/src/main.ts`):
    - Boot gated on bucket, with compile and instantiate spread across ticks.
    - Calls `loop`.
@@ -100,8 +100,6 @@ Modules:
   Inter-room routes use PathFinder with cached results.
 - Minimal spawn path, which the P5 queue replaces.
 - RCL1–3 opening, zero-creep recovery, and deadlock watchdogs (for example no harvester, or energy stuck in containers), with interim extension placement from RCL2 until P4 (ADR-020).
-- API tools (from P1 module 3, ADR-017), after the Node 22 or 24 upgrade (VERIFICATION_LOG V11): npm scripts `deploy` (an API upload),
-  `console` (the server console into `logs/`) and `stats` (segment 99 in the profiler's format v1). The gate's live captures use them.
 
 **Gate:**
 - The user's fresh MMO room reaches RCL3 with no manual action. Record the tick count.
@@ -110,7 +108,7 @@ Modules:
 - No deadlock over 20k live ticks.
 - CPU per tick is recorded against the naive baseline.
 - The profiler build's live check (P1.8, moved here from the P1 gate by ADR-016): a `profiler` build on the MMO logs its cold loop once, and at least
-  two closed 1000-loop windows are read from segment 99 (matched to the boot's `Game.time`). The floor, the fixed per-tick cost outside the jobs
+  two closed 1000-loop windows are read from segment 99 in the console (matched to the boot's `Game.time`; TEST_PLAN §8). The floor, the fixed per-tick cost outside the jobs
   (`start`, the snapshot and the act step's per-tick overhead, each less its own reading), is taken from a window after the first and recorded
   beside the CPU per tick.
 

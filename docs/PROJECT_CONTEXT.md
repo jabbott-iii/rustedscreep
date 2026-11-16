@@ -26,7 +26,7 @@ Answers recorded 2026-11-13 (P0 kickoff).
 - Toolchain policy (stable pinned, or nightly allowed): stable only, pinned. If a target server rejects the wasm features that current stable emits, the options are an older pinned stable or wasm-opt lowering passes (ADR-002), never nightly.
 - Developer OS and Node version (checked 2026-11-13 with `uname -sr`, `node -v`, `rustc -Vv`):
   - Linux 7.2.15 (x86_64).
-  - Node v18.19.1 and npm 9.2.0. KIT_README asks for Node 20+, and the starter README installs Node 20 (VERIFICATION_LOG V70). The deploy package screeps-api 2.x needs Node 22.x or 24.x (V11).
+  - Node v18.19.1 and npm 9.2.0. KIT_README asks for Node 20+, and the starter README installs Node 20 (VERIFICATION_LOG V70). The deploy package screeps-api 2.x needs Node 22.x or 24.x (V11); no tool uses it since ADR-021.
   - rustc and cargo 1.99.0 stable (LLVM 23.1.1). Toolchains 1.99.0 and 1.99.1 are also installed.
   - The `wasm32-unknown-unknown` target is not installed for any toolchain. wasm-pack, wasm-bindgen and wasm-opt are not on PATH.
 
@@ -36,5 +36,5 @@ Answers recorded 2026-11-13 (P0 kickoff).
 - **Pixels on the free tier.** In scope. The docs state no free-tier restriction, but the MMO backend is closed, so eligibility is unverified (VERIFICATION_LOG V38). The probe's api part reports whether `Game.cpu.generatePixel` exists. Safest default: keep pixel generation behind a runtime capability check and a config flag, and never spend bucket below the configured threshold.
 - **Power and power creeps.** Not asked. Assumption: in scope as part of SPEC §3.8 (late game), built in P9, and enabled only once the room economy supports it. Safest default: disabled in config until P9's gate passes.
 - **Offense.** Not asked directly. SPEC §4 makes offense mandatory, and the breaker answer is "conservative". Assumption: offense is enabled by default with conservative pacing, inside its own energy and CPU budget (SPEC §4c). It never targets protected rooms (safe mode, novice or respawn areas). With an empty whitelist, no player is exempt.
-- **Deploy profile names.** Not given. Assumption: `mmo` for the core, matching the server profile in `config.rs` (ROADMAP P1.10). A `private` profile is added in PS1 and a `season` profile in SE2. The user creates `.screeps.yaml`; Claude never reads it.
-- **Node version.** The local Node is 18.19.1. The hooks and the probe check run on it, but the deploy tool cannot: screeps-api 2.x needs Node 22.x or 24.x (V11), and Babel 8 needs ^22.18 or >=24.11 (V10). Upgrading Node is the user's call. It blocks `npm run deploy` (a P2 item since ADR-017), not P0 or P1.
+- **Deploy profile names.** Not given. Assumption: `mmo` for the core, matching the server profile in `config.rs` (ROADMAP P1.10). A `private` profile is added in PS1 and a `season` profile in SE2. No tool reads `.screeps.yaml` (ADR-021); Claude never reads it.
+- **Node version.** The local Node is 18.19.1. The build, the stage, `npm run check`, the hooks and the probe check run on it. screeps-api 2.x needs Node 22.x or 24.x (V11) and Babel 8 needs ^22.18 or >=24.11 (V10), but neither is used (ADR-008, ADR-021), so nothing in the core track needs an upgrade (the optional PS4 mockup spike may, V61, V63).

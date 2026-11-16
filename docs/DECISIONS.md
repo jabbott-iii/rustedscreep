@@ -193,7 +193,7 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
 - Decision: (a), as recommended; the user accepted it on 2026-11-13 ("Accept all three", covering ADR-002, 008 and 011 as recommended).
 - Consequences: `/deploy mmo` (check, dry run, then upload to a named branch) is the only way code reaches the MMO. Unlinking the GitHub integration is the user's action; until the user confirms it, STATUS keeps it as a blocker, because a push could overwrite the live `default` branch.
 
-## ADR-012 Deploy path to the official MMO through the GitHub link: Accepted (2026-11-13; supersedes ADR-011; the wasm's form in `deploy/` amended by ADR-015)
+## ADR-012 Deploy path to the official MMO through the GitHub link: Accepted (2026-11-13; supersedes ADR-011; the wasm's form in `deploy/` amended by ADR-015; the API fallback has no tool since ADR-021)
 - Context: ADR-011 chose the repo's Node tool and asked the user to unlink the client's GitHub integration. The user decided to keep the link: "I am leaving it linked because what we make will be live tested with the link". Every push to `main` triggers the sync (the user's observation, VERIFICATION_LOG V77). Community reports say the sync copies the top-level files of the linked folder into the account's `default` branch (V75, inferred). The repository root has no top-level `.js` files and `dist/` is git-ignored, so a root link cannot deliver the bot. The user pushed commit 665d204 with the root linked, so that push synced the root.
 - Options:
   - (a) Keep the root link and commit the built files at the repository root, next to the docs.
@@ -269,7 +269,7 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
   - TEST_PLAN §8 and STATUS say where the check now belongs.
 
 
-## ADR-017 The API tools move to P2, and P1's live evidence is the user's console output: Accepted (2026-11-14)
+## ADR-017 The API tools move to P2, and P1's live evidence is the user's console output: Accepted (2026-11-14; superseded in part by ADR-021, which drops the tools)
 - Context: ROADMAP P1 module 3 lists the npm scripts `deploy`, `console` and `stats` (STATUS item 3b), on screeps-api 2.x, which needs Node 22 or 24 (V11); local Node is 18.19.1, and the user deferred the tools until an upgrade. The ROADMAP evidence conventions say a live run's result is captured through `npm run console` and `npm run stats` into `logs/`. Every P1 live check (V136, V137 and V140 to V149; V150 derives the gate from them) instead rests on the user's console output and observations, pasted into the conversation and recorded in STATUS.md and VERIFICATION_LOG.md; the phase-gate skill accepts in-game observations from the user, so the two documents disagreed. No P1 gate criterion names the tools.
 - Options:
   - (a) Keep P1 open until Node 22 or 24 is installed and the tools exist, then capture the live checks again into `logs/`.
@@ -324,3 +324,20 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
   - A new Optional job in rustedscreep-wasm (planning is Optional, CLAUDE.md): per owned room with a spawn, while its extensions and extension sites are fewer than `CONTROLLER_STRUCTURES[extension][level]`, it picks one tile and the act step calls `Room.createConstructionSite(x, y, "extension")` (bound with `catch`); at most one call per room per tick, so a site never races another one's count (V200). A refused tile is skipped for the rest of the global. `opening.place_extensions` turns it off at runtime (for example before P4 takes over).
   - P4's planner keeps or replaces the extensions it finds; replacing one loses at most its 3000 energy.
 - Evidence: V200, V203 (billed 0.2 CPU per accepted call), V204 (no same-tick counting on the game side; the processor drops the excess), V205 (the edge and exit rules); the scenario tests above, and with the bot's own placement `a_fresh_room_reaches_rcl3_with_no_manual_action`: RCL3 in 6029 ticks (2026-11-15), against 8022 without extensions and 5892 with sites placed by hand on another row; ROADMAP P2 and P4.
+
+## ADR-021 The API tools are dropped; live evidence is the user's console output: Accepted (2026-11-15)
+- Context: ADR-017 moved the npm scripts `deploy`, `console` and `stats` (on screeps-api 2.x, which needs Node 22 or 24, V11; local Node is 18.19.1) to P2, where the gate's live captures were to use them. The MMO deploy needs none of them: it goes through the GitHub link (ADR-012, ADR-015; verified V140, V145). P2's live checks so far rest on the user's console output recorded in STATUS (the deploy of build `83dbcc549b05-eab3fade`, the opening's TEST_PLAN §8 checks, RCL2 and RCL3), as P1's did (ADR-017), and segment 99 can be read in the console (`RawMemory.setActiveSegments([99])`, then `RawMemory.segments[99]` on the next tick; TEST_PLAN §8). SPEC §1 has the glue deployed via `screeps-api`/`cargo-screeps`; ADR-001 and ADR-012 already deploy otherwise.
+- Options:
+  - (a) Keep the item: upgrade Node, write the three tools, and capture P2's gate into `logs/`.
+  - (b) Drop the item: no API tools; every core gate's live evidence is the user's console output.
+- Decision: (b), the user's decision on 2026-11-15: "The API tools item is unnecessary and can be removed."
+- Consequences:
+  - P2's module list and checklist lose the API tools. ROADMAP's evidence conventions extend ADR-017's P1 rule to every core gate: a live run's result is the user's console output (the bot's log lines, the `rustedscreep.*` summaries, segment 99 read in the console), recorded in STATUS.md and VERIFICATION_LOG.md, with its limits: no raw file in `logs/`, and times only as exact as the readings.
+  - Nothing in the core track needs Node 22 or 24: the build, the stage, `npm run check` and the hooks run on 18.19.1. The Node blocker leaves STATUS.
+  - ADR-012's fallback (an API upload if the link fails) has no tool. The link works (V140, V145); if it ever fails, the fallback needs a new decision. `/deploy` stages for `mmo` and, for any other server or the fallback, says there is no deploy path and stops; its capture step becomes a request for the user's console output.
+  - No tool reads `.screeps.yaml`. The rule that Claude never reads, prints or writes it stays, as do the hook that blocks commands naming it and the permission prompts for `npm run deploy`, `console` and `stats` (harmless while no such script exists).
+  - The optional tracks choose their own deploy and capture path when they start (PS1 for the private server, SE1 and SE2 for Seasonal).
+  - Supersedes ADR-017 in part (where the tools belong); ADR-017's acceptance of P1's console evidence stands.
+  - The gate's "no deadlock over 20k live ticks" rests on console readings: no stall notification, `stalls 0` in each `rustedscreep.opening()` reading, each global's start, and the controller's progress rising between readings (TEST_PLAN §8). Readings bound a stall's absence only as finely as they are spaced.
+  - Updated: ROADMAP (the evidence conventions, P1 module 3, P2's modules and gate), ROADMAP_PRIVATE (PS1), ROADMAP_SEASONAL (SE2), STATUS, TEST_PLAN §3 and §8, ARCHITECTURE (segment 99), PROJECT_CONTEXT (Node, deploy profiles), KIT_README (step 3), CLAUDE.md (the `js/` invariant and the commands table), `.claude/rules/js-loader.md` and `wasm-bot.md`, the `/deploy` skill, the bash hook's message, and the doc comments of rustedscreep-core `profiler/mod.rs` and `profiler/text.rs`.
+- Evidence: V11, V140, V145; STATUS (the P2.4 deploy and its live checks).

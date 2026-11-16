@@ -8,8 +8,8 @@ evidence conventions of the core track apply here as well.
 What it adds: a reproducible local server, cheap baseline comparisons, and the scripted and destructive scenarios that would be unsafe
 or impossible on the live MMO (killing the colony's creeps, scripted attackers, dummy bases).
 
-"Private-server run" means screeps-launcher (or equivalent) with the result captured through `npm run console` and `npm run stats`
-into `logs/`. Deploy to the private server only when the user asks (CLAUDE.md).
+"Private-server run" means screeps-launcher (or equivalent) with the result captured into `logs/` by a deploy and capture path that
+PS1 chooses (the API tools were dropped, ADR-021). Deploy to the private server only when the user asks (CLAUDE.md).
 
 ---
 
@@ -18,7 +18,7 @@ Modules:
 - screeps-launcher pinned to `v1.17.0` (Docker image or release binary, VERIFICATION_LOG V59). `nodeVersion` pinned to an exact
   `vX.Y.Z` string so runs are reproducible (V61). Docker commands always ask first.
 - `config.yml`, mods, world reset and the bot user, written up in `docs/TEST_PLAN.md` §3 so the setup can be rebuilt from scratch.
-- A `private` server profile in `config.rs` and `docs/TUNING.md`, and a `private` server entry that the user adds to their `.screeps.yaml` (format: VERIFICATION_LOG V93).
+- A `private` server profile in `config.rs` and `docs/TUNING.md`, and the deploy and capture path into `logs/` for the private server, chosen here in an ADR (there are no API tools, ADR-021; a `private` entry in `.screeps.yaml`, format V93, only if that path reads one).
   The profile handles an unlimited CPU setting, where `Game.cpu.limit` and `bucket` read `Infinity` (V37).
 - Feature probe on the private server, with results in VERIFICATION_LOG section D. Re-check ADR-002 and ADR-008 against them.
 - Cold-start cost measured on the private server, and the `private` profile's boot gate set from it.

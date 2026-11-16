@@ -315,7 +315,7 @@ Current state (P1.10; the manager and the frame are P1.9, ADR-004):
 |---|---|---|---|---|
 | 97 (`PersistConfig::config_segment`) | runtime config overrides (`config::overrides`) | frame kind 2, schema 1; payload ASCII `key=value\n` lines in field order | after a console change, on the next tick that runs the Standard tier | once per global: requested at the start, looked up on the first loop, read on the next after the activation |
 | 98 (`PersistConfig::self_test_segment`) | the self-test (`rustedscreep.persistTest`) | frame kind 1, a test pattern | on the tick after the command | on the tick after the write |
-| 99 (`ProfilerConfig::stats_segment`) | the profiler (`profiler` builds) | JSON, format v1 (`profiler/text.rs`) | once per 1000-loop window, without activation | never by the bot (`npm run stats`); the manager reserves it |
+| 99 (`ProfilerConfig::stats_segment`) | the profiler (`profiler` builds) | JSON, format v1 (`profiler/text.rs`) | once per 1000-loop window, without activation | never by the bot (read in the console, TEST_PLAN §8); the manager reserves it |
 
 - Frame (ADR-004): `rs1b` + base64 of a 16-byte header (kind, schema, write tick, length, CRC-32) and the payload. Every decode
   failure is an error the owner answers by rebuilding: for the config record, the profile's values apply (an empty segment means no

@@ -49,7 +49,7 @@ The live server's constants are the ground truth for that server. At init, the b
 - `crates/rustedscreep-consts` is the constants facade. Besides `rustedscreep-wasm`, it is the only crate that may name `screeps::`, and only for constants and pure local types.
 - `crates/rustedscreep-core` holds all decision logic in pure, deterministic Rust that is testable natively. It has no JS dependencies. It covers the scheduler, planner, economy, spawning, logistics, defense, offense (combat sim, formations, breaker solver), expansion, movement (flow fields, BFS, A*), market policy, profiling math, and util. Criterion benches live here.
 - `crates/rustedscreep-wasm` is the `cdylib`. It handles the snapshot (JS → Rust), the act step (Rust → intents), persistence (RawMemory), the profiler, and the exported `loop`. It is the only crate that uses `wasm-bindgen`, `js-sys`, or game-object APIs.
-- `js/` is the TypeScript loader and tools only. It handles bucket-gated compile/instantiate, calling `loop`, trap/panic recovery, and the deploy, console, and stats scripts. It contains no game logic.
+- `js/` is the TypeScript loader and tools only. It handles bucket-gated compile/instantiate, calling `loop`, trap/panic recovery, and the build, stage, size, check and sandbox tools (no API tools, ADR-021). It contains no game logic.
 - Each tick runs **snapshot → decide → act**:
   - The snapshot makes one pass over game objects into Rust-native SoA structs with numeric handles.
   - Decisions are pure Rust.
@@ -71,7 +71,7 @@ The live server's constants are the ground truth for that server. At init, the b
   - Keep the tick path off `Memory`: never read it for state. The only writes undo `spawnCreep`'s `Memory.creeps[name]` entry and reset a `Memory` that does not parse (ADR-018, ADR-019).
   - Missing or corrupt data triggers a rebuild, never a crash.
 
-## Commands (P1 created most of these; the API tools come in P2, ADR-017; update this table if they change)
+## Commands (P1 and P2 created these; there are no API tools, ADR-021; update this table if they change)
 | Purpose | Command |
 |---|---|
 | Native tests (pure logic) | `cargo test -p rustedscreep-core -p rustedscreep-consts` |
@@ -94,8 +94,6 @@ The live server's constants are the ground truth for that server. At init, the b
 | Tool tests (Node) / sizes and upload budget | `npm run test` / `npm run size` |
 | Full gate (same as `/check`) | `npm run check` |
 | Stage the MMO deploy folder for the GitHub link (ask first; the user pushes) | `npm run stage` (`-- --out <dir>` for a dry run, `-- --features trap-test` for the gate's recovery test, `-- --features profiler` for the live CPU measurements) |
-| Deploy through the API (ask first; private, season, or the ADR-012 fallback; not written yet: P2, ADR-017; needs Node 22/24) | `npm run deploy -- --server <name> [--dryrun]` |
-| Capture console / profiler stats to `logs/` (not written yet: P2, ADR-017; needs Node 22/24) | `npm run console -- --server <name>` / `npm run stats -- --server <name>` |
 
 ## Workflow
 - Start with `/kickoff` (P0). Then run `/module` repeatedly. With no argument it takes the next item in STATUS and ROADMAP. Close each phase with `/phase-gate <P#|PS#|SE#>`.
