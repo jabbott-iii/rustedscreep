@@ -805,6 +805,10 @@ function __wbg_get_imports() {
             const ret = arg0.harvest(arg1);
             return ret;
         }, arguments); },
+        __wbg_has_2c4d5cf25ec8c1cf: function() { return handleError(function (arg0, arg1) {
+            const ret = Reflect.has(arg0, arg1);
+            return ret;
+        }, arguments); },
         __wbg_heal_d2bc1a58d75e2495: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.heal(arg1);
             return ret;
@@ -833,6 +837,10 @@ function __wbg_get_imports() {
             const ret = arg0.pos;
             return ret;
         },
+        __wbg_keys_e730aa5b1a04c9c6: function() { return handleError(function (arg0) {
+            const ret = Object.keys(arg0);
+            return ret;
+        }, arguments); },
         __wbg_keys_ebebf2dd9d489a7e: function() { return handleError(function (arg0) {
             const ret = Object.keys(arg0);
             return ret;
@@ -1989,7 +1997,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"83dbcc549b05-eab3fade","wasmCrc32":"eab3fade","features":[]});
+const BUILD = ({"id":"872f9901e804-d66d09d2+profiler","wasmCrc32":"d66d09d2","features":["profiler"]});
 const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;
