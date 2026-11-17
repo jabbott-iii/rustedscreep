@@ -40,5 +40,5 @@ List every game rule or number the module depends on. Run `/verify` for any that
 ## 5. Post-summary and record
 - Done, stubbed (with reason), and test next.
 - Files changed. Checks run with their results. Checks not run and why. Assumptions. Residual risks.
-- Add one log line to `docs/STATUS.md` with the evidence and tick the item.
+- Add one log line to `docs/STATUS.md` with the evidence and tick the item there and in its track's roadmap.
 - Offer a commit message (`/commit-msg`). Never commit.

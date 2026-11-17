@@ -17,8 +17,9 @@ disable-model-invocation: true
    Any fail or "not evaluated" means the gate is **not passed**.
 4. Measured numbers (CPU per tick per subsystem, bucket trend, wasm and bundle size, cold-start cost, throughput) go into
    STATUS.md. Where a comparison against the naive baseline is part of the criteria, record both sides and the method.
-5. If the gate passes, tick the phase in STATUS.md. For a core phase (P#), set the next core phase as current and suggest starting a
+5. If the gate passes, tick the phase in STATUS.md, and in its track's roadmap tick the gate's criteria and add the pass date to its
+   **Gate:** line. For a core phase (P#), set the next core phase as current and suggest starting a
    fresh session (`/clear`) for it. For an optional-track phase (PS#, SE#), tick only its entry under "Optional tracks" (for PS3, the
-   scenario's own entry) and leave the core's current phase and checklist unchanged. If the gate fails, list the blocking items as
+   scenario's own entry, and in the roadmap the scenario's box, since PS3's gate criteria have none) and leave the core's current phase and checklist unchanged. If the gate fails, list the blocking items as
    STATUS checklist entries (core) or under the optional phase's entry (PS#, SE#).
 6. Offer a commit message (`/commit-msg`).
