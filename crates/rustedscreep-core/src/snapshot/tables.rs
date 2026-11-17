@@ -388,6 +388,61 @@ impl Spawns {
     }
 }
 
+/// The bot's own links this tick (P3.2), one row per link in `Game.structures`: its handle, its row
+/// in [`Structures`], the energy it holds (`store.getUsedCapacity(RESOURCE_ENERGY)`) and its
+/// `cooldown`, both read every tick.
+#[derive(Default)]
+pub struct Links {
+    structure: Vec<StructureHandle>,
+    row: Vec<u32>,
+    energy: Vec<u32>,
+    cooldown: Vec<u32>,
+}
+
+impl Links {
+    pub(super) fn begin(&mut self) {
+        self.structure.clear();
+        self.row.clear();
+        self.energy.clear();
+        self.cooldown.clear();
+    }
+
+    /// Adds a link: its handle, its row in this tick's [`Structures`], its energy and its cooldown.
+    pub fn push(&mut self, structure: StructureHandle, row: u32, energy: u32, cooldown: u32) {
+        self.structure.push(structure);
+        self.row.push(row);
+        self.energy.push(energy);
+        self.cooldown.push(cooldown);
+    }
+
+    pub fn len(&self) -> usize {
+        self.structure.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.structure.is_empty()
+    }
+
+    pub fn handles(&self) -> &[StructureHandle] {
+        &self.structure
+    }
+
+    /// Each link's row in this tick's [`Structures`] columns.
+    pub fn rows(&self) -> &[u32] {
+        &self.row
+    }
+
+    /// Unit: energy.
+    pub fn energy(&self) -> &[u32] {
+        &self.energy
+    }
+
+    /// Unit: ticks.
+    pub fn cooldowns(&self) -> &[u32] {
+        &self.cooldown
+    }
+}
+
 /// What never changes for a structure: read from JS once, when the structure is first seen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StructureStatic {

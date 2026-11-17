@@ -15,11 +15,20 @@
 //! dies `CREEP_LIFE_TIME` ticks after it is born and leaves a tombstone with its store (V194, the
 //! body reclaim left out: about 0 at old age); piles lose `ceil(amount / ENERGY_DECAY)` a tick and
 //! merge on a tile (V193). Moves follow V51, V52 and the fatigue rules (V54, V55) on plain terrain.
+//! The game side accepts the bot's plan and the processor then runs each creep's intents in its own
+//! order (`creepActions`, V45), creep by creep, so a transfer lands before a harvest.
 //! Containers (P3.1, ADR-023): energy made on a tile (a harvest's overflow, a decayed tombstone)
 //! goes into a container there first, up to `CONTAINER_CAPACITY`, and the rest onto a pile (V193);
 //! `withdraw` takes from one (V192); a finished container site becomes one; a container refuses
-//! another site on its tile (V205). Their decay is left out (`CONTAINER_DECAY` per
-//! `CONTAINER_DECAY_TIME_OWNED` leaves a new one 25000 ticks, beyond every scenario here).
+//! another site on its tile (V205). Their decay is left out (a new one lasts about 24550 ticks
+//! unrepaired in an owned room, V214, beyond every scenario here).
+//! Links (P3.2, ADR-024): a finished link site becomes a link holding up to `LINK_CAPACITY`; a
+//! creep's transfer into one moves `min(stock, free space)` and `withdraw` takes `min(free space,
+//! energy)`, refused when it is empty (V220); a send is checked against the tick's start (cooldown,
+//! energy, the receiver's room; V216), then clamped to the receiver's room, which gets the amount
+//! less [`link_loss`], and the sender's cooldown becomes `LINK_COOLDOWN` per tile of range, counted
+//! down at the end of every tick (V217). Sends run after the creep intents, so a withdraw sees the
+//! link's energy at the tick's start, as the game side computes it.
 
 use super::placement::{
     CONTROLLER_CLEAR, EDGE_MARGIN, Placement, SPAWN_CLEAR, extensions_in, next_extension,
@@ -30,7 +39,8 @@ use super::sizing::{
 };
 use super::*;
 use crate::config::{
-    CACHE_MMO, MINING_MMO, MMO, MOVEMENT_MMO, MiningConfig, OPENING_MMO, OpeningConfig, SPAWN_MMO,
+    CACHE_MMO, LINK_MMO, LinkConfig, MINING_MMO, MMO, MOVEMENT_MMO, MiningConfig, OPENING_MMO,
+    OpeningConfig, SPAWN_MMO,
 };
 use crate::intents::{ActLog, CreepIntent, IntentBuffer, Outcome, Target, TargetRow};
 use crate::movement::{
@@ -44,11 +54,12 @@ use crate::snapshot::{
 use crate::spawning::{Body, Identity, Role, Spawner, WORKER_PATTERN};
 use rustedscreep_consts::{
     BUILD_POWER, CARRY_CAPACITY, CONTAINER_CAPACITY, CONTROLLER_DOWNGRADE_RESTORE, CREEP_LIFE_TIME,
-    ENERGY_DECAY, ENERGY_REGEN_TIME, ErrorCode, HARVEST_POWER, MAX_CREEP_SIZE, MOVE_COST_PLAIN,
-    MOVE_COST_ROAD, MOVE_COST_SWAMP, MOVE_POWER, Part, Position, RoomCoordinate, RoomName,
-    SOURCE_ENERGY_CAPACITY, SOURCE_ENERGY_KEEPER_CAPACITY, SOURCE_ENERGY_NEUTRAL_CAPACITY,
-    SPAWN_ENERGY_CAPACITY, SPAWN_ENERGY_START, StructureType, TOMBSTONE_DECAY_PER_PART, Terrain,
-    UPGRADE_CONTROLLER_POWER, controller_downgrade, controller_levels, extension_energy_capacity,
+    ENERGY_DECAY, ENERGY_REGEN_TIME, ErrorCode, HARVEST_POWER, LINK_CAPACITY, LINK_COOLDOWN,
+    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, MOVE_POWER, Part, Position,
+    RoomCoordinate, RoomName, SOURCE_ENERGY_CAPACITY, SOURCE_ENERGY_KEEPER_CAPACITY,
+    SOURCE_ENERGY_NEUTRAL_CAPACITY, SPAWN_ENERGY_CAPACITY, SPAWN_ENERGY_START, StructureType,
+    TOMBSTONE_DECAY_PER_PART, Terrain, UPGRADE_CONTROLLER_POWER, controller_downgrade,
+    controller_levels, extension_energy_capacity,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -532,6 +543,15 @@ struct SimStore {
     at: Tile,
     energy: u32,
     capacity: u32,
+    /// A link's cooldown (P3.2); 0 for the others.
+    cooldown: u32,
+}
+
+impl SimStore {
+    /// Spawns and extensions: what `Room.energyAvailable` sums and spawning drains (V173, V175).
+    fn spawn_energy(&self) -> bool {
+        matches!(self.kind, StructureType::Spawn | StructureType::Extension)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -619,10 +639,30 @@ struct World {
     placement: Placement,
     cfg: OpeningConfig,
     mining_cfg: MiningConfig,
-    /// Sites the bot's placement asked for: extensions accepted, containers accepted, refused by
-    /// the model.
+    link_cfg: LinkConfig,
+    /// Sites the bot's placement asked for: extensions accepted, containers accepted, links accepted
+    /// (in the order placed), refused by the model.
     placed: u32,
     placed_containers: u32,
+    placed_links: Vec<Tile>,
+    /// Link sends: accepted, refused, clamped by the processor to less than asked, and the energy
+    /// the receivers got; workers' takes from links.
+    sends: u32,
+    refused_sends: u32,
+    clamped_sends: u32,
+    received: u32,
+    link_takes: u32,
+    /// Each accepted send's sender.
+    senders: Vec<Tile>,
+    /// Orders dropped because a later order of the same tick came from the same link (the engine
+    /// keeps the last call per object, V34, V216); the tick and the sender of every order; tiles the
+    /// model refuses a site on; a tick before which every send is refused (`ERR_NOT_OWNER`).
+    dup_sends: u32,
+    orders_at: Vec<(u32, Tile)>,
+    refuse_tiles: Vec<Tile>,
+    refuse_sends_until: u32,
+    /// Billed intents and calls since the start (V34): creep intents, spawn orders, sites, sends.
+    billed: u64,
     refused_sites: u32,
     /// Whether the Standard tier runs (`opening work`); off, as below `standard_bucket_min`.
     standard: bool,
@@ -695,8 +735,21 @@ impl World {
             placement: Placement::default(),
             cfg: OPENING_MMO,
             mining_cfg: MINING_MMO,
+            link_cfg: LINK_MMO,
             placed: 0,
             placed_containers: 0,
+            placed_links: Vec::new(),
+            sends: 0,
+            refused_sends: 0,
+            clamped_sends: 0,
+            received: 0,
+            link_takes: 0,
+            senders: Vec::new(),
+            dup_sends: 0,
+            orders_at: Vec::new(),
+            refuse_tiles: Vec::new(),
+            refuse_sends_until: 0,
+            billed: 0,
             refused_sites: 0,
             standard: true,
             drop_sites: false,
@@ -719,6 +772,7 @@ impl World {
             at: tile(25, 25),
             energy: spawn_energy,
             capacity: SPAWN_ENERGY_CAPACITY,
+            cooldown: 0,
         });
         w.add_extensions(0);
         for at in [tile(8, 30), tile(42, 20)] {
@@ -738,20 +792,22 @@ impl World {
         self.next_key
     }
 
-    /// Extensions up to the level's count, with the level's capacity, in a row at y 28 (the
-    /// first `from` already exist).
+    /// Extensions up to the level's count, with the level's capacity, in rows of ten from y 28,
+    /// two tiles apart (the first `from` already exist).
     fn add_extensions(&mut self, from: u32) {
         let rcl = u32::from(self.level);
         let n = StructureType::Extension.controller_structures(rcl);
         for i in from..n {
             let key = self.key();
-            let x = 15 + 2 * u8::try_from(i).expect("small");
+            let i = u8::try_from(i).expect("small");
+            let (x, y) = (15 + 2 * (i % 10), 28 + 2 * (i / 10));
             self.stores.push(SimStore {
                 key,
                 kind: StructureType::Extension,
-                at: tile(x, 28),
+                at: tile(x, y),
                 energy: 0,
                 capacity: extension_energy_capacity(rcl),
+                cooldown: 0,
             });
         }
         for s in &mut self.stores {
@@ -770,9 +826,10 @@ impl World {
     }
 
     fn room_energy(&self) -> RoomEnergy {
+        let stores = || self.stores.iter().filter(|s| s.spawn_energy());
         RoomEnergy {
-            available: self.stores.iter().map(|s| s.energy).sum(),
-            capacity: self.stores.iter().map(|s| s.capacity).sum(),
+            available: stores().map(|s| s.energy).sum(),
+            capacity: stores().map(|s| s.capacity).sum(),
         }
     }
 
@@ -863,7 +920,7 @@ impl World {
                 .push(ObjectKey(s.key), || Ok(StructureStatic { kind, pos }))
                 .expect("structure");
             let row = self.snap.structures.len() - 1;
-            if not_full {
+            if not_full && s.spawn_energy() {
                 self.snap
                     .structures
                     .set_free_energy(row, s.capacity - s.energy);
@@ -871,6 +928,9 @@ impl World {
             if kind == StructureType::Spawn {
                 let busy = self.creeps.iter().any(|c| c.spawning > 0);
                 self.snap.spawns.push(h, row as u32, busy);
+            }
+            if kind == StructureType::Link {
+                self.snap.links.push(h, row as u32, s.energy, s.cooldown);
             }
             self.struct_rows.push(StructRow::Store(i));
         }
@@ -947,12 +1007,14 @@ impl World {
         let mut commit = Commit::default();
         let cfg = self.cfg;
         let mining_cfg = self.mining_cfg;
+        let link_cfg = self.link_cfg;
         // The Critical `mining` job, then `opening` (rustedscreep-wasm's order).
         for unit in 0..self.mining.room_count() {
-            let cap = self
-                .mining
-                .room_name(unit)
-                .and_then(|room| self.opening.cap(room));
+            let room = self.mining.room_name(unit);
+            let cap = room.and_then(|room| self.opening.cap(room));
+            let refused = room.map_or(Vec::new(), |room| {
+                self.placement.refused_tiles(room).to_vec()
+            });
             self.mining
                 .plan_room(
                     unit,
@@ -961,8 +1023,10 @@ impl World {
                     &mut self.spawner,
                     &mut self.buffer,
                     &mining_cfg,
+                    &link_cfg,
                     &mcfg,
                     cap,
+                    &refused,
                     &mut commit,
                 )
                 .expect("mining");
@@ -970,6 +1034,7 @@ impl World {
         for unit in 0..self.opening.room_count() {
             let room = self.opening.room_name(unit).expect("room");
             let mined = self.mining.mined(room).to_vec();
+            let receivers = self.mining.receivers(room).to_vec();
             self.opening
                 .plan_room(
                     unit,
@@ -980,6 +1045,7 @@ impl World {
                     &cfg,
                     &mcfg,
                     &mined,
+                    &receivers,
                     &mut commit,
                 )
                 .expect("plan");
@@ -1001,12 +1067,19 @@ impl World {
                 )
                 .expect("work");
         }
-        // The Optional placement job (ADR-020, ADR-023).
+        // The Standard `links` job (P3.2).
+        for unit in 0..self.mining.send_count() * u32::from(self.standard) {
+            self.mining
+                .send_room(unit, &link_cfg, &mut commit)
+                .expect("links");
+        }
+        // The Optional placement job (ADR-020, ADR-023, ADR-024).
         self.placement.begin(&self.snap);
-        if cfg.place_extensions || mining_cfg.place_containers {
+        if cfg.place_extensions || mining_cfg.place_containers || link_cfg.place_links {
             for unit in 0..self.placement.room_count() {
                 let room = self.placement.room_name(unit).expect("room");
                 let containers = self.mining.container_needs(room).to_vec();
+                let links = self.mining.link_needs(room).to_vec();
                 self.placement
                     .plan_room(
                         unit,
@@ -1015,6 +1088,7 @@ impl World {
                         &mcfg,
                         cfg.place_extensions,
                         &containers,
+                        &links,
                         &mut commit,
                     )
                     .expect("placement");
@@ -1037,24 +1111,53 @@ impl World {
             let outcome = self.create_site(order.tile, order.kind);
             self.placement.record(i, outcome);
         }
+        let start: Vec<(u32, u32)> = self.stores.iter().map(|s| (s.energy, s.cooldown)).collect();
         let mut dest: Vec<Option<Tile>> = vec![None; self.creeps.len()];
         let mut upgraded = false;
         let mut log = ActLog::default();
         let mut buffer = std::mem::take(&mut self.buffer);
+        // The game side accepts the plan; the processor then runs each creep's intents in its own
+        // order (`creepActions`, V45: transfer before harvest), creep by creep.
+        let mut issued = Vec::new();
         buffer.issue(&mut log, |issue| {
-            let outcome = self.apply(
-                issue.actor as usize,
-                issue.target,
-                issue.intent,
-                &mut dest,
-                &mut upgraded,
-            );
+            issued.push((issue.actor as usize, issue.target, issue.intent));
+            Some(Outcome::Ok)
+        });
+        issued.sort_by_key(|&(actor, _, intent)| (actor, intent.action() as u8));
+        for (actor, target, intent) in issued {
+            let outcome = self.apply(actor, target, intent, &mut dest, &mut upgraded);
             if !outcome.recorded() {
                 self.failed += 1;
             }
-            Some(outcome)
-        });
+        }
         self.buffer = buffer;
+        self.billed += u64::from(log.issues().billed);
+        // The link sends, against the links as they were at the tick's start; of two calls from one
+        // link the engine keeps the last (V34, V216).
+        let orders = self.mining.link_orders().to_vec();
+        for (i, &order) in orders.iter().enumerate() {
+            if orders[i + 1..].iter().any(|o| o.from_row == order.from_row) {
+                self.dup_sends += 1;
+                continue;
+            }
+            let at = match self.struct_rows[order.from_row as usize] {
+                StructRow::Store(k) => self.stores[k].at,
+                StructRow::Controller => self.controller_at,
+            };
+            self.orders_at.push((self.time, at));
+            let outcome = if self.time < self.refuse_sends_until {
+                Outcome::Failed(ErrorCode::NotOwner)
+            } else {
+                self.send(order, &start)
+            };
+            if outcome == Outcome::Ok {
+                self.billed += 1;
+            }
+            if !outcome.recorded() {
+                self.refused_sends += 1;
+            }
+            self.mining.record_send(i, outcome, &link_cfg);
+        }
         self.movement.moves_refused(&self.snap, Vec::new(), &mcfg);
         self.resolve_moves(&dest);
         self.end_of_tick(upgraded);
@@ -1071,7 +1174,10 @@ impl World {
                 .iter()
                 .any(|l| matches!(*l, Loose::Container { at, .. } if at == t))
         };
-        let taken = self.blocked(at) || self.sites.iter().any(|s| s.at == at) || container_at(at);
+        let taken = self.blocked(at)
+            || self.sites.iter().any(|s| s.at == at)
+            || container_at(at)
+            || self.refuse_tiles.contains(&at);
         let containers = self
             .loose
             .iter()
@@ -1091,6 +1197,8 @@ impl World {
         }
         if kind == StructureType::Container {
             self.placed_containers += 1;
+        } else if kind == StructureType::Link {
+            self.placed_links.push(at);
         } else {
             self.placed += 1;
         }
@@ -1118,7 +1226,7 @@ impl World {
             return Outcome::Failed(ErrorCode::NotEnough);
         }
         let mut left = cost;
-        for s in &mut self.stores {
+        for s in self.stores.iter_mut().filter(|s| s.spawn_energy()) {
             let take = s.energy.min(left);
             s.energy -= take;
             left -= take;
@@ -1202,6 +1310,27 @@ impl World {
                 self.creeps[actor].energy -= amount;
                 Outcome::Ok
             }
+            (CreepIntent::Withdraw { .. }, Some(TargetRow::Structure(row))) => {
+                let StructRow::Store(i) = self.struct_rows[row as usize] else {
+                    return fail;
+                };
+                let s = &mut self.stores[i];
+                if !near(c.at, s.at, 1) {
+                    return Outcome::Failed(ErrorCode::NotInRange);
+                }
+                let free = c.capacity() - c.energy;
+                if free == 0 {
+                    return Outcome::Failed(ErrorCode::Full);
+                }
+                if s.energy == 0 {
+                    return Outcome::Failed(ErrorCode::NotEnough);
+                }
+                let amount = s.energy.min(free);
+                s.energy -= amount;
+                self.creeps[actor].energy += amount;
+                self.link_takes += 1;
+                Outcome::Ok
+            }
             (CreepIntent::UpgradeController { .. }, Some(TargetRow::Structure(_))) => {
                 if !near(c.at, self.controller_at, 3) || c.energy == 0 {
                     return Outcome::Failed(ErrorCode::NotInRange);
@@ -1258,6 +1387,68 @@ impl World {
             }
             other => panic!("the opening queued {other:?}"),
         }
+    }
+
+    /// `transferEnergy(target, amount)`: the game side's checks on the tick's start (`start`, each
+    /// store's energy and cooldown; V216), then links/transfer.js (V217).
+    fn send(&mut self, order: LinkOrder, start: &[(u32, u32)]) -> Outcome {
+        let row = |r: u32| match self.struct_rows[r as usize] {
+            StructRow::Store(i) => Some(i),
+            StructRow::Controller => None,
+        };
+        let (Some(from), Some(to)) = (row(order.from_row), row(order.to_row)) else {
+            return Outcome::Failed(ErrorCode::InvalidTarget);
+        };
+        let link = |i: usize| self.stores[i].kind == StructureType::Link;
+        if from == to || !link(from) || !link(to) {
+            return Outcome::Failed(ErrorCode::InvalidTarget);
+        }
+        let (energy, cooldown) = start[from];
+        let (target, _) = start[to];
+        if cooldown > 0 {
+            return Outcome::Failed(ErrorCode::Tired);
+        }
+        // `checkStructureAgainstController` (V218): the level's count of links nearest the
+        // controller stay active, ties in the engine's object order (here the world's).
+        let allowed = StructureType::Link.controller_structures(u32::from(self.level)) as usize;
+        let d = |i: usize| self.stores[i].at.range(self.controller_at);
+        let ahead = (0..self.stores.len())
+            .filter(|&i| i != from && link(i) && (d(i) < d(from) || (d(i) == d(from) && i < from)))
+            .count();
+        if ahead >= allowed {
+            return Outcome::Failed(ErrorCode::RclNotEnough);
+        }
+        if energy == 0 || energy < order.amount {
+            return Outcome::Failed(ErrorCode::NotEnough);
+        }
+        if target + order.amount > LINK_CAPACITY {
+            return Outcome::Failed(ErrorCode::Full);
+        }
+        // The processor: clamp to the receiver's room now, the loss off what arrives.
+        let room = LINK_CAPACITY - self.stores[to].energy;
+        if room == 0 {
+            return Outcome::Ok;
+        }
+        assert!(
+            order.amount >= self.link_cfg.send_min,
+            "a send below send_min"
+        );
+        let amount = order.amount.min(room).min(self.stores[from].energy);
+        if amount < order.amount {
+            self.clamped_sends += 1;
+        }
+        let lost = link_loss(amount);
+        self.stores[to].energy += amount - lost;
+        self.stores[from].energy -= amount;
+        let dist = u32::from(self.stores[from].at.range(self.stores[to].at));
+        self.stores[from].cooldown += LINK_COOLDOWN * dist;
+        self.sends += 1;
+        self.received += amount - lost;
+        let at = self.stores[from].at;
+        if !self.senders.contains(&at) {
+            self.senders.push(at);
+        }
+        Outcome::Ok
     }
 
     fn drop_at(&mut self, at: Tile, amount: u32) {
@@ -1390,13 +1581,22 @@ impl World {
                 continue;
             }
             let rcl = u32::from(self.level);
+            let capacity = match s.kind {
+                StructureType::Link => LINK_CAPACITY,
+                _ => extension_energy_capacity(rcl),
+            };
             self.stores.push(SimStore {
                 key: s.key,
                 kind: s.kind,
                 at: s.at,
                 energy: 0,
-                capacity: extension_energy_capacity(rcl),
+                capacity,
+                cooldown: 0,
             });
+        }
+        // Links' cooldowns (links/tick.js, after the intents).
+        for s in &mut self.stores {
+            s.cooldown = s.cooldown.saturating_sub(1);
         }
         // Sources (sources/tick.js).
         for (i, s) in self.sources.iter_mut().enumerate() {
@@ -2465,4 +2665,407 @@ fn neighbouring_sources_get_their_own_mining_tiles() {
     assert_ne!(tiles[0], tiles[1], "{tiles:?}");
     assert!(tiles.contains(&tile(25, 29)));
     assert_eq!(stats.mined as usize, w.sources.len());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The link network (P3.2, ADR-024)
+
+/// links/transfer.js L46 at a90d26f takes `Math.ceil(amount * C.LINK_LOSS_RATIO)` with the engine's
+/// double, 0.03 (engine common constants.js; a pinned value from that source, V134, V217). Over every
+/// amount one send can move, [`link_loss`] from the crate's f32 constant gives the same.
+#[test]
+fn link_loss_matches_the_engines_double() {
+    let engine = 0.03_f64;
+    assert_eq!(engine as f32, rustedscreep_consts::LINK_LOSS_RATIO);
+    for amount in 1..=LINK_CAPACITY {
+        assert_eq!(
+            link_loss(amount),
+            (f64::from(amount) * engine).ceil() as u32,
+            "{amount}"
+        );
+        assert!(link_loss(amount) >= 1 && link_loss(amount) < amount.max(2));
+    }
+    assert_eq!(link_loss(0), 0);
+}
+
+/// A linked miner's body (P3.2) is the plain miner's plus one CARRY: an empty CARRY makes no
+/// fatigue (V54), so whenever the CARRY's cost fits, the WORK and MOVE parts are the same; when it
+/// does not, it has no more MOVE parts, and never a body where the plain miner has none.
+#[test]
+fn a_linked_miner_adds_one_carry() {
+    let carry = Part::Carry.cost();
+    for capacity in [
+        SOURCE_ENERGY_NEUTRAL_CAPACITY,
+        SOURCE_ENERGY_CAPACITY,
+        SOURCE_ENERGY_KEEPER_CAPACITY,
+    ] {
+        for tiles in [1, 4, 8, 20, 45] {
+            for cost in [tiles, MOVE_COST_PLAIN * tiles, MOVE_COST_SWAMP * tiles] {
+                let trip = Trip { tiles, cost };
+                for energy in (300..=12_900).step_by(50) {
+                    let plain = miner_body(capacity, trip, energy);
+                    let linked = super::sizing::miner_body_with(capacity, trip, energy, 1);
+                    match (plain, linked) {
+                        (Some(p), Some(l)) => {
+                            assert_eq!(count(&l, Part::Carry), 1);
+                            assert_eq!(count(&l, Part::Work), count(&p, Part::Work));
+                            assert!(l.cost() <= energy && l.len() <= MAX_CREEP_SIZE as usize);
+                            if p.cost() + carry <= energy && p.len() < MAX_CREEP_SIZE as usize {
+                                assert_eq!(count(&l, Part::Move), count(&p, Part::Move));
+                                assert_eq!(l.cost(), p.cost() + carry);
+                            } else {
+                                assert!(count(&l, Part::Move) <= count(&p, Part::Move));
+                            }
+                        }
+                        (None, Some(l)) => panic!("linked {l:?} where the plain miner has none"),
+                        (Some(p), None) => assert!(
+                            count(&p, Part::Work) * Part::Work.cost() + carry + Part::Move.cost()
+                                > energy
+                        ),
+                        (None, None) => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The mining plan of room `w` (after a run).
+fn mine_plan(w: &World) -> MinePlan {
+    w.mining
+        .room_states()
+        .next()
+        .and_then(|(_, p, _)| p.cloned())
+        .expect("plan")
+}
+
+/// ADR-024's tiles in the scenario room at RCL5: the controller link 2 from the controller, each
+/// source link next to its mining tile, all inside the margin, off the mining tiles and each other,
+/// and none closes a way (its free neighbours stay connected); then the sites go in order, the
+/// controller link first and the farthest source's next, as many as the level allows
+/// (`CONTROLLER_STRUCTURES`) and `links.source_links` leaves.
+#[test]
+fn links_are_planned_and_placed_by_the_rules() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.run(3);
+    let plan = mine_plan(&w);
+    let controller = w.pos(w.controller_at);
+    let c = plan.controller_link.expect("a controller link tile");
+    assert_eq!(
+        c.x()
+            .u8()
+            .abs_diff(controller.x().u8())
+            .max(c.y().u8().abs_diff(controller.y().u8())),
+        CONTROLLER_LINK_RANGE
+    );
+    let high = rustedscreep_consts::ROOM_SIZE - 1 - LINK_MARGIN;
+    let mining: Vec<Tile> = plan
+        .sources
+        .iter()
+        .filter_map(|s| s.tile.map(tile_of))
+        .collect();
+    let mut links = vec![tile_of(c)];
+    for s in &plan.sources {
+        let (Some(t), Some(l)) = (s.tile, s.link) else {
+            panic!("source {s:?} has no link tile");
+        };
+        assert_eq!(tile_of(l).range(tile_of(t)), 1, "next to the mining tile");
+        links.push(tile_of(l));
+    }
+    for (i, &l) in links.iter().enumerate() {
+        assert!((LINK_MARGIN..=high).contains(&l.x()) && (LINK_MARGIN..=high).contains(&l.y()));
+        assert!(!mining.contains(&l), "{l:?} is a mining tile");
+        assert!(!links[..i].contains(&l), "{l:?} twice");
+        assert!(!w.blocked(l));
+        let others: Vec<Tile> = links.iter().copied().filter(|&o| o != l).collect();
+        assert!(super::placement::keeps_neighbours_connected(l, |n| {
+            w.blocked(n) || others.contains(&n)
+        }));
+    }
+    w.run(3000);
+    let allowed = StructureType::Link.controller_structures(5) as usize;
+    let want = allowed.min(1 + LINK_MMO.source_links as usize);
+    assert_eq!(w.placed_links.len(), want, "{:?}", w.placed_links);
+    assert_eq!(w.placed_links[0], tile_of(c), "the controller link first");
+    let farthest = plan
+        .sources
+        .iter()
+        .max_by_key(|s| {
+            (
+                s.trip.map_or(0, |t| t.cost),
+                std::cmp::Reverse(tile_key_of(s.source)),
+            )
+        })
+        .and_then(|s| s.link)
+        .expect("a source link");
+    assert_eq!(
+        w.placed_links[1],
+        tile_of(farthest),
+        "then the farthest source's"
+    );
+    assert_eq!(w.refused_sites, 0);
+}
+
+fn tile_key_of(p: Position) -> (u8, u8) {
+    (p.x().u8(), p.y().u8())
+}
+
+/// The network at RCL5 (ADR-024), over four miner lives: both links stand, the linked source's
+/// next miner carries one CARRY part, its harvest goes miner → source link → controller link →
+/// workers, every send moves at least `links.send_min` and loses [`link_loss`] of it, none is
+/// refused or clamped (each fits the receiver's room at the tick's start, V216, V217), no intent
+/// fails, and the sends keep going to the end (a controller link no send fits is drained, so the
+/// pipe never stalls).
+#[test]
+fn links_carry_a_sources_energy_to_the_controller() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.run(4 * CREEP_LIFE_TIME);
+    let links = w
+        .stores
+        .iter()
+        .filter(|s| s.kind == StructureType::Link)
+        .count();
+    assert_eq!(links, 2);
+    assert!(
+        w.spawned.iter().any(|(_, b)| count(b, Part::Carry) == 1
+            && count(b, Part::Work) == miner_work(SOURCE_ENERGY_CAPACITY)),
+        "a linked miner"
+    );
+    let totals = *w.mining.link_totals();
+    assert!(w.sends > 0 && totals.sent == w.sends && totals.failed == 0);
+    assert_eq!(w.refused_sends, 0);
+    assert_eq!(w.clamped_sends, 0);
+    assert_eq!(w.dup_sends, 0);
+    assert_eq!(w.failed, 0);
+    assert!(w.link_takes > 0, "workers take from the controller link");
+    // What arrived is what was sent less the loss of each send.
+    assert!(
+        u64::from(w.received) < totals.energy && u64::from(w.received) * 100 >= totals.energy * 96
+    );
+    let before = w.sends;
+    w.run(CREEP_LIFE_TIME);
+    assert!(w.sends > before, "the sends go on");
+    assert_eq!(w.failed, 0);
+}
+
+/// Upgrade progress from tick 6000 to 18000 of a room that starts at the level, with the defaults
+/// (`LINK_MMO`) or with the network off.
+fn steady_progress(level: u8, links: LinkConfig) -> (u32, u64) {
+    let mut w = World::new(level, SPAWN_ENERGY_CAPACITY);
+    w.link_cfg = links;
+    w.run(6000);
+    let (p, b) = (w.progress, w.billed);
+    w.run(12_000);
+    assert_eq!(w.failed, 0);
+    (w.progress - p, w.billed - b)
+}
+
+/// The network pays at RCL5 and RCL6 in the scenario room (ADR-024 "As built"): more upgrade
+/// progress from tick 6000 to 18000 than with it off, for fewer billed intents. Measured
+/// 2026-11-16: RCL5 162285 against 154665 progress (+4.9%), 4.83 against 5.13 billed a tick; RCL6
+/// 164133 against 156211 (+5.1%), 4.32 against 4.50. Counted from tick 0, the links' build cost
+/// (`CONSTRUCTION_COST` 5000 each) is paid back by tick 24000 at RCL5 (286491 against 286604), not
+/// yet at RCL6 (279027 against 281219).
+#[test]
+fn links_raise_the_upgrade_rate() {
+    let off = LinkConfig {
+        enabled: false,
+        place_links: false,
+        ..LINK_MMO
+    };
+    for level in [5, 6] {
+        let (with, with_billed) = steady_progress(level, LINK_MMO);
+        let (without, without_billed) = steady_progress(level, off);
+        assert!(with > without, "RCL{level}: {with} against {without}");
+        assert!(
+            with_billed < without_billed,
+            "RCL{level}: {with_billed} against {without_billed}"
+        );
+    }
+}
+
+/// With `links.enabled` and `links.place_links` off, no link site is placed, no miner gets a
+/// CARRY part and nothing is sent.
+#[test]
+fn links_off_place_nothing_and_add_no_carry() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.link_cfg = LinkConfig {
+        enabled: false,
+        place_links: false,
+        ..LINK_MMO
+    };
+    w.run(2 * CREEP_LIFE_TIME);
+    assert!(w.placed_links.is_empty());
+    assert!(w.sites.iter().all(|s| s.kind != StructureType::Link));
+    assert!(w.spawned.iter().all(|(_, b)| count(b, Part::Carry) == 0
+        || count(b, Part::Work) != miner_work(SOURCE_ENERGY_CAPACITY)
+        || b.len() > 12));
+    assert_eq!(w.sends, 0);
+    assert!(w.mining.link_orders().is_empty());
+}
+
+/// Two source links into one controller link (RCL6, `links.source_links` 2): each tick's sends
+/// share the receiver's room at the tick's start, so none is refused or clamped, and both send.
+#[test]
+fn two_source_links_share_the_receivers_room() {
+    let mut w = World::new(6, SPAWN_ENERGY_CAPACITY);
+    w.link_cfg = LinkConfig {
+        source_links: 2,
+        ..LINK_MMO
+    };
+    w.run(4 * CREEP_LIFE_TIME);
+    assert_eq!(w.placed_links.len(), 3);
+    let plan = mine_plan(&w);
+    let senders: Vec<Tile> = plan
+        .sources
+        .iter()
+        .filter_map(|s| s.link.map(tile_of))
+        .collect();
+    assert_eq!(senders.len(), 2);
+    let sent: Vec<bool> = senders.iter().map(|t| w.senders.contains(t)).collect();
+    assert_eq!(sent, [true, true], "both source links send");
+    assert!(w.sends > 0);
+    assert_eq!(w.refused_sends, 0);
+    assert_eq!(w.clamped_sends, 0);
+    assert_eq!(w.dup_sends, 0);
+    assert_eq!(w.failed, 0);
+}
+
+/// Links past the level's count (V218): at RCL5, three links placed by hand (the planned tiles of
+/// the controller link and both source links), so the source link farther from the controller is
+/// inactive. The bot adopts all three, never orders a send from the inactive one (none is refused),
+/// and the active one sends; no miner fills the inactive one, and its source's miners get no CARRY
+/// part for it.
+#[test]
+fn an_inactive_link_never_sends() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.run(3);
+    let plan = mine_plan(&w);
+    let mut tiles = vec![tile_of(plan.controller_link.expect("controller link"))];
+    tiles.extend(plan.sources.iter().filter_map(|s| s.link.map(tile_of)));
+    assert_eq!(tiles.len(), 3);
+    for &at in &tiles {
+        let key = w.key();
+        w.stores.push(SimStore {
+            key,
+            kind: StructureType::Link,
+            at,
+            energy: 0,
+            capacity: LINK_CAPACITY,
+            cooldown: 0,
+        });
+    }
+    let (near, far) = tiles[1].min_by_range(tiles[2], w.controller_at);
+    w.run(4 * CREEP_LIFE_TIME);
+    assert!(w.placed_links.is_empty(), "the level's links stand already");
+    assert_eq!(w.refused_sends, 0);
+    assert!(w.senders.contains(&near), "the active source link sends");
+    assert!(!w.senders.contains(&far), "the inactive one never does");
+    let far_link = w.stores.iter().find(|s| s.at == far).expect("far link");
+    assert_eq!(far_link.energy, 0, "no miner fills an inactive link");
+    let plan = mine_plan(&w);
+    let far_source = plan
+        .sources
+        .iter()
+        .find(|s| s.tile.is_some_and(|t| tile_of(t).range(far) <= 1))
+        .expect("the far source");
+    assert_eq!(far_source.body.map(|b| count(&b, Part::Carry)), Some(0));
+    assert_eq!(w.dup_sends, 0);
+    assert_eq!(w.failed, 0);
+}
+
+/// One link next to two mining tiles (two sources three tiles apart, so both plan sources take the
+/// link the planner places between their tiles): it is one sender, so it gets at most one order a
+/// tick, and none is clamped (the reviewers' layout, 2026-11-16).
+#[test]
+fn a_link_two_mining_tiles_share_sends_once_a_tick() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.sources[0].at = tile(5, 5);
+    w.sources[1].at = tile(5, 8);
+    w.run(3);
+    let plan = mine_plan(&w);
+    let links: Vec<Option<Position>> = plan.sources.iter().map(|s| s.link).collect();
+    w.run(4 * CREEP_LIFE_TIME);
+    let plan = mine_plan(&w);
+    let shared = plan
+        .sources
+        .iter()
+        .filter_map(|s| s.link)
+        .collect::<Vec<_>>();
+    assert_eq!(shared.len(), 2);
+    assert_eq!(
+        shared[0], shared[1],
+        "both sources name one link (planned {links:?})"
+    );
+    assert!(w.sends > 0);
+    assert_eq!(w.dup_sends, 0, "one order a tick per link");
+    assert_eq!(w.clamped_sends, 0);
+    assert_eq!(w.refused_sends, 0);
+    assert_eq!(w.failed, 0);
+}
+
+/// A link tile the game refuses (here the planned controller link's) is never picked again: the
+/// plan takes another tile 2 from the controller, and both links the level allows are placed.
+#[test]
+fn a_refused_link_tile_is_not_picked_again() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.run(3);
+    let first = tile_of(mine_plan(&w).controller_link.expect("controller link"));
+    w.refuse_tiles.push(first);
+    w.run(3000);
+    let plan = mine_plan(&w);
+    let c = tile_of(plan.controller_link.expect("another controller link tile"));
+    assert_ne!(c, first);
+    assert_eq!(c.range(w.controller_at), CONTROLLER_LINK_RANGE);
+    assert_eq!(w.placed_links.len(), 2, "{:?}", w.placed_links);
+    assert_eq!(w.placed_links[0], c);
+    assert_eq!(w.refused_sites, 1, "one refusal, then another tile");
+}
+
+/// A send the game refuses holds its link for `links.hold_ticks`: no order from it until then.
+#[test]
+fn a_refused_send_holds_its_link() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.run(3 * CREEP_LIFE_TIME);
+    assert!(w.sends > 0, "the network runs");
+    let start = w.time;
+    w.refuse_sends_until = start + 2 * LINK_MMO.hold_ticks;
+    w.run(4 * LINK_MMO.hold_ticks);
+    let during: Vec<(u32, Tile)> = w
+        .orders_at
+        .iter()
+        .copied()
+        .filter(|o| o.0 >= start)
+        .collect();
+    assert!(!during.is_empty());
+    for pair in during.windows(2) {
+        if pair[0].1 == pair[1].1 && pair[0].0 < w.refuse_sends_until {
+            assert!(pair[1].0 - pair[0].0 >= LINK_MMO.hold_ticks, "{pair:?}");
+        }
+    }
+    assert!(
+        w.refused_sends >= 1 && w.refused_sends <= 2,
+        "{}",
+        w.refused_sends
+    );
+    assert!(
+        during.iter().any(|o| o.0 >= w.refuse_sends_until),
+        "it sends again after the hold"
+    );
+}
+
+trait NearerOf {
+    /// `(nearer, farther)` of two tiles by range to `to` (they must differ).
+    fn min_by_range(self, other: Tile, to: Tile) -> (Tile, Tile);
+}
+
+impl NearerOf for Tile {
+    fn min_by_range(self, other: Tile, to: Tile) -> (Tile, Tile) {
+        assert_ne!(self.range(to), other.range(to));
+        if self.range(to) < other.range(to) {
+            (self, other)
+        } else {
+            (other, self)
+        }
+    }
 }

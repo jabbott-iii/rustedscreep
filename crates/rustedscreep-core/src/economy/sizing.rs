@@ -142,15 +142,30 @@ pub fn miner_work(capacity: u32) -> u32 {
 /// Uses: `BODYPART_COST` (`Part::cost`), `ENERGY_REGEN_TIME`, `MAX_CREEP_SIZE`, [`miner_work`],
 /// [`walk_ticks`].
 pub fn miner_body(capacity: u32, trip: Trip, energy: u32) -> Option<Body> {
+    miner_body_with(capacity, trip, energy, 0)
+}
+
+/// A static miner's body as [`miner_body`] gives it, with `carry` CARRY parts between the WORK and
+/// the MOVE parts (P3.2: a miner beside a link holds its harvest and transfers it). An empty CARRY
+/// part makes no fatigue (V54), so the walk out and the MOVE count stay those of [`miner_body`];
+/// the CARRY parts add their cost and their share of `MAX_CREEP_SIZE`. `None` when the parts with
+/// one MOVE cost more than `energy` or pass `MAX_CREEP_SIZE`, or for an empty capacity.
+///
+/// Uses: `BODYPART_COST` (`Part::cost`), `ENERGY_REGEN_TIME`, `MAX_CREEP_SIZE`, [`miner_work`],
+/// [`walk_ticks`].
+pub fn miner_body_with(capacity: u32, trip: Trip, energy: u32, carry: u32) -> Option<Body> {
     let work = miner_work(capacity);
     if work == 0 {
         return None;
     }
-    let work_cost = Part::Work.cost().saturating_mul(work);
+    let fixed = Part::Work
+        .cost()
+        .saturating_mul(work)
+        .saturating_add(Part::Carry.cost().saturating_mul(carry));
     let move_cost = Part::Move.cost();
     let mut best: Option<(u64, u32)> = None;
-    for moves in 1..=MAX_CREEP_SIZE.saturating_sub(work) {
-        let cost = work_cost.saturating_add(move_cost.saturating_mul(moves));
+    for moves in 1..=MAX_CREEP_SIZE.saturating_sub(work).saturating_sub(carry) {
+        let cost = fixed.saturating_add(move_cost.saturating_mul(moves));
         if cost > energy {
             break;
         }
@@ -167,9 +182,13 @@ pub fn miner_body(capacity: u32, trip: Trip, energy: u32) -> Option<Body> {
     }
     let (_, moves) = best?;
     let mut parts = [Part::Move; MAX_CREEP_SIZE as usize];
-    let len = usize::try_from(work.saturating_add(moves)).ok()?;
-    for part in parts.iter_mut().take(usize::try_from(work).ok()?) {
-        *part = Part::Work;
+    let work = usize::try_from(work).ok()?;
+    let carry = usize::try_from(carry).ok()?;
+    let len = work
+        .checked_add(carry)?
+        .checked_add(usize::try_from(moves).ok()?)?;
+    for (i, part) in parts.iter_mut().enumerate().take(work + carry) {
+        *part = if i < work { Part::Work } else { Part::Carry };
     }
     Body::new(parts.get(..len)?)
 }

@@ -21,7 +21,8 @@ pub mod overrides;
 use core::fmt;
 
 use rustedscreep_consts::{
-    CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP,
+    CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, LINK_CAPACITY, MOVE_COST_PLAIN, MOVE_COST_ROAD,
+    MOVE_COST_SWAMP,
 };
 
 /// How the loader recovers after a trap or an aborted tick (ADR-003).
@@ -451,6 +452,42 @@ pub const MINING_MMO: MiningConfig = MiningConfig {
     harvest_efficiency_pct: 95,
 };
 
+/// The link network's switches and send threshold (ROADMAP P3.2, ADR-024); `docs/TUNING.md` gives
+/// each one's rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkConfig {
+    /// Runs the network (`economy::mining`): a miner beside a built source link gets a CARRY part
+    /// and transfers its harvest into the link, and source links send to the controller link. Off,
+    /// new miners have no CARRY, no miner transfers and no link sends; workers still take from the
+    /// controller link.
+    pub enabled: bool,
+    /// Places link sites (ADR-024) in the Optional tier from the level that allows links: the
+    /// controller link, then a source link beside each mining tile, farthest source first. Off,
+    /// the network runs only links that are there already.
+    pub place_links: bool,
+    /// The most source links the bot places, farthest source from the spawn first; the other
+    /// sources keep their containers, which feed the spawn and the extensions, until P4's storage
+    /// link. Links placed by hand run whatever this says. Unit: links.
+    pub source_links: u32,
+    /// A source link sends once it can move at least this much to the controller link: its energy
+    /// and the controller link's room both reach it. Unit: energy.
+    pub send_min: u32,
+    /// A source link whose `transferEnergy` call the game refused (or that threw) sends no more for
+    /// this long: every check the game makes is modelled (V216), so a refusal means something the
+    /// bot cannot see, and the hold keeps it (and its log line) from repeating every tick.
+    /// Unit: ticks.
+    pub hold_ticks: u32,
+}
+
+/// Link values for the official MMO.
+pub const LINK_MMO: LinkConfig = LinkConfig {
+    enabled: true,
+    place_links: true,
+    source_links: 1,
+    send_min: LINK_CAPACITY / 4,
+    hold_ticks: 20,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -465,6 +502,7 @@ pub struct Config {
     pub spawn: SpawnConfig,
     pub opening: OpeningConfig,
     pub mining: MiningConfig,
+    pub links: LinkConfig,
 }
 
 /// A server profile: a name and its values.
@@ -488,6 +526,7 @@ pub const MMO: Profile = Profile {
         spawn: SPAWN_MMO,
         opening: OPENING_MMO,
         mining: MINING_MMO,
+        links: LINK_MMO,
     },
 };
 
@@ -648,15 +687,15 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 65;
+pub const FIELD_COUNT: usize = 70;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
 /// also depends on another field, [`RULES`] states it.
 ///
 /// Uses: rustedscreep_consts::{CPU_BUCKET_MAX (10000), extra::MEMORY_SEGMENT_COUNT (100),
-/// MEMORY_SEGMENT_ACTIVE_LIMIT (10), extra::MEMORY_SEGMENT_SAVE_LIMIT (10)} for the bounds named
-/// after them; the config tests check each one against its constant.
+/// MEMORY_SEGMENT_ACTIVE_LIMIT (10), extra::MEMORY_SEGMENT_SAVE_LIMIT (10), LINK_CAPACITY (800)}
+/// for the bounds named after them; the config tests check each one against its constant.
 pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(loader, "LoaderConfig", boot_bucket_min, 0, 10_000, false),
     flag!(loader, "LoaderConfig", boot_split_ticks, false),
@@ -882,6 +921,11 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         100,
         false
     ),
+    flag!(links, "LinkConfig", enabled, true),
+    flag!(links, "LinkConfig", place_links, true),
+    number!(links, "LinkConfig", source_links, 0, 5, true),
+    number!(links, "LinkConfig", send_min, 1, LINK_CAPACITY / 2, true),
+    number!(links, "LinkConfig", hold_ticks, 1, CREEP_LIFE_TIME, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -960,7 +1004,7 @@ pub static RULES: [Rule; 8] = [
 mod tests {
     use super::*;
     use rustedscreep_consts::extra::{MEMORY_SEGMENT_COUNT, MEMORY_SEGMENT_SAVE_LIMIT};
-    use rustedscreep_consts::{CPU_BUCKET_MAX, MEMORY_SEGMENT_ACTIVE_LIMIT};
+    use rustedscreep_consts::{CPU_BUCKET_MAX, MEMORY_SEGMENT_ACTIVE_LIMIT, StructureType};
 
     const TUNING: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/TUNING.md"));
 
@@ -1076,6 +1120,7 @@ mod tests {
             spawn: _,
             opening: _,
             mining: _,
+            links: _,
         } = MMO.config;
         let SpawnConfig { hold_ticks: _ } = SPAWN_MMO;
         let OpeningConfig {
@@ -1093,7 +1138,14 @@ mod tests {
             place_containers: _,
             harvest_efficiency_pct: _,
         } = MINING_MMO;
-        let expected: [(&str, &[&str]); 10] = [
+        let LinkConfig {
+            enabled: _,
+            place_links: _,
+            source_links: _,
+            send_min: _,
+            hold_ticks: _,
+        } = LINK_MMO;
+        let expected: [(&str, &[&str]); 11] = [
             (
                 "loader",
                 &[
@@ -1189,6 +1241,16 @@ mod tests {
                 "mining",
                 &["enabled", "place_containers", "harvest_efficiency_pct"],
             ),
+            (
+                "links",
+                &[
+                    "enabled",
+                    "place_links",
+                    "source_links",
+                    "send_min",
+                    "hold_ticks",
+                ],
+            ),
         ];
         let mut total = 0;
         for (group, names) in expected {
@@ -1257,6 +1319,14 @@ mod tests {
         };
         assert_eq!(range("loader.boot_bucket_min"), (0, CPU_BUCKET_MAX));
         assert_eq!(range("cache.naive_stop_bucket"), (0, CPU_BUCKET_MAX));
+        // Above half a link, a send needs a sender and a receiver that are both nearly at the end
+        // of their store at once (the native scenario stalls at `LINK_CAPACITY`).
+        assert_eq!(range("links.send_min"), (1, LINK_CAPACITY / 2));
+        // Every link the top level allows but the controller link.
+        assert_eq!(
+            range("links.source_links"),
+            (0, StructureType::Link.controller_structures(8) - 1)
+        );
         for key in [
             "scheduler.standard_bucket_min",
             "scheduler.optional_bucket_min",

@@ -1,29 +1,37 @@
-//! The RCL1–3 opening's glue (ROADMAP P2.4, over `rustedscreep_core::economy::Opening`) and static
-//! mining's (P3.1, `economy::Mining`): the scheduler jobs, the watchdogs' log lines and
-//! notifications, the early rescan after a room's own sites change, and the `rustedscreep.opening()`
-//! console summary.
+//! The RCL1–3 opening's glue (ROADMAP P2.4, over `rustedscreep_core::economy::Opening`), static
+//! mining's (P3.1, `economy::Mining`) and the link network's (P3.2): the scheduler jobs, the
+//! watchdogs' log lines and notifications, the early rescan after a room's own sites change, the
+//! link sends, and the `rustedscreep.opening()` console summary.
 //!
 //! - `mining` (Critical), after movement's first reads and before `opening`: per owned room each
-//!   source's mining tile, its miner's spawn request, harvest and move, the sources the workers
-//!   leave to it, and the tiles that need a container site.
+//!   source's mining tile, its miner's spawn request, transfer into its source link, harvest and
+//!   move, the sources the workers leave to it or take from the controller link, and the tiles that
+//!   need a container or a link site.
+//! - `links` (Standard, P3.2), after `opening work`: per owned room with a source link that may
+//!   send, its sends to the controller link (moving energy is hauling, which CLAUDE.md puts in
+//!   Standard; when the tier is off the source link fills and the container takes the harvest).
 //! - `opening` (Critical), after `mining` and before the `spawn` job: per owned room
 //!   the plan, the watchdog, the spawn request, every worker's task, and the intents and moves of
 //!   harvesting, taking energy, filling spawns and extensions, and the downgrade guard's upgrade.
 //! - `opening work` (Standard), after the persistence loads: building and upgrading.
-//! - `opening placement` (Optional, after the constants self-check; ADR-020, ADR-023): per owned
-//!   room, one tile to place a site on (`economy::placement`): a mining tile's container while
-//!   `mining.place_containers` is on, else, while `opening.place_extensions` is on and the room has a
-//!   spawn and fewer extensions and extension sites than its level allows, an extension. The act
-//!   step calls `Room.createConstructionSite(x, y, type)` for it, after the spawn orders and before
-//!   the creep intents: one JS call per site, billed like an intent (V203).
+//! - `opening placement` (Optional, after the constants self-check; ADR-020, ADR-023, ADR-024): per
+//!   owned room, one tile to place a site on (`economy::placement`): a mining tile's container while
+//!   `mining.place_containers` is on, else a link tile while `links.place_links` is on and the level
+//!   allows another link, else, while `opening.place_extensions` is on and the room has a spawn and
+//!   fewer extensions and extension sites than its level allows, an extension. The act step calls
+//!   `Room.createConstructionSite(x, y, type)` for it, after the spawn orders and before the creep
+//!   intents: one JS call per site, billed like an intent (V203).
 //!
-//! JS calls of its own: those site calls, and `Game.notify` on a recovery or a stall (once per kind
-//! per global). Everything it reads comes from the snapshot, and its creep intents go through the
-//! buffer.
+//! JS calls of its own: those site calls, one `StructureLink.transferEnergy(target, amount)` per
+//! link send (after the sites, before the creep intents; billed, V34, V216), and `Game.notify` on a
+//! recovery or a stall (once per kind per global). Everything it reads comes from the snapshot, and
+//! its creep intents go through the buffer.
 
 use std::fmt::Write as _;
 
-use rustedscreep_core::config::{MiningConfig, MovementConfig, OpeningConfig, SchedulerConfig};
+use rustedscreep_core::config::{
+    LinkConfig, MiningConfig, MovementConfig, OpeningConfig, SchedulerConfig,
+};
 use rustedscreep_core::economy::placement::Placement;
 use rustedscreep_core::economy::{Event, Mining, Opening, Task};
 use rustedscreep_core::intents::{ActLog, IntentBuffer, Outcome, error_name};
@@ -50,6 +58,15 @@ extern "C" {
     /// `createConstructionSite(x, y, structureType)`; the type crosses as its string.
     #[wasm_bindgen(method, catch, js_name = createConstructionSite)]
     fn create_site(this: &SiteRoom, x: u8, y: u8, kind: StructureType) -> Result<f64, JsValue>;
+
+    /// A link, for `transferEnergy` (engine game/structures.js L488-533 at a90d26f, V216). Bound
+    /// here, not through screeps-game-api's `transfer_energy`, which unwraps the return code (V111).
+    type LinkActor;
+
+    /// `transferEnergy(target, amount)`, always with an explicit amount: with none, or 0, into a
+    /// full link the call returns OK and is billed for nothing (V216).
+    #[wasm_bindgen(method, catch, js_name = transferEnergy)]
+    fn transfer_energy(this: &LinkActor, target: &JsValue, amount: u32) -> Result<f64, JsValue>;
 }
 
 /// Harvesting is Critical (CLAUDE.md).
@@ -70,6 +87,12 @@ const WORK_JOB: Job = Job {
     tier: Tier::Standard,
 };
 
+/// Moving energy between links is hauling, Standard (CLAUDE.md).
+const SEND_JOB: Job = Job {
+    name: "links",
+    tier: Tier::Standard,
+};
+
 /// Planning is Optional (CLAUDE.md): the interim extension placement (ADR-020).
 const PLACE_JOB: Job = Job {
     name: "opening placement",
@@ -78,6 +101,9 @@ const PLACE_JOB: Job = Job {
 
 /// The job name the act step's site faults are logged under.
 const SITE_JOB: &str = "opening sites";
+
+/// The job name the act step's link-send faults are logged under.
+const LINK_JOB: &str = "link sends";
 
 /// The opening's state for one global.
 #[derive(Default)]
@@ -88,6 +114,7 @@ pub struct OpeningGlue {
     mine_job: JobState,
     plan_job: JobState,
     work_job: JobState,
+    send_job: JobState,
     place_job: JobState,
     /// Own sites per owned room on the last tick, to ask movement for an early rescan when the
     /// count changes (a new obstacle site blocks its tile; a finished one becomes a structure).
@@ -149,11 +176,13 @@ impl OpeningGlue {
         buffer: &mut IntentBuffer,
         cfg: &OpeningConfig,
         mining_cfg: &MiningConfig,
+        link_cfg: &LinkConfig,
         mcfg: &MovementConfig,
     ) {
         let Self {
             core,
             mining,
+            placement,
             mine_job,
             plan_job,
             ..
@@ -161,9 +190,12 @@ impl OpeningGlue {
         let mines = mining.room_count();
         if mines > 0 {
             tick.run_units(&MINE_JOB, mine_job, mines, |unit, commit| {
-                let cap = mining.room_name(unit).and_then(|room| core.cap(room));
+                let room = mining.room_name(unit);
+                let cap = room.and_then(|room| core.cap(room));
+                let refused = room.map_or(&[][..], |room| placement.refused_tiles(room));
                 mining.plan_room(
-                    unit, snapshot, movement, spawner, buffer, mining_cfg, mcfg, cap, commit,
+                    unit, snapshot, movement, spawner, buffer, mining_cfg, link_cfg, mcfg, cap,
+                    refused, commit,
                 )
             });
         }
@@ -172,11 +204,11 @@ impl OpeningGlue {
             return;
         }
         tick.run_units(&PLAN_JOB, plan_job, count, |unit, commit| {
-            let mined = core
-                .room_name(unit)
-                .map_or(&[][..], |room| mining.mined(room));
+            let room = core.room_name(unit);
+            let mined = room.map_or(&[][..], |room| mining.mined(room));
+            let receivers = room.map_or(&[][..], |room| mining.receivers(room));
             core.plan_room(
-                unit, snapshot, movement, spawner, buffer, cfg, mcfg, mined, commit,
+                unit, snapshot, movement, spawner, buffer, cfg, mcfg, mined, receivers, commit,
             )
         });
     }
@@ -200,9 +232,25 @@ impl OpeningGlue {
         });
     }
 
+    /// The Standard `links` job (P3.2): one unit per owned room whose `mining` run found a source
+    /// link that may send; none, and no clock reading, on a tick with none.
+    pub fn send_links<C: Clock>(&mut self, tick: &mut TickCpu<'_, C>, link_cfg: &LinkConfig) {
+        let count = self.mining.send_count();
+        if count == 0 {
+            return;
+        }
+        let Self {
+            mining, send_job, ..
+        } = self;
+        tick.run_units(&SEND_JOB, send_job, count, |unit, commit| {
+            mining.send_room(unit, link_cfg, commit)
+        });
+    }
+
     /// The Optional `opening placement` job: one unit per owned room, while
-    /// `opening.place_extensions` or `mining.place_containers` is on (the mining job lists no
-    /// container tile while the latter is off).
+    /// `opening.place_extensions`, `mining.place_containers` or `links.place_links` is on (the mining
+    /// job lists no container tile or link tile while the switch for it is off).
+    #[allow(clippy::too_many_arguments)]
     pub fn place<C: Clock>(
         &mut self,
         tick: &mut TickCpu<'_, C>,
@@ -210,10 +258,12 @@ impl OpeningGlue {
         movement: &mut Movement,
         cfg: &OpeningConfig,
         mining_cfg: &MiningConfig,
+        link_cfg: &LinkConfig,
         mcfg: &MovementConfig,
     ) {
         let count = self.placement.room_count();
-        if !(cfg.place_extensions || mining_cfg.place_containers) || count == 0 {
+        let any = cfg.place_extensions || mining_cfg.place_containers || link_cfg.place_links;
+        if !any || count == 0 {
             return;
         }
         let Self {
@@ -224,11 +274,11 @@ impl OpeningGlue {
         } = self;
         let extensions = cfg.place_extensions;
         tick.run_units(&PLACE_JOB, place_job, count, |unit, commit| {
-            let containers = placement
-                .room_name(unit)
-                .map_or(&[][..], |room| mining.container_needs(room));
+            let room = placement.room_name(unit);
+            let containers = room.map_or(&[][..], |room| mining.container_needs(room));
+            let links = room.map_or(&[][..], |room| mining.link_needs(room));
             placement.plan_room(
-                unit, snapshot, movement, mcfg, extensions, containers, commit,
+                unit, snapshot, movement, mcfg, extensions, containers, links, commit,
             )
         });
     }
@@ -276,6 +326,7 @@ impl OpeningGlue {
                 let kind = match order.kind {
                     StructureType::Container => "container",
                     StructureType::Extension => "extension",
+                    StructureType::Link => "link",
                     _ => "construction",
                 };
                 log::info!(
@@ -287,6 +338,62 @@ impl OpeningGlue {
                 );
             }
             self.placement.record(index, outcome);
+        }
+    }
+
+    /// Calls `transferEnergy` for this tick's link sends (P3.2) and records each outcome. Call in
+    /// the act step, after the sites and before the creep intents. A call that throws, or a send
+    /// with no JS object for one of its links, is a fault under `link sends`; a refusal is logged
+    /// at info, and its link sends no more for `links.hold_ticks`, so the line repeats at most once
+    /// per hold.
+    pub fn issue_links(
+        &mut self,
+        snapshot: &Snapshot,
+        js: &JsWorld,
+        log: &mut ActLog,
+        sched: &mut Scheduler,
+        cfg: &SchedulerConfig,
+        link_cfg: &LinkConfig,
+    ) {
+        for index in 0..self.mining.link_orders().len() {
+            let Some(&order) = self.mining.link_orders().get(index) else {
+                break;
+            };
+            let (Some(from), Some(to)) = (
+                js.structures.get(order.from_row as usize),
+                js.structures.get(order.to_row as usize),
+            ) else {
+                link_fault(sched, cfg, snapshot, "no JS object for a link row", index);
+                log.missing();
+                continue;
+            };
+            let call = from
+                .unchecked_ref::<LinkActor>()
+                .transfer_energy(to.as_ref(), order.amount);
+            let outcome = match call {
+                Ok(value) => Outcome::from_return(value),
+                Err(_) => {
+                    link_fault(sched, cfg, snapshot, "transferEnergy threw", index);
+                    Outcome::Threw
+                }
+            };
+            log.record_structure(outcome);
+            if outcome != Outcome::Ok {
+                let what = match outcome {
+                    Outcome::Failed(code) => error_name(code),
+                    Outcome::Unknown => "unknown return",
+                    Outcome::Threw => "threw",
+                    Outcome::Ok => "ok",
+                };
+                log::info!(
+                    "rustedscreep links: a send of {} energy was refused at tick {}: {what}; the \
+                     link waits {} ticks",
+                    order.amount,
+                    snapshot.tick.time,
+                    link_cfg.hold_ticks
+                );
+            }
+            self.mining.record_send(index, outcome, link_cfg);
         }
     }
 
@@ -355,6 +462,9 @@ impl OpeningGlue {
                         if s.mined {
                             text.push_str(" mined");
                         }
+                        if s.linked {
+                            text.push_str(" linked");
+                        }
                     }
                 }
             }
@@ -391,9 +501,15 @@ impl OpeningGlue {
         let skipped: usize = self.placement.refused().map(|(_, n)| n).sum();
         let _ = write!(
             text,
-            " | sites: picked {} ({} containers), placed {}, refused {}, never seen {}, tiles \
-             skipped {}",
-            p.picked, p.containers, p.placed, p.refused, p.lost, skipped
+            " | sites: picked {} ({} containers, {} links), placed {}, refused {}, never seen {}, \
+             tiles skipped {}",
+            p.picked, p.containers, p.links, p.placed, p.refused, p.lost, skipped
+        );
+        let l = self.mining.link_totals();
+        let _ = write!(
+            text,
+            " | link sends since boot: ordered {}, sent {}, failed {}, energy {}",
+            l.ordered, l.sent, l.failed, l.energy
         );
         text
     }
@@ -405,13 +521,28 @@ impl OpeningGlue {
         for (room, plan, stats) in self.mining.room_states() {
             let _ = write!(
                 text,
-                " {room}: miners {} (mined {}, harvests {}, requested {}, idle {})",
-                stats.miners, stats.mined, stats.harvests, stats.requested, stats.idle
+                " {room}: miners {} (mined {}, harvests {}, requested {}, idle {}), links {} \
+                 (linked {}, transfers {}, sends {})",
+                stats.miners,
+                stats.mined,
+                stats.harvests,
+                stats.requested,
+                stats.idle,
+                stats.links,
+                stats.linked,
+                stats.transfers,
+                stats.sends
             );
             let Some(p) = plan else {
                 text.push_str(", no plan yet;");
                 continue;
             };
+            match p.controller_link {
+                Some(c) => {
+                    let _ = write!(text, ", controller link ({},{})", c.x().u8(), c.y().u8());
+                }
+                None => text.push_str(", no controller link tile"),
+            }
             for s in &p.sources {
                 let _ = write!(
                     text,
@@ -432,15 +563,16 @@ impl OpeningGlue {
                     }
                     _ => text.push_str(" no tile"),
                 }
+                if let Some(l) = s.link {
+                    let _ = write!(text, " link ({},{})", l.x().u8(), l.y().u8());
+                }
                 match s.body {
                     Some(b) => {
-                        let _ = write!(
-                            text,
-                            " body {} WORK {} MOVE ({} energy)",
-                            b.count(Part::Work),
-                            b.count(Part::Move),
-                            b.cost()
-                        );
+                        let _ = write!(text, " body {} WORK", b.count(Part::Work));
+                        if b.count(Part::Carry) > 0 {
+                            let _ = write!(text, " {} CARRY", b.count(Part::Carry));
+                        }
+                        let _ = write!(text, " {} MOVE ({} energy)", b.count(Part::Move), b.cost());
                     }
                     None => {
                         let _ = write!(text, " no miner at capacity {}", p.capacity);
@@ -531,6 +663,24 @@ fn site_fault(
     let record = FaultRecord {
         time: snapshot.tick.time,
         job: SITE_JOB,
+        fault: Fault::new(what, u32::try_from(index).unwrap_or(u32::MAX)),
+    };
+    sched.faults_mut().record(record, cfg);
+}
+
+/// A fault of the act step's link sends (`LINK_JOB`), rate-limited like a job's.
+#[cold]
+#[inline(never)]
+fn link_fault(
+    sched: &mut Scheduler,
+    cfg: &SchedulerConfig,
+    snapshot: &Snapshot,
+    what: &'static str,
+    index: usize,
+) {
+    let record = FaultRecord {
+        time: snapshot.tick.time,
+        job: LINK_JOB,
         fault: Fault::new(what, u32::try_from(index).unwrap_or(u32::MAX)),
     };
     sched.faults_mut().record(record, cfg);

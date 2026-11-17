@@ -702,7 +702,7 @@ export function openingSim(dir = join(ROOT, 'dist')) {
     const n = seen.siteCalls;
     const parts = [
       `rustedscreep opening at tick ${T0 + o}: ${ROOM}: workers `,
-      ` | sites: picked ${n} (0 containers), placed ${n}, refused 0, never seen 0, tiles skipped 0`,
+      ` | sites: picked ${n} (0 containers, 0 links), placed ${n}, refused 0, never seen 0, tiles skipped 0`,
     ];
     // The first loop has no plan: movement reads a room only once an own creep is in it (its first creep is in
     // Game.creeps from the next tick), and until its grid exists the room asks for min_workers. The recovery's

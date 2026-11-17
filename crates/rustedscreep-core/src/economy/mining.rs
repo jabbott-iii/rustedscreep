@@ -1,40 +1,74 @@
-//! Static miners (ROADMAP P3.1): one creep per source that stands on the source's mining tile and
-//! harvests every tick the source holds energy. Its body is [`miner_work`] WORK parts and the MOVE
-//! parts [`miner_body`] picks, with no CARRY: harvesting has no store check (V182), and what does
-//! not fit the store goes into a container on the miner's tile or onto a pile there (V183, V193).
-//! The opening's workers leave a source whose miner is next to it alone and take its energy off
-//! the tile ([`Mined`]); the container the miner stands on is placed by `economy::placement`
-//! (ADR-023) from [`Mining::container_needs`]. P3.2 adds links, P3.3 the haulers that replace the
-//! workers' carrying.
+//! Static miners (ROADMAP P3.1) and the link network (P3.2): one creep per source that stands on the
+//! source's mining tile and harvests every tick the source holds energy, and from the level that
+//! allows links a source link beside each mining tile that sends to the controller link.
+//!
+//! A miner's body is [`miner_work`] WORK parts and the MOVE parts [`miner_body`] picks. With no
+//! CARRY, harvesting has no store check (V182), and what does not fit the store goes into a
+//! container on the miner's tile or onto a pile there (V183, V193). The opening's workers leave a
+//! source whose miner is next to it alone and take its energy off the tile ([`Mined`]); the
+//! container the miner stands on is placed by `economy::placement` (ADR-023) from
+//! [`Mining::container_needs`]. P3.3 adds the haulers that replace the workers' carrying.
+//!
+//! Links (ADR-024): the plan holds a controller link tile and a source link tile per mining tile;
+//! `economy::placement` places them from [`Mining::link_needs`]. A miner of a source with a built
+//! source link gets one CARRY part ([`miner_body_with`]): it transfers its store into the link on
+//! the tick its harvest would overflow (a creep's transfer runs before its harvest, V45), so the
+//! harvest lands in an empty store; while the link is full the harvest overflows into the container
+//! as before; an inactive link (V218) that is not a controller link gets neither the transfers nor
+//! the CARRY part, since it could never pass the energy on. A source link that holds at least
+//! `links.send_min` sends that much or more to the controller link with the most room, an explicit
+//! amount the receiver's room at the start of the tick can take (V216, V217), once a tick, and a
+//! refused send holds its link for `links.hold_ticks`. The receiver gets the amount less `LINK_LOSS_RATIO` of it, rounded
+//! up ([`link_loss`]), and the sender waits `LINK_COOLDOWN` per tile between them. The opening's
+//! workers take whole loads from the controller link ([`Receiver`]) and wait next to it for a
+//! linked source's energy ([`Mined::link`]). When the controller link backs up, the source links
+//! fill, the miners stop transferring and the containers take the harvest again: nothing is lost.
 //!
 //! One tick, as rustedscreep-wasm drives it:
 //! 1. [`Mining::begin`] after the snapshot: the owned rooms (the job's units, by name) and each
 //!    room's miners (own creeps whose name says `miner` and that room, by id).
 //! 2. The Critical `mining` job runs [`Mining::plan_room`] per room, before the opening's job and
 //!    the spawn job: the room's plan (built again when movement's grid version, the room's
-//!    capacity, its first spawn, its sources or the containers next to them change), each miner's
-//!    source, one spawn request per source with no miner, the mined sources, the tiles that need a
-//!    container site, and each miner's harvest and move.
+//!    capacity, its first spawn, its controller, its sources, the containers next to them, its links
+//!    and link sites, the network's switch, the level or the placement's refused tiles change), each
+//!    miner's source, one spawn request per source with no miner, the mined sources, the tiles that
+//!    need a container or a link site (never a refused one), each miner's transfer, harvest and move,
+//!    and whether a source link may send.
+//! 3. The Standard `links` job runs [`Mining::send_room`] per room with a link that may send: each
+//!    source link sends at most once ([`Mining::link_orders`]; moving energy is hauling, which
+//!    CLAUDE.md puts in Standard). With the tier off the source link fills, the miner stops
+//!    transferring and the container takes the harvest.
 //!
 //! The mining tile is the source's walkable neighbour, not on the room's edge and not another
 //! source's mining tile, nearest the room's first spawn by path on movement's grid; a tile with a
 //! container or a container site wins, so a container placed earlier (by the bot or by hand) keeps
-//! its miner. The miner's walk out is
-//! measured on the same field. A source gets a miner only once the room's capacity pays for one
-//! that drains it; below that the opening's workers harvest it as before.
+//! its miner. The miner's walk out is measured on the same field. A source gets a miner only once
+//! the room's capacity pays for one that drains it; below that the opening's workers harvest it as
+//! before. Link tiles follow the extension pattern's rules for not closing the room (ADR-020): a
+//! link tile is free, off any road, at x and y of [`LINK_MARGIN`] to `ROOM_SIZE - 1 -
+//! LINK_MARGIN`, not a mining tile, and its free neighbours stay connected without it.
 //!
 //! Miners keep their source between ticks in the heap. After a global reset a miner on a mining
 //! tile takes that tile's source, and the others take the nearest source with no miner, so a reset
-//! never orders a second miner for a mined source. Nothing is read from or written to `Memory`.
+//! never orders a second miner for a mined source. Link roles are read from the links' places every
+//! tick. Nothing is read from or written to `Memory`.
 
-use rustedscreep_consts::{Position, RoomCoordinate, RoomName, StructureType};
+use rustedscreep_consts::{
+    HARVEST_POWER, INTENT_CPU_COST, LINK_CAPACITY, LINK_LOSS_RATIO, Position, ROOM_SIZE,
+    ResourceType, RoomCoordinate, RoomName, StructureType,
+};
 
-use super::sizing::{Trip, miner_body};
-use crate::config::{MiningConfig, MovementConfig};
-use crate::intents::{CreepIntent, IntentBuffer};
-use crate::movement::{Dial, FlowField, Goal, MoveError, MoveTo, Movement, Tile, UNREACHED};
+use super::placement::keeps_neighbours_connected;
+use super::sizing::{Trip, miner_body, miner_body_with, miner_work};
+use crate::config::{LinkConfig, MiningConfig, MovementConfig};
+use crate::intents::{CreepIntent, IntentBuffer, Outcome, Target};
+use crate::movement::{
+    CostGrid, Dial, FlowField, Goal, MoveError, MoveTo, Movement, Tile, UNREACHED,
+};
 use crate::scheduler::{Commit, Fault, Tier};
-use crate::snapshot::{CreepHandle, ObjectHandle, ObjectKind, Snapshot};
+use crate::snapshot::{
+    Controller, CreepHandle, ObjectHandle, ObjectKind, Snapshot, StructureHandle,
+};
 use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner};
 
 /// The spawn priority of a miner request: above the opening's normal worker requests
@@ -42,12 +76,43 @@ use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner}
 /// (`PRIORITY_RECOVERY`), whose workers carry what the miner drops.
 pub const PRIORITY_MINER: u8 = 125;
 
+/// How far from the controller the bot plans its controller link (ADR-024): every tile next to a
+/// link at this range is within `upgradeController`'s range of the controller (V187), so up to
+/// eight upgraders can stand around it.
+pub const CONTROLLER_LINK_RANGE: u8 = 2;
+
+/// A link this close to the controller is a controller link, whoever placed it: an upgrader next to
+/// it can stand within `upgradeController`'s range (`inRangeTo(target, 3)`, V187).
+pub const RECEIVER_RANGE: u8 = 3;
+
+/// The least x and y of a planned link tile (and `ROOM_SIZE - 1` less it, the most): clear of the
+/// engine's edge and exit rules for sites (V205), which refuse a link at 0 or 49 and, beside an
+/// exit, at 1 or 48.
+pub const LINK_MARGIN: u8 = 2;
+
 /// How hard a miner's moves push past other creeps (`MoveTo::priority`): above every opening task,
 /// so a worker standing on a mining tile makes way.
 const MOVE_PRIORITY: u8 = 4;
 
-/// Harvesting reaches 1 tile (`isNearTo`, V182).
+/// Harvesting and transferring reach 1 tile (`isNearTo`, V182, V108).
 const NEAR: u8 = 1;
+
+/// The energy a link's send of `amount` loses on the way: `Math.ceil(amount * LINK_LOSS_RATIO)`
+/// (links/transfer.js L46, V217). The engine's ratio is the double 0.03 and the crate's the f32
+/// nearest it (V134); over every amount from 1 to `LINK_CAPACITY` both give the same loss (the
+/// test checks it against the double), which is all one send can move. Unit: energy.
+///
+/// Uses: `LINK_LOSS_RATIO`.
+pub fn link_loss(amount: u32) -> u32 {
+    let loss = (f64::from(amount) * f64::from(LINK_LOSS_RATIO)).ceil();
+    if loss <= 0.0 {
+        0
+    } else if loss >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        loss as u32
+    }
+}
 
 /// One source in a room's mining plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,12 +124,17 @@ pub struct MineSource {
     /// The miner's walk from the spawn to `tile`.
     pub trip: Option<Trip>,
     /// The miner's body at the room's capacity, or `None` when the room cannot pay for one that
-    /// drains the source ([`miner_body`]).
+    /// drains the source ([`miner_body`]); with one CARRY part while a built link stands next to
+    /// `tile` and the network runs ([`miner_body_with`]).
     pub body: Option<Body>,
+    /// Its source link's tile (ADR-024): a link or a link site next to `tile`, else the tile picked
+    /// for one; `None` without a mining tile or a tile that qualifies.
+    pub link: Option<Position>,
 }
 
 /// A room's mining plan: built again when movement's grid version, the room's capacity, its first
-/// spawn, its sources or the containers and container sites next to them change.
+/// spawn, its controller, its sources, the containers and container sites next to them, its links
+/// and link sites or the network's switch change.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MinePlan {
     pub version: u32,
@@ -73,6 +143,19 @@ pub struct MinePlan {
     pub spawn: Option<Position>,
     /// Containers and container sites next to the sources. Unit: structures and sites.
     pub containers: u32,
+    pub controller: Option<Position>,
+    /// The room's links and link sites, and of them the built links. Unit: structures and sites.
+    pub links: u32,
+    pub built: u32,
+    /// `links.enabled` when the plan was built (a miner's CARRY part depends on it), the level
+    /// (which links are active, V218) and the placement's refused tiles in the room (none is picked).
+    pub network: bool,
+    pub level: u8,
+    pub refused: u32,
+    /// The controller link's tile (ADR-024): a link or a link site within [`RECEIVER_RANGE`] of the
+    /// controller, else the tile picked for one at [`CONTROLLER_LINK_RANGE`], nearest the spawn by
+    /// path; `None` when none qualifies.
+    pub controller_link: Option<Position>,
     pub sources: Vec<MineSource>,
 }
 
@@ -83,6 +166,35 @@ pub struct MinePlan {
 pub struct Mined {
     pub source: Position,
     pub tile: Position,
+    /// Where the source's energy goes instead of `tile` (P3.2): the controller link's place, while
+    /// the miner holds a CARRY part next to a source link that sends there or is that link. The
+    /// workers take its loads there; only an overflow lands on `tile`.
+    pub link: Option<Position>,
+}
+
+/// A controller link (P3.2): an own link within [`RECEIVER_RANGE`] of the controller, where the
+/// opening's workers take energy to upgrade with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Receiver {
+    pub link: StructureHandle,
+    pub pos: Position,
+    /// The energy it holds at the start of the tick. Unit: energy.
+    pub energy: u32,
+    /// No send fits it: its room is below `links.send_min` (or the network is off), so energy
+    /// arrives only once a worker takes some. Then any take is worth it, not only a whole load.
+    pub full: bool,
+}
+
+/// One `StructureLink.transferEnergy(target, amount)` call for the act step (V216).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkOrder {
+    pub from: StructureHandle,
+    /// The sender's and the receiver's rows in this tick's structures (their JS objects).
+    pub from_row: u32,
+    pub to: StructureHandle,
+    pub to_row: u32,
+    /// Unit: energy, at least 1 and at most the sender's energy and the receiver's room.
+    pub amount: u32,
 }
 
 /// One room's counters for the console, from its last run.
@@ -99,6 +211,25 @@ pub struct MineStats {
     pub requested: u32,
     /// Miners with no source to mine (more miners than sources with a tile).
     pub idle: u32,
+    /// Built links in the room. Unit: structures.
+    pub links: u32,
+    /// Mined sources whose energy goes to a controller link this tick.
+    pub linked: u32,
+    /// Miner transfers into source links pushed this tick.
+    pub transfers: u32,
+    /// Link sends ordered this tick.
+    pub sends: u32,
+}
+
+/// Link sends since the global started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkTotals {
+    pub ordered: u32,
+    /// Of `ordered`, calls the game accepted.
+    pub sent: u32,
+    pub failed: u32,
+    /// What the accepted sends moved, before the loss. Unit: energy.
+    pub energy: u64,
 }
 
 struct MineRoom {
@@ -110,6 +241,13 @@ struct MineRoom {
     mined: Vec<Mined>,
     /// Mining tiles with no container and no container site, once the room pays for their miner.
     containers: Vec<Tile>,
+    /// Link tiles with no link and no link site, in the order to place them (ADR-024).
+    link_sites: Vec<Tile>,
+    receivers: Vec<Receiver>,
+    /// This tick's built links with what the miners promised them, and the controller, for the
+    /// Standard `links` job ([`Mining::send_room`]).
+    links: Vec<RoomLink>,
+    controller: Option<Position>,
     /// Mining tiles movement found no way to, each skipped until the tick given
     /// (`movement.route_retry_ticks` later): the miner goes next to its source instead.
     unreachable: Vec<(Position, u32)>,
@@ -133,6 +271,29 @@ struct Miner {
     source: Option<Position>,
 }
 
+/// One built link of the room being run.
+#[derive(Clone, Copy, Debug)]
+struct RoomLink {
+    handle: StructureHandle,
+    row: u32,
+    pos: Position,
+    energy: u32,
+    cooldown: u32,
+    /// Among the links the level allows (the engine keeps the nearest to the controller active,
+    /// V218); an inactive link cannot send.
+    active: bool,
+    /// Energy promised to it this tick: miner transfers in, sends in.
+    incoming: u32,
+}
+
+/// What [`Mining::gather`] found in a room besides the scratch lists.
+#[derive(Clone, Copy, Debug)]
+struct Found {
+    spawn: Option<Position>,
+    controller: Option<Position>,
+    level: u8,
+}
+
 /// Static mining's state for one global.
 #[derive(Default)]
 pub struct Mining {
@@ -141,21 +302,35 @@ pub struct Mining {
     members: Vec<Member>,
     /// Indexed by creep handle slot.
     miners: Vec<Option<Miner>>,
+    orders: Vec<LinkOrder>,
+    totals: LinkTotals,
+    /// The rooms (by index) with a link that may send this tick: the Standard `links` job's units.
+    send_rooms: Vec<usize>,
+    /// Senders whose last call the game refused, each held until the tick given
+    /// (`links.hold_ticks` later), so a refusal repeats at most once per hold.
+    held: Vec<(StructureHandle, u32)>,
     field: FlowField,
     dial: Dial,
     /// Scratch, kept for its capacity: the room's sources (handle, place, energy, capacity), its
-    /// containers and container sites, the plan's sources with their tiles, and the member index of
-    /// each plan source's miner.
+    /// containers and container sites, its links and link sites, its built links, the tiles a
+    /// structure, a site or a container takes (with whether it blocks movement), its sources and
+    /// minerals, the plan's sources with their tiles, and the member index of each plan source's
+    /// miner.
     sources: Vec<(ObjectHandle, Position, u32, u32)>,
     stores: Vec<Position>,
+    link_spots: Vec<Position>,
+    links: Vec<RoomLink>,
+    occupied: Vec<(Tile, bool)>,
+    statics: Vec<Tile>,
     targets: Vec<(Position, Option<Position>)>,
     claims: Vec<Option<usize>>,
 }
 
 impl Mining {
-    /// Starts a tick: the owned rooms, by name, and their miners, by room and id.
+    /// Starts a tick: the owned rooms, by name, their miners, by room and id, and no link orders.
     pub fn begin(&mut self, snap: &Snapshot) {
         self.time = snap.tick.time;
+        self.orders.clear();
         let rooms = &snap.rooms;
         for state in &mut self.rooms {
             state.row = None;
@@ -182,6 +357,10 @@ impl Mining {
                         members: (0, 0),
                         mined: Vec::new(),
                         containers: Vec::new(),
+                        link_sites: Vec::new(),
+                        receivers: Vec::new(),
+                        links: Vec::new(),
+                        controller: None,
                         unreachable: Vec::new(),
                         stats: MineStats::default(),
                     },
@@ -190,10 +369,15 @@ impl Mining {
         }
         self.rooms.retain(|r| r.row.is_some());
         for r in &mut self.rooms {
-            // Until the room's run this tick, nothing is mined and nothing needs a container.
+            // Until the room's run this tick, nothing is mined and nothing needs a site.
             r.mined.clear();
             r.containers.clear();
+            r.link_sites.clear();
+            r.receivers.clear();
+            r.links.clear();
         }
+        self.send_rooms.clear();
+        self.held.retain(|&(_, until)| self.time < until);
         self.members.clear();
         let creeps = &snap.creeps;
         for (row, identity) in creeps.identities().iter().enumerate() {
@@ -249,10 +433,146 @@ impl Mining {
         self.room(room).map_or(&[], |r| r.mined.as_slice())
     }
 
+    /// The controller links of `room` from its run this tick (P3.2).
+    pub fn receivers(&self, room: RoomName) -> &[Receiver] {
+        self.room(room).map_or(&[], |r| r.receivers.as_slice())
+    }
+
     /// The mining tiles of `room` that need a container site, from its run this tick (none while
     /// `mining.place_containers` is off).
     pub fn container_needs(&self, room: RoomName) -> &[Tile] {
         self.room(room).map_or(&[], |r| r.containers.as_slice())
+    }
+
+    /// The link tiles of `room` that need a link site, in the order to place them (ADR-024): from
+    /// its run this tick, none while `links.place_links` is off or below the level that allows links.
+    pub fn link_needs(&self, room: RoomName) -> &[Tile] {
+        self.room(room).map_or(&[], |r| r.link_sites.as_slice())
+    }
+
+    /// This tick's link sends, for the act step.
+    pub fn link_orders(&self) -> &[LinkOrder] {
+        &self.orders
+    }
+
+    /// The outcome of link order `index`. A sender whose call the game refused (or that threw)
+    /// sends no more for `lcfg.hold_ticks`: the planner models every check of V216, so a refusal
+    /// means something it cannot see, and the hold keeps it from repeating every tick.
+    pub fn record_send(&mut self, index: usize, outcome: Outcome, lcfg: &LinkConfig) {
+        let Some(order) = self.orders.get(index) else {
+            return;
+        };
+        let t = &mut self.totals;
+        if outcome == Outcome::Ok {
+            t.sent = t.sent.saturating_add(1);
+            t.energy = t.energy.saturating_add(u64::from(order.amount));
+        } else {
+            t.failed = t.failed.saturating_add(1);
+            let until = self.time.saturating_add(lcfg.hold_ticks.max(1));
+            self.held.push((order.from, until));
+        }
+    }
+
+    /// Units of the Standard `links` job: the rooms with a source link that may send this tick
+    /// (from their `mining` runs).
+    pub fn send_count(&self) -> u32 {
+        u32::try_from(self.send_rooms.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The Standard `links` job's unit: in the room, each built source link (next to a mining tile)
+    /// that is not a controller link, is active, has no cooldown, is not held and holds at least
+    /// `links.send_min` sends once, to the controller link with the most room left this tick (after
+    /// the miners' transfers and the earlier sends), an explicit amount: the smaller of its energy
+    /// and that room, when it reaches `send_min` (V216, V217). A link sends at most once a tick: the
+    /// engine keeps one call per object and method, the last (V34).
+    ///
+    /// Uses: `LINK_CAPACITY` (a link's room), `INTENT_CPU_COST` (each send, V34).
+    pub fn send_room(
+        &mut self,
+        unit: u32,
+        lcfg: &LinkConfig,
+        commit: &mut Commit,
+    ) -> Result<(), Fault> {
+        let ri = usize::try_from(unit)
+            .ok()
+            .and_then(|u| self.send_rooms.get(u))
+            .copied()
+            .ok_or(Fault::new("no room for the unit", unit))?;
+        let Self {
+            rooms,
+            orders,
+            totals,
+            held,
+            ..
+        } = self;
+        let MineRoom {
+            plan,
+            links,
+            controller,
+            stats,
+            ..
+        } = rooms
+            .get_mut(ri)
+            .ok_or(Fault::new("no room for the unit", unit))?;
+        let controller = *controller;
+        let receiver = |p: Position| controller.is_some_and(|c| range(p, c) <= RECEIVER_RANGE);
+        let plan_sources = plan.as_ref().map_or(&[][..], |p| p.sources.as_slice());
+        let mining_tile = |p: Position| {
+            plan_sources
+                .iter()
+                .any(|s| s.tile.is_some_and(|t| range(p, t) <= NEAR))
+        };
+        let room = |l: &RoomLink| {
+            LINK_CAPACITY
+                .saturating_sub(l.energy)
+                .saturating_sub(l.incoming)
+        };
+        let send_min = lcfg.send_min.max(1);
+        let mut sends = 0u32;
+        for i in 0..links.len() {
+            let Some(from) = links.get(i).copied() else {
+                continue;
+            };
+            if !(from.active
+                && from.cooldown == 0
+                && from.energy >= send_min
+                && !receiver(from.pos)
+                && mining_tile(from.pos)
+                && !held.iter().any(|h| h.0 == from.handle))
+            {
+                continue;
+            }
+            let best = links
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| receiver(l.pos) && l.handle != from.handle)
+                .max_by_key(|(_, l)| (room(l), std::cmp::Reverse(tile_key(l.pos))))
+                .map(|(j, _)| j);
+            let Some(to) = best.and_then(|j| links.get_mut(j)) else {
+                continue;
+            };
+            let amount = from.energy.min(room(to));
+            if amount < send_min {
+                continue;
+            }
+            to.incoming = to.incoming.saturating_add(amount);
+            orders.push(LinkOrder {
+                from: from.handle,
+                from_row: from.row,
+                to: to.handle,
+                to_row: to.row,
+                amount,
+            });
+            commit.add(INTENT_CPU_COST);
+            sends = sends.saturating_add(1);
+        }
+        stats.sends = stats.sends.saturating_add(sends);
+        totals.ordered = totals.ordered.saturating_add(sends);
+        Ok(())
+    }
+
+    pub fn link_totals(&self) -> &LinkTotals {
+        &self.totals
     }
 
     /// Each room's plan and counters, by name.
@@ -276,6 +596,12 @@ impl Mining {
 
     /// Room `unit`'s tick (module docs, step 2). `cap`, the most energy the opening's watchdog saw
     /// the room hold while it never filled (`Watchdog::cap`), holds back a miner that costs more.
+    /// `refused` are the room's tiles the placement gave up on (`Placement::refused_tiles`): the
+    /// plan picks no link tile there.
+    ///
+    /// Uses: `HARVEST_POWER` and [`miner_work`] (a miner's harvest a tick), `LINK_CAPACITY` (a
+    /// link's room), `CONTROLLER_STRUCTURES` (`StructureType::controller_structures`: the links the
+    /// level allows).
     #[allow(clippy::too_many_arguments)]
     pub fn plan_room(
         &mut self,
@@ -285,8 +611,10 @@ impl Mining {
         spawner: &mut Spawner,
         buffer: &mut IntentBuffer,
         cfg: &MiningConfig,
+        lcfg: &LinkConfig,
         mcfg: &MovementConfig,
         cap: Option<u32>,
+        refused: &[Tile],
         commit: &mut Commit,
     ) -> Result<(), Fault> {
         let ri = usize::try_from(unit).map_err(|_| Fault::new("unit out of range", unit))?;
@@ -298,8 +626,11 @@ impl Mining {
             (r.name, r.row, r.members)
         };
         let row = row.ok_or(Fault::new("room not in this tick", unit))?;
-        let spawn = self.gather(snap, name);
-        self.ensure_plan(ri, snap, row, spawn, movement, mcfg, commit);
+        let found = self.gather(snap, name, row);
+        let allowed = StructureType::Link.controller_structures(u32::from(found.level));
+        // Before the plan: a miner's CARRY part is only for a link that can pass the energy on.
+        self.rank_links(found.controller, allowed);
+        self.ensure_plan(ri, snap, row, found, movement, lcfg, mcfg, refused, commit);
         self.assign(ri, snap, members);
         let now = self.time;
         if let Some(r) = self.rooms.get_mut(ri) {
@@ -311,7 +642,11 @@ impl Mining {
             members: all,
             sources,
             stores,
+            link_spots,
+            links,
             claims,
+            send_rooms,
+            held,
             ..
         } = self;
         let Some(r) = rooms.get_mut(ri) else {
@@ -320,11 +655,72 @@ impl Mining {
         let mut stats = MineStats {
             time: now,
             miners: u32::try_from(members.1.saturating_sub(members.0)).unwrap_or(u32::MAX),
+            links: u32::try_from(links.len()).unwrap_or(u32::MAX),
             ..MineStats::default()
         };
         r.mined.clear();
         r.containers.clear();
-        let plan_sources = r.plan.as_ref().map_or(&[][..], |p| p.sources.as_slice());
+        r.link_sites.clear();
+        r.receivers.clear();
+        let receiver = |p: Position| {
+            found
+                .controller
+                .is_some_and(|c| range(p, c) <= RECEIVER_RANGE)
+        };
+        r.receivers
+            .extend(links.iter().filter(|l| receiver(l.pos)).map(|l| Receiver {
+                link: l.handle,
+                pos: l.pos,
+                energy: l.energy,
+                full: !lcfg.enabled
+                    || LINK_CAPACITY.saturating_sub(l.energy) < lcfg.send_min.max(1),
+            }));
+        let receiver_at = r
+            .receivers
+            .iter()
+            .map(|x| x.pos)
+            .min_by_key(|&p| tile_key(p));
+        let plan = r.plan.as_ref();
+        let plan_sources = plan.map_or(&[][..], |p| p.sources.as_slice());
+        // The link sites to place (ADR-024), while the room has fewer links and link sites than the
+        // level allows (the placement's own count, without its scan): the controller link first,
+        // then, once it stands or is placed, the source links, farthest source first.
+        let spots = u32::try_from(link_spots.len()).unwrap_or(u32::MAX);
+        if lcfg.place_links && spots < allowed {
+            let has = |p: Position| link_spots.contains(&p);
+            let controller_link = plan.and_then(|p| p.controller_link);
+            if let Some(c) = controller_link.filter(|&c| !has(c)) {
+                r.link_sites.push(Tile::of(c));
+            }
+            if controller_link.is_some_and(has) || receiver_at.is_some() {
+                // The `source_links` sources farthest from the spawn (by trip, then the plan's
+                // order), whether their links stand already or not, farthest first: a source's rank
+                // is the number of qualifying sources before it.
+                let linkable = |s: &MineSource| s.body.is_some() && s.link.is_some();
+                let cost = |s: &MineSource| s.trip.map_or(0, |t| t.cost);
+                let rank = |j: usize, s: &MineSource| {
+                    plan_sources
+                        .iter()
+                        .enumerate()
+                        .filter(|&(k, o)| {
+                            linkable(o) && (cost(o) > cost(s) || (cost(o) == cost(s) && k < j))
+                        })
+                        .count()
+                };
+                let take = usize::try_from(lcfg.source_links).unwrap_or(usize::MAX);
+                for want in 0..take.min(plan_sources.len()) {
+                    let next = plan_sources
+                        .iter()
+                        .enumerate()
+                        .find(|&(j, s)| linkable(s) && rank(j, s) == want);
+                    if let Some((_, s)) = next
+                        && let Some(l) = s.link.filter(|&l| !has(l))
+                    {
+                        r.link_sites.push(Tile::of(l));
+                    }
+                }
+            }
+        }
         for (j, s) in plan_sources.iter().enumerate() {
             let claim = claims.get(j).copied().flatten();
             // The spawn request: a source with no miner, once the room pays for one (and it has
@@ -354,6 +750,15 @@ impl Mining {
             {
                 r.containers.push(Tile::of(tile));
             }
+            // Its source link: the built link next to its tile, the planned one first.
+            let source_link = s.tile.and_then(|tile| {
+                links
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| range(l.pos, tile) <= NEAR)
+                    .min_by_key(|(_, l)| (Some(l.pos) != s.link, tile_key(l.pos)))
+                    .map(|(i, _)| i)
+            });
             let Some(m) = claim.and_then(|i| all.get(i)).copied() else {
                 continue;
             };
@@ -364,14 +769,59 @@ impl Mining {
                 continue;
             };
             let near = range(at, s.source) <= NEAR;
+            let store = snap.creeps.stores().get(m.row).copied().unwrap_or_default();
+            // Its energy goes to the controller link: it can hold a harvest, it stands next to a
+            // source link, and that link is a controller link or an active link that sends to one
+            // (an inactive one could never pass it on, V218).
+            let link = source_link
+                .and_then(|i| links.get(i))
+                .filter(|l| lcfg.enabled && store.capacity > 0 && range(at, l.pos) <= NEAR);
+            let linked = link.and_then(|l| {
+                if receiver(l.pos) {
+                    Some(l.pos)
+                } else if l.active {
+                    receiver_at
+                } else {
+                    None
+                }
+            });
+            let has_link = linked.is_some();
             if near {
                 // Where its harvest lands this tick: its tile, or wherever it stands next to the
-                // source on the way there.
+                // source on the way there; or the controller link.
                 r.mined.push(Mined {
                     source: s.source,
                     tile: at,
+                    link: linked,
                 });
                 stats.mined = stats.mined.saturating_add(1);
+                if linked.is_some() {
+                    stats.linked = stats.linked.saturating_add(1);
+                }
+            }
+            // Its store into the link on the tick the harvest would not fit (the transfer runs
+            // first, V45), when the link has room for all of it at the start of the tick (V216).
+            let per_tick = miner_work(sources.iter().find(|x| x.1 == s.source).map_or(0, |x| x.3))
+                .saturating_mul(HARVEST_POWER);
+            if let Some(i) = source_link
+                && has_link
+                && store.energy > 0
+                && store.energy.saturating_add(per_tick) > store.capacity
+                && let Some(l) = links.get_mut(i)
+                && LINK_CAPACITY
+                    .saturating_sub(l.energy)
+                    .saturating_sub(l.incoming)
+                    >= store.energy
+            {
+                let intent = CreepIntent::Transfer {
+                    target: Target::Structure(l.handle),
+                    resource: ResourceType::Energy,
+                    amount: None,
+                };
+                if buffer.push(snap, m.handle, intent, commit).is_ok() {
+                    l.incoming = l.incoming.saturating_add(store.energy);
+                    stats.transfers = stats.transfers.saturating_add(1);
+                }
             }
             // Harvest while the source holds energy: an empty one would be a billed no-op.
             let source = sources.iter().find(|x| x.1 == s.source);
@@ -402,6 +852,27 @@ impl Mining {
                 let until = now.saturating_add(mcfg.route_retry_ticks);
                 r.unreachable.push((target, until));
             }
+        }
+        // The sends are the Standard `links` job's (`send_room`): the room is a unit when a
+        // source link may send to a controller link this tick.
+        r.links.clear();
+        r.links.extend(links.iter().copied());
+        r.controller = found.controller;
+        let mining_tile = |p: Position| {
+            plan_sources
+                .iter()
+                .any(|s| s.tile.is_some_and(|t| range(p, t) <= NEAR))
+        };
+        let may_send = |l: &RoomLink| {
+            l.active
+                && l.cooldown == 0
+                && l.energy >= lcfg.send_min.max(1)
+                && !receiver(l.pos)
+                && mining_tile(l.pos)
+                && !held.iter().any(|h| h.0 == l.handle)
+        };
+        if lcfg.enabled && receiver_at.is_some() && links.iter().any(may_send) {
+            send_rooms.push(ri);
         }
         // Miners with no source make way.
         for i in members.0..members.1 {
@@ -445,11 +916,14 @@ impl Mining {
         cell.as_mut()
     }
 
-    /// Reads room `name`'s sources (by tile), containers and container sites into the scratch
-    /// lists, and returns its first spawn by id.
-    fn gather(&mut self, snap: &Snapshot, name: RoomName) -> Option<Position> {
+    /// Reads room `name`'s sources (by tile), containers and container sites, links and link sites
+    /// and built links into the scratch lists, and returns its first spawn by id, its controller and
+    /// its level.
+    fn gather(&mut self, snap: &Snapshot, name: RoomName, row: usize) -> Found {
         self.sources.clear();
         self.stores.clear();
+        self.link_spots.clear();
+        self.links.clear();
         let ob = &snap.objects;
         for ((((&h, &kind), &pos), &amount), &total) in ob
             .handles()
@@ -467,6 +941,7 @@ impl Mining {
                 ObjectKind::Container | ObjectKind::Site(StructureType::Container) => {
                     self.stores.push(pos);
                 }
+                ObjectKind::Site(StructureType::Link) => self.link_spots.push(pos),
                 _ => {}
             }
         }
@@ -474,16 +949,102 @@ impl Mining {
         self.sources.sort_unstable_by_key(|s| tile_key(s.1));
         let st = &snap.structures;
         let mut spawn: Option<(u128, Position)> = None;
+        let mut controller = None;
         for ((&h, &kind), &pos) in st.handles().iter().zip(st.kinds()).zip(st.positions()) {
-            if kind != StructureType::Spawn || pos.room_name() != name {
+            if pos.room_name() != name {
                 continue;
             }
-            let key = st.key_of(h).map_or(u128::MAX, |k| k.0);
-            if spawn.is_none_or(|(k, _)| key < k) {
-                spawn = Some((key, pos));
+            match kind {
+                StructureType::Spawn => {
+                    let key = st.key_of(h).map_or(u128::MAX, |k| k.0);
+                    if spawn.is_none_or(|(k, _)| key < k) {
+                        spawn = Some((key, pos));
+                    }
+                }
+                StructureType::Controller => controller = Some(pos),
+                StructureType::Link => self.link_spots.push(pos),
+                _ => {}
             }
         }
-        spawn.map(|(_, pos)| pos)
+        let ln = &snap.links;
+        for (((&handle, &lrow), &energy), &cooldown) in ln
+            .handles()
+            .iter()
+            .zip(ln.rows())
+            .zip(ln.energy())
+            .zip(ln.cooldowns())
+        {
+            let Some(&pos) = usize::try_from(lrow)
+                .ok()
+                .and_then(|r| st.positions().get(r))
+            else {
+                continue;
+            };
+            if pos.room_name() == name {
+                self.links.push(RoomLink {
+                    handle,
+                    row: lrow,
+                    pos,
+                    energy,
+                    cooldown,
+                    active: true,
+                    incoming: 0,
+                });
+            }
+        }
+        let level = match snap.rooms.controllers().get(row) {
+            Some(&Controller::Mine { level }) => level,
+            _ => 0,
+        };
+        Found {
+            spawn: spawn.map(|(_, pos)| pos),
+            controller,
+            level,
+        }
+    }
+
+    /// Reads the tiles of room `name` that a structure, a site or a container takes, with whether it
+    /// blocks movement, into `self.occupied`: a road or a rampart does not refuse a site (V205), every
+    /// other structure, any site and a container do. Only a plan rebuild needs them.
+    fn gather_occupied(&mut self, snap: &Snapshot, name: RoomName) {
+        self.occupied.clear();
+        let ob = &snap.objects;
+        for (&kind, &pos) in ob.kinds().iter().zip(ob.positions()) {
+            if pos.room_name() != name {
+                continue;
+            }
+            match kind {
+                ObjectKind::Container => self.occupied.push((Tile::of(pos), false)),
+                ObjectKind::Site(t) => self.occupied.push((Tile::of(pos), t.is_obstacle())),
+                _ => {}
+            }
+        }
+        let st = &snap.structures;
+        for (&kind, &pos) in st.kinds().iter().zip(st.positions()) {
+            if pos.room_name() == name
+                && !matches!(kind, StructureType::Road | StructureType::Rampart)
+            {
+                self.occupied.push((Tile::of(pos), kind.is_obstacle()));
+            }
+        }
+    }
+
+    /// Marks the links the level keeps active: the engine counts, for each link, the links strictly
+    /// nearer the controller (Chebyshev range) and those at the same range met first in its object
+    /// order, and keeps it active while that count is below `allowed` (V218). The object order is not
+    /// the bot's to see, so a link counts as active only when at most `allowed` links stand at its
+    /// range or nearer: links tied at the last allowed range count as inactive.
+    fn rank_links(&mut self, controller: Option<Position>, allowed: u32) {
+        let at = |l: &RoomLink| controller.map_or(u8::MAX, |c| range(l.pos, c));
+        for i in 0..self.links.len() {
+            let Some(d) = self.links.get(i).map(at) else {
+                continue;
+            };
+            let level = self.links.iter().filter(|l| at(l) <= d).count();
+            if let Some(l) = self.links.get_mut(i) {
+                l.active = u32::try_from(level).unwrap_or(u32::MAX) <= allowed;
+            }
+        }
     }
 
     /// Builds room `ri`'s plan when it has none or its key changed (module docs). Without a grid
@@ -495,9 +1056,11 @@ impl Mining {
         ri: usize,
         snap: &Snapshot,
         row: usize,
-        spawn: Option<Position>,
+        found: Found,
         movement: &mut Movement,
+        lcfg: &LinkConfig,
         mcfg: &MovementConfig,
+        refused: &[Tile],
         commit: &mut Commit,
     ) {
         let Some(r) = self.rooms.get(ri) else {
@@ -505,17 +1068,27 @@ impl Mining {
         };
         let name = r.name;
         let capacity = snap.rooms.energy().get(row).map_or(0, |e| e.capacity);
-        let Some((grid, version)) = movement.room_grid(name, mcfg, commit) else {
+        let refused_n = u32::try_from(refused.len()).unwrap_or(u32::MAX);
+        let Some((_, version)) = movement.room_grid(name, mcfg, commit) else {
             return;
         };
         let near_source = |p: &Position| self.sources.iter().any(|s| range(*p, s.1) <= NEAR);
         let containers =
             u32::try_from(self.stores.iter().filter(|p| near_source(p)).count()).unwrap_or(0);
+        let links = u32::try_from(self.link_spots.len()).unwrap_or(u32::MAX);
+        let built = u32::try_from(self.links.len()).unwrap_or(u32::MAX);
+        let spawn = found.spawn;
         if r.plan.as_ref().is_some_and(|p| {
             p.version == version
                 && p.capacity == capacity
                 && p.spawn == spawn
                 && p.containers == containers
+                && p.controller == found.controller
+                && p.links == links
+                && p.built == built
+                && p.network == lcfg.enabled
+                && p.level == found.level
+                && p.refused == refused_n
                 && p.sources.len() == self.sources.len()
                 && p.sources
                     .iter()
@@ -524,6 +1097,15 @@ impl Mining {
         }) {
             return;
         }
+        // A rebuild: the sources and minerals, the taken tiles, then the grid (cached since the
+        // call above).
+        self.statics.clear();
+        self.statics.extend(movement.room_statics(name));
+        self.gather_occupied(snap, name);
+        let profile = crate::movement::profile(mcfg);
+        let Some((grid, _)) = movement.room_grid(name, mcfg, commit) else {
+            return;
+        };
         let reached = match spawn {
             Some(pos) => {
                 commit.heavy();
@@ -536,7 +1118,7 @@ impl Mining {
             None => false,
         };
         let mut sources: Vec<MineSource> = Vec::with_capacity(self.sources.len());
-        for &(_, pos, _, source_capacity) in &self.sources {
+        for &(_, pos, _, _) in &self.sources {
             let at = Tile::of(pos);
             let has_store = |t: Tile| self.stores.iter().any(|&p| Tile::of(p) == t);
             // Two sources can share a neighbour: each tile holds one miner.
@@ -561,12 +1143,115 @@ impl Mining {
                 }),
                 _ => None,
             };
-            let body = trip.and_then(|t| miner_body(source_capacity, t, capacity));
             sources.push(MineSource {
                 source: pos,
                 tile,
                 trip,
-                body,
+                body: None,
+                link: None,
+            });
+        }
+        // The link tiles (ADR-024), the controller link first.
+        let mining: Vec<Tile> = sources
+            .iter()
+            .filter_map(|s| s.tile.map(Tile::of))
+            .collect();
+        let mut planned: Vec<Tile> = self.link_spots.iter().map(|&p| Tile::of(p)).collect();
+        let controller_link = found.controller.and_then(|c| {
+            let existing = self
+                .link_spots
+                .iter()
+                .copied()
+                .filter(|&p| range(p, c) <= RECEIVER_RANGE)
+                .min_by_key(|&p| (range(p, c), tile_key(p)));
+            existing.or_else(|| {
+                let ok = |t: Tile| {
+                    reached
+                        && link_tile_ok(t, grid, profile.road != profile.plain, profile.road)
+                        && !refused.contains(&t)
+                        && !self.occupied.iter().any(|&(o, _)| o == t)
+                        && !mining.contains(&t)
+                        && !self.statics.iter().any(|&s| t.range(s) <= NEAR)
+                        && self.field.distance(t) != UNREACHED
+                        && keeps_neighbours_connected(t, |n| {
+                            blocks(n, grid, &self.occupied, &planned)
+                        })
+                };
+                let ct = Tile::of(c);
+                let best = (0..rustedscreep_consts::ROOM_AREA)
+                    .filter_map(Tile::from_index)
+                    .filter(|&t| t.range(ct) == CONTROLLER_LINK_RANGE && ok(t))
+                    .min_by_key(|&t| (self.field.distance(t), t.index()));
+                best.and_then(|t| place(name, t))
+            })
+        });
+        if let Some(c) = controller_link {
+            planned.push(Tile::of(c));
+        }
+        for s in &mut sources {
+            let Some(tile) = s.tile else {
+                continue;
+            };
+            let existing = self
+                .link_spots
+                .iter()
+                .copied()
+                .filter(|&p| range(p, tile) <= NEAR)
+                .min_by_key(|&p| tile_key(p));
+            let link = existing.or_else(|| {
+                let source = Tile::of(s.source);
+                let best = Tile::of(tile)
+                    .neighbors()
+                    .map(|(_, t)| t)
+                    .filter(|&t| {
+                        reached
+                            && link_tile_ok(t, grid, profile.road != profile.plain, profile.road)
+                            && !refused.contains(&t)
+                            && !self.occupied.iter().any(|&(o, _)| o == t)
+                            && !mining.contains(&t)
+                            && !planned.contains(&t)
+                            && self.field.distance(t) != UNREACHED
+                            && keeps_neighbours_connected(t, |n| {
+                                blocks(n, grid, &self.occupied, &planned)
+                            })
+                    })
+                    // Off the source's other tiles first (workers harvest there while it has no
+                    // miner), then away from the spawn's way in.
+                    .min_by_key(|&t| {
+                        (
+                            t.range(source) <= NEAR,
+                            std::cmp::Reverse(self.field.distance(t)),
+                            t.index(),
+                        )
+                    });
+                best.and_then(|t| place(name, t))
+            });
+            if let Some(l) = link {
+                planned.push(Tile::of(l));
+            }
+            s.link = link;
+        }
+        // Bodies: one CARRY part while a built link that can pass the energy on (a controller link,
+        // or an active one, V218) stands next to the mining tile.
+        let passes = |l: &RoomLink| {
+            l.active
+                || found
+                    .controller
+                    .is_some_and(|c| range(l.pos, c) <= RECEIVER_RANGE)
+        };
+        for (s, &(_, _, _, source_capacity)) in sources.iter_mut().zip(&self.sources) {
+            let linked = lcfg.enabled
+                && s.tile.is_some_and(|t| {
+                    self.links
+                        .iter()
+                        .any(|l| range(l.pos, t) <= NEAR && passes(l))
+                });
+            s.body = s.trip.and_then(|t| {
+                if linked {
+                    miner_body_with(source_capacity, t, capacity, 1)
+                } else {
+                    miner_body(source_capacity, t, capacity)
+                }
             });
         }
         if let Some(r) = self.rooms.get_mut(ri) {
@@ -575,6 +1260,13 @@ impl Mining {
                 capacity,
                 spawn,
                 containers,
+                controller: found.controller,
+                links,
+                built,
+                network: lcfg.enabled,
+                level: found.level,
+                refused: refused_n,
+                controller_link,
                 sources,
             });
         }
@@ -651,6 +1343,22 @@ impl Mining {
         self.claims = claims;
         self.targets = plan;
     }
+}
+
+/// Whether `t` may take a link (module docs): inside [`LINK_MARGIN`], walkable, and not a road
+/// while roads cost less than plain (a road keeps its tile, as for extensions).
+///
+/// Uses: [`LINK_MARGIN`], `ROOM_SIZE`.
+fn link_tile_ok(t: Tile, grid: &CostGrid, roads: bool, road: u8) -> bool {
+    let high = ROOM_SIZE.saturating_sub(1).saturating_sub(LINK_MARGIN);
+    let inside = |c: u8| (LINK_MARGIN..=high).contains(&c);
+    inside(t.x()) && inside(t.y()) && grid.walkable(t) && !(roads && grid.cost(t) == road)
+}
+
+/// Whether `n` blocks a way around a link tile: a wall, a structure or a site that blocks
+/// movement, or a link tile already planned.
+fn blocks(n: Tile, grid: &CostGrid, occupied: &[(Tile, bool)], planned: &[Tile]) -> bool {
+    !grid.walkable(n) || occupied.iter().any(|&(o, b)| o == n && b) || planned.contains(&n)
 }
 
 /// The position of tile `t` in `room`.

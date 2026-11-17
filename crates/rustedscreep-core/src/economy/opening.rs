@@ -29,7 +29,7 @@ use rustedscreep_consts::{
     BUILD_POWER, HARVEST_POWER, Position, ResourceType, RoomName, StructureType,
 };
 
-use super::mining::Mined;
+use super::mining::{Mined, Receiver};
 use super::sizing::{Trip, carry_round, worker_body, worker_round, workers_for_source};
 use super::watchdog::{Event, Observation, Watchdog};
 use crate::config::{MovementConfig, OpeningConfig};
@@ -58,6 +58,8 @@ pub enum Task {
     Harvest(ObjectHandle),
     /// Take energy from a pile (`pickup`) or a tombstone, ruin or container (`withdraw`).
     Take(ObjectHandle),
+    /// Take energy from a controller link (`withdraw`, P3.2). Counted with [`Task::Take`].
+    Withdraw(StructureHandle),
     /// Transfer energy to a spawn or an extension.
     Fill(StructureHandle),
     Build(ObjectHandle),
@@ -79,6 +81,7 @@ impl Task {
         match self {
             Self::Harvest(_)
             | Self::Take(_)
+            | Self::Withdraw(_)
             | Self::Fill(_)
             | Self::Upgrade { guard: true, .. }
             | Self::Wait(_)
@@ -90,7 +93,7 @@ impl Task {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Harvest(_) => "harvest",
-            Self::Take(_) => "take",
+            Self::Take(_) | Self::Withdraw(_) => "take",
             Self::Fill(_) => "fill",
             Self::Build(_) => "build",
             Self::Upgrade { guard: true, .. } => "guard",
@@ -108,7 +111,7 @@ impl Task {
     fn kind_index(self) -> usize {
         match self {
             Self::Harvest(_) => 0,
-            Self::Take(_) => 1,
+            Self::Take(_) | Self::Withdraw(_) => 1,
             Self::Fill(_) => 2,
             Self::Build(_) => 3,
             Self::Upgrade { guard: true, .. } => 4,
@@ -122,7 +125,7 @@ impl Task {
     const fn move_priority(self) -> u8 {
         match self {
             Self::Fill(_) | Self::Upgrade { guard: true, .. } => 3,
-            Self::Harvest(_) | Self::Take(_) | Self::Wait(_) => 2,
+            Self::Harvest(_) | Self::Take(_) | Self::Withdraw(_) | Self::Wait(_) => 2,
             Self::Build(_) | Self::Upgrade { guard: false, .. } => 1,
             Self::Idle => 0,
         }
@@ -159,6 +162,9 @@ pub struct SourcePlan {
     /// Its miner was next to it when the plan was built (P3.1): workers take its energy off the
     /// miner's tile ([`carry_round`]) instead of harvesting it.
     pub mined: bool,
+    /// Its miner sent its energy to a controller link when the plan was built (P3.2): workers take
+    /// it next to the link, within upgrading range of the controller, so their round has no walk.
+    pub linked: bool,
 }
 
 /// A room's plan: built again when movement's grid version, the room's energy capacity or the
@@ -171,8 +177,10 @@ pub struct Plan {
     /// objects were all seen is built again once they are.
     pub controller: bool,
     pub sources: Vec<SourcePlan>,
-    /// The mined sources the plan was built with, by index in `sources` (bit `i`).
+    /// The mined sources the plan was built with, by index in `sources` (bit `i`), and of them the
+    /// linked ones.
     pub mined: u32,
+    pub linked: u32,
     /// Workers the room spawns up to: the sources' sum within `min_workers..=max_workers` (0 when
     /// no source has an open tile). Unit: creeps.
     pub want: u32,
@@ -235,6 +243,9 @@ struct Facts {
     sites: Vec<(ObjectHandle, Position, StructureType, u32, u32, u128)>,
     /// Energy to take: handle, place, kind, energy left to reserve.
     loose: Vec<(ObjectHandle, Position, ObjectKind, u32)>,
+    /// Controller links (`economy::mining`, P3.2): handle, place, energy left to reserve, and
+    /// whether no send fits it ([`Receiver::full`]).
+    links: Vec<(StructureHandle, Position, u32, bool)>,
     /// Sources whose miner is next to them this tick (`economy::mining`, P3.1).
     mined: Vec<Mined>,
 }
@@ -383,6 +394,7 @@ impl Opening {
         cfg: &OpeningConfig,
         mcfg: &MovementConfig,
         mined: &[Mined],
+        receivers: &[Receiver],
         commit: &mut Commit,
     ) -> Result<(), Fault> {
         let ri = usize::try_from(unit).map_err(|_| Fault::new("unit out of range", unit))?;
@@ -394,7 +406,7 @@ impl Opening {
             (r.name, r.row, r.members)
         };
         let row = row.ok_or(Fault::new("room not in this tick", unit))?;
-        self.gather_facts(snap, name, mined);
+        self.gather_facts(snap, name, mined, receivers);
         self.ensure_plan(ri, snap, row, movement, cfg, mcfg, commit);
         let want = self
             .rooms
@@ -656,17 +668,31 @@ impl Opening {
         }
     }
 
-    /// Reads what room `name` holds this tick, and its mined sources, into `self.facts`.
-    fn gather_facts(&mut self, snap: &Snapshot, name: RoomName, mined: &[Mined]) {
+    /// Reads what room `name` holds this tick, its mined sources and its controller links, into
+    /// `self.facts`.
+    fn gather_facts(
+        &mut self,
+        snap: &Snapshot,
+        name: RoomName,
+        mined: &[Mined],
+        receivers: &[Receiver],
+    ) {
         let f = &mut self.facts;
         f.controller = None;
         f.fills.clear();
         f.sources.clear();
         f.sites.clear();
         f.loose.clear();
+        f.links.clear();
         f.mined.clear();
         f.mined
             .extend(mined.iter().filter(|m| m.source.room_name() == name));
+        f.links.extend(
+            receivers
+                .iter()
+                .filter(|r| r.pos.room_name() == name && r.energy > 0)
+                .map(|r| (r.link, r.pos, r.energy, r.full)),
+        );
         let st = &snap.structures;
         for (((&h, &kind), &pos), &free) in st
             .handles()
@@ -736,24 +762,32 @@ impl Opening {
         };
         let controller = self.facts.controller.is_some();
         let seen = self.facts.sources.len();
-        let mined = self
-            .facts
-            .sources
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| self.facts.mined.iter().any(|m| m.source == s.1))
-            .fold(0u32, |bits, (i, _)| {
-                bits | u32::try_from(i)
-                    .ok()
-                    .and_then(|i| 1u32.checked_shl(i))
-                    .unwrap_or(0)
-            });
+        let mask = |linked: bool| {
+            self.facts
+                .sources
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    self.facts
+                        .mined
+                        .iter()
+                        .any(|m| m.source == s.1 && (!linked || m.link.is_some()))
+                })
+                .fold(0u32, |bits, (i, _)| {
+                    bits | u32::try_from(i)
+                        .ok()
+                        .and_then(|i| 1u32.checked_shl(i))
+                        .unwrap_or(0)
+                })
+        };
+        let (mined, linked) = (mask(false), mask(true));
         if r.plan.as_ref().is_some_and(|p| {
             p.version == version
                 && p.capacity == capacity
                 && p.controller == controller
                 && p.sources.len() == seen
                 && p.mined == mined
+                && p.linked == linked
         }) {
             return;
         }
@@ -771,10 +805,9 @@ impl Opening {
         };
         let mut sources = Vec::with_capacity(self.facts.sources.len());
         for (i, &(_, pos, _, source_capacity)) in self.facts.sources.iter().enumerate() {
-            let is_mined = u32::try_from(i)
-                .ok()
-                .and_then(|i| 1u32.checked_shl(i))
-                .is_some_and(|bit| mined & bit != 0);
+            let bit = u32::try_from(i).ok().and_then(|i| 1u32.checked_shl(i));
+            let is_mined = bit.is_some_and(|bit| mined & bit != 0);
+            let is_linked = bit.is_some_and(|bit| linked & bit != 0);
             let at = Tile::of(pos);
             let open = at.neighbors().filter(|&(_, t)| grid.walkable(t)).count();
             let open = u32::try_from(open).unwrap_or(0);
@@ -793,9 +826,15 @@ impl Opening {
                 }),
                 _ => None,
             };
-            // At a mined source a worker takes its load off the miner's tile in one tick.
+            // At a mined source a worker takes its load off the miner's tile in one tick; at a
+            // linked one it takes it next to the controller link and upgrades from there.
             let round = if is_mined { carry_round } else { worker_round };
-            let want = match (body.as_ref(), trip) {
+            let walk = if is_linked {
+                trip.map(|_| Trip { tiles: 0, cost: 0 })
+            } else {
+                trip
+            };
+            let want = match (body.as_ref(), walk) {
                 (Some(b), Some(t)) => round(b, t).map_or(0, |round| {
                     workers_for_source(source_capacity, open, b, round)
                 }),
@@ -807,6 +846,7 @@ impl Opening {
                 want,
                 trip,
                 mined: is_mined,
+                linked: is_linked,
             });
         }
         let sum = sources.iter().fold(0u32, |s, p| s.saturating_add(p.want));
@@ -822,6 +862,7 @@ impl Opening {
                 controller,
                 sources,
                 mined,
+                linked,
                 want,
             });
         }
@@ -987,6 +1028,11 @@ impl Opening {
                 && let Some(l) = self.facts.loose.iter_mut().find(|l| l.0 == h)
             {
                 l.3 = l.3.saturating_sub(free);
+            }
+            if let Task::Withdraw(h) = task
+                && let Some(l) = self.facts.links.iter_mut().find(|l| l.0 == h)
+            {
+                l.2 = l.2.saturating_sub(free);
             }
             if let Some(w) = self.worker_mut(i, snap) {
                 w.task = task;
@@ -1213,7 +1259,10 @@ impl Opening {
     /// several small ones (each a billed intent) in the same time; a take kept from the last tick
     /// follows the same rule. A gatherer whose own source is mined takes its load there, or the
     /// nearer energy found first, and otherwise waits there (`Task::Wait`), with a partial load
-    /// too, so it carries whole loads.
+    /// too, so it carries whole loads. A controller link (P3.2) fills by whole sends, so it follows
+    /// the same rule as a miner's tile until no send fits it ([`Receiver::full`]): then its energy
+    /// comes only once a worker takes some, so `enough` is worth a take. A gatherer whose mined
+    /// source sends its energy there ([`Mined::link`]) takes and waits next to it.
     fn pick_gather(&self, w: Worker, at: Position, free: u32, scavenge_min: u32) -> Option<Task> {
         let enough = scavenge_min.min(free).max(1);
         let f = &self.facts;
@@ -1230,6 +1279,14 @@ impl Opening {
         {
             return Some(Task::Take(h));
         }
+        let link_worth = |l: &(StructureHandle, Position, u32, bool)| {
+            open(l.1) && (l.2 >= free.max(1) || (l.3 && l.2 >= enough))
+        };
+        if let Task::Withdraw(h) = w.task
+            && f.links.iter().any(|l| l.0 == h && link_worth(l))
+        {
+            return Some(Task::Withdraw(h));
+        }
         let worth = |l: &&(ObjectHandle, Position, ObjectKind, u32)| {
             open(l.1)
                 && if at_mined(l.1) {
@@ -1238,16 +1295,32 @@ impl Opening {
                     l.3 >= enough
                 }
         };
-        let take = f
+        let object = f
             .loose
             .iter()
             .filter(worth)
-            .min_by_key(|l| (range(at, l.1), tile_key(l.1)))
-            .copied();
+            .map(|l| (Task::Take(l.0), l.1))
+            .min_by_key(|t| (range(at, t.1), tile_key(t.1)));
+        let link = f
+            .links
+            .iter()
+            .filter(|l| link_worth(l))
+            .map(|l| (Task::Withdraw(l.0), l.1))
+            .min_by_key(|t| (range(at, t.1), tile_key(t.1)));
+        let take = match (object, link) {
+            (Some(o), Some(l)) => Some(
+                if (range(at, l.1), tile_key(l.1)) < (range(at, o.1), tile_key(o.1)) {
+                    l
+                } else {
+                    o
+                },
+            ),
+            (o, l) => o.or(l),
+        };
         if let Some(tile) = w.source.and_then(|p| self.mined_tile(p)) {
             return take
                 .filter(|t| range(at, t.1) <= range(at, tile))
-                .map(|t| Task::Take(t.0))
+                .map(|t| t.0)
                 .or_else(|| open(tile).then_some(Task::Wait(tile)));
         }
         let own = f
@@ -1256,7 +1329,7 @@ impl Opening {
             .find(|s| Some(s.1) == w.source && s.2 > 0 && open(s.1) && !mined(s.1))
             .copied();
         match (take, own) {
-            (Some(t), Some(s)) if range(at, t.1) <= range(at, s.1) => Some(Task::Take(t.0)),
+            (Some(t), Some(s)) if range(at, t.1) <= range(at, s.1) => Some(t.0),
             (_, Some(s)) => Some(Task::Harvest(s.0)),
             (take, None) => f
                 .sources
@@ -1264,7 +1337,7 @@ impl Opening {
                 .filter(|s| s.2 > 0 && open(s.1) && !mined(s.1))
                 .min_by_key(|s| (range(at, s.1), tile_key(s.1)))
                 .map(|s| Task::Harvest(s.0))
-                .or_else(|| take.map(|t| Task::Take(t.0)))
+                .or_else(|| take.map(|t| t.0))
                 .or_else(|| {
                     f.loose
                         .iter()
@@ -1275,13 +1348,14 @@ impl Opening {
         }
     }
 
-    /// The miner's tile of `source` when its miner is next to it this tick.
+    /// Where the energy of `source` lands when its miner is next to it this tick: the miner's tile,
+    /// or the controller link it sends to (P3.2).
     fn mined_tile(&self, source: Position) -> Option<Position> {
         self.facts
             .mined
             .iter()
             .find(|m| m.source == source)
-            .map(|m| m.tile)
+            .map(|m| m.link.unwrap_or(m.tile))
     }
 
     /// Pushes `members[i]`'s intent when it is in range of its task's target, and asks movement to
@@ -1332,6 +1406,14 @@ impl Opening {
                         resource: energy,
                         amount: None,
                     }
+                };
+                (pos, NEAR, Some(intent))
+            }),
+            Task::Withdraw(h) => structure(h).map(|pos| {
+                let intent = CreepIntent::Withdraw {
+                    target: h,
+                    resource: energy,
+                    amount: None,
                 };
                 (pos, NEAR, Some(intent))
             }),

@@ -318,7 +318,7 @@ export function moveSim(dir = join(ROOT, 'dist')) {
   const openingSummary = commandResults(world, OPENING_CMD);
   const openingParts = [
     `rustedscreep opening at tick ${T0 + OPENING_AT}: ${ROOM}: workers 0 of 0 (working 0), no request, plan at capacity 0: `,
-    ` | sites: picked ${LOST_MAX} (0 containers), placed ${LOST_MAX}, refused 0, never seen ${LOST_MAX}, tiles skipped ${LOST_MAX}`,
+    ` | sites: picked ${LOST_MAX} (0 containers, 0 links), placed ${LOST_MAX}, refused 0, never seen ${LOST_MAX}, tiles skipped ${LOST_MAX}`,
   ];
   if (openingSummary.length !== 1) problems.push(`${openingSummary.length} opening summaries, expected 1`);
   else for (const p of openingParts) if (!openingSummary[0].includes(p)) problems.push(`opening summary lacks "${p}": ${openingSummary[0]}`);

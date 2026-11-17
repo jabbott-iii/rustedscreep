@@ -24,7 +24,7 @@ mod tick;
 pub use intern::{Handle, Interner, ObjectKey};
 pub use room_name::parse_room_name;
 pub use tables::{
-    Controller, ControllerState, CreepClass, CreepHandle, CreepRow, CreepStore, Creeps,
+    Controller, ControllerState, CreepClass, CreepHandle, CreepRow, CreepStore, Creeps, Links,
     ObjectClass, ObjectHandle, ObjectKind, ObjectRow, ObjectStatic, RoomEnergy, RoomObjects, Rooms,
     Spawns, StructureClass, StructureHandle, StructureStatic, Structures, known_structure_type,
     position_from_packed,
@@ -179,6 +179,8 @@ pub struct Snapshot {
     pub structures: Structures,
     /// The bot's spawns (P2.3), a view over `structures`.
     pub spawns: Spawns,
+    /// The bot's links (P3.2), a view over `structures`.
+    pub links: Links,
     /// Sources, own sites, piles, tombstones, ruins and containers in owned rooms (P2.4).
     pub objects: RoomObjects,
     pub skipped: SkipCounts,
@@ -192,6 +194,7 @@ impl Snapshot {
         self.creeps.begin();
         self.structures.begin();
         self.spawns.begin();
+        self.links.begin();
         self.objects.begin();
         self.skipped = SkipCounts::default();
     }

@@ -90,6 +90,7 @@ The live server's constants are the ground truth for that server. At init, the b
 | Inter-room routes in the sandbox (the plain build with a PathFinder model: a cross-room order, room callback answers, a search that throws) | `node js/tools/route-sim.mjs` |
 | Spawn path in the sandbox (the plain build with two spawns: a console request, energy waits, a refused call's hold, the body and name passed, a dropped order re-armed, the `Memory` entry delete and reset of ADR-018 and ADR-019) | `node js/tools/spawn-sim.mjs` |
 | Opening in the sandbox (the plain build from zero creeps at RCL1 to level 2 and a first extension: the recovery and its log lines, the worker calls and their targets, the `Memory` entries, the extension sites of ADR-020, a pile and a tombstone, `rustedscreep.opening()`) | `node js/tools/opening-sim.mjs` |
+| Links in the sandbox (the plain build at RCL5 with a source link and a controller link: the snapshot's link reads, the miner's transfers, the sends with their targets, amounts and cooldowns, the worker's withdraws, the summary's link fragments) | `node js/tools/link-sim.mjs` |
 | Regenerate the engine-constants fixture from an engine's `lib/constants.js` | `node js/tools/consts-fixture.mjs <path> <version>` |
 | Tool tests (Node) / sizes and upload budget | `npm run test` / `npm run size` |
 | Full gate (same as `/check`) | `npm run check` |

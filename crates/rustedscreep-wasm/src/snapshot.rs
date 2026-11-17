@@ -30,7 +30,9 @@
 //!   With `cache.structure_static` off (the naive baseline, P1.10) those three are read every tick.
 //!   A spawn adds `spawning` (P2.3, V175); while it is spawning the `Spawning` object comes back
 //!   through an `Option` (below), and dropping it runs in wasm (V100). A spawn or an extension in a
-//!   room that is not full adds `store` and `getFreeCapacity` for energy (P2.4, V196).
+//!   room that is not full adds `store` and `getFreeCapacity` for energy (P2.4, V196). A link adds
+//!   `store` and `getUsedCapacity` for energy every tick, and `cooldown` while it holds energy (an
+//!   empty link cannot send, so its cooldown is never read) (P3.2, V216).
 //!
 //! Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and one
 //! `__externref_table_alloc` (with a JS `Table.set`) per object returned through an `Option`: every
@@ -56,7 +58,7 @@ use rustedscreep_core::spawning::{CreepName, Identity};
 use screeps::{
     ConstructionSite, Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Position,
     Resource, ResourceType, Room, RoomObject, Source, Store, Structure, StructureController,
-    StructureSpawn, StructureType, find, game,
+    StructureLink, StructureSpawn, StructureType, find, game,
 };
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
@@ -435,6 +437,22 @@ fn push_structure(snapshot: &mut Snapshot, js: &mut JsWorld, structure: Structur
                     .is_some();
                 let row = u32::try_from(structures.len().saturating_sub(1)).unwrap_or(u32::MAX);
                 snapshot.spawns.push(handle, row, busy);
+            }
+            if kind == Some(StructureType::Link) {
+                // `store.energy` behind the getter, and the raw `cooldown || 0` (V216): the crate's
+                // getters read them as u32 (a missing value is 0), with no type check to trap on.
+                // An empty link cannot send (V216), so its cooldown stays 0, unread.
+                let energy = structure
+                    .unchecked_ref::<Stored>()
+                    .store_of()
+                    .get_used_capacity(Some(ResourceType::Energy));
+                let cooldown = if energy > 0 {
+                    structure.unchecked_ref::<StructureLink>().cooldown()
+                } else {
+                    0
+                };
+                let row = u32::try_from(structures.len().saturating_sub(1)).unwrap_or(u32::MAX);
+                snapshot.links.push(handle, row, energy, cooldown);
             }
             js.structures.push(structure);
         }

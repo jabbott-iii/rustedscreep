@@ -133,6 +133,7 @@ pub fn game_loop() {
                     &mut act.buffer,
                     &cfg.opening,
                     &cfg.mining,
+                    &cfg.links,
                     &cfg.movement,
                 );
                 spawn.plan(&mut tick, snapshot);
@@ -145,6 +146,8 @@ pub fn game_loop() {
                     &mut act.buffer,
                     &cfg.movement,
                 );
+                // Standard: the link sends (P3.2), from the `mining` job's rooms.
+                opening.send_links(&mut tick, &cfg.links);
                 // Standard: the periodic room rescans, then the console's move order.
                 movement.rescan(&mut tick, snapshot, js, &cfg.movement);
                 movement.run_console(&mut tick, snapshot, &cfg.movement);
@@ -152,14 +155,15 @@ pub fn game_loop() {
                 // the config in force after the loads (on a global's second loop the record loads in
                 // this same step, and the check usually completes in it).
                 consts.run(&mut tick, snapshot.tick.time, &runtime.get().log);
-                // Optional: the interim container and extension placement (ADR-023, ADR-020),
-                // after the self-check.
+                // Optional: the interim container, link and extension placement (ADR-023, ADR-024,
+                // ADR-020), after the self-check.
                 opening.place(
                     &mut tick,
                     snapshot,
                     &mut movement.core,
                     &cfg.opening,
                     &cfg.mining,
+                    &cfg.links,
                     &cfg.movement,
                 );
                 act.queue_console_say(snapshot, tick.commit());
@@ -182,8 +186,17 @@ pub fn game_loop() {
                     &cfg.scheduler,
                     &cfg.spawn,
                 );
-                // Then the sites the placement picked (ADR-020, ADR-023), then the creep intents.
+                // Then the sites the placement picked (ADR-020, ADR-023, ADR-024), the link sends
+                // (P3.2), then the creep intents.
                 opening.issue_sites(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
+                opening.issue_links(
+                    snapshot,
+                    js,
+                    act.log_mut(),
+                    sched,
+                    &cfg.scheduler,
+                    &cfg.links,
+                );
                 act::issue(act, snapshot, js, sched, &cfg.scheduler);
                 movement.after_act(snapshot, act.refused_moves(), &cfg.movement);
                 probe.act();

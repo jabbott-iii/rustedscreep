@@ -1,5 +1,5 @@
-//! Interim extension placement (ADR-020) and source containers (ADR-023); the P4 base planner keeps
-//! or replaces what it builds: while an owned room with a spawn has fewer extensions and extension
+//! Interim extension placement (ADR-020), source containers (ADR-023) and links (ADR-024); the P4
+//! base planner keeps or replaces what it builds: while an owned room with a spawn has fewer extensions and extension
 //! sites than its level allows (`CONTROLLER_STRUCTURES`), the Optional job picks one tile per tick
 //! and the act step calls `Room.createConstructionSite` on it. The opening's workers build the
 //! sites.
@@ -8,6 +8,12 @@
 //! (`Mining::container_needs`: the room pays for the source's miner and the tile has no container
 //! and no container site), while the room has fewer containers and container sites than its level
 //! allows. They take the same one call per room per tick and the same refusal rules below.
+//!
+//! Links go next (ADR-024): the tiles `economy::mining` lists (`Mining::link_needs`: the controller
+//! link, then the source links, farthest source first), while the room has fewer links and link
+//! sites than its level allows. The game side does not count the tick's earlier link sites either,
+//! and the processor drops a site past the level's count silently (V219), so the one call per tick
+//! keeps the count right.
 //!
 //! The pattern is a checkerboard around the room's first spawn (by id): extensions take the tiles of
 //! the spawn's parity (`(x + y) % 2`) at range 2 or more, nearest by path first. Diagonal steps keep a
@@ -106,6 +112,8 @@ pub struct PlacementTotals {
     pub picked: u32,
     /// Of `picked`, container sites (ADR-023).
     pub containers: u32,
+    /// Of `picked`, link sites (ADR-024).
+    pub links: u32,
     pub placed: u32,
     pub refused: u32,
     /// Picks that never appeared within [`APPEAR_TICKS`].
@@ -173,8 +181,8 @@ impl Placement {
     }
 
     /// Room `unit`'s pick for this tick, if it needs one (module docs): a container site on the
-    /// first of `containers` (the room's mining tiles that need one) not refused yet, else, with
-    /// `extensions`, an extension site. An extension pick is a heavy unit (a flow field from the
+    /// first of `containers` (the room's mining tiles that need one) not refused yet, else a link
+    /// site on the first of `links` not refused yet, else, with `extensions`, an extension site. An extension pick is a heavy unit (a flow field from the
     /// spawn); either commits one intent (`INTENT_CPU_COST`: each accepted call is billed, V203).
     #[allow(clippy::too_many_arguments)]
     pub fn plan_room(
@@ -185,6 +193,7 @@ impl Placement {
         mcfg: &MovementConfig,
         extensions: bool,
         containers: &[Tile],
+        links: &[Tile],
         commit: &mut Commit,
     ) -> Result<(), Fault> {
         let now = self.time;
@@ -236,6 +245,27 @@ impl Placement {
                 tile,
                 at: now,
                 kind: container,
+            });
+            return Ok(());
+        }
+        // Then a link (ADR-024): no pattern, no flow field.
+        let link = StructureType::Link;
+        if let Some(&tile) = links.iter().find(|t| !r.refused.contains(t))
+            && links_in(snap, name) < link.controller_structures(u32::from(level))
+        {
+            self.orders.push(SiteOrder {
+                room: name,
+                room_row: row,
+                tile,
+                kind: link,
+            });
+            commit.add(INTENT_CPU_COST);
+            self.totals.picked = self.totals.picked.saturating_add(1);
+            self.totals.links = self.totals.links.saturating_add(1);
+            r.pending = Some(Pending {
+                tile,
+                at: now,
+                kind: link,
             });
             return Ok(());
         }
@@ -370,6 +400,15 @@ impl Placement {
         &self.totals
     }
 
+    /// The tiles of `room` this global gave up on (refused by the game, or never seen within
+    /// [`APPEAR_TICKS`]); `economy::mining` picks no link tile there.
+    pub fn refused_tiles(&self, room: RoomName) -> &[Tile] {
+        self.rooms
+            .iter()
+            .find(|r| r.name == room)
+            .map_or(&[], |r| r.refused.as_slice())
+    }
+
     /// Tiles skipped per room, for the console.
     pub fn refused(&self) -> impl Iterator<Item = (RoomName, usize)> + '_ {
         self.rooms.iter().map(|r| (r.name, r.refused.len()))
@@ -409,6 +448,25 @@ pub fn containers_in(snap: &Snapshot, room: RoomName) -> u32 {
         })
         .count();
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Own links and link sites in `room`.
+pub fn links_in(snap: &Snapshot, room: RoomName) -> u32 {
+    let st = &snap.structures;
+    let built = st
+        .kinds()
+        .iter()
+        .zip(st.positions())
+        .filter(|&(&k, p)| k == StructureType::Link && p.room_name() == room)
+        .count();
+    let ob = &snap.objects;
+    let sites = ob
+        .kinds()
+        .iter()
+        .zip(ob.positions())
+        .filter(|&(&k, p)| k == ObjectKind::Site(StructureType::Link) && p.room_name() == room)
+        .count();
+    u32::try_from(built + sites).unwrap_or(u32::MAX)
 }
 
 /// Own extensions and extension sites in `room`.
@@ -512,7 +570,7 @@ pub fn next_extension(
 
 /// Whether the free neighbours of `t` stay one group (8-connected among themselves) once `t` is
 /// blocked: then any way through `t` can go around it, so blocking it never splits the room.
-fn keeps_neighbours_connected(t: Tile, blocked: impl Fn(Tile) -> bool) -> bool {
+pub(super) fn keeps_neighbours_connected(t: Tile, blocked: impl Fn(Tile) -> bool) -> bool {
     let mut free = [None; 8];
     let mut n = 0;
     for (_, nb) in t.neighbors() {
