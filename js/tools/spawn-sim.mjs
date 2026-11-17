@@ -285,11 +285,11 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
     if (!c.isArray || JSON.stringify(c.body) !== JSON.stringify(BODY)) problems.push(`offset ${c.offset}: body ${JSON.stringify(c.body)}, expected ${JSON.stringify(BODY)}`);
   }
   // No request can be served while SpawnA is held and SpawnB busy, nor on the quiet tick (no request), nor once both
-  // are busy again: no spawn job runs, so the plain build reads the clock in its loop only for the P2.4 opening's
-  // three jobs, one unit each for W1N1 with a sample before and after (6: the Critical and Standard jobs, and the
-  // Optional extension placement of ADR-020; was 0 before P2.4; the constants self-check is done by then;
-  // movement's next rescan is 50 ticks after the first).
-  const OPENING_SAMPLES = 6;
+  // are busy again: no spawn job runs, so the plain build reads the clock in its loop only for the economy's four
+  // jobs, one unit each for W1N1 with a sample before and after (8: the P3.1 static miners' Critical job, the P2.4
+  // opening's Critical and Standard jobs, and the Optional site placement of ADR-020; was 6 before P3.1 and 0
+  // before P2.4; the constants self-check is done by then; movement's next rescan is 50 ticks after the first).
+  const OPENING_SAMPLES = 8;
   const idle = [];
   for (let o = AGAIN_AT + 1; o < B_FREE; o++) idle.push(o);
   idle.push(QUIET, REARMED + 1);

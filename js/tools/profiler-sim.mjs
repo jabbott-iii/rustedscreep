@@ -10,7 +10,8 @@
 //   loops the constants self-check (P1.11) runs in, which read the clock up to 64 more times, and every
 //   movement.scan_interval_ticks-th loop after the first, whose rescan of the owned W1N1 (P2.1, a Standard job
 //   of one unit) reads it twice more; every loop also reads it four times for the P2.4 opening's two jobs (one unit
-//   each for W1N1, which has no source, so the opening stays inert), and from the second loop twice more for its
+//   each for W1N1, which has no source, so the opening stays inert), twice for the P3.1 mining job (one unit for
+//   W1N1, inert with no source), and from the second loop twice more for its
 //   Optional extension placement (ADR-020), whose createConstructionSite calls (the fake room places nothing, so
 //   each pick is given up after APPEAR_TICKS and the next made, LOST_MAX times, then none for the global) count in
 //   the first window's calls and billed;
@@ -232,9 +233,9 @@ export function profilerSim() {
     // periodic rescan comes every SCAN_INTERVAL loops after it: one unit, a sample before and after.
     const rescan = offset > 1 && (offset - 1) % SCAN_INTERVAL === 0 ? 1 : 0;
     // The opening (P2.4): its Critical and Standard jobs run one unit each for W1N1 on every loop, a sample before
-    // and after each (4 more than before P2.4), and its Optional placement job (ADR-020) one unit from the second
-    // loop (2 more).
-    const opening = 4 + (offset >= 2 ? 2 : 0);
+    // and after each (4 more than before P2.4), the mining job (P3.1) one unit on every loop (2 more), and its
+    // Optional placement job (ADR-020) one unit from the second loop (2 more).
+    const opening = 4 + 2 + (offset >= 2 ? 2 : 0);
     const reads = (closing.has(offset) && offset !== closeAt(noRawMemory.window) ? 1 : 0) + config;
     const want = { getUsed: (closing.has(offset) ? 7 : 6) + 2 * config + 2 * rescan + opening, segments: reads };
     const checking = offset <= constsLast;

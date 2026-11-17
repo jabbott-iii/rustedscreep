@@ -15,13 +15,23 @@
 //! dies `CREEP_LIFE_TIME` ticks after it is born and leaves a tombstone with its store (V194, the
 //! body reclaim left out: about 0 at old age); piles lose `ceil(amount / ENERGY_DECAY)` a tick and
 //! merge on a tile (V193). Moves follow V51, V52 and the fatigue rules (V54, V55) on plain terrain.
+//! Containers (P3.1, ADR-023): energy made on a tile (a harvest's overflow, a decayed tombstone)
+//! goes into a container there first, up to `CONTAINER_CAPACITY`, and the rest onto a pile (V193);
+//! `withdraw` takes from one (V192); a finished container site becomes one; a container refuses
+//! another site on its tile (V205). Their decay is left out (`CONTAINER_DECAY` per
+//! `CONTAINER_DECAY_TIME_OWNED` leaves a new one 25000 ticks, beyond every scenario here).
 
 use super::placement::{
     CONTROLLER_CLEAR, EDGE_MARGIN, Placement, SPAWN_CLEAR, extensions_in, next_extension,
 };
-use super::sizing::{Round, Trip, walk_ticks, worker_body, worker_round, workers_for_source};
+use super::sizing::{
+    Round, Trip, carry_round, miner_body, miner_work, walk_ticks, worker_body, worker_round,
+    workers_for_source,
+};
 use super::*;
-use crate::config::{CACHE_MMO, MMO, MOVEMENT_MMO, OPENING_MMO, OpeningConfig, SPAWN_MMO};
+use crate::config::{
+    CACHE_MMO, MINING_MMO, MMO, MOVEMENT_MMO, MiningConfig, OPENING_MMO, OpeningConfig, SPAWN_MMO,
+};
 use crate::intents::{ActLog, CreepIntent, IntentBuffer, Outcome, Target, TargetRow};
 use crate::movement::{
     CostGrid, Dial, FlowField, Footprint, Movement, ShoveCaps, TerrainGrid, Tile,
@@ -31,13 +41,14 @@ use crate::snapshot::{
     Controller, ControllerState, CreepRow, CreepStore, ObjectKey, ObjectKind, ObjectRow,
     ObjectStatic, RoomEnergy, Snapshot, StructureStatic, TickContext,
 };
-use crate::spawning::{Body, Identity, Spawner, WORKER_PATTERN};
+use crate::spawning::{Body, Identity, Role, Spawner, WORKER_PATTERN};
 use rustedscreep_consts::{
-    BUILD_POWER, CARRY_CAPACITY, CONTROLLER_DOWNGRADE_RESTORE, CREEP_LIFE_TIME, ENERGY_DECAY,
-    ENERGY_REGEN_TIME, ErrorCode, HARVEST_POWER, MOVE_COST_PLAIN, MOVE_COST_SWAMP, MOVE_POWER,
-    Part, Position, RoomCoordinate, RoomName, SOURCE_ENERGY_CAPACITY, SPAWN_ENERGY_CAPACITY,
-    SPAWN_ENERGY_START, StructureType, TOMBSTONE_DECAY_PER_PART, Terrain, UPGRADE_CONTROLLER_POWER,
-    controller_downgrade, controller_levels, extension_energy_capacity,
+    BUILD_POWER, CARRY_CAPACITY, CONTAINER_CAPACITY, CONTROLLER_DOWNGRADE_RESTORE, CREEP_LIFE_TIME,
+    ENERGY_DECAY, ENERGY_REGEN_TIME, ErrorCode, HARVEST_POWER, MAX_CREEP_SIZE, MOVE_COST_PLAIN,
+    MOVE_COST_ROAD, MOVE_COST_SWAMP, MOVE_POWER, Part, Position, RoomCoordinate, RoomName,
+    SOURCE_ENERGY_CAPACITY, SOURCE_ENERGY_KEEPER_CAPACITY, SOURCE_ENERGY_NEUTRAL_CAPACITY,
+    SPAWN_ENERGY_CAPACITY, SPAWN_ENERGY_START, StructureType, TOMBSTONE_DECAY_PER_PART, Terrain,
+    UPGRADE_CONTROLLER_POWER, controller_downgrade, controller_levels, extension_energy_capacity,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -172,6 +183,141 @@ fn worker_bodies_by_level() {
         assert!(body.cost() <= capacity);
     }
     assert_eq!(worker_body(unit - 1), None);
+}
+
+/// Uses: HARVEST_POWER, ENERGY_REGEN_TIME, SOURCE_ENERGY_CAPACITY, SOURCE_ENERGY_NEUTRAL_CAPACITY,
+/// SOURCE_ENERGY_KEEPER_CAPACITY. A miner's WORK parts take a source's whole capacity within one
+/// regeneration window, and one part fewer would not.
+#[test]
+fn a_miners_work_parts_drain_its_source() {
+    for capacity in [
+        SOURCE_ENERGY_NEUTRAL_CAPACITY,
+        SOURCE_ENERGY_CAPACITY,
+        SOURCE_ENERGY_KEEPER_CAPACITY,
+    ] {
+        let work = miner_work(capacity);
+        let per_window = HARVEST_POWER * ENERGY_REGEN_TIME;
+        assert!(work * per_window >= capacity, "{capacity}");
+        assert!((work - 1) * per_window < capacity, "{capacity}");
+    }
+    assert_eq!(miner_work(0), 0);
+}
+
+/// Every loss a miner body can have, by brute force: (MOVE parts, loss in energy ×
+/// ENERGY_REGEN_TIME) for each MOVE count that fits `energy`. Uses: BODYPART_COST,
+/// ENERGY_REGEN_TIME, MAX_CREEP_SIZE.
+fn miner_losses(capacity: u32, trip: Trip, energy: u32) -> Vec<(u32, u64)> {
+    let work = miner_work(capacity);
+    (1..=MAX_CREEP_SIZE - work)
+        .filter(|&m| work * Part::Work.cost() + m * Part::Move.cost() <= energy)
+        .map(|m| {
+            let walk = walk_ticks(trip, work, m).expect("walk");
+            let loss = u64::from(m * Part::Move.cost()) * u64::from(ENERGY_REGEN_TIME)
+                + u64::from(walk) * u64::from(capacity);
+            (m, loss)
+        })
+        .collect()
+}
+
+/// Property test over source capacities, trips (plain, swamp and road tiles) and the room
+/// capacities of every level: a miner body costs at most the energy, has `miner_work` WORK parts
+/// and at least one MOVE, at most MAX_CREEP_SIZE parts, the least loss of every MOVE count that
+/// fits (the fewest MOVE among equal losses), and more energy never makes the loss larger.
+/// Uses: BODYPART_COST, MOVE_COST_PLAIN, MOVE_COST_SWAMP, MOVE_COST_ROAD, MAX_CREEP_SIZE,
+/// SPAWN_ENERGY_CAPACITY, CONTROLLER_STRUCTURES, EXTENSION_ENERGY_CAPACITY.
+#[test]
+fn miner_bodies_fit_and_lose_the_least() {
+    let energies: Vec<u32> = (1..=8u32)
+        .map(|rcl| {
+            SPAWN_ENERGY_CAPACITY
+                + StructureType::Extension.controller_structures(rcl)
+                    * extension_energy_capacity(rcl)
+        })
+        .chain([0, 299, 549, 551, 649, 1000])
+        .collect();
+    for capacity in [
+        SOURCE_ENERGY_NEUTRAL_CAPACITY,
+        SOURCE_ENERGY_CAPACITY,
+        SOURCE_ENERGY_KEEPER_CAPACITY,
+    ] {
+        let work = miner_work(capacity);
+        for tiles in [1u32, 5, 13, 30, 60] {
+            for rate in [MOVE_COST_ROAD, MOVE_COST_PLAIN, MOVE_COST_SWAMP] {
+                let trip = Trip {
+                    tiles,
+                    cost: tiles * rate,
+                };
+                let mut sorted = energies.clone();
+                sorted.sort_unstable();
+                let mut last: Option<u64> = None;
+                for &energy in &sorted {
+                    let losses = miner_losses(capacity, trip, energy);
+                    let Some(body) = miner_body(capacity, trip, energy) else {
+                        assert!(losses.is_empty(), "{capacity} {tiles} {rate} {energy}");
+                        continue;
+                    };
+                    assert!(body.cost() <= energy);
+                    assert!(body.len() <= MAX_CREEP_SIZE as usize);
+                    assert_eq!(count(&body, Part::Work), work);
+                    assert_eq!(count(&body, Part::Carry), 0);
+                    let moves = count(&body, Part::Move);
+                    assert!(moves >= 1);
+                    assert_eq!(body.len() as u32, work + moves, "only WORK and MOVE");
+                    let least = losses.iter().map(|l| l.1).min().expect("a loss");
+                    let fewest = losses.iter().find(|l| l.1 == least).expect("least").0;
+                    assert_eq!(moves, fewest, "{capacity} {tiles} {rate} {energy}");
+                    if let Some(prev) = last {
+                        assert!(least <= prev, "more energy, no larger loss");
+                    }
+                    last = Some(least);
+                }
+            }
+        }
+    }
+}
+
+/// At RCL2's full capacity a source of SOURCE_ENERGY_CAPACITY gets its miner, with as many MOVE
+/// parts as the energy left after the WORK parts pays for (one, at 550); at RCL1's spawn alone it
+/// gets none. Uses: BODYPART_COST, SPAWN_ENERGY_CAPACITY, CONTROLLER_STRUCTURES,
+/// EXTENSION_ENERGY_CAPACITY, MOVE_COST_PLAIN.
+#[test]
+fn miner_bodies_by_level() {
+    let trip = Trip {
+        tiles: 15,
+        cost: 15 * MOVE_COST_PLAIN,
+    };
+    let work = miner_work(SOURCE_ENERGY_CAPACITY);
+    let rcl2 = SPAWN_ENERGY_CAPACITY
+        + StructureType::Extension.controller_structures(2) * extension_energy_capacity(2);
+    let left = rcl2 - work * Part::Work.cost();
+    let body = miner_body(SOURCE_ENERGY_CAPACITY, trip, rcl2).expect("a miner at RCL2");
+    assert!(count(&body, Part::Move) <= left / Part::Move.cost());
+    assert!(work * Part::Work.cost() + Part::Move.cost() > SPAWN_ENERGY_CAPACITY);
+    assert_eq!(
+        miner_body(SOURCE_ENERGY_CAPACITY, trip, SPAWN_ENERGY_CAPACITY),
+        None
+    );
+}
+
+/// Uses: CARRY_CAPACITY, UPGRADE_CONTROLLER_POWER, MOVE_COST_PLAIN. At a mined source a worker's
+/// round takes one tick there; its walk and upgrade are the harvesting round's.
+#[test]
+fn a_carry_round_takes_one_tick_at_the_source() {
+    let trip = Trip {
+        tiles: 12,
+        cost: 12 * MOVE_COST_PLAIN,
+    };
+    for n in 1..=4 {
+        let body = repeats(n);
+        let harvest = worker_round(&body, trip).expect("round");
+        let carry = carry_round(&body, trip).expect("round");
+        assert_eq!(carry.harvest, 1);
+        assert_eq!(carry.walk, harvest.walk);
+        assert_eq!(
+            carry.upgrade,
+            (n * CARRY_CAPACITY).div_ceil(UPGRADE_CONTROLLER_POWER * n)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -418,6 +564,12 @@ enum Loose {
         energy: u32,
         decay_at: u32,
     },
+    /// A container (ADR-023): it holds up to `CONTAINER_CAPACITY` and never decays here.
+    Container {
+        key: u128,
+        at: Tile,
+        energy: u32,
+    },
 }
 
 /// What the world adds when the controller levels up: the level's extensions built at once (the
@@ -463,10 +615,14 @@ struct World {
     movement: Movement,
     spawner: Spawner,
     opening: Opening,
+    mining: Mining,
     placement: Placement,
     cfg: OpeningConfig,
-    /// Sites the bot's placement asked for: accepted, refused by the model.
+    mining_cfg: MiningConfig,
+    /// Sites the bot's placement asked for: extensions accepted, containers accepted, refused by
+    /// the model.
     placed: u32,
+    placed_containers: u32,
     refused_sites: u32,
     /// Whether the Standard tier runs (`opening work`); off, as below `standard_bucket_min`.
     standard: bool,
@@ -479,6 +635,9 @@ struct World {
     failed: u32,
     spawned: Vec<(u32, Body)>,
     levels: Vec<(u32, u8)>,
+    /// Each source refill: the tick, the source's index, and the energy it still held (none taken
+    /// that cycle is wasted).
+    regens: Vec<(u32, usize, u32)>,
     full_at: Option<u32>,
     struct_rows: Vec<StructRow>,
     obj_rows: Vec<ObjRow>,
@@ -532,9 +691,12 @@ impl World {
             movement: Movement::default(),
             spawner: Spawner::default(),
             opening: Opening::default(),
+            mining: Mining::default(),
             placement: Placement::default(),
             cfg: OPENING_MMO,
+            mining_cfg: MINING_MMO,
             placed: 0,
+            placed_containers: 0,
             refused_sites: 0,
             standard: true,
             drop_sites: false,
@@ -543,6 +705,7 @@ impl World {
             failed: 0,
             spawned: Vec::new(),
             levels: Vec::new(),
+            regens: Vec::new(),
             full_at: None,
             struct_rows: Vec::new(),
             obj_rows: Vec::new(),
@@ -750,6 +913,7 @@ impl World {
                 Loose::Tomb {
                     key, at, energy, ..
                 } => (key, ObjectKind::Tombstone, at, energy),
+                Loose::Container { key, at, energy } => (key, ObjectKind::Container, at, energy),
             };
             push(&mut self.snap, key, kind, place(room, at), amount, 0);
             self.obj_rows.push(ObjRow::Loose(i));
@@ -779,9 +943,33 @@ impl World {
         self.buffer.begin(&self.snap);
         self.spawner.begin(&self.snap);
         self.opening.begin(&self.snap);
+        self.mining.begin(&self.snap);
         let mut commit = Commit::default();
         let cfg = self.cfg;
+        let mining_cfg = self.mining_cfg;
+        // The Critical `mining` job, then `opening` (rustedscreep-wasm's order).
+        for unit in 0..self.mining.room_count() {
+            let cap = self
+                .mining
+                .room_name(unit)
+                .and_then(|room| self.opening.cap(room));
+            self.mining
+                .plan_room(
+                    unit,
+                    &self.snap,
+                    &mut self.movement,
+                    &mut self.spawner,
+                    &mut self.buffer,
+                    &mining_cfg,
+                    &mcfg,
+                    cap,
+                    &mut commit,
+                )
+                .expect("mining");
+        }
         for unit in 0..self.opening.room_count() {
+            let room = self.opening.room_name(unit).expect("room");
+            let mined = self.mining.mined(room).to_vec();
             self.opening
                 .plan_room(
                     unit,
@@ -791,6 +979,7 @@ impl World {
                     &mut self.buffer,
                     &cfg,
                     &mcfg,
+                    &mined,
                     &mut commit,
                 )
                 .expect("plan");
@@ -812,12 +1001,22 @@ impl World {
                 )
                 .expect("work");
         }
-        // The Optional placement job (ADR-020).
+        // The Optional placement job (ADR-020, ADR-023).
         self.placement.begin(&self.snap);
-        if cfg.place_extensions {
+        if cfg.place_extensions || mining_cfg.place_containers {
             for unit in 0..self.placement.room_count() {
+                let room = self.placement.room_name(unit).expect("room");
+                let containers = self.mining.container_needs(room).to_vec();
                 self.placement
-                    .plan_room(unit, &self.snap, &mut self.movement, &mcfg, &mut commit)
+                    .plan_room(
+                        unit,
+                        &self.snap,
+                        &mut self.movement,
+                        &mcfg,
+                        cfg.place_extensions,
+                        &containers,
+                        &mut commit,
+                    )
                     .expect("placement");
             }
         }
@@ -867,15 +1066,34 @@ impl World {
     fn create_site(&mut self, at: Tile, kind: StructureType) -> Outcome {
         let wall =
             self.raw[usize::from(at.y()) * 50 + usize::from(at.x())] & (Terrain::Wall as u8) != 0;
-        let taken = self.blocked(at) || self.sites.iter().any(|s| s.at == at);
+        let container_at = |t: Tile| {
+            self.loose
+                .iter()
+                .any(|l| matches!(*l, Loose::Container { at, .. } if at == t))
+        };
+        let taken = self.blocked(at) || self.sites.iter().any(|s| s.at == at) || container_at(at);
+        let containers = self
+            .loose
+            .iter()
+            .filter(|l| matches!(l, Loose::Container { .. }))
+            .count();
         let have = self.stores.iter().filter(|s| s.kind == kind).count()
-            + self.sites.iter().filter(|s| s.kind == kind).count();
+            + self.sites.iter().filter(|s| s.kind == kind).count()
+            + if kind == StructureType::Container {
+                containers
+            } else {
+                0
+            };
         let allowed = kind.controller_structures(u32::from(self.level)) as usize;
         if wall || taken || at.is_edge() || have >= allowed {
             self.refused_sites += 1;
             return Outcome::Failed(ErrorCode::InvalidTarget);
         }
-        self.placed += 1;
+        if kind == StructureType::Container {
+            self.placed_containers += 1;
+        } else {
+            self.placed += 1;
+        }
         if self.drop_sites {
             return Outcome::Ok;
         }
@@ -1025,7 +1243,9 @@ impl World {
                 let free = c.capacity() - c.energy;
                 let (at, have) = match &mut self.loose[i] {
                     Loose::Pile { at, amount, .. } => (*at, amount),
-                    Loose::Tomb { at, energy, .. } => (*at, energy),
+                    Loose::Tomb { at, energy, .. } | Loose::Container { at, energy, .. } => {
+                        (*at, energy)
+                    }
                 };
                 if !near(c.at, at, 1) || free == 0 {
                     return Outcome::Failed(ErrorCode::NotInRange);
@@ -1041,6 +1261,21 @@ impl World {
     }
 
     fn drop_at(&mut self, at: Tile, amount: u32) {
+        let mut amount = amount;
+        for l in &mut self.loose {
+            if let Loose::Container {
+                at: a, energy: e, ..
+            } = l
+                && *a == at
+            {
+                let into = amount.min(CONTAINER_CAPACITY - *e);
+                *e += into;
+                amount -= into;
+            }
+        }
+        if amount == 0 {
+            return;
+        }
         for l in &mut self.loose {
             if let Loose::Pile {
                 at: a, amount: n, ..
@@ -1144,6 +1379,16 @@ impl World {
             .collect();
         self.sites.retain(|s| s.progress < s.total);
         for s in done {
+            if s.kind == StructureType::Container {
+                // A new object with its own id (the snapshot reads an object's kind once per id).
+                let key = self.key();
+                self.loose.push(Loose::Container {
+                    key,
+                    at: s.at,
+                    energy: 0,
+                });
+                continue;
+            }
             let rcl = u32::from(self.level);
             self.stores.push(SimStore {
                 key: s.key,
@@ -1154,11 +1399,12 @@ impl World {
             });
         }
         // Sources (sources/tick.js).
-        for s in &mut self.sources {
+        for (i, s) in self.sources.iter_mut().enumerate() {
             if s.energy < SOURCE_ENERGY_CAPACITY && s.regen_at.is_none() {
                 s.regen_at = Some(now + ENERGY_REGEN_TIME);
             }
             if s.regen_at.is_some_and(|at| now >= at - 1) {
+                self.regens.push((now, i, s.energy));
                 s.energy = SOURCE_ENERGY_CAPACITY;
                 s.regen_at = None;
             }
@@ -1227,11 +1473,13 @@ impl World {
                         *decay_at = 0;
                     }
                 }
+                Loose::Container { .. } => {}
             }
         }
         self.loose.retain(|l| match l {
             Loose::Pile { amount, .. } => *amount > 0,
             Loose::Tomb { decay_at, .. } => *decay_at > 0,
+            Loose::Container { .. } => true,
         });
         for (at, energy) in dropped {
             if energy > 0 {
@@ -1251,7 +1499,17 @@ impl World {
     }
 
     fn workers(&self) -> usize {
-        self.creeps.len()
+        self.creeps
+            .iter()
+            .filter(|c| c.identity.role == Role::Worker)
+            .count()
+    }
+
+    fn miners(&self) -> usize {
+        self.creeps
+            .iter()
+            .filter(|c| c.identity.role == Role::Miner)
+            .count()
     }
 
     fn event_at(&self, want: impl Fn(&Event) -> bool) -> Option<u32> {
@@ -1660,6 +1918,15 @@ fn ticks_to_rcl3(at_level_up: LevelUp, place: bool, limit: u32) -> Option<u32> {
                     "the bot placed RCL2's extensions"
                 );
             }
+            // A room whose capacity pays for a miner places a container per source (ADR-023);
+            // the spawn's capacity alone pays for none.
+            let one = Trip {
+                tiles: 1,
+                cost: MOVE_COST_PLAIN,
+            };
+            let pays = miner_body(SOURCE_ENERGY_CAPACITY, one, w.room_energy().capacity).is_some();
+            let want = if pays { w.sources.len() } else { 0 };
+            assert_eq!(w.placed_containers as usize, want, "containers");
             return Some(w.time - start);
         }
     }
@@ -1687,7 +1954,7 @@ fn a_fresh_room_reaches_rcl3_without_extensions() {
 
 /// The level's extension sites placed by hand at each level-up (what ADR-020 measured): the
 /// workers build and fill them, and a fresh room reaches RCL3 within 3 times the floor: 5892 ticks
-/// in the scenario room (2026-11-15).
+/// in the scenario room (2026-11-15), 6146 with P3.1's miners and their containers (2026-11-16).
 #[test]
 fn a_fresh_room_reaches_rcl3_building_its_extensions() {
     let bound = 3 * rcl3_floor();
@@ -1697,7 +1964,9 @@ fn a_fresh_room_reaches_rcl3_building_its_extensions() {
 
 /// The P2 gate's path (ROADMAP P2: a fresh room reaches RCL3 with no manual action): the bot places
 /// RCL2's extensions itself (ADR-020), its workers build and fill them, and the room reaches RCL3
-/// within 3 times the source-limited floor, with no site refused, no intent failed and no stall.
+/// within 3 times the source-limited floor, with no site refused, no intent failed and no stall:
+/// 6029 ticks before P3.1, 6258 with its miners and containers, which pay off by RCL4
+/// (`static_mining_reaches_rcl4_sooner`; 2026-11-16).
 #[test]
 fn a_fresh_room_reaches_rcl3_with_no_manual_action() {
     let bound = 3 * rcl3_floor();
@@ -1952,4 +2221,246 @@ fn placement_picks_one_site_per_tick_up_to_the_level() {
     assert_eq!(w.refused_sites, 0);
     w.take_snapshot();
     assert_eq!(extensions_in(&w.snap, w.room), allowed);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Static mining (P3.1, ADR-023)
+
+/// The tile of `p` in the scenario room.
+fn tile_of(p: Position) -> Tile {
+    Tile::of(p)
+}
+
+/// The miner of each source: its creep's index in the world, by plan order (none before the room
+/// has a plan).
+fn miners_on(w: &World) -> Vec<Option<usize>> {
+    let Some((_, Some(plan), _)) = w.mining.room_states().next() else {
+        return Vec::new();
+    };
+    plan.sources
+        .iter()
+        .map(|s| {
+            w.creeps.iter().position(|c| {
+                c.identity.role == Role::Miner
+                    && c.spawning == 0
+                    && w.snap
+                        .creeps
+                        .handle_of(ObjectKey(c.key))
+                        .and_then(|h| w.mining.source_of(h))
+                        == Some(s.source)
+            })
+        })
+        .collect()
+}
+
+/// Uses: SOURCE_ENERGY_CAPACITY, ENERGY_REGEN_TIME, HARVEST_POWER, BODYPART_COST, CREEP_LIFE_TIME,
+/// CONSTRUCTION_COST, CONTAINER_CAPACITY. At RCL2 with its extensions built (550 capacity), each
+/// source gets one miner of `miner_body` for its plan's trip (`miner_work` WORK parts), standing on
+/// a walkable tile next to it, off the room's edge. Once both stand there, every regeneration cycle
+/// of each source ends with the source empty (all of `SOURCE_ENERGY_CAPACITY` harvested) until the
+/// first miner ages out, and no worker harvests a source whose miner is next to it. Within a second
+/// creep life the workers have built a container on each tile (2 × `CONSTRUCTION_COST` of
+/// building on top of the upgrading).
+#[test]
+fn miners_drain_their_sources_from_their_containers() {
+    let mut w = World::new(2, SPAWN_ENERGY_CAPACITY);
+    let capacity = w.room_energy().capacity;
+    let mut settled: Option<u32> = None;
+    for _ in 0..CREEP_LIFE_TIME {
+        w.step();
+        // No worker harvests a mined source.
+        for c in &w.creeps {
+            let Some(h) = w.snap.creeps.handle_of(ObjectKey(c.key)) else {
+                continue;
+            };
+            if let Some(Task::Harvest(src)) = w.opening.task(h) {
+                let row = w.snap.objects.row_of(src).expect("source row");
+                let pos = w.snap.objects.positions()[row];
+                assert!(
+                    w.mining.mined(w.room).iter().all(|m| m.source != pos),
+                    "a worker harvests mined source {pos:?} at {}",
+                    w.time
+                );
+            }
+        }
+        let on = miners_on(&w);
+        let Some((_, Some(plan), _)) = w.mining.room_states().next() else {
+            continue;
+        };
+        let all_on = !on.is_empty()
+            && on
+                .iter()
+                .zip(&plan.sources)
+                .all(|(m, s)| m.is_some_and(|i| Some(w.pos(w.creeps[i].at)) == s.tile));
+        if all_on && settled.is_none() {
+            settled = Some(w.time);
+        }
+    }
+    let settled = settled.expect("both miners on their tiles within a creep's life");
+    let (_, plan, stats) = w.mining.room_states().next().expect("room");
+    let plan = plan.expect("plan").clone();
+    assert_eq!(stats.miners as usize, w.sources.len());
+    for s in &plan.sources {
+        let tile = tile_of(s.tile.expect("a tile"));
+        assert_eq!(tile.range(tile_of(s.source)), 1, "next to its source");
+        assert!(!tile.is_edge());
+        let body = miner_body(SOURCE_ENERGY_CAPACITY, s.trip.expect("trip"), capacity);
+        assert_eq!(s.body, body);
+        assert_eq!(
+            count(&body.expect("body"), Part::Work),
+            miner_work(SOURCE_ENERGY_CAPACITY)
+        );
+    }
+    let miners: Vec<&(u32, Body)> = w
+        .spawned
+        .iter()
+        .filter(|(_, b)| b.count(Part::Carry) == 0)
+        .collect();
+    assert_eq!(miners.len(), w.sources.len(), "one miner per source");
+    let first_death = miners
+        .iter()
+        .map(|(t, b)| t + b.spawn_time() + CREEP_LIFE_TIME)
+        .min();
+    let window = |t: u32| t > settled + ENERGY_REGEN_TIME && first_death.is_none_or(|d| t < d);
+    let cycles: Vec<_> = w.regens.iter().filter(|r| window(r.0)).collect();
+    for i in 0..w.sources.len() {
+        assert!(
+            cycles.iter().any(|r| r.1 == i),
+            "a cycle of source {i}: {cycles:?}"
+        );
+    }
+    assert!(
+        cycles.iter().all(|r| r.2 == 0),
+        "energy left at a refill: {cycles:?}"
+    );
+    // The containers, within a second creep life.
+    let containers = |w: &World| {
+        plan.sources.iter().all(|s| {
+            let tile = s.tile.map(tile_of);
+            w.loose
+                .iter()
+                .any(|l| matches!(*l, Loose::Container { at, .. } if Some(at) == tile))
+        })
+    };
+    for _ in 0..CREEP_LIFE_TIME {
+        if containers(&w) {
+            break;
+        }
+        w.step();
+    }
+    assert!(containers(&w), "a container on each mining tile");
+    assert_eq!(w.placed_containers as usize, w.sources.len());
+    assert_eq!(w.failed, 0);
+    assert!(w.event_at(|e| matches!(e, Event::Stalled { .. })).is_none());
+}
+
+/// After a global reset (the heap state of mining and the opening lost), each miner takes the
+/// source of the mining tile it stands on again, so no second miner is ordered for a mined source,
+/// and the run is the same for two identical worlds (determinism).
+#[test]
+fn a_reset_keeps_one_miner_per_source() {
+    let run = || {
+        let mut w = World::new(2, SPAWN_ENERGY_CAPACITY);
+        w.run(900);
+        let before = miners_on(&w);
+        assert!(before.iter().all(Option::is_some), "{before:?}");
+        let spawned = w.spawned.len();
+        w.mining = Mining::default();
+        w.opening = Opening::default();
+        w.run(300);
+        let after = miners_on(&w);
+        assert_eq!(before, after, "each miner keeps its source");
+        let new_miners = w.spawned[spawned..]
+            .iter()
+            .filter(|(_, b)| b.count(Part::Carry) == 0)
+            .count();
+        assert_eq!(new_miners, 0, "no second miner");
+        w
+    };
+    let (a, b) = (run(), run());
+    let at = |w: &World| {
+        w.creeps
+            .iter()
+            .map(|c| (c.key, c.at, c.energy))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(at(&a), at(&b));
+    assert_eq!(a.progress, b.progress);
+}
+
+/// With `mining.enabled` and `mining.place_containers` off the room runs the opening alone: no
+/// miner and no container site.
+#[test]
+fn mining_off_orders_no_miner_and_no_container() {
+    let mut w = World::new(2, SPAWN_ENERGY_CAPACITY);
+    w.mining_cfg = MiningConfig {
+        enabled: false,
+        place_containers: false,
+    };
+    w.run(1500);
+    assert_eq!(w.miners(), 0);
+    assert_eq!(w.placed_containers, 0);
+    assert!(w.sites.iter().all(|s| s.kind != StructureType::Container));
+    assert!(w.workers() > 0);
+}
+
+/// Ticks from a fresh room (RCL1, a full spawn, no creeps) to RCL4, with `mining`.
+fn ticks_to_rcl4(mining: MiningConfig, limit: u32) -> Option<u32> {
+    let mut w = World::new(1, SPAWN_ENERGY_START);
+    w.at_level_up = LevelUp::Nothing;
+    w.mining_cfg = mining;
+    let start = w.time;
+    for _ in 0..limit {
+        w.step();
+        if w.level >= 4 {
+            assert_eq!(w.failed, 0);
+            assert!(w.event_at(|e| matches!(e, Event::Stalled { .. })).is_none());
+            return Some(w.time - start);
+        }
+    }
+    None
+}
+
+/// The P2 gate's fresh room, on to RCL4 (`CONTROLLER_LEVELS[1..=3]`), with no manual action: with
+/// static miners and their containers (the default) it gets there sooner than the opening alone,
+/// after paying for the containers' `CONSTRUCTION_COST` and the miners at RCL2. 17334 ticks
+/// against 18643 in the scenario room (2026-11-16, P3.1).
+#[test]
+fn static_mining_reaches_rcl4_sooner() {
+    let need: u32 = (1..=3).map(|l| controller_levels(l).expect("level")).sum();
+    let floor = (need * ENERGY_REGEN_TIME).div_ceil(2 * SOURCE_ENERGY_CAPACITY);
+    let limit = 3 * floor;
+    let off = MiningConfig {
+        enabled: false,
+        place_containers: false,
+    };
+    let without = ticks_to_rcl4(off, limit).expect("RCL4 without miners");
+    let with = ticks_to_rcl4(MINING_MMO, limit).expect("RCL4 with miners");
+    assert!(with >= floor);
+    assert!(with < without, "with miners {with}, without {without}");
+}
+
+/// Two sources whose nearest free neighbour to the spawn is the same tile get two mining tiles,
+/// each next to its own source, so both miners reach a tile and both sources are mined.
+#[test]
+fn neighbouring_sources_get_their_own_mining_tiles() {
+    let mut w = World::new(2, SPAWN_ENERGY_CAPACITY);
+    // (25,29) is next to both and the nearest of their neighbours to the spawn at (25,25).
+    w.sources[0].at = tile(24, 30);
+    w.sources[1].at = tile(26, 30);
+    w.run(900);
+    let (_, plan, stats) = w.mining.room_states().next().expect("room");
+    let plan = plan.expect("plan");
+    let tiles: Vec<Tile> = plan
+        .sources
+        .iter()
+        .map(|s| {
+            let t = tile_of(s.tile.expect("a tile"));
+            assert_eq!(t.range(tile_of(s.source)), 1);
+            t
+        })
+        .collect();
+    assert_ne!(tiles[0], tiles[1], "{tiles:?}");
+    assert!(tiles.contains(&tile(25, 29)));
+    assert_eq!(stats.mined as usize, w.sources.len());
 }

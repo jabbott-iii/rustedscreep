@@ -19,21 +19,24 @@ use rustedscreep_consts::{RoomName, extra::HALF_WORLD_SIZE};
 
 use crate::snapshot::parse_room_name;
 
-/// A creep's job, as its name records it. P2's opening adds the roles it needs; P3 more.
+/// A creep's job, as its name records it. P2's opening added the worker; P3 adds its roles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Role {
     /// The bootstrap generalist: harvests, carries, builds and upgrades (RCL1–3 opening).
     Worker,
+    /// A static miner: stands on its source's mining tile and harvests (P3.1).
+    Miner,
 }
 
 impl Role {
     /// Every role, in a fixed order.
-    pub const ALL: [Self; 1] = [Self::Worker];
+    pub const ALL: [Self; 2] = [Self::Worker, Self::Miner];
 
     /// The first byte of the role's creep names. Never change or reuse one (see the module docs).
     pub const fn code(self) -> u8 {
         match self {
             Self::Worker => b'w',
+            Self::Miner => b'm',
         }
     }
 
@@ -44,6 +47,7 @@ impl Role {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Worker => "worker",
+            Self::Miner => "miner",
         }
     }
 

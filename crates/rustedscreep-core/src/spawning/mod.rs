@@ -20,7 +20,7 @@ mod spawner;
 pub use body::{Body, known_part};
 pub use name::{CreepName, Identity, NAME_MAX, ORDERS_PER_TICK, Role, serial};
 pub use spawner::{
-    EnergyBudget, SpawnEvent, SpawnOrder, SpawnRequest, SpawnStats, SpawnTotals, Spawner,
+    BodySpec, EnergyBudget, SpawnEvent, SpawnOrder, SpawnRequest, SpawnStats, SpawnTotals, Spawner,
 };
 
 use rustedscreep_consts::Part;

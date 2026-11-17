@@ -29,7 +29,8 @@ use rustedscreep_consts::{
     BUILD_POWER, HARVEST_POWER, Position, ResourceType, RoomName, StructureType,
 };
 
-use super::sizing::{Trip, worker_body, worker_round, workers_for_source};
+use super::mining::Mined;
+use super::sizing::{Trip, carry_round, worker_body, worker_round, workers_for_source};
 use super::watchdog::{Event, Observation, Watchdog};
 use crate::config::{MovementConfig, OpeningConfig};
 use crate::intents::{CreepIntent, IntentBuffer, Target};
@@ -38,7 +39,7 @@ use crate::scheduler::{Commit, Fault, Tier};
 use crate::snapshot::{
     Controller, CreepHandle, ObjectHandle, ObjectKind, Snapshot, StructureHandle,
 };
-use crate::spawning::{EnergyBudget, Role, SpawnRequest, Spawner, WORKER_PATTERN};
+use crate::spawning::{BodySpec, EnergyBudget, Role, SpawnRequest, Spawner, WORKER_PATTERN};
 
 /// Spawn priorities of the opening's requests (higher first): a room with no worker that can work,
 /// a room below `min_workers`, and the rest.
@@ -65,6 +66,9 @@ pub enum Task {
         controller: StructureHandle,
         guard: bool,
     },
+    /// A gatherer next to its mined source's tile while too little energy lies there (P3.1): it
+    /// waits there with no intent.
+    Wait(Position),
     /// Nothing to do: it makes way.
     Idle,
 }
@@ -77,6 +81,7 @@ impl Task {
             | Self::Take(_)
             | Self::Fill(_)
             | Self::Upgrade { guard: true, .. }
+            | Self::Wait(_)
             | Self::Idle => Tier::Critical,
             Self::Build(_) | Self::Upgrade { guard: false, .. } => Tier::Standard,
         }
@@ -90,13 +95,14 @@ impl Task {
             Self::Build(_) => "build",
             Self::Upgrade { guard: true, .. } => "guard",
             Self::Upgrade { guard: false, .. } => "upgrade",
+            Self::Wait(_) => "wait",
             Self::Idle => "idle",
         }
     }
 
     /// Every kind, in a fixed order (the order of [`RoomStats::tasks`]).
-    pub const KINDS: [&'static str; 7] = [
-        "harvest", "take", "fill", "build", "guard", "upgrade", "idle",
+    pub const KINDS: [&'static str; 8] = [
+        "harvest", "take", "fill", "build", "guard", "upgrade", "wait", "idle",
     ];
 
     fn kind_index(self) -> usize {
@@ -107,7 +113,8 @@ impl Task {
             Self::Build(_) => 3,
             Self::Upgrade { guard: true, .. } => 4,
             Self::Upgrade { guard: false, .. } => 5,
-            Self::Idle => 6,
+            Self::Wait(_) => 6,
+            Self::Idle => 7,
         }
     }
 
@@ -115,7 +122,7 @@ impl Task {
     const fn move_priority(self) -> u8 {
         match self {
             Self::Fill(_) | Self::Upgrade { guard: true, .. } => 3,
-            Self::Harvest(_) | Self::Take(_) => 2,
+            Self::Harvest(_) | Self::Take(_) | Self::Wait(_) => 2,
             Self::Build(_) | Self::Upgrade { guard: false, .. } => 1,
             Self::Idle => 0,
         }
@@ -149,9 +156,13 @@ pub struct SourcePlan {
     pub want: u32,
     /// The way from it to the controller.
     pub trip: Option<Trip>,
+    /// Its miner was next to it when the plan was built (P3.1): workers take its energy off the
+    /// miner's tile ([`carry_round`]) instead of harvesting it.
+    pub mined: bool,
 }
 
-/// A room's plan: built again when movement's grid version or the room's energy capacity changes.
+/// A room's plan: built again when movement's grid version, the room's energy capacity or the
+/// sources its miners mine change.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub version: u32,
@@ -160,6 +171,8 @@ pub struct Plan {
     /// objects were all seen is built again once they are.
     pub controller: bool,
     pub sources: Vec<SourcePlan>,
+    /// The mined sources the plan was built with, by index in `sources` (bit `i`).
+    pub mined: u32,
     /// Workers the room spawns up to: the sources' sum within `min_workers..=max_workers` (0 when
     /// no source has an open tile). Unit: creeps.
     pub want: u32,
@@ -173,7 +186,7 @@ pub struct RoomStats {
     pub working: u32,
     pub want: u32,
     /// Workers per task, in [`Task::KINDS`] order.
-    pub tasks: [u32; 7],
+    pub tasks: [u32; 8],
     /// What this tick asked of the spawner: `None`, or the budget and priority.
     pub request: Option<(EnergyBudget, u8)>,
     pub sources: u32,
@@ -222,6 +235,8 @@ struct Facts {
     sites: Vec<(ObjectHandle, Position, StructureType, u32, u32, u128)>,
     /// Energy to take: handle, place, kind, energy left to reserve.
     loose: Vec<(ObjectHandle, Position, ObjectKind, u32)>,
+    /// Sources whose miner is next to them this tick (`economy::mining`, P3.1).
+    mined: Vec<Mined>,
 }
 
 /// The opening's state for one global.
@@ -340,7 +355,23 @@ impl Opening {
         u32::try_from(self.rooms.len()).unwrap_or(u32::MAX)
     }
 
-    /// The Critical half of room `unit`'s tick (module docs, step 2).
+    /// The name of room `unit`.
+    pub fn room_name(&self, unit: u32) -> Option<RoomName> {
+        self.rooms.get(usize::try_from(unit).ok()?).map(|r| r.name)
+    }
+
+    /// The most energy `room`'s watchdog saw it hold while it never filled ([`Watchdog::cap`]), from
+    /// its last run.
+    pub fn cap(&self, room: RoomName) -> Option<u32> {
+        self.rooms
+            .binary_search_by_key(&room.packed_repr(), |r| r.name.packed_repr())
+            .ok()
+            .and_then(|i| self.rooms.get(i))
+            .and_then(|r| r.watch.cap())
+    }
+
+    /// The Critical half of room `unit`'s tick (module docs, step 2). `mined` lists the room's
+    /// sources whose miner is next to them this tick (`Mining::mined`; empty without miners).
     #[allow(clippy::too_many_arguments)]
     pub fn plan_room(
         &mut self,
@@ -351,6 +382,7 @@ impl Opening {
         buffer: &mut IntentBuffer,
         cfg: &OpeningConfig,
         mcfg: &MovementConfig,
+        mined: &[Mined],
         commit: &mut Commit,
     ) -> Result<(), Fault> {
         let ri = usize::try_from(unit).map_err(|_| Fault::new("unit out of range", unit))?;
@@ -362,7 +394,7 @@ impl Opening {
             (r.name, r.row, r.members)
         };
         let row = row.ok_or(Fault::new("room not in this tick", unit))?;
-        self.gather_facts(snap, name);
+        self.gather_facts(snap, name, mined);
         self.ensure_plan(ri, snap, row, movement, cfg, mcfg, commit);
         let want = self
             .rooms
@@ -459,8 +491,10 @@ impl Opening {
             let _ = spawner.request(SpawnRequest {
                 home: name,
                 role: Role::Worker,
-                pattern: &WORKER_PATTERN,
-                max_repeats: u8::MAX,
+                body: BodySpec::Scaled {
+                    pattern: &WORKER_PATTERN,
+                    max_repeats: u8::MAX,
+                },
                 budget,
                 priority,
             });
@@ -485,7 +519,7 @@ impl Opening {
                 .iter()
                 .map(|s| (s.0, s.4.saturating_sub(s.3))),
         );
-        let mut tasks = [0u32; 7];
+        let mut tasks = [0u32; 8];
         for i in members.0..members.1 {
             if let Some(task) = self.task_of(i, snap) {
                 if let Some(t) = tasks.get_mut(task.kind_index()) {
@@ -622,14 +656,17 @@ impl Opening {
         }
     }
 
-    /// Reads what room `name` holds this tick into `self.facts`.
-    fn gather_facts(&mut self, snap: &Snapshot, name: RoomName) {
+    /// Reads what room `name` holds this tick, and its mined sources, into `self.facts`.
+    fn gather_facts(&mut self, snap: &Snapshot, name: RoomName, mined: &[Mined]) {
         let f = &mut self.facts;
         f.controller = None;
         f.fills.clear();
         f.sources.clear();
         f.sites.clear();
         f.loose.clear();
+        f.mined.clear();
+        f.mined
+            .extend(mined.iter().filter(|m| m.source.room_name() == name));
         let st = &snap.structures;
         for (((&h, &kind), &pos), &free) in st
             .handles()
@@ -699,11 +736,24 @@ impl Opening {
         };
         let controller = self.facts.controller.is_some();
         let seen = self.facts.sources.len();
+        let mined = self
+            .facts
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| self.facts.mined.iter().any(|m| m.source == s.1))
+            .fold(0u32, |bits, (i, _)| {
+                bits | u32::try_from(i)
+                    .ok()
+                    .and_then(|i| 1u32.checked_shl(i))
+                    .unwrap_or(0)
+            });
         if r.plan.as_ref().is_some_and(|p| {
             p.version == version
                 && p.capacity == capacity
                 && p.controller == controller
                 && p.sources.len() == seen
+                && p.mined == mined
         }) {
             return;
         }
@@ -720,7 +770,11 @@ impl Opening {
             None => false,
         };
         let mut sources = Vec::with_capacity(self.facts.sources.len());
-        for &(_, pos, _, source_capacity) in &self.facts.sources {
+        for (i, &(_, pos, _, source_capacity)) in self.facts.sources.iter().enumerate() {
+            let is_mined = u32::try_from(i)
+                .ok()
+                .and_then(|i| 1u32.checked_shl(i))
+                .is_some_and(|bit| mined & bit != 0);
             let at = Tile::of(pos);
             let open = at.neighbors().filter(|&(_, t)| grid.walkable(t)).count();
             let open = u32::try_from(open).unwrap_or(0);
@@ -739,8 +793,10 @@ impl Opening {
                 }),
                 _ => None,
             };
+            // At a mined source a worker takes its load off the miner's tile in one tick.
+            let round = if is_mined { carry_round } else { worker_round };
             let want = match (body.as_ref(), trip) {
-                (Some(b), Some(t)) => worker_round(b, t).map_or(0, |round| {
+                (Some(b), Some(t)) => round(b, t).map_or(0, |round| {
                     workers_for_source(source_capacity, open, b, round)
                 }),
                 _ => 0,
@@ -750,6 +806,7 @@ impl Opening {
                 open,
                 want,
                 trip,
+                mined: is_mined,
             });
         }
         let sum = sources.iter().fold(0u32, |s, p| s.saturating_add(p.want));
@@ -764,6 +821,7 @@ impl Opening {
                 capacity,
                 controller,
                 sources,
+                mined,
                 want,
             });
         }
@@ -907,13 +965,23 @@ impl Opening {
                     }
                     continue;
                 }
-                // Nothing at all: wait at its source for the refill.
-                None => self
-                    .facts
-                    .sources
-                    .iter()
-                    .find(|s| Some(s.1) == w.source)
-                    .map_or(Task::Idle, |s| Task::Harvest(s.0)),
+                // Nothing at all: wait at its mined source's tile for a load, or at its source for
+                // the refill.
+                None => match w.source.and_then(|p| self.mined_tile(p)) {
+                    Some(tile)
+                        if !self.blocked.contains(&tile)
+                            && !skipped_by(&self.private, tile, w.handle) =>
+                    {
+                        Task::Wait(tile)
+                    }
+                    Some(_) => Task::Idle,
+                    None => self
+                        .facts
+                        .sources
+                        .iter()
+                        .find(|s| Some(s.1) == w.source)
+                        .map_or(Task::Idle, |s| Task::Harvest(s.0)),
+                },
             };
             if let Task::Take(h) = task
                 && let Some(l) = self.facts.loose.iter_mut().find(|l| l.0 == h)
@@ -1139,27 +1207,53 @@ impl Opening {
     /// (`scavenge_min`, or what its store needs if less) that is no farther than its source, else
     /// its source while it has energy, else another source with energy, else any energy to take.
     /// Targets in this tick's unreachable list are skipped.
+    ///
+    /// Mined sources (P3.1) are never harvested. Energy on a miner's tile counts only once it fills
+    /// the gatherer's store: the miner adds to it every tick, so one take of a whole load replaces
+    /// several small ones (each a billed intent) in the same time; a take kept from the last tick
+    /// follows the same rule. A gatherer whose own source is mined takes its load there, or the
+    /// nearer energy found first, and otherwise waits there (`Task::Wait`), with a partial load
+    /// too, so it carries whole loads.
     fn pick_gather(&self, w: Worker, at: Position, free: u32, scavenge_min: u32) -> Option<Task> {
         let enough = scavenge_min.min(free).max(1);
         let f = &self.facts;
         let open =
             |p: Position| !self.blocked.contains(&p) && !skipped_by(&self.private, p, w.handle);
-        // Last tick's take, while it still has energy for this worker.
+        let at_mined = |p: Position| f.mined.iter().any(|m| m.tile == p);
+        let mined = |p: Position| f.mined.iter().any(|m| m.source == p);
+        // Last tick's take, while it still has energy for this worker (a whole load on a miner's
+        // tile).
         if let Task::Take(h) = w.task
-            && f.loose.iter().any(|l| l.0 == h && l.3 > 0 && open(l.1))
+            && f.loose
+                .iter()
+                .any(|l| l.0 == h && l.3 > 0 && open(l.1) && (!at_mined(l.1) || l.3 >= free.max(1)))
         {
             return Some(Task::Take(h));
         }
+        let worth = |l: &&(ObjectHandle, Position, ObjectKind, u32)| {
+            open(l.1)
+                && if at_mined(l.1) {
+                    l.3 >= free.max(1)
+                } else {
+                    l.3 >= enough
+                }
+        };
         let take = f
             .loose
             .iter()
-            .filter(|l| l.3 >= enough && open(l.1))
+            .filter(worth)
             .min_by_key(|l| (range(at, l.1), tile_key(l.1)))
             .copied();
+        if let Some(tile) = w.source.and_then(|p| self.mined_tile(p)) {
+            return take
+                .filter(|t| range(at, t.1) <= range(at, tile))
+                .map(|t| Task::Take(t.0))
+                .or_else(|| open(tile).then_some(Task::Wait(tile)));
+        }
         let own = f
             .sources
             .iter()
-            .find(|s| Some(s.1) == w.source && s.2 > 0 && open(s.1))
+            .find(|s| Some(s.1) == w.source && s.2 > 0 && open(s.1) && !mined(s.1))
             .copied();
         match (take, own) {
             (Some(t), Some(s)) if range(at, t.1) <= range(at, s.1) => Some(Task::Take(t.0)),
@@ -1167,18 +1261,27 @@ impl Opening {
             (take, None) => f
                 .sources
                 .iter()
-                .filter(|s| s.2 > 0 && open(s.1))
+                .filter(|s| s.2 > 0 && open(s.1) && !mined(s.1))
                 .min_by_key(|s| (range(at, s.1), tile_key(s.1)))
                 .map(|s| Task::Harvest(s.0))
                 .or_else(|| take.map(|t| Task::Take(t.0)))
                 .or_else(|| {
                     f.loose
                         .iter()
-                        .filter(|l| l.3 > 0 && open(l.1))
+                        .filter(|l| l.3 > 0 && open(l.1) && !at_mined(l.1))
                         .min_by_key(|l| (range(at, l.1), tile_key(l.1)))
                         .map(|l| Task::Take(l.0))
                 }),
         }
+    }
+
+    /// The miner's tile of `source` when its miner is next to it this tick.
+    fn mined_tile(&self, source: Position) -> Option<Position> {
+        self.facts
+            .mined
+            .iter()
+            .find(|m| m.source == source)
+            .map(|m| m.tile)
     }
 
     /// Pushes `members[i]`'s intent when it is in range of its task's target, and asks movement to
@@ -1250,6 +1353,7 @@ impl Opening {
                     Some(CreepIntent::UpgradeController { target: controller }),
                 )
             }),
+            Task::Wait(tile) => Some((tile, NEAR, None)),
             Task::Idle => None,
         };
         let Some((target, reach, intent)) = plan else {

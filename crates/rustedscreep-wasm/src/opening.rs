@@ -1,16 +1,21 @@
-//! The RCL1–3 opening's glue (ROADMAP P2.4, over `rustedscreep_core::economy::Opening`): two
-//! scheduler jobs, the watchdogs' log lines and notifications, the early rescan after a room's own
-//! sites change, and the `rustedscreep.opening()` console summary.
+//! The RCL1–3 opening's glue (ROADMAP P2.4, over `rustedscreep_core::economy::Opening`) and static
+//! mining's (P3.1, `economy::Mining`): the scheduler jobs, the watchdogs' log lines and
+//! notifications, the early rescan after a room's own sites change, and the `rustedscreep.opening()`
+//! console summary.
 //!
-//! - `opening` (Critical), after movement's first reads and before the `spawn` job: per owned room
+//! - `mining` (Critical), after movement's first reads and before `opening`: per owned room each
+//!   source's mining tile, its miner's spawn request, harvest and move, the sources the workers
+//!   leave to it, and the tiles that need a container site.
+//! - `opening` (Critical), after `mining` and before the `spawn` job: per owned room
 //!   the plan, the watchdog, the spawn request, every worker's task, and the intents and moves of
 //!   harvesting, taking energy, filling spawns and extensions, and the downgrade guard's upgrade.
 //! - `opening work` (Standard), after the persistence loads: building and upgrading.
-//! - `opening placement` (Optional, after the constants self-check; ADR-020): per owned room with
-//!   a spawn and fewer extensions and extension sites than its level allows, one tile to place an
-//!   extension site on (`economy::placement`), unless `opening.place_extensions` is off. The act
-//!   step calls `Room.createConstructionSite(x, y, "extension")` for it, after the spawn orders and
-//!   before the creep intents: one JS call per site, billed like an intent (V203).
+//! - `opening placement` (Optional, after the constants self-check; ADR-020, ADR-023): per owned
+//!   room, one tile to place a site on (`economy::placement`): a mining tile's container while
+//!   `mining.place_containers` is on, else, while `opening.place_extensions` is on and the room has a
+//!   spawn and fewer extensions and extension sites than its level allows, an extension. The act
+//!   step calls `Room.createConstructionSite(x, y, type)` for it, after the spawn orders and before
+//!   the creep intents: one JS call per site, billed like an intent (V203).
 //!
 //! JS calls of its own: those site calls, and `Game.notify` on a recovery or a stall (once per kind
 //! per global). Everything it reads comes from the snapshot, and its creep intents go through the
@@ -18,9 +23,9 @@
 
 use std::fmt::Write as _;
 
-use rustedscreep_core::config::{MovementConfig, OpeningConfig, SchedulerConfig};
+use rustedscreep_core::config::{MiningConfig, MovementConfig, OpeningConfig, SchedulerConfig};
 use rustedscreep_core::economy::placement::Placement;
-use rustedscreep_core::economy::{Event, Opening, Task};
+use rustedscreep_core::economy::{Event, Mining, Opening, Task};
 use rustedscreep_core::intents::{ActLog, IntentBuffer, Outcome, error_name};
 use rustedscreep_core::movement::Movement;
 use rustedscreep_core::scheduler::{
@@ -28,7 +33,7 @@ use rustedscreep_core::scheduler::{
 };
 use rustedscreep_core::snapshot::{ObjectKind, Snapshot};
 use rustedscreep_core::spawning::{EnergyBudget, Spawner};
-use screeps::{RoomName, StructureType};
+use screeps::{Part, RoomName, StructureType};
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
 use crate::snapshot::JsWorld;
@@ -46,6 +51,12 @@ extern "C" {
     #[wasm_bindgen(method, catch, js_name = createConstructionSite)]
     fn create_site(this: &SiteRoom, x: u8, y: u8, kind: StructureType) -> Result<f64, JsValue>;
 }
+
+/// Harvesting is Critical (CLAUDE.md).
+const MINE_JOB: Job = Job {
+    name: "mining",
+    tier: Tier::Critical,
+};
 
 /// Harvesting and filling the spawns are Critical (CLAUDE.md).
 const PLAN_JOB: Job = Job {
@@ -72,7 +83,9 @@ const SITE_JOB: &str = "opening sites";
 #[derive(Default)]
 pub struct OpeningGlue {
     core: Opening,
+    mining: Mining,
     placement: Placement,
+    mine_job: JobState,
     plan_job: JobState,
     work_job: JobState,
     place_job: JobState,
@@ -96,6 +109,7 @@ impl OpeningGlue {
     /// own sites changed in number since the last tick.
     pub fn begin(&mut self, snapshot: &Snapshot, movement: &mut Movement) {
         self.core.begin(snapshot);
+        self.mining.begin(snapshot);
         self.placement.begin(snapshot);
         self.sites_now.clear();
         let objects = &snapshot.objects;
@@ -121,8 +135,10 @@ impl OpeningGlue {
         self.started = true;
     }
 
-    /// The Critical `opening` job: one unit per owned room. Run it after movement's first reads
-    /// and before the `spawn` job, which plans the requests it makes.
+    /// The Critical `mining` job, then the Critical `opening` job: one unit per owned room each.
+    /// Run them after movement's first reads and before the `spawn` job, which plans the requests
+    /// they make. A miner's request is held back while it costs more than the opening's watchdog
+    /// caps the room's bodies at (from the opening's last run).
     #[allow(clippy::too_many_arguments)]
     pub fn plan<C: Clock>(
         &mut self,
@@ -132,15 +148,36 @@ impl OpeningGlue {
         spawner: &mut Spawner,
         buffer: &mut IntentBuffer,
         cfg: &OpeningConfig,
+        mining_cfg: &MiningConfig,
         mcfg: &MovementConfig,
     ) {
-        let count = self.core.room_count();
+        let Self {
+            core,
+            mining,
+            mine_job,
+            plan_job,
+            ..
+        } = self;
+        let mines = mining.room_count();
+        if mines > 0 {
+            tick.run_units(&MINE_JOB, mine_job, mines, |unit, commit| {
+                let cap = mining.room_name(unit).and_then(|room| core.cap(room));
+                mining.plan_room(
+                    unit, snapshot, movement, spawner, buffer, mining_cfg, mcfg, cap, commit,
+                )
+            });
+        }
+        let count = core.room_count();
         if count == 0 {
             return;
         }
-        let Self { core, plan_job, .. } = self;
         tick.run_units(&PLAN_JOB, plan_job, count, |unit, commit| {
-            core.plan_room(unit, snapshot, movement, spawner, buffer, cfg, mcfg, commit)
+            let mined = core
+                .room_name(unit)
+                .map_or(&[][..], |room| mining.mined(room));
+            core.plan_room(
+                unit, snapshot, movement, spawner, buffer, cfg, mcfg, mined, commit,
+            )
         });
     }
 
@@ -164,26 +201,35 @@ impl OpeningGlue {
     }
 
     /// The Optional `opening placement` job: one unit per owned room, while
-    /// `opening.place_extensions` is on.
+    /// `opening.place_extensions` or `mining.place_containers` is on (the mining job lists no
+    /// container tile while the latter is off).
     pub fn place<C: Clock>(
         &mut self,
         tick: &mut TickCpu<'_, C>,
         snapshot: &Snapshot,
         movement: &mut Movement,
         cfg: &OpeningConfig,
+        mining_cfg: &MiningConfig,
         mcfg: &MovementConfig,
     ) {
         let count = self.placement.room_count();
-        if !cfg.place_extensions || count == 0 {
+        if !(cfg.place_extensions || mining_cfg.place_containers) || count == 0 {
             return;
         }
         let Self {
             placement,
+            mining,
             place_job,
             ..
         } = self;
+        let extensions = cfg.place_extensions;
         tick.run_units(&PLACE_JOB, place_job, count, |unit, commit| {
-            placement.plan_room(unit, snapshot, movement, mcfg, commit)
+            let containers = placement
+                .room_name(unit)
+                .map_or(&[][..], |room| mining.container_needs(room));
+            placement.plan_room(
+                unit, snapshot, movement, mcfg, extensions, containers, commit,
+            )
         });
     }
 
@@ -227,9 +273,14 @@ impl OpeningGlue {
                     Outcome::Threw => "threw",
                     Outcome::Ok => "ok",
                 };
+                let kind = match order.kind {
+                    StructureType::Container => "container",
+                    StructureType::Extension => "extension",
+                    _ => "construction",
+                };
                 log::info!(
-                    "rustedscreep opening: no extension site at ({}, {}) in {}: {what}; the tile \
-                     is skipped",
+                    "rustedscreep opening: no {kind} site at ({}, {}) in {}: {what}; the tile is \
+                     skipped",
                     order.tile.x(),
                     order.tile.y(),
                     order.room
@@ -301,6 +352,9 @@ impl OpeningGlue {
                         if let Some(t) = s.trip {
                             let _ = write!(text, " trip {} tiles cost {}", t.tiles, t.cost);
                         }
+                        if s.mined {
+                            text.push_str(" mined");
+                        }
                     }
                 }
             }
@@ -332,14 +386,69 @@ impl OpeningGlue {
             " since boot: recoveries {started} (ended {recovered}), guards {guards}, wait fallbacks \
              {fallbacks}, stalls {stalls}"
         );
+        self.mining_summary(&mut text);
         let p = self.placement.totals();
         let skipped: usize = self.placement.refused().map(|(_, n)| n).sum();
         let _ = write!(
             text,
-            " | extension sites: picked {}, placed {}, refused {}, never seen {}, tiles skipped {}",
-            p.picked, p.placed, p.refused, p.lost, skipped
+            " | sites: picked {} ({} containers), placed {}, refused {}, never seen {}, tiles \
+             skipped {}",
+            p.picked, p.containers, p.placed, p.refused, p.lost, skipped
         );
         text
+    }
+
+    /// The mining part of the summary: per owned room its miners, the sources they mine, this
+    /// tick's harvests and requests, and per source its tile, the miner's walk and body.
+    fn mining_summary(&self, text: &mut String) {
+        text.push_str(" | mining:");
+        for (room, plan, stats) in self.mining.room_states() {
+            let _ = write!(
+                text,
+                " {room}: miners {} (mined {}, harvests {}, requested {}, idle {})",
+                stats.miners, stats.mined, stats.harvests, stats.requested, stats.idle
+            );
+            let Some(p) = plan else {
+                text.push_str(", no plan yet;");
+                continue;
+            };
+            for s in &p.sources {
+                let _ = write!(
+                    text,
+                    ", source ({},{})",
+                    s.source.x().u8(),
+                    s.source.y().u8()
+                );
+                match (s.tile, s.trip) {
+                    (Some(tile), Some(t)) => {
+                        let _ = write!(
+                            text,
+                            " tile ({},{}) trip {} tiles cost {}",
+                            tile.x().u8(),
+                            tile.y().u8(),
+                            t.tiles,
+                            t.cost
+                        );
+                    }
+                    _ => text.push_str(" no tile"),
+                }
+                match s.body {
+                    Some(b) => {
+                        let _ = write!(
+                            text,
+                            " body {} WORK {} MOVE ({} energy)",
+                            b.count(Part::Work),
+                            b.count(Part::Move),
+                            b.cost()
+                        );
+                    }
+                    None => {
+                        let _ = write!(text, " no miner at capacity {}", p.capacity);
+                    }
+                }
+            }
+            text.push(';');
+        }
     }
 }
 

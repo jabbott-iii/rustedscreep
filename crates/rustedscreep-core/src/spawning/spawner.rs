@@ -11,7 +11,8 @@
 //! capacity or from what it holds now ([`EnergyBudget`]); when the next request cannot be paid for,
 //! the room waits and no request below it spawns, so energy is never spent around a waiting one. A
 //! request whose body cannot be built even at the room's capacity (one repeat of its pattern costs
-//! more, or it allows no repeat) is skipped, whatever its budget, so it never blocks the room.
+//! more, it allows no repeat, or its exact body costs more) is skipped, whatever its budget, so it
+//! never blocks the room.
 //!
 //! The planner keeps the room's energy left over its orders: the runtime checks every spawn against
 //! the same tick-start `room.energyAvailable` (V172), and the processor silently drops a second
@@ -51,6 +52,22 @@ pub enum EnergyBudget {
     UpTo(u32),
 }
 
+/// The body a request asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodySpec {
+    /// Whole repeats of `pattern`, at most `max_repeats` of them ([`Body::scaled`]), sized by the
+    /// request's budget.
+    Scaled {
+        pattern: &'static [Part],
+        /// Unit: repeats.
+        max_repeats: u8,
+    },
+    /// This body, whatever the budget: unfit when it costs more than the room's capacity, else the
+    /// request waits until the room holds its cost (a body a job computed from its targets, such
+    /// as a static miner's, P3.1).
+    Exact(Body),
+}
+
 /// One creep a job wants spawned this tick. Requests last one tick: a job asks again each tick
 /// until the creep it wants exists (spawning creeps included, which the snapshot shows from the
 /// tick after the order, V101).
@@ -59,10 +76,8 @@ pub struct SpawnRequest {
     /// The room the creep works for; a spawn of that room spawns it (P5 lets others).
     pub home: RoomName,
     pub role: Role,
-    /// The body is whole repeats of this ([`Body::scaled`]).
-    pub pattern: &'static [Part],
-    /// Most repeats of `pattern`. Unit: repeats.
-    pub max_repeats: u8,
+    pub body: BodySpec,
+    /// What a [`BodySpec::Scaled`] body is sized to; an exact body only waits for its cost.
     pub budget: EnergyBudget,
     /// Higher first; equal priorities keep the order they were requested in.
     pub priority: u8,
@@ -248,7 +263,8 @@ impl Spawner {
     /// Plans room `unit` of [`Self::rooms`]: its idle spawns take its requests (module docs). Each
     /// order commits `INTENT_CPU_COST` (V34). Call after [`Self::close`].
     ///
-    /// Uses: `INTENT_CPU_COST`; `BODYPART_COST` and `MAX_CREEP_SIZE` through [`Body::scaled`].
+    /// Uses: `INTENT_CPU_COST`; `BODYPART_COST` and `MAX_CREEP_SIZE` through [`Body::scaled`] and
+    /// [`Body::cost`].
     pub fn plan_room(
         &mut self,
         snap: &Snapshot,
@@ -335,20 +351,27 @@ impl Spawner {
                 };
                 // A request no body of which fits the room's capacity can never be paid for: skip
                 // it, whatever its budget, so it never blocks the requests below it.
-                let Some(at_capacity) = Body::scaled(req.pattern, energy.capacity, req.max_repeats)
-                else {
+                let fit = match req.body {
+                    BodySpec::Scaled {
+                        pattern,
+                        max_repeats,
+                    } => Body::scaled(pattern, energy.capacity, max_repeats).map(|at_capacity| {
+                        match req.budget {
+                            EnergyBudget::Capacity => Some(at_capacity),
+                            EnergyBudget::Available => Body::scaled(pattern, left, max_repeats),
+                            // Below one repeat it is the smallest body, as for `Available`.
+                            EnergyBudget::UpTo(cap) => {
+                                Body::scaled(pattern, cap.min(energy.capacity), max_repeats)
+                                    .or_else(|| Body::new(pattern))
+                            }
+                        }
+                    }),
+                    BodySpec::Exact(b) => (b.cost() <= energy.capacity).then_some(Some(b)),
+                };
+                let Some(body) = fit else {
                     self.stats.unfit = self.stats.unfit.saturating_add(1);
                     next += 1;
                     continue;
-                };
-                let body = match req.budget {
-                    EnergyBudget::Capacity => Some(at_capacity),
-                    EnergyBudget::Available => Body::scaled(req.pattern, left, req.max_repeats),
-                    // Below one repeat it is the smallest body, as for `Available`.
-                    EnergyBudget::UpTo(cap) => {
-                        Body::scaled(req.pattern, cap.min(energy.capacity), req.max_repeats)
-                            .or_else(|| Body::new(req.pattern))
-                    }
                 };
                 let Some(body) = body.filter(|b| b.cost() <= left) else {
                     self.stats.waiting = self.stats.waiting.saturating_add(1);

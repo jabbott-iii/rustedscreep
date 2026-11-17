@@ -97,12 +97,42 @@ fn energy(available: u32, capacity: u32) -> RoomEnergy {
     }
 }
 
+/// `req` with at most `max_repeats` repeats of its pattern.
+fn capped(req: SpawnRequest, max_repeats: u8) -> SpawnRequest {
+    let BodySpec::Scaled { pattern, .. } = req.body else {
+        panic!("a scaled request")
+    };
+    SpawnRequest {
+        body: BodySpec::Scaled {
+            pattern,
+            max_repeats,
+        },
+        ..req
+    }
+}
+
+/// `req` with `pattern` in place of its own.
+fn patterned(req: SpawnRequest, pattern: &'static [Part]) -> SpawnRequest {
+    let BodySpec::Scaled { max_repeats, .. } = req.body else {
+        panic!("a scaled request")
+    };
+    SpawnRequest {
+        body: BodySpec::Scaled {
+            pattern,
+            max_repeats,
+        },
+        ..req
+    }
+}
+
 fn worker(home: &str, budget: EnergyBudget, priority: u8) -> SpawnRequest {
     SpawnRequest {
         home: room(home),
         role: Role::Worker,
-        pattern: &WORKER_PATTERN,
-        max_repeats: u8::MAX,
+        body: BodySpec::Scaled {
+            pattern: &WORKER_PATTERN,
+            max_repeats: u8::MAX,
+        },
         budget,
         priority,
     }
@@ -170,14 +200,8 @@ fn a_capacity_request_waits_for_energy_and_blocks_lower_ones() {
         &[spawn(1, "W1N1", 20), spawn(2, "W1N1", 30)],
     );
     let mut sp = Spawner::default();
-    let top = SpawnRequest {
-        max_repeats: 2,
-        ..worker("W1N1", EnergyBudget::Capacity, 9)
-    };
-    let cheap = SpawnRequest {
-        max_repeats: 1,
-        ..worker("W1N1", EnergyBudget::Available, 0)
-    };
+    let top = capped(worker("W1N1", EnergyBudget::Capacity, 9), 2);
+    let cheap = capped(worker("W1N1", EnergyBudget::Available, 0), 1);
     let commit = plan(&mut sp, &snap, &[cheap, top]);
     assert!(sp.orders().is_empty(), "{:?}", sp.orders());
     assert_eq!(sp.stats().waiting, 1);
@@ -245,14 +269,8 @@ fn spawns_of_one_room_share_its_energy() {
         ],
     );
     let mut sp = Spawner::default();
-    let two = SpawnRequest {
-        max_repeats: 2,
-        ..worker("W1N1", EnergyBudget::Available, 1)
-    };
-    let one = SpawnRequest {
-        max_repeats: 1,
-        ..worker("W1N1", EnergyBudget::Available, 1)
-    };
+    let two = capped(worker("W1N1", EnergyBudget::Available, 1), 2);
+    let one = capped(worker("W1N1", EnergyBudget::Available, 1), 1);
     let commit = plan(&mut sp, &snap, &[two, one, one]);
     let orders = sp.orders();
     assert_eq!(orders.len(), 2, "{orders:?}");
@@ -352,10 +370,7 @@ fn a_pattern_beyond_the_capacity_is_skipped() {
         unit_cost(&CLAIMER) > unit,
         "the test needs a pattern above the capacity"
     );
-    let claimer = SpawnRequest {
-        pattern: &CLAIMER,
-        ..worker("W1N1", EnergyBudget::Capacity, 9)
-    };
+    let claimer = patterned(worker("W1N1", EnergyBudget::Capacity, 9), &CLAIMER);
     plan(
         &mut sp,
         &snap,
@@ -368,15 +383,71 @@ fn a_pattern_beyond_the_capacity_is_skipped() {
     assert_eq!(sp.stats().unfit, 1);
 }
 
+/// An exact body (P3.1's miners) is that body whatever the budget: it waits until the room holds
+/// its cost, and is skipped as unfit, without blocking the requests below it, when it costs more
+/// than the room's capacity. Uses: BODYPART_COST (through `Body::cost`).
+#[test]
+fn an_exact_body_waits_for_its_cost_or_is_unfit() {
+    let body = Body::new(&[Part::Work, Part::Work, Part::Move]).expect("body");
+    let cost = body.cost();
+    let exact = |budget| SpawnRequest {
+        body: BodySpec::Exact(body),
+        ..worker("W1N1", budget, 9)
+    };
+    for budget in [
+        EnergyBudget::Capacity,
+        EnergyBudget::Available,
+        EnergyBudget::UpTo(cost - 1),
+    ] {
+        // It waits for its cost, and holds the cheaper request below it back.
+        let snap = snap_at(
+            T0,
+            &[("W1N1", energy(cost - 1, cost))],
+            &[spawn(1, "W1N1", 20)],
+        );
+        let mut sp = Spawner::default();
+        plan(
+            &mut sp,
+            &snap,
+            &[exact(budget), worker("W1N1", EnergyBudget::Available, 1)],
+        );
+        assert!(sp.orders().is_empty(), "{budget:?}: {:?}", sp.orders());
+        assert_eq!(sp.stats().waiting, 1, "{budget:?}");
+        // At its cost it spawns as it is.
+        let snap = snap_at(T0, &[("W1N1", energy(cost, cost))], &[spawn(1, "W1N1", 20)]);
+        let mut sp = Spawner::default();
+        plan(&mut sp, &snap, &[exact(budget)]);
+        let [order] = sp.orders() else {
+            panic!("{budget:?}: one order: {:?}", sp.orders())
+        };
+        assert_eq!(order.body, body, "{budget:?}");
+        // Above the room's capacity it is unfit and the next request spawns.
+        let unit = unit_cost(&WORKER_PATTERN);
+        let snap = snap_at(
+            T0,
+            &[("W1N1", energy(unit, cost - 1))],
+            &[spawn(1, "W1N1", 20)],
+        );
+        let mut sp = Spawner::default();
+        plan(
+            &mut sp,
+            &snap,
+            &[exact(budget), worker("W1N1", EnergyBudget::Available, 1)],
+        );
+        let [order] = sp.orders() else {
+            panic!("{budget:?}: one order: {:?}", sp.orders())
+        };
+        assert_eq!(order.request, 1, "{budget:?}");
+        assert_eq!(sp.stats().unfit, 1, "{budget:?}");
+    }
+}
+
 #[test]
 fn a_refused_call_holds_the_spawn_for_hold_ticks() {
     let unit = unit_cost(&WORKER_PATTERN);
     let cfg = SPAWN_MMO;
     let spawns = [spawn(1, "W1N1", 20), spawn(2, "W1N1", 30)];
-    let req = SpawnRequest {
-        max_repeats: 1,
-        ..worker("W1N1", EnergyBudget::Available, 1)
-    };
+    let req = capped(worker("W1N1", EnergyBudget::Available, 1), 1);
     let mut sp = Spawner::default();
     let mut snap = snap_at(T0, &[("W1N1", energy(unit, unit))], &spawns);
     plan(&mut sp, &snap, &[req]);
@@ -477,18 +548,9 @@ fn a_request_that_can_never_fit_is_skipped_whatever_its_budget() {
     static CLAIMER: [Part; 2] = [Part::Claim, Part::Move];
     assert!(unit_cost(&CLAIMER) > unit);
     let never = [
-        SpawnRequest {
-            pattern: &CLAIMER,
-            ..worker("W1N1", EnergyBudget::Available, 9)
-        },
-        SpawnRequest {
-            max_repeats: 0,
-            ..worker("W1N1", EnergyBudget::Available, 8)
-        },
-        SpawnRequest {
-            max_repeats: 0,
-            ..worker("W1N1", EnergyBudget::Capacity, 7)
-        },
+        patterned(worker("W1N1", EnergyBudget::Available, 9), &CLAIMER),
+        capped(worker("W1N1", EnergyBudget::Available, 8), 0),
+        capped(worker("W1N1", EnergyBudget::Capacity, 7), 0),
     ];
     for bad in never {
         let mut sp = Spawner::default();
@@ -535,10 +597,7 @@ fn orders_past_the_per_tick_cap_fault() {
     let snap = snap_at(T0, &[("W1N1", energy(count * unit, count * unit))], &spawns);
     let mut sp = Spawner::default();
     sp.begin(&snap);
-    let req = SpawnRequest {
-        max_repeats: 1,
-        ..worker("W1N1", EnergyBudget::Available, 1)
-    };
+    let req = capped(worker("W1N1", EnergyBudget::Available, 1), 1);
     for _ in 0..count {
         sp.request(req).expect("open");
     }
@@ -621,10 +680,7 @@ fn planning_is_deterministic() {
     let requests = [
         worker("W1N1", EnergyBudget::Available, 2),
         worker("W2N1", EnergyBudget::Capacity, 2),
-        SpawnRequest {
-            max_repeats: 2,
-            ..worker("W1N1", EnergyBudget::Available, 2)
-        },
+        capped(worker("W1N1", EnergyBudget::Available, 2), 2),
     ];
     let mut a = Spawner::default();
     let mut b = Spawner::default();

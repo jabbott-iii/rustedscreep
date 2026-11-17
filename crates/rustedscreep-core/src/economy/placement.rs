@@ -1,7 +1,13 @@
-//! Interim extension placement (ADR-020; the P4 base planner keeps or replaces what it builds):
-//! while an owned room with a spawn has fewer extensions and extension sites than its level allows
-//! (`CONTROLLER_STRUCTURES`), the Optional job picks one tile per tick and the act step calls
-//! `Room.createConstructionSite` on it. The opening's workers build the sites.
+//! Interim extension placement (ADR-020) and source containers (ADR-023); the P4 base planner keeps
+//! or replaces what it builds: while an owned room with a spawn has fewer extensions and extension
+//! sites than its level allows (`CONTROLLER_STRUCTURES`), the Optional job picks one tile per tick
+//! and the act step calls `Room.createConstructionSite` on it. The opening's workers build the
+//! sites.
+//!
+//! Containers go first: the mining tiles `economy::mining` lists as needing one
+//! (`Mining::container_needs`: the room pays for the source's miner and the tile has no container
+//! and no container site), while the room has fewer containers and container sites than its level
+//! allows. They take the same one call per room per tick and the same refusal rules below.
 //!
 //! The pattern is a checkerboard around the room's first spawn (by id): extensions take the tiles of
 //! the spawn's parity (`(x + y) % 2`) at range 2 or more, nearest by path first. Diagonal steps keep a
@@ -70,6 +76,7 @@ pub struct SiteOrder {
 struct Pending {
     tile: Tile,
     at: u32,
+    kind: StructureType,
 }
 
 /// What a room's last pick that found no tile was made from: the next pick waits until it changes.
@@ -97,6 +104,8 @@ struct RoomPlace {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlacementTotals {
     pub picked: u32,
+    /// Of `picked`, container sites (ADR-023).
+    pub containers: u32,
     pub placed: u32,
     pub refused: u32,
     /// Picks that never appeared within [`APPEAR_TICKS`].
@@ -158,15 +167,24 @@ impl Placement {
         u32::try_from(self.rooms.len()).unwrap_or(u32::MAX)
     }
 
-    /// Room `unit`'s pick for this tick, if it needs one (module docs). A pick is a heavy unit (a
-    /// flow field from the spawn) and commits one intent (`INTENT_CPU_COST`: each accepted call is
-    /// billed, V203).
+    /// The name of room `unit`.
+    pub fn room_name(&self, unit: u32) -> Option<RoomName> {
+        self.rooms.get(usize::try_from(unit).ok()?).map(|r| r.name)
+    }
+
+    /// Room `unit`'s pick for this tick, if it needs one (module docs): a container site on the
+    /// first of `containers` (the room's mining tiles that need one) not refused yet, else, with
+    /// `extensions`, an extension site. An extension pick is a heavy unit (a flow field from the
+    /// spawn); either commits one intent (`INTENT_CPU_COST`: each accepted call is billed, V203).
+    #[allow(clippy::too_many_arguments)]
     pub fn plan_room(
         &mut self,
         unit: u32,
         snap: &Snapshot,
         movement: &mut Movement,
         mcfg: &MovementConfig,
+        extensions: bool,
+        containers: &[Tile],
         commit: &mut Commit,
     ) -> Result<(), Fault> {
         let now = self.time;
@@ -184,8 +202,8 @@ impl Placement {
         let allowed = StructureType::Extension.controller_structures(u32::from(level));
         let have = extensions_in(snap, name);
         if let Some(p) = r.pending {
-            // Judged by its own tile, so an extension lost elsewhere does not hide it.
-            if extension_at(snap, name, p.tile) {
+            // Judged by its own tile, so a structure lost elsewhere does not hide it.
+            if placed_at(snap, name, p.tile, p.kind) {
                 r.pending = None;
                 r.lost = 0;
             } else if now.wrapping_sub(p.at) < APPEAR_TICKS {
@@ -197,7 +215,31 @@ impl Placement {
                 self.totals.lost = self.totals.lost.saturating_add(1);
             }
         }
-        if have >= allowed || r.lost >= LOST_MAX {
+        if r.lost >= LOST_MAX {
+            return Ok(());
+        }
+        // A container for a mining tile first (ADR-023): no pattern, no flow field.
+        let container = StructureType::Container;
+        if let Some(&tile) = containers.iter().find(|t| !r.refused.contains(t))
+            && containers_in(snap, name) < container.controller_structures(u32::from(level))
+        {
+            self.orders.push(SiteOrder {
+                room: name,
+                room_row: row,
+                tile,
+                kind: container,
+            });
+            commit.add(INTENT_CPU_COST);
+            self.totals.picked = self.totals.picked.saturating_add(1);
+            self.totals.containers = self.totals.containers.saturating_add(1);
+            r.pending = Some(Pending {
+                tile,
+                at: now,
+                kind: container,
+            });
+            return Ok(());
+        }
+        if !extensions || have >= allowed {
             return Ok(());
         }
         // The first spawn by id anchors the pattern; the controller keeps its upgrade range.
@@ -280,7 +322,11 @@ impl Placement {
             commit.add(INTENT_CPU_COST);
             totals.picked = totals.picked.saturating_add(1);
             if let Some(r) = rooms.get_mut(ri) {
-                r.pending = Some(Pending { tile, at: now });
+                r.pending = Some(Pending {
+                    tile,
+                    at: now,
+                    kind: StructureType::Extension,
+                });
                 r.idle = None;
             }
         } else if let Some(r) = rooms.get_mut(ri) {
@@ -330,20 +376,39 @@ impl Placement {
     }
 }
 
-/// Whether an own extension or extension site stands on `tile` in `room`.
-fn extension_at(snap: &Snapshot, room: RoomName, tile: Tile) -> bool {
+/// Whether a structure of type `kind` (an own one, or a container, which has no owner) or an own
+/// site of it stands on `tile` in `room`.
+fn placed_at(snap: &Snapshot, room: RoomName, tile: Tile, kind: StructureType) -> bool {
     let here = |p: &rustedscreep_consts::Position| p.room_name() == room && Tile::of(*p) == tile;
     let st = &snap.structures;
     let ob = &snap.objects;
     st.kinds()
         .iter()
         .zip(st.positions())
-        .any(|(&k, p)| k == StructureType::Extension && here(p))
-        || ob
-            .kinds()
-            .iter()
-            .zip(ob.positions())
-            .any(|(&k, p)| k == ObjectKind::Site(StructureType::Extension) && here(p))
+        .any(|(&k, p)| k == kind && here(p))
+        || ob.kinds().iter().zip(ob.positions()).any(|(&k, p)| {
+            (k == ObjectKind::Site(kind)
+                || (kind == StructureType::Container && k == ObjectKind::Container))
+                && here(p)
+        })
+}
+
+/// Containers and own container sites in `room` (containers have no owner, so the snapshot keeps
+/// them with the room objects, not the own structures).
+pub fn containers_in(snap: &Snapshot, room: RoomName) -> u32 {
+    let ob = &snap.objects;
+    let n = ob
+        .kinds()
+        .iter()
+        .zip(ob.positions())
+        .filter(|&(&k, p)| {
+            matches!(
+                k,
+                ObjectKind::Container | ObjectKind::Site(StructureType::Container)
+            ) && p.room_name() == room
+        })
+        .count();
+    u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 /// Own extensions and extension sites in `room`.

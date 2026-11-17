@@ -13,7 +13,8 @@
 //   which a runtime override lowers (to 0 here: the next global prints only the counts and how many it held back);
 // - a global without game constants fails the check once, with a fault line, and it is not retried;
 // - below the Optional gate the check waits with no JS call, and the second loop's only readings are the config
-//   record load's two samples and the P2.4 opening's four (two jobs of one unit for the owned W1N1);
+//   record load's two samples, the P2.4 opening's four (two jobs of one unit for the owned W1N1) and the P3.1
+//   mining job's two (one unit for W1N1);
 // - rustedscreep.consts() reports each phase, the findings and the known differences with their reasons.
 // The sandbox clock is wall time, so the check may take more than one tick on a loaded machine: the script reads
 // the ticks from the check's own line and never assumes them. npm run check runs it after the build; standalone,
@@ -244,10 +245,10 @@ function lowBucket(dir) {
   const replies = samplesMatch(world, 'low bucket');
   // Tier-off skips 2 (was 1 before ADR-020): the check and the opening's extension placement, both Optional.
   expectParts(replies.at(-1), ['optional off', 'tier-off skips 2,', 'rustedscreep consts: not run yet in this global'], 'low bucket');
-  // The second loop's only readings are the config record load's two samples (P1.10) and the opening's (P2.4):
-  // its two jobs, Critical and Standard, run one unit each for the owned W1N1 with a sample before and after (was
-  // 2 before P2.4).
-  const want = 2 + 4;
+  // The second loop's only readings are the config record load's two samples (P1.10), the opening's (P2.4): its
+  // two jobs, Critical and Standard, run one unit each for the owned W1N1 with a sample before and after (was 2
+  // before P2.4), and the static miners' Critical job (P3.1), one unit for W1N1 (2 more).
+  const want = 2 + 4 + 2;
   if (world.loopCalls[2]?.getUsed !== want) throw new Error(`low bucket: offset 2 made ${world.loopCalls[2]?.getUsed} getUsed calls, expected ${want}`);
   if (Object.values(counts).some((c) => c.names || c.descriptors)) throw new Error(`low bucket: the check read the global: ${JSON.stringify(counts)}`);
 }

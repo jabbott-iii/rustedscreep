@@ -119,7 +119,7 @@ Modules:
 
 ## P3 Economy (SPEC §3.2)
 Modules:
-- [ ] Static miners on containers or links.
+- [x] Static miners on containers or links.
 - [ ] Link network.
 - [ ] Haulers sized from distance and throughput math.
 - [ ] Upgraders sized to the energy budget.

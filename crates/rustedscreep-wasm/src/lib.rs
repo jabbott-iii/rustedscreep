@@ -123,8 +123,8 @@ pub fn game_loop() {
                 let mut tick = sched.begin(&snapshot.tick, &cfg.scheduler, scheduler::GameClock);
                 // Critical: the rooms movement needs before anything in them can move, first.
                 movement.read_first(&mut tick, snapshot, js, &cfg.movement);
-                // Critical: the opening's workers and spawn requests (P2.4), then the spawn plan,
-                // after the Critical jobs that request creeps (P2.3).
+                // Critical: the static miners (P3.1), the opening's workers and their spawn requests
+                // (P2.4), then the spawn plan, after the Critical jobs that request creeps (P2.3).
                 opening.plan(
                     &mut tick,
                     snapshot,
@@ -132,6 +132,7 @@ pub fn game_loop() {
                     spawn.spawner_mut(),
                     &mut act.buffer,
                     &cfg.opening,
+                    &cfg.mining,
                     &cfg.movement,
                 );
                 spawn.plan(&mut tick, snapshot);
@@ -151,12 +152,14 @@ pub fn game_loop() {
                 // the config in force after the loads (on a global's second loop the record loads in
                 // this same step, and the check usually completes in it).
                 consts.run(&mut tick, snapshot.tick.time, &runtime.get().log);
-                // Optional: the interim extension placement (ADR-020), after the self-check.
+                // Optional: the interim container and extension placement (ADR-023, ADR-020),
+                // after the self-check.
                 opening.place(
                     &mut tick,
                     snapshot,
                     &mut movement.core,
                     &cfg.opening,
+                    &cfg.mining,
                     &cfg.movement,
                 );
                 act.queue_console_say(snapshot, tick.commit());
@@ -179,7 +182,7 @@ pub fn game_loop() {
                     &cfg.scheduler,
                     &cfg.spawn,
                 );
-                // Then the extension sites the placement picked (ADR-020), then the creep intents.
+                // Then the sites the placement picked (ADR-020, ADR-023), then the creep intents.
                 opening.issue_sites(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
                 act::issue(act, snapshot, js, sched, &cfg.scheduler);
                 movement.after_act(snapshot, act.refused_moves(), &cfg.movement);

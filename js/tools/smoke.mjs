@@ -284,7 +284,8 @@ export const CONFIG_SEGMENT = 97;
  * 20, tickLimit 500 and bucket 10000, so with SCHEDULER_MMO (crates/rustedscreep-core/src/config.rs) the
  * ceiling is 500 × (100 − 10) / 100 = 450 and the Optional cap 20 + (10000 − 9000) / 100 = 30. The first loop
  * of a global runs no Optional work (warm-up); its jobs are movement's first read of the owned room (P2.1), the
- * opening's two jobs for that room (P2.4: `opening`, Critical, and `opening work`, Standard) and the persistence
+ * static miners' job for that room (P3.1: `mining`, Critical), the opening's two jobs for that room (P2.4:
+ * `opening`, Critical, and `opening work`, Standard) and the persistence
  * load's one step, the config record's look-up (P1.10), each sampling the clock twice, and the two Optional jobs,
  * the constants self-check (P1.11) and the opening's extension placement (ADR-020), are tier-off skips. Both run
  * from the second loop (see CONSTS_DONE and PLACEMENT_SAMPLES).
@@ -293,12 +294,12 @@ const SCHEDULER_EXPECTED = {
   1: [
     'rustedscreep scheduler at tick 50000001 (loop 0 of this global): cpu limit 20, tickLimit 500, bucket 10000',
     'ceiling 450.0; critical on; standard on (cap 450.0); optional off (warm-up)',
-    // Four jobs of one unit each, two samples each: movement's first read of the owned W1N1, where the
-    // Harvester is (P2.1, a Critical job), the opening's two jobs for W1N1 (P2.4, Critical and Standard: was
-    // samples 4, units 2 before them), and the persistence load job's one step, the config segment's
-    // look-up (P1.10). Tier-off skips 2 (was 1 before ADR-020): the constants self-check and the extension
-    // placement.
-    'samples 8 (bad 0), units 4, budget stops 0, tier-off skips 2, out of order 0, faults 0',
+    // Five jobs of one unit each, two samples each: movement's first read of the owned W1N1, where the
+    // Harvester is (P2.1, a Critical job), the static miners' job for W1N1 (P3.1, Critical: was samples 8,
+    // units 4 before it), the opening's two jobs for W1N1 (P2.4, Critical and Standard: was samples 4,
+    // units 2 before them), and the persistence load job's one step, the config segment's look-up (P1.10).
+    // Tier-off skips 2 (was 1 before ADR-020): the constants self-check and the site placement.
+    'samples 10 (bad 0), units 5, budget stops 0, tier-off skips 2, out of order 0, faults 0',
     'faults since boot 0 (this window 0)',
   ],
   4: ['(loop 3 of this global)', 'optional on (cap 30.0)', ' | clock now '],
@@ -451,11 +452,13 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [], wasmForm = 'bin
   // until it is done, with a sample before its job and the slicer's samples (one per batch: about 30 for the whole
   // check, how many depends on the measured cost per step; js/tools/consts-sim.mjs checks that every reading is a
   // scheduler sample); after that it reads no clock but the opening's (P2.4): its two jobs run one unit each for
-  // the owned W1N1 on every loop, a sample before and after each, so 4 per loop (was 0 before P2.4), and from the
-  // second loop the extension placement's Optional job (ADR-020), one unit for W1N1, two more (was 0 before it).
+  // the owned W1N1 on every loop, a sample before and after each, so 4 per loop (was 0 before P2.4), the static
+  // miners' Critical job (P3.1), one unit for W1N1 on every loop, two more (was 0 before it), and from the second
+  // loop the site placement's Optional job (ADR-020), one unit for W1N1, two more (was 0 before it).
   const OPENING_SAMPLES = 4;
+  const MINING_SAMPLES = 2;
   const PLACEMENT_SAMPLES = 2;
-  const perLoop = (features.includes('profiler') ? 6 : 0) + OPENING_SAMPLES;
+  const perLoop = (features.includes('profiler') ? 6 : 0) + OPENING_SAMPLES + MINING_SAMPLES;
   const constsLines = world.logs.filter((l) => l.startsWith('rustedscreep consts:'));
   const constsDone = constsLines.length === 1 ? CONSTS_DONE.exec(constsLines[0]) : null;
   if (!constsDone) throw new Error(`constants self-check: expected one line matching ${CONSTS_DONE}, got ${constsLines.join(' / ') || 'none'}`);

@@ -48,7 +48,7 @@ use rustedscreep_core::scheduler::{
 };
 use rustedscreep_core::snapshot::{Snapshot, parse_room_name};
 use rustedscreep_core::spawning::{
-    Body, CreepName, EnergyBudget, Identity, Role, SpawnEvent, SpawnRequest, Spawner,
+    Body, BodySpec, CreepName, EnergyBudget, Identity, Role, SpawnEvent, SpawnRequest, Spawner,
     WORKER_PATTERN,
 };
 use screeps::{Part, RoomName};
@@ -91,10 +91,12 @@ const JOB: Job = Job {
 /// The job name the act step's spawn faults are logged under.
 const ACT_JOB: &str = "spawn act";
 
-/// The pattern a console request of `role` repeats.
-fn pattern(role: Role) -> &'static [Part] {
+/// The pattern a console request of `role` repeats, or `None` for a role the console does not
+/// spawn: a miner's body comes from its source (`economy::mining`, P3.1).
+fn pattern(role: Role) -> Option<&'static [Part]> {
     match role {
-        Role::Worker => &WORKER_PATTERN,
+        Role::Worker => Some(&WORKER_PATTERN),
+        Role::Miner => None,
     }
 }
 
@@ -147,8 +149,10 @@ impl SpawnGlue {
             self.spawner.request(SpawnRequest {
                 home: c.home,
                 role: c.role,
-                pattern: pattern(c.role),
-                max_repeats: u8::MAX,
+                body: BodySpec::Scaled {
+                    pattern: pattern(c.role)?,
+                    max_repeats: u8::MAX,
+                },
                 budget: EnergyBudget::Capacity,
                 priority: 0,
             })
@@ -278,10 +282,15 @@ impl SpawnGlue {
         let role = match role {
             None => Role::Worker,
             Some(name) => match Role::from_name(name) {
-                Some(role) => role,
-                None => {
-                    let mut text = String::from("rustedscreep spawn: unknown role; roles:");
-                    for r in Role::ALL {
+                Some(role) if pattern(role).is_some() => role,
+                found => {
+                    let mut text = String::from(match found {
+                        Some(_) => {
+                            "rustedscreep spawn: the mining job sizes and orders miners; console roles:"
+                        }
+                        None => "rustedscreep spawn: unknown role; roles:",
+                    });
+                    for r in Role::ALL.into_iter().filter(|&r| pattern(r).is_some()) {
                         let _ = write!(text, " {}", r.as_str());
                     }
                     return text;

@@ -1,9 +1,11 @@
 //! Worker sizing for the opening (ROADMAP P2.4): how long one worker's round takes between a source
-//! and the controller, and how many workers keep a source busy. The P3 body solver and hauler math
-//! replace it; the formulas stay simple on purpose and are lower bounds where noted.
+//! and the controller, and how many workers keep a source busy; and the static miner's body
+//! (P3.1). The P3 body solver and hauler math replace the worker sizing; the formulas stay simple
+//! on purpose and are lower bounds where noted.
 
 use rustedscreep_consts::{
-    CARRY_CAPACITY, ENERGY_REGEN_TIME, HARVEST_POWER, MOVE_POWER, Part, UPGRADE_CONTROLLER_POWER,
+    CARRY_CAPACITY, ENERGY_REGEN_TIME, HARVEST_POWER, MAX_CREEP_SIZE, MOVE_POWER, Part,
+    UPGRADE_CONTROLLER_POWER,
 };
 
 use crate::spawning::{Body, WORKER_PATTERN};
@@ -40,6 +42,7 @@ pub fn walk_ticks(trip: Trip, weight: u32, moves: u32) -> Option<u32> {
 /// time than upgrading). Unit: ticks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Round {
+    /// Ticks at the source: harvesting a load, or one take at a mined source ([`carry_round`]).
     pub harvest: u32,
     pub walk: u32,
     pub upgrade: u32,
@@ -51,6 +54,16 @@ impl Round {
             .saturating_add(self.walk)
             .saturating_add(self.upgrade)
     }
+}
+
+/// One worker's round at a mined source (P3.1): as [`worker_round`], but its load comes off the
+/// miner's tile in one `withdraw` or `pickup` (V190, V192) instead of being harvested, so it spends
+/// one tick at the source. `None` as for [`worker_round`].
+pub fn carry_round(body: &Body, trip: Trip) -> Option<Round> {
+    worker_round(body, trip).map(|round| Round {
+        harvest: 1,
+        ..round
+    })
 }
 
 /// The round of a worker of `body` on `trip`, or `None` for a body that cannot harvest, carry or
@@ -105,4 +118,58 @@ pub fn worker_body(energy: u32) -> Option<Body> {
 
 fn count(body: &Body, part: Part) -> u32 {
     u32::try_from(body.count(part)).unwrap_or(u32::MAX)
+}
+
+/// WORK parts that harvest a source of `capacity` empty in each regeneration window: the source
+/// refills to `capacity` `ENERGY_REGEN_TIME` ticks after it first drops below it, and harvests on
+/// all of those ticks count (V184), each WORK part taking `HARVEST_POWER` a tick (V183). 0 for an
+/// empty capacity. Unit: parts.
+///
+/// Uses: `ENERGY_REGEN_TIME`, `HARVEST_POWER`.
+pub fn miner_work(capacity: u32) -> u32 {
+    capacity.div_ceil(ENERGY_REGEN_TIME.saturating_mul(HARVEST_POWER).max(1))
+}
+
+/// A static miner's body for a source of `capacity` whose mining tile is `trip` from the spawn, in a
+/// room that holds at most `energy` (P3.1): [`miner_work`] WORK parts, then the MOVE parts that
+/// waste the least energy over its life. Each MOVE costs `BODYPART_COST[MOVE]`; each tick of the
+/// walk out is a tick its source is not harvested, a loss of the source's yield `capacity /
+/// ENERGY_REGEN_TIME` (the miner's WORK parts take at least that). The walk is [`walk_ticks`] with
+/// the WORK parts as the weight (no CARRY). Ties go to fewer MOVE parts; MOVE parts past the one
+/// that brings the walk down to `trip.tiles` save nothing. `None` when the WORK parts and one MOVE
+/// cost more than `energy` or pass `MAX_CREEP_SIZE`, or for an empty capacity.
+///
+/// Uses: `BODYPART_COST` (`Part::cost`), `ENERGY_REGEN_TIME`, `MAX_CREEP_SIZE`, [`miner_work`],
+/// [`walk_ticks`].
+pub fn miner_body(capacity: u32, trip: Trip, energy: u32) -> Option<Body> {
+    let work = miner_work(capacity);
+    if work == 0 {
+        return None;
+    }
+    let work_cost = Part::Work.cost().saturating_mul(work);
+    let move_cost = Part::Move.cost();
+    let mut best: Option<(u64, u32)> = None;
+    for moves in 1..=MAX_CREEP_SIZE.saturating_sub(work) {
+        let cost = work_cost.saturating_add(move_cost.saturating_mul(moves));
+        if cost > energy {
+            break;
+        }
+        let walk = walk_ticks(trip, work, moves)?;
+        // In energy × ENERGY_REGEN_TIME, so the yield per tick needs no division.
+        let loss = u64::from(move_cost) * u64::from(moves) * u64::from(ENERGY_REGEN_TIME)
+            + u64::from(walk) * u64::from(capacity);
+        if best.is_none_or(|(least, _)| loss < least) {
+            best = Some((loss, moves));
+        }
+        if walk <= trip.tiles {
+            break;
+        }
+    }
+    let (_, moves) = best?;
+    let mut parts = [Part::Move; MAX_CREEP_SIZE as usize];
+    let len = usize::try_from(work.saturating_add(moves)).ok()?;
+    for part in parts.iter_mut().take(usize::try_from(work).ok()?) {
+        *part = Part::Work;
+    }
+    Body::new(parts.get(..len)?)
 }

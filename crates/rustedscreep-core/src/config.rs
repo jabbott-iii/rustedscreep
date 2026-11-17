@@ -426,6 +426,24 @@ pub const OPENING_MMO: OpeningConfig = OpeningConfig {
     place_extensions: true,
 };
 
+/// Static mining switches (ROADMAP P3.1, ADR-023); `docs/TUNING.md` gives the rationale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MiningConfig {
+    /// Requests a static miner for each source of an owned room whose capacity pays for one that
+    /// drains it (`economy::mining`). Off, no new miner is requested; live ones keep mining.
+    pub enabled: bool,
+    /// Places a container site on each source's mining tile (ADR-023) in the Optional tier, once
+    /// the room's capacity pays for the source's miner. Off, miners drop their energy on a pile
+    /// unless a container is there already.
+    pub place_containers: bool,
+}
+
+/// Mining values for the official MMO.
+pub const MINING_MMO: MiningConfig = MiningConfig {
+    enabled: true,
+    place_containers: true,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,6 +457,7 @@ pub struct Config {
     pub movement: MovementConfig,
     pub spawn: SpawnConfig,
     pub opening: OpeningConfig,
+    pub mining: MiningConfig,
 }
 
 /// A server profile: a name and its values.
@@ -461,6 +480,7 @@ pub const MMO: Profile = Profile {
         movement: MOVEMENT_MMO,
         spawn: SPAWN_MMO,
         opening: OPENING_MMO,
+        mining: MINING_MMO,
     },
 };
 
@@ -621,7 +641,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 62;
+pub const FIELD_COUNT: usize = 64;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -845,6 +865,8 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(opening, "OpeningConfig", min_upgraders, 0, 10, true),
     number!(opening, "OpeningConfig", stall_ticks, 100, 20_000, true),
     flag!(opening, "OpeningConfig", place_extensions, true),
+    flag!(mining, "MiningConfig", enabled, true),
+    flag!(mining, "MiningConfig", place_containers, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -1038,6 +1060,7 @@ mod tests {
             movement: _,
             spawn: _,
             opening: _,
+            mining: _,
         } = MMO.config;
         let SpawnConfig { hold_ticks: _ } = SPAWN_MMO;
         let OpeningConfig {
@@ -1050,7 +1073,11 @@ mod tests {
             stall_ticks: _,
             place_extensions: _,
         } = OPENING_MMO;
-        let expected: [(&str, &[&str]); 9] = [
+        let MiningConfig {
+            enabled: _,
+            place_containers: _,
+        } = MINING_MMO;
+        let expected: [(&str, &[&str]); 10] = [
             (
                 "loader",
                 &[
@@ -1142,6 +1169,7 @@ mod tests {
                     "place_extensions",
                 ],
             ),
+            ("mining", &["enabled", "place_containers"]),
         ];
         let mut total = 0;
         for (group, names) in expected {
