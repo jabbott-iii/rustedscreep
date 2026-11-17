@@ -34,10 +34,26 @@ without gaps a window's `last` is `cold.time` plus a multiple of `ProfilerConfig
 Console commands run after the loop (V118), so the next loop is the span's first, and the guard ends it after 1000 ticks with the line
 `rustedscreep config: naive baseline ended after 1000 ticks ..., ticks S to L`, which gives the span's exact range; `rustedscreep.config()`
 shows a running span. A span set a tick late leaves a few cached loops at the start of the naive window and as many naive ones in the next;
-the span's range from the log line counts them. The window counts as the naive window only when the line's S and L are its own first and
-last ticks (a whole profiler window, ADR-022), with the windows before and after as the optimized ones; otherwise run the procedure again on a
-later window. Run it again too if the bucket ends the span (the warning `rustedscreep config: naive baseline ended early at bucket B ...`), if a
-global reset comes during the span (the loops before the record's load run cached), or if another config change is written during it. The end
+the span's range from the log line counts them.
+To start at any tick instead, set the length in the same entry so the span ends on the last tick of the first whole window after it
+(a `configSet` applies to the store at once and the guard reads the length on every loop; config-sim sets it before the caches); with C the
+global's `cold.time` (in a global with a gap since its cold loop, C = F − 1 for F the open window's first tick in `rustedscreep.profiler()`) and W `window_loops` (1000), the length is E − T (the end line then shows it in place of 1000) for E = C + W × ⌈(T − C + W) / W⌉, between W and 2W − 1:
+`(() => { const C = <cold.time>, T = Game.time, E = C + 1000 * Math.ceil((T - C + 1000) / 1000); return [T, E - 999, E, rustedscreep.configSet('cache.naive_max_ticks', String(E - T)), ...['cache.structure_static', 'cache.movement_grid', 'cache.flow_fields'].map(k => rustedscreep.configSet(k, 'false'))].join('\n'); })()`.
+The window before E − 999 is then mixed and is not used. Remove the length with `rustedscreep.configUnset('cache.naive_max_ticks')` (the guard
+removes only the cache overrides) on console tick E + 1000 or later, once the optimized window after the naive one has closed: an unset before L
+shortens the span to W ticks, and one before E + 1000 writes the record inside that window. The ADR-022 build's first span (V208) was set on
+84305517, 1400 ticks after the planned 84304117 (400 after window 3 closed), and left two mixed windows.
+Take `[Game.time, level, progress]`, `Object.keys(Game.creeps).length` and `rustedscreep.opening()` once inside each of the three windows (the
+segment holds only the ticks and the intents), and keep the spawn lines of all three: a creep name gives its order's tick
+(Game.time × 256 + index), and a window that holds a worker generation's turnover bills fewer intents, since a spawn's energy is not
+upgraded (V210). Give the orders per window with the result. Push nothing to `main` from the span's start until segment 99 has been read: any push reloads the
+code (V145). If the end line was missed, `rustedscreep.config()` shows the record `written at tick L`: the stop's flush writes it on L when L
+runs the Standard tier.
+The window counts as the naive window only when it lies within the line's S to L and its last tick is L (a whole profiler window
+of naive loops, ADR-022), with the optimized ones around it: the window after it and, before it, the last window that ends before S, each with no naive loop; otherwise
+run the procedure again on a later window. Run it again too if the bucket ends the span (the warning `rustedscreep config: naive baseline ended early at bucket B ...`), if a
+global reset comes during the span (the loops before the record's load run cached) or before the optimized window after it closes (that window is
+then never written), or if another config change is written during it. The end
 line is at info level, so keep `log.level` at info (the profile's value) for the run. PS2 method (optional private track): identical seed and map, the same tick window, the naive mode that runtime config toggles, mean and p95 CPU per tick,
 and the bucket trend. Results go in a table per phase.
 

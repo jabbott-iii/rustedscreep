@@ -397,7 +397,8 @@ fn log_event(
             bump(counts, 4);
             let text = format!(
                 "rustedscreep opening: {room} stood still for {ticks} ticks (no controller \
-                 progress, no change in spawn energy, no construction); planning it again"
+                 progress, no change in its sources' energy, no construction progress); \
+                 planning it again"
             );
             log::warn!("{text}");
             if !*notified_stall {
