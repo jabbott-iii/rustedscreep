@@ -2396,6 +2396,7 @@ fn mining_off_orders_no_miner_and_no_container() {
     w.mining_cfg = MiningConfig {
         enabled: false,
         place_containers: false,
+        ..MINING_MMO
     };
     w.run(1500);
     assert_eq!(w.miners(), 0);
@@ -2433,6 +2434,7 @@ fn static_mining_reaches_rcl4_sooner() {
     let off = MiningConfig {
         enabled: false,
         place_containers: false,
+        ..MINING_MMO
     };
     let without = ticks_to_rcl4(off, limit).expect("RCL4 without miners");
     let with = ticks_to_rcl4(MINING_MMO, limit).expect("RCL4 with miners");

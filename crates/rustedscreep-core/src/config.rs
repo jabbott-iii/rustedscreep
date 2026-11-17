@@ -426,7 +426,8 @@ pub const OPENING_MMO: OpeningConfig = OpeningConfig {
     place_extensions: true,
 };
 
-/// Static mining switches (ROADMAP P3.1, ADR-023); `docs/TUNING.md` gives the rationale.
+/// Static mining switches (ROADMAP P3.1, ADR-023) and the P3 gate's harvest target;
+/// `docs/TUNING.md` gives each one's rationale and safe range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MiningConfig {
     /// Requests a static miner for each source of an owned room whose capacity pays for one that
@@ -436,12 +437,18 @@ pub struct MiningConfig {
     /// the room's capacity pays for the source's miner. Off, miners drop their energy on a pile
     /// unless a container is there already.
     pub place_containers: bool,
+    /// The P3 gate's harvest-efficiency target: per source, the energy harvested in each
+    /// regeneration cycle against its capacity, averaged over the cycles of one miner life
+    /// (`CREEP_LIFE_TIME / ENERGY_REGEN_TIME`). The gate reads it (TEST_PLAN §8); no tick does, so
+    /// it has no runtime key. Unit: percent.
+    pub harvest_efficiency_pct: u32,
 }
 
 /// Mining values for the official MMO.
 pub const MINING_MMO: MiningConfig = MiningConfig {
     enabled: true,
     place_containers: true,
+    harvest_efficiency_pct: 95,
 };
 
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
@@ -550,7 +557,7 @@ pub struct Field {
     pub kind: Kind,
     /// Whether a runtime override may change it. The loader's values are built into the bundle; the
     /// profiler's and the segment ids are fixed for a global (a changed window length would split a
-    /// statistics window, a changed id would orphan its segment).
+    /// statistics window, a changed id would orphan its segment); a gate's target is read by no tick.
     pub runtime: bool,
     /// Reads the field.
     pub get: fn(&Config) -> Value,
@@ -641,7 +648,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 64;
+pub const FIELD_COUNT: usize = 65;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -867,6 +874,14 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     flag!(opening, "OpeningConfig", place_extensions, true),
     flag!(mining, "MiningConfig", enabled, true),
     flag!(mining, "MiningConfig", place_containers, true),
+    number!(
+        mining,
+        "MiningConfig",
+        harvest_efficiency_pct,
+        50,
+        100,
+        false
+    ),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -1076,6 +1091,7 @@ mod tests {
         let MiningConfig {
             enabled: _,
             place_containers: _,
+            harvest_efficiency_pct: _,
         } = MINING_MMO;
         let expected: [(&str, &[&str]); 10] = [
             (
@@ -1169,7 +1185,10 @@ mod tests {
                     "place_extensions",
                 ],
             ),
-            ("mining", &["enabled", "place_containers"]),
+            (
+                "mining",
+                &["enabled", "place_containers", "harvest_efficiency_pct"],
+            ),
         ];
         let mut total = 0;
         for (group, names) in expected {
