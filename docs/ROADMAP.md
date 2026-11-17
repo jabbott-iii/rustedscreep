@@ -122,7 +122,7 @@ Modules:
 - [x] Static miners on containers or links.
 - [x] Link network.
 - [x] Haulers sized from distance and throughput math.
-- [ ] Upgraders sized to the energy budget.
+- [x] Upgraders sized to the energy budget.
 - [x] Minimal builders and repairers.
 - [ ] Body solver from targets, with no hardcoded bodies.
 

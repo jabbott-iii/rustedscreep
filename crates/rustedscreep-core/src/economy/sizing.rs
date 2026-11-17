@@ -1,12 +1,12 @@
 //! Worker sizing for the opening (ROADMAP P2.4): how long one worker's round takes between a source
 //! and the controller, and how many workers keep a source busy; the static miner's body (P3.1);
-//! and the haulers' bodies and counts from a source's yield and trip (P3.3). The P3 body solver
-//! replaces the worker sizing; the formulas stay simple on purpose and are lower bounds where
-//! noted.
+//! the haulers' bodies and counts from a source's yield and trip (P3.3); and the upgraders' bodies
+//! and counts from the energy that reaches the controller (P3.4). The P3 body solver replaces the
+//! worker sizing; the formulas stay simple on purpose and are lower bounds where noted.
 
 use rustedscreep_consts::{
-    CARRY_CAPACITY, CONTAINER_CAPACITY, ENERGY_REGEN_TIME, HARVEST_POWER, MAX_CREEP_SIZE,
-    MOVE_POWER, Part, UPGRADE_CONTROLLER_POWER,
+    CARRY_CAPACITY, CONTAINER_CAPACITY, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, ENERGY_REGEN_TIME,
+    HARVEST_POWER, MAX_CREEP_SIZE, MOVE_POWER, Part, UPGRADE_CONTROLLER_POWER,
 };
 
 use crate::spawning::{Body, WORKER_PATTERN};
@@ -317,6 +317,154 @@ pub fn hauler_plan(
     let len = carry_n.checked_add(usize::try_from(moves).ok()?)?;
     for part in parts.iter_mut().take(carry_n) {
         *part = Part::Carry;
+    }
+    Some((Body::new(parts.get(..len)?)?, n))
+}
+
+/// What a source of `capacity` yields over one creep life: `capacity` every `ENERGY_REGEN_TIME`
+/// ticks (V184), for `CREEP_LIFE_TIME` ticks (V170). The upgraders' budget is counted per creep
+/// life, so every creep's body cost (paid once a life) adds up with it in whole energy. An upper
+/// bound on what a mined source gives: each miner life loses the replacement's spawning and walk
+/// out (no pre-spawn before P5). Unit: energy.
+///
+/// Uses: `CREEP_LIFE_TIME`, `ENERGY_REGEN_TIME`.
+pub fn yield_per_life(capacity: u32) -> u64 {
+    u64::from(capacity) * u64::from(CREEP_LIFE_TIME) / u64::from(ENERGY_REGEN_TIME.max(1))
+}
+
+/// CARRY parts an upgrader of `work` WORK parts takes (P3.4): the fewest whose load is more than one
+/// tick's upgrade, `floor(work × UPGRADE_CONTROLLER_POWER / CARRY_CAPACITY) + 1`. Its `withdraw`
+/// runs before its `upgradeController` in the same tick (V45, V46), so it refills on the tick its
+/// store would run dry and upgrades every tick; a CARRY part more saves a withdraw now and then (a
+/// billed intent) for `BODYPART_COST[CARRY]` a life, energy the economy keeps. Unit: parts.
+///
+/// Uses: `UPGRADE_CONTROLLER_POWER`, `CARRY_CAPACITY`.
+pub fn upgrader_carry(work: u32) -> u32 {
+    work.saturating_mul(UPGRADE_CONTROLLER_POWER)
+        .checked_div(CARRY_CAPACITY)
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+/// What one upgrader of `work` WORK, `carry` CARRY and `moves` MOVE parts upgrades over a life
+/// when its post is `trip` from the spawn (P3.4): `work × UPGRADE_CONTROLLER_POWER` a tick for the
+/// life left after its spawning (`CREEP_SPAWN_TIME` a part, V170: its replacement is ordered once
+/// it is gone, so the room waits that long) and its walk out (empty, so only the WORK parts weigh,
+/// V54). A lower bound: spawning lengthens its cycle rather than shortening its life. `None`
+/// without a MOVE part. Unit: energy.
+///
+/// Uses: `CREEP_LIFE_TIME`, `CREEP_SPAWN_TIME`, `UPGRADE_CONTROLLER_POWER`, [`walk_ticks`].
+pub fn upgrader_upgrade(work: u32, carry: u32, moves: u32, trip: Trip) -> Option<u64> {
+    let walk = walk_ticks(trip, work, moves)?;
+    let parts = work.saturating_add(carry).saturating_add(moves);
+    let spawn = parts.saturating_mul(CREEP_SPAWN_TIME);
+    let active = CREEP_LIFE_TIME.saturating_sub(walk).saturating_sub(spawn);
+    Some(u64::from(work) * u64::from(UPGRADE_CONTROLLER_POWER) * u64::from(active))
+}
+
+/// What `n` upgraders that each cost `cost` and upgrade `upgrade` a life (P3.4) upgrade of `budget`
+/// a life: their bodies come out of it first, and they upgrade the rest up to what they can. The
+/// energy neither upgraded nor paid for piles up in the stores (lost once they are full). Unit:
+/// energy.
+pub fn upgraded(budget: u64, n: u32, cost: u32, upgrade: u64) -> u64 {
+    let paid = u64::from(n).saturating_mul(u64::from(cost));
+    budget
+        .saturating_sub(paid)
+        .min(u64::from(n).saturating_mul(upgrade))
+}
+
+/// The upgraders for a room whose controller gets `budget` energy a creep life (P3.4: what reaches
+/// its controller container and controller link, less every other creep's body), whose posts are
+/// `trip` from the spawn, whose spawns and extensions hold at most `energy`, with at most
+/// `max_creeps` posts and, at level 8, at most `max_work` WORK parts in all
+/// (`CONTROLLER_MAX_UPGRADE_PER_TICK`, V188). Each body is WORK parts, [`upgrader_carry`] CARRY
+/// parts and MOVE parts. For each body that costs at most `energy` and holds at most
+/// `MAX_CREEP_SIZE` parts, the count is the one of `floor` and `ceil(budget / (cost + upgrade))`
+/// (within the caps) that upgrades more ([`upgraded`]). It takes the body and count that upgrade
+/// the most of the budget, then the fewest upgraders (each is a billed upgrade a tick, and holds
+/// a post), then the least energy, then the fewest MOVE parts. A body with too few MOVE parts walks
+/// out longer and upgrades less ([`upgrader_upgrade`]); MOVE parts past the ones that bring the
+/// walk down to `trip.tiles` only cost. `None` for an empty budget, no post, when one WORK, its
+/// CARRY and one MOVE cost more than `energy`, or when the best plan upgrades nothing (the budget
+/// does not pay for one body).
+///
+/// Uses: `BODYPART_COST` (`Part::cost`), `MAX_CREEP_SIZE`, [`upgrader_carry`],
+/// [`upgrader_upgrade`], [`upgraded`], [`walk_ticks`].
+pub fn upgrader_plan(
+    budget: u64,
+    trip: Trip,
+    energy: u32,
+    max_creeps: u32,
+    max_work: Option<u32>,
+) -> Option<(Body, u32)> {
+    if budget == 0 || max_creeps == 0 {
+        return None;
+    }
+    let work_cost = Part::Work.cost();
+    let carry_cost = Part::Carry.cost();
+    let move_cost = Part::Move.cost();
+    // (not upgraded, upgraders, energy for all of them, MOVE parts, WORK parts, CARRY parts)
+    let mut best: Option<(u64, u32, u64, u32, u32, u32)> = None;
+    for work in 1..MAX_CREEP_SIZE {
+        if max_work.is_some_and(|m| work > m) {
+            break;
+        }
+        let carry = upgrader_carry(work);
+        let fixed = work_cost
+            .saturating_mul(work)
+            .saturating_add(carry_cost.saturating_mul(carry));
+        if fixed.saturating_add(move_cost) > energy
+            || work.saturating_add(carry).saturating_add(1) > MAX_CREEP_SIZE
+        {
+            break;
+        }
+        let most = max_work
+            .map_or(max_creeps, |m| {
+                m.checked_div(work).unwrap_or(0).min(max_creeps)
+            })
+            .max(1);
+        for moves in 1..=MAX_CREEP_SIZE.saturating_sub(work).saturating_sub(carry) {
+            let cost = fixed.saturating_add(move_cost.saturating_mul(moves));
+            if cost > energy {
+                break;
+            }
+            let Some(upgrade) = upgrader_upgrade(work, carry, moves, trip) else {
+                break;
+            };
+            let per = u64::from(cost).saturating_add(upgrade).max(1);
+            let floor = u32::try_from(budget / per).unwrap_or(u32::MAX);
+            let ceil = u32::try_from(budget.div_ceil(per)).unwrap_or(u32::MAX);
+            for n in [floor, ceil] {
+                let n = n.clamp(1, most);
+                let key = (
+                    budget.saturating_sub(upgraded(budget, n, cost, upgrade)),
+                    n,
+                    u64::from(n) * u64::from(cost),
+                    moves,
+                    work,
+                    carry,
+                );
+                if best.is_none_or(|b| (key.0, key.1, key.2, key.3) < (b.0, b.1, b.2, b.3)) {
+                    best = Some(key);
+                }
+            }
+            if walk_ticks(trip, work, moves).is_some_and(|w| w <= trip.tiles) {
+                break;
+            }
+        }
+    }
+    if best.is_some_and(|b| b.0 >= budget) {
+        return None;
+    }
+    let (_, n, _, moves, work, carry) = best?;
+    let mut parts = [Part::Move; MAX_CREEP_SIZE as usize];
+    let work = usize::try_from(work).ok()?;
+    let carry = usize::try_from(carry).ok()?;
+    let len = work
+        .checked_add(carry)?
+        .checked_add(usize::try_from(moves).ok()?)?;
+    for (i, part) in parts.iter_mut().enumerate().take(work + carry) {
+        *part = if i < work { Part::Work } else { Part::Carry };
     }
     Some((Body::new(parts.get(..len)?)?, n))
 }

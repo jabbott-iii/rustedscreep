@@ -608,6 +608,11 @@ impl Mining {
         &self.totals
     }
 
+    /// `room`'s counters, from its last run (P3.4's upgraders count on its miners).
+    pub fn stats(&self, room: RoomName) -> Option<&MineStats> {
+        self.room(room).map(|r| &r.stats)
+    }
+
     /// Each room's plan and counters, by name.
     pub fn room_states(&self) -> impl Iterator<Item = (RoomName, Option<&MinePlan>, &MineStats)> {
         self.rooms

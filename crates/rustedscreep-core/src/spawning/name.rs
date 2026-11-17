@@ -29,11 +29,14 @@ pub enum Role {
     /// A hauler: carries a mined source's energy to the spawns, the extensions and the controller
     /// container (P3.3).
     Hauler,
+    /// An upgrader: stands at a post next to the controller container or a controller link,
+    /// withdraws and upgrades (P3.4).
+    Upgrader,
 }
 
 impl Role {
     /// Every role, in a fixed order.
-    pub const ALL: [Self; 3] = [Self::Worker, Self::Miner, Self::Hauler];
+    pub const ALL: [Self; 4] = [Self::Worker, Self::Miner, Self::Hauler, Self::Upgrader];
 
     /// The first byte of the role's creep names. Never change or reuse one (see the module docs).
     pub const fn code(self) -> u8 {
@@ -41,6 +44,7 @@ impl Role {
             Self::Worker => b'w',
             Self::Miner => b'm',
             Self::Hauler => b'h',
+            Self::Upgrader => b'u',
         }
     }
 
@@ -53,6 +57,7 @@ impl Role {
             Self::Worker => "worker",
             Self::Miner => "miner",
             Self::Hauler => "hauler",
+            Self::Upgrader => "upgrader",
         }
     }
 
@@ -332,7 +337,7 @@ mod tests {
         // The codes creeps alive today carry (a persisted format, module docs).
         assert_eq!(
             Role::ALL.map(Role::code),
-            [b'w', b'm', b'h'],
+            [b'w', b'm', b'h', b'u'],
             "never change or reuse a code"
         );
     }

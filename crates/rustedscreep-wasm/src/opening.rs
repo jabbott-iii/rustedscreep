@@ -1,6 +1,6 @@
 //! The RCL1–3 opening's glue (ROADMAP P2.4, over `rustedscreep_core::economy::Opening`), static
-//! mining's (P3.1, `economy::Mining`), the link network's (P3.2) and hauling's (P3.3,
-//! `economy::Hauling`): the scheduler jobs, the
+//! mining's (P3.1, `economy::Mining`), the link network's (P3.2), hauling's (P3.3,
+//! `economy::Hauling`) and upgrading's (P3.4, `economy::Upgrading`): the scheduler jobs, the
 //! watchdogs' log lines and notifications, the early rescan after a room's own sites change, the
 //! link sends, and the `rustedscreep.opening()` console summary.
 //!
@@ -10,8 +10,14 @@
 //!   need a container or a link site.
 //! - `hauling` (Critical, P3.3), after `mining` and before `opening`: per owned room the haulers'
 //!   plan, their spawn requests, and their takes at the mining tiles, waits and fills.
+//! - `upgrading` (Critical, P3.4), after `hauling` and before `opening`: per owned room with a
+//!   controller store (a container or a site on the mining plan's controller container tile, or a
+//!   controller link) or an upgrader, the upgraders' plan, posts and spawn request, and the view
+//!   the opening sizes its workers by. No unit, and no clock reading, for the other rooms.
 //! - `hauling work` (Standard, P3.3), after `opening work`: per owned room with a hauler to store
 //!   this tick, its transfers into the controller container (hauling).
+//! - `upgrading work` (Standard, P3.4), after `hauling work`: per owned room with an upgrader out of
+//!   the spawn, its withdraws, upgrades and moves (upgrading), less what the workers took.
 //! - `links` (Standard, P3.2), after `hauling work`: per owned room with a source link that may
 //!   send, its sends to the controller link (moving energy is hauling, which CLAUDE.md puts in
 //!   Standard; when the tier is off the source link fills and the container takes the harvest).
@@ -37,10 +43,12 @@ use std::fmt::Write as _;
 
 use rustedscreep_core::config::{
     HaulingConfig, LinkConfig, MiningConfig, MovementConfig, OpeningConfig, RepairConfig,
-    SchedulerConfig,
+    SchedulerConfig, UpgradingConfig,
 };
 use rustedscreep_core::economy::placement::Placement;
-use rustedscreep_core::economy::{Event, HaulTask, Hauling, Mining, Opening, Task};
+use rustedscreep_core::economy::{
+    Crew, Event, HaulTask, Hauling, Mining, Opening, Task, UpgradeTask, Upgrading,
+};
 use rustedscreep_core::intents::{ActLog, IntentBuffer, Outcome, error_name};
 use rustedscreep_core::movement::Movement;
 use rustedscreep_core::scheduler::{
@@ -94,6 +102,19 @@ const HAUL_WORK_JOB: Job = Job {
     tier: Tier::Standard,
 };
 
+/// The upgraders' plan and spawn request run with the other spawn requests, Critical (P2.3: a
+/// request must come before the spawn job); their work is upgrading, Standard.
+const UPGRADE_JOB: Job = Job {
+    name: "upgrading",
+    tier: Tier::Critical,
+};
+
+/// Upgrading is Standard (CLAUDE.md).
+const UPGRADE_WORK_JOB: Job = Job {
+    name: "upgrading work",
+    tier: Tier::Standard,
+};
+
 /// Harvesting and filling the spawns are Critical (CLAUDE.md).
 const PLAN_JOB: Job = Job {
     name: "opening",
@@ -130,10 +151,13 @@ pub struct OpeningGlue {
     core: Opening,
     mining: Mining,
     hauling: Hauling,
+    upgrading: Upgrading,
     placement: Placement,
     mine_job: JobState,
     haul_job: JobState,
     haul_work_job: JobState,
+    upgrade_job: JobState,
+    upgrade_work_job: JobState,
     plan_job: JobState,
     work_job: JobState,
     send_job: JobState,
@@ -160,6 +184,7 @@ impl OpeningGlue {
         self.core.begin(snapshot);
         self.mining.begin(snapshot);
         self.hauling.begin(snapshot);
+        self.upgrading.begin(snapshot);
         self.placement.begin(snapshot);
         self.sites_now.clear();
         let objects = &snapshot.objects;
@@ -185,11 +210,12 @@ impl OpeningGlue {
         self.started = true;
     }
 
-    /// The Critical `mining` job, then the Critical `hauling` job, then the Critical `opening` job:
-    /// one unit per owned room each. Run them after movement's first reads and before the `spawn`
-    /// job, which plans the requests they make. A miner's or a hauler's request is held back while
-    /// it costs more than the opening's watchdog caps the room's bodies at (from the opening's last
-    /// run).
+    /// The Critical `mining` job, then the Critical `hauling` job, then the Critical `upgrading` job
+    /// (for the rooms with a controller store or an upgrader), then the Critical `opening` job: one
+    /// unit per owned room each. Run them after movement's first reads and before the `spawn` job,
+    /// which plans the requests they make. A miner's, a hauler's or an upgrader's request is held
+    /// back while it costs more than the opening's watchdog caps the room's bodies at (from the
+    /// opening's last run).
     #[allow(clippy::too_many_arguments)]
     pub fn plan<C: Clock>(
         &mut self,
@@ -203,15 +229,18 @@ impl OpeningGlue {
         link_cfg: &LinkConfig,
         repair_cfg: &RepairConfig,
         hauling_cfg: &HaulingConfig,
+        upgrading_cfg: &UpgradingConfig,
         mcfg: &MovementConfig,
     ) {
         let Self {
             core,
             mining,
             hauling,
+            upgrading,
             placement,
             mine_job,
             haul_job,
+            upgrade_job,
             plan_job,
             ..
         } = self;
@@ -261,6 +290,36 @@ impl OpeningGlue {
                 )
             });
         }
+        upgrading.select(|room| {
+            mining.plan(room).is_some_and(|p| p.controller_store)
+                || !mining.receivers(room).is_empty()
+        });
+        let upgrades = upgrading.unit_count();
+        if upgrades > 0 {
+            tick.run_units(&UPGRADE_JOB, upgrade_job, upgrades, |unit, commit| {
+                let room = upgrading.unit_room(unit);
+                let cap = room.and_then(|room| core.cap(room));
+                let crew = room.map_or(Crew::default(), |room| Crew {
+                    miners: mining.stats(room).map_or(0, |s| s.miners),
+                    haulers: hauling.stats(room).map_or(0, |s| s.haulers),
+                });
+                upgrading.plan_room(
+                    unit,
+                    snapshot,
+                    movement,
+                    spawner,
+                    upgrading_cfg,
+                    mcfg,
+                    room.and_then(|room| mining.plan(room)),
+                    room.map_or(&[][..], |room| mining.receivers(room)),
+                    room.and_then(|room| hauling.plan(room)),
+                    crew,
+                    room.and_then(|room| core.plan(room)),
+                    cap,
+                    commit,
+                )
+            });
+        }
         let count = core.room_count();
         if count == 0 {
             return;
@@ -271,15 +330,18 @@ impl OpeningGlue {
             let tiles = room.map_or(&[][..], |room| mining.mine_tiles(room));
             let receivers = room.map_or(&[][..], |room| mining.receivers(room));
             let haul = room.map(|room| hauling.view(room)).unwrap_or_default();
+            let upgrade = room.map(|room| upgrading.view(room)).unwrap_or_default();
             core.plan_room(
                 unit, snapshot, movement, spawner, buffer, cfg, repair_cfg, mcfg, mined, tiles,
-                receivers, &haul, commit,
+                receivers, &haul, &upgrade, commit,
             )
         });
     }
 
     /// The Standard `opening work` job (one unit per owned room), then the Standard `hauling work`
-    /// job (one per room with a hauler to store this tick; none, and no clock reading, without).
+    /// job (one per room with a hauler to store this tick; none, and no clock reading, without),
+    /// then the Standard `upgrading work` job (one per room with an upgrader out of the spawn; none,
+    /// and no clock reading, without).
     pub fn work<C: Clock>(
         &mut self,
         tick: &mut TickCpu<'_, C>,
@@ -291,8 +353,10 @@ impl OpeningGlue {
         let Self {
             core,
             hauling,
+            upgrading,
             work_job,
             haul_work_job,
+            upgrade_work_job,
             ..
         } = self;
         let count = core.room_count();
@@ -306,6 +370,20 @@ impl OpeningGlue {
             tick.run_units(&HAUL_WORK_JOB, haul_work_job, hauls, |unit, commit| {
                 hauling.work_room(unit, snapshot, movement, buffer, mcfg, commit)
             });
+        }
+        let upgrades = upgrading.work_count();
+        if upgrades > 0 {
+            tick.run_units(
+                &UPGRADE_WORK_JOB,
+                upgrade_work_job,
+                upgrades,
+                |unit, commit| {
+                    let taken = upgrading
+                        .work_room_name(unit)
+                        .map_or(&[][..], |room| core.taken(room));
+                    upgrading.work_room(unit, snapshot, movement, buffer, mcfg, taken, commit)
+                },
+            );
         }
     }
 
@@ -593,6 +671,7 @@ impl OpeningGlue {
         );
         self.mining_summary(&mut text);
         self.hauling_summary(&mut text);
+        self.upgrading_summary(&mut text);
         let p = self.placement.totals();
         let skipped: usize = self.placement.refused().map(|(_, n)| n).sum();
         let _ = write!(
@@ -668,6 +747,61 @@ impl OpeningGlue {
                 }
             }
             text.push(';');
+        }
+    }
+
+    /// The upgrading part of the summary (P3.4): per owned room its upgraders and what they did in
+    /// the last work run, whether they take the controller's energy, and the plan's budget a tick
+    /// (what reaches the controller less the other creeps' bodies), body, count and posts.
+    fn upgrading_summary(&self, text: &mut String) {
+        text.push_str(" | upgrading:");
+        for (room, plan, stats) in self.upgrading.room_states() {
+            let _ = write!(
+                text,
+                " {room}: upgraders {} of {} (working {}, requested {}, upgrades {}{})",
+                stats.upgraders,
+                stats.want,
+                stats.working,
+                stats.requested,
+                stats.upgrades,
+                if stats.takes { ", taking" } else { "" }
+            );
+            let mut first = true;
+            for (&n, kind) in stats.tasks.iter().zip(UpgradeTask::KINDS) {
+                if n > 0 {
+                    let _ = write!(text, "{} {kind} {n}", if first { ", tasks" } else { "," });
+                    first = false;
+                }
+            }
+            let Some(p) = plan else {
+                text.push_str(", no controller store;");
+                continue;
+            };
+            let life = u64::from(screeps::CREEP_LIFE_TIME.max(1));
+            let _ = write!(
+                text,
+                ", budget {} a tick ({} in, {} other bodies), posts {}",
+                p.budget() / life,
+                p.delivered / life,
+                p.upkeep / life,
+                p.posts.len()
+            );
+            match p.body {
+                Some(b) => {
+                    let _ = write!(
+                        text,
+                        ", want {} of {} WORK {} CARRY {} MOVE ({} energy);",
+                        p.want,
+                        b.count(Part::Work),
+                        b.count(Part::Carry),
+                        b.count(Part::Move),
+                        b.cost()
+                    );
+                }
+                None => {
+                    let _ = write!(text, ", no upgrader at capacity {};", p.capacity);
+                }
+            }
         }
     }
 

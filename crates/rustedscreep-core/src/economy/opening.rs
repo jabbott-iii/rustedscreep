@@ -26,8 +26,15 @@
 //! Haulers (P3.3, `economy::hauling`): a source whose haulers work this tick is treated as a linked
 //! one ([`HaulView::redirect`]): its gatherers take its energy at the controller container and its
 //! workers are sized with no walk; energy the haulers take this tick is not offered to gatherers,
-//! nor room they fill to fillers; and while a hauler hauls a mined source no worker fills, except in
-//! a recovery.
+//! nor room they fill to fillers, nor at all a spawn or extension a hauler's transfer goes into this
+//! tick (P3.4); and while a hauler hauls a mined source no worker fills, except in a recovery.
+//!
+//! Upgraders (P3.4, `economy::upgrading`): while the room's upgraders take the energy at the
+//! controller ([`UpgradeView::takes`]), a linked or hauled source gets no worker of its own (the
+//! room keeps `min_workers`, which build, repair and fill), no worker is held to upgrading while
+//! others build (`min_upgraders`), and a worker with nothing else to do holds its energy, unless its
+//! source is one the upgraders do not count. What the workers take this tick is recorded per target
+//! ([`Opening::taken`]), so the upgraders, whose job runs later in the tick, do not take it too.
 //!
 //! Distances are Chebyshev ranges; only sizing measures paths (movement's grid). State lives in the
 //! heap: a global reset loses the modes, sources and tasks, and the next tick rebuilds them from the
@@ -40,7 +47,8 @@ use rustedscreep_consts::{
 
 use super::hauling::HaulView;
 use super::mining::{Mined, Receiver};
-use super::sizing::{Trip, carry_round, worker_body, worker_round, workers_for_source};
+use super::sizing::{Trip, carry_round, worker_round, workers_for_source};
+use super::upgrading::UpgradeView;
 use super::watchdog::{Event, Observation, Watchdog};
 use crate::config::{MovementConfig, OpeningConfig, RepairConfig};
 use crate::intents::{CreepIntent, IntentBuffer, Target};
@@ -49,7 +57,7 @@ use crate::scheduler::{Commit, Fault, Tier};
 use crate::snapshot::{
     Controller, CreepHandle, ObjectHandle, ObjectKind, Snapshot, StructureHandle,
 };
-use crate::spawning::{BodySpec, EnergyBudget, Role, SpawnRequest, Spawner, WORKER_PATTERN};
+use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner, WORKER_PATTERN};
 
 /// Spawn priorities of the opening's requests (higher first): a room with no worker that can work,
 /// a room below `min_workers`, and the rest.
@@ -204,6 +212,13 @@ pub struct Plan {
     pub mined: u32,
     pub linked: u32,
     pub hauled: u32,
+    /// The room's upgraders took the energy at the controller (P3.4, [`UpgradeView::takes`]): the
+    /// linked sources and those the upgraders count (`upgraded`, by index as `mined`) want no
+    /// worker, and the room keeps `min_workers`.
+    pub upgraders: bool,
+    pub upgraded: u32,
+    /// The most `WORKER_PATTERN` repeats its workers get ([`UpgradeView::worker_repeats`]).
+    pub repeats: u8,
     /// Workers the room spawns up to: the sources' sum within `min_workers..=max_workers` (0 when
     /// no source has an open tile). Unit: creeps.
     pub want: u32,
@@ -249,6 +264,9 @@ struct RoomState {
     /// Containers under repair (P3.5): below `repair.start_pct` of their `hitsMax` once, and not
     /// full since. A global reset forgets them; they are found again below the share.
     repairing: Vec<ObjectHandle>,
+    /// What its workers take this tick (P3.4): each pushed pickup or withdraw's target and the
+    /// taker's free room, cleared in [`Opening::begin`]. Unit: energy.
+    took: Vec<(Target, u32)>,
 }
 
 /// Unreachable targets a room remembers at once.
@@ -352,11 +370,15 @@ impl Opening {
                         members: (0, 0),
                         unreachable: Vec::new(),
                         repairing: Vec::new(),
+                        took: Vec::new(),
                     },
                 ),
             }
         }
         self.rooms.retain(|r| r.row.is_some());
+        for r in &mut self.rooms {
+            r.took.clear();
+        }
         self.members.clear();
         let creeps = &snap.creeps;
         for (row, identity) in creeps.identities().iter().enumerate() {
@@ -411,6 +433,24 @@ impl Opening {
         self.rooms.get(usize::try_from(unit).ok()?).map(|r| r.name)
     }
 
+    fn room(&self, room: RoomName) -> Option<&RoomState> {
+        self.rooms
+            .binary_search_by_key(&room.packed_repr(), |r| r.name.packed_repr())
+            .ok()
+            .and_then(|i| self.rooms.get(i))
+    }
+
+    /// `room`'s plan, from its last run.
+    pub fn plan(&self, room: RoomName) -> Option<&Plan> {
+        self.room(room).and_then(|r| r.plan.as_ref())
+    }
+
+    /// What `room`'s workers take this tick (P3.4): per pushed `pickup` or `withdraw`, its target
+    /// and the taker's free room; empty before the room's Critical run. Unit: energy.
+    pub fn taken(&self, room: RoomName) -> &[(Target, u32)] {
+        self.room(room).map_or(&[], |r| &r.took[..])
+    }
+
     /// The most energy `room`'s watchdog saw it hold while it never filled ([`Watchdog::cap`]), from
     /// its last run.
     pub fn cap(&self, room: RoomName) -> Option<u32> {
@@ -424,7 +464,8 @@ impl Opening {
     /// The Critical half of room `unit`'s tick (module docs, step 2). `mined` lists the room's
     /// sources whose miner is next to them this tick (`Mining::mined`; empty without miners),
     /// `mine_tiles` the mining plan's tiles (`Mining::mine_tiles`), whose containers are repaired,
-    /// and `haul` what the room's haulers do this tick (`Hauling::view`; the default without).
+    /// `haul` what the room's haulers do this tick (`Hauling::view`; the default without), and
+    /// `upgrade` whether its upgraders take the energy at the controller (`Upgrading::view`).
     #[allow(clippy::too_many_arguments)]
     pub fn plan_room(
         &mut self,
@@ -440,6 +481,7 @@ impl Opening {
         mine_tiles: &[Position],
         receivers: &[Receiver],
         haul: &HaulView<'_>,
+        upgrade: &UpgradeView<'_>,
         commit: &mut Commit,
     ) -> Result<(), Fault> {
         let ri = usize::try_from(unit).map_err(|_| Fault::new("unit out of range", unit))?;
@@ -452,7 +494,7 @@ impl Opening {
         };
         let row = row.ok_or(Fault::new("room not in this tick", unit))?;
         self.gather_facts(snap, name, mined, mine_tiles, receivers, haul);
-        self.ensure_plan(ri, snap, row, movement, cfg, mcfg, commit);
+        self.ensure_plan(ri, snap, row, movement, cfg, mcfg, upgrade, commit);
         let want = self
             .rooms
             .get(ri)
@@ -551,7 +593,7 @@ impl Opening {
                 role: Role::Worker,
                 body: BodySpec::Scaled {
                     pattern: &WORKER_PATTERN,
-                    max_repeats: u8::MAX,
+                    max_repeats: upgrade.worker_repeats,
                 },
                 budget,
                 priority,
@@ -569,6 +611,8 @@ impl Opening {
             guard && !state.upgrade_blocked,
             state,
             !haul.fills || recovering,
+            upgrade.takes,
+            upgrade.sources,
         );
         self.source_left.clear();
         self.source_left
@@ -772,9 +816,13 @@ impl Opening {
             match kind {
                 StructureType::Controller => f.controller = Some((h, pos)),
                 StructureType::Spawn | StructureType::Extension if free > 0 => {
-                    // Less what the haulers fill this tick (P3.3).
-                    let filled = haul.filled.iter().find(|x| x.0 == h).map_or(0, |x| x.1);
-                    if free > filled {
+                    // Less what the haulers fill this tick (P3.3), and none a hauler's transfer
+                    // goes into this tick (P3.4): a worker's transfer fills all the room it finds
+                    // (no amount), so the hauler's, processed after it, would find the structure
+                    // full and be billed for nothing.
+                    let claim = haul.filled.iter().find(|x| x.0 == h);
+                    let filled = claim.map_or(0, |x| x.1);
+                    if !claim.is_some_and(|x| x.2) && free > filled {
                         f.fills.push((h, pos, free - filled));
                     }
                 }
@@ -828,8 +876,10 @@ impl Opening {
         movement: &mut Movement,
         cfg: &OpeningConfig,
         mcfg: &MovementConfig,
+        upgrade: &UpgradeView<'_>,
         commit: &mut Commit,
     ) {
+        let upgraders = upgrade.takes;
         let Some(r) = self.rooms.get(ri) else {
             return;
         };
@@ -860,6 +910,18 @@ impl Opening {
                 })
         };
         let (mined, linked, hauled) = (mask(false, false), mask(true, false), mask(true, true));
+        let upgraded = self
+            .facts
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| upgraders && upgrade.sources.contains(&s.1))
+            .fold(0u32, |bits, (i, _)| {
+                bits | u32::try_from(i)
+                    .ok()
+                    .and_then(|i| 1u32.checked_shl(i))
+                    .unwrap_or(0)
+            });
         if r.plan.as_ref().is_some_and(|p| {
             p.version == version
                 && p.capacity == capacity
@@ -868,10 +930,13 @@ impl Opening {
                 && p.mined == mined
                 && p.linked == linked
                 && p.hauled == hauled
+                && p.upgraders == upgraders
+                && p.upgraded == upgraded
+                && p.repeats == upgrade.worker_repeats
         }) {
             return;
         }
-        let body = worker_body(capacity);
+        let body = Body::scaled(&WORKER_PATTERN, capacity, upgrade.worker_repeats);
         let goal = self.facts.controller.map(|(_, pos)| Goal {
             tile: Tile::of(pos),
             range: WORK_RANGE,
@@ -915,7 +980,9 @@ impl Opening {
             } else {
                 trip
             };
+            // The upgraders spend a linked source's energy (P3.4).
             let want = match (body.as_ref(), walk) {
+                _ if upgraders && (is_linked || bit.is_some_and(|bit| upgraded & bit != 0)) => 0,
                 (Some(b), Some(t)) => round(b, t).map_or(0, |round| {
                     workers_for_source(source_capacity, open, b, round)
                 }),
@@ -936,7 +1003,8 @@ impl Opening {
         // of their summed capacity and tiles, and split over them in order, rather than rounded up
         // per source.
         let pooled = |p: &SourcePlan| p.linked && p.trip.is_some();
-        if sources.iter().filter(|p| pooled(p)).count() > 1
+        if !upgraders
+            && sources.iter().filter(|p| pooled(p)).count() > 1
             && let Some(b) = body.as_ref()
             && let Some(round) = carry_round(b, Trip { tiles: 0, cost: 0 })
         {
@@ -956,7 +1024,8 @@ impl Opening {
             }
         }
         let sum = sources.iter().fold(0u32, |s, p| s.saturating_add(p.want));
-        let want = if sum == 0 {
+        // With upgraders the room still keeps `min_workers` to build, repair and fill (P3.4).
+        let want = if sum == 0 && !upgraders {
             0
         } else {
             sum.clamp(cfg.min_workers.min(cfg.max_workers), cfg.max_workers)
@@ -970,6 +1039,9 @@ impl Opening {
                 mined,
                 linked,
                 hauled,
+                upgraders,
+                upgraded,
+                repeats: upgrade.worker_repeats,
                 want,
             });
         }
@@ -987,6 +1059,8 @@ impl Opening {
         guard: bool,
         controller: crate::snapshot::ControllerState,
         fill: bool,
+        upgraders_take: bool,
+        counted: &[Position],
     ) {
         let now = self.time;
         // This tick's unreachable targets: every worker skips them.
@@ -1314,7 +1388,12 @@ impl Opening {
             .iter()
             .filter(|(_, t)| matches!(t, Task::Upgrade { .. }))
             .count();
-        let min_upgraders = usize::try_from(cfg.min_upgraders).unwrap_or(usize::MAX);
+        // With upgraders at the controller (P3.4) no worker is held to upgrading.
+        let min_upgraders = if upgraders_take {
+            0
+        } else {
+            usize::try_from(cfg.min_upgraders).unwrap_or(usize::MAX)
+        };
         if let Some((c, cpos)) = upgrade {
             while upgraders < min_upgraders && !left.is_empty() && other_work {
                 let pick = left
@@ -1396,6 +1475,15 @@ impl Opening {
         }
         self.repairs = repairs;
         let site = best_site(&self.facts.sites, &self.blocked);
+        let holds = |i: usize| {
+            upgraders_take
+                && self
+                    .members
+                    .get(i)
+                    .and_then(|m| self.worker(m.handle))
+                    .and_then(|w| w.source)
+                    .is_none_or(|src| counted.contains(&src))
+        };
         for &(i, _, _, prev, _) in &left {
             let handle = self.members.get(i).map(|m| m.handle);
             let open = |p: Position| {
@@ -1414,7 +1502,12 @@ impl Opening {
             ) {
                 (Task::Build(h), _, _) if keep => Task::Build(h),
                 (_, Some(h), _) => Task::Build(h),
-                (_, None, Some((c, cpos))) if open(cpos) => Task::Upgrade {
+                // With upgraders at the controller (P3.4) a worker with nothing else to do holds
+                // its energy for the next site: an upgrade by a small worker bills an intent for a
+                // few energy the upgraders would spend anyway. Not a worker whose source the
+                // upgraders do not count (say, an unhauled source while hauling is off): no one
+                // else spends that energy.
+                (_, None, Some((c, cpos))) if open(cpos) && !holds(i) => Task::Upgrade {
                     controller: c,
                     guard: false,
                 },
@@ -1669,7 +1762,21 @@ impl Opening {
                     }
                 }
                 None => {
-                    let _ = buffer.push(snap, m.handle, intent, commit);
+                    let taken = match intent {
+                        CreepIntent::Pickup { target }
+                        | CreepIntent::WithdrawObject { target, .. } => {
+                            Some(Target::Object(target))
+                        }
+                        CreepIntent::Withdraw { target, .. } => Some(Target::Structure(target)),
+                        _ => None,
+                    };
+                    if buffer.push(snap, m.handle, intent, commit).is_ok()
+                        && let Some(t) = taken
+                        && let Some(r) = self.rooms.get_mut(ri)
+                    {
+                        let free = snap.creeps.stores().get(m.row).map_or(0, |s| s.free());
+                        r.took.push((t, free));
+                    }
                 }
             }
         }

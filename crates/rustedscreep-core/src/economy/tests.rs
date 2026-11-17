@@ -39,12 +39,14 @@ use super::placement::{
 };
 use super::sizing::{
     Round, Trip, carry_round, haul_round, hauler_plan, haulers_for, miner_body, miner_work,
-    walk_ticks, worker_body, worker_round, workers_for_source,
+    upgraded, upgrader_carry, upgrader_plan, upgrader_upgrade, walk_ticks, worker_body,
+    worker_round, workers_for_source, yield_per_life,
 };
 use super::*;
 use crate::config::{
     CACHE_MMO, HAULING_MMO, HaulingConfig, LINK_MMO, LinkConfig, MINING_MMO, MMO, MOVEMENT_MMO,
-    MiningConfig, OPENING_MMO, OpeningConfig, REPAIR_MMO, RepairConfig, SPAWN_MMO,
+    MiningConfig, OPENING_MMO, OpeningConfig, REPAIR_MMO, RepairConfig, SPAWN_MMO, UPGRADING_MMO,
+    UpgradingConfig,
 };
 use crate::intents::{ActLog, CreepIntent, IntentBuffer, Outcome, Target, TargetRow};
 use crate::movement::{
@@ -58,13 +60,14 @@ use crate::snapshot::{
 use crate::spawning::{Body, Identity, Role, Spawner, WORKER_PATTERN};
 use rustedscreep_consts::{
     BUILD_POWER, CARRY_CAPACITY, CONTAINER_CAPACITY, CONTAINER_DECAY, CONTAINER_DECAY_TIME,
-    CONTAINER_DECAY_TIME_OWNED, CONTAINER_HITS, CONTROLLER_DOWNGRADE_RESTORE, CREEP_LIFE_TIME,
-    ENERGY_DECAY, ENERGY_REGEN_TIME, ErrorCode, HARVEST_POWER, LINK_CAPACITY, LINK_COOLDOWN,
-    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, MOVE_POWER, Part, Position,
-    REPAIR_COST, REPAIR_POWER, RoomCoordinate, RoomName, SOURCE_ENERGY_CAPACITY,
-    SOURCE_ENERGY_KEEPER_CAPACITY, SOURCE_ENERGY_NEUTRAL_CAPACITY, SPAWN_ENERGY_CAPACITY,
-    SPAWN_ENERGY_START, StructureType, TOMBSTONE_DECAY_PER_PART, Terrain, UPGRADE_CONTROLLER_POWER,
-    controller_downgrade, controller_levels, extension_energy_capacity,
+    CONTAINER_DECAY_TIME_OWNED, CONTAINER_HITS, CONTROLLER_DOWNGRADE_RESTORE,
+    CONTROLLER_MAX_UPGRADE_PER_TICK, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, ENERGY_DECAY,
+    ENERGY_REGEN_TIME, ErrorCode, HARVEST_POWER, LINK_CAPACITY, LINK_COOLDOWN, MAX_CREEP_SIZE,
+    MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, MOVE_POWER, Part, Position, REPAIR_COST,
+    REPAIR_POWER, RoomCoordinate, RoomName, SOURCE_ENERGY_CAPACITY, SOURCE_ENERGY_KEEPER_CAPACITY,
+    SOURCE_ENERGY_NEUTRAL_CAPACITY, SPAWN_ENERGY_CAPACITY, SPAWN_ENERGY_START, StructureType,
+    TOMBSTONE_DECAY_PER_PART, Terrain, UPGRADE_CONTROLLER_POWER, controller_downgrade,
+    controller_levels, extension_energy_capacity,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -891,12 +894,14 @@ struct World {
     opening: Opening,
     mining: Mining,
     hauling: Hauling,
+    upgrading: Upgrading,
     placement: Placement,
     cfg: OpeningConfig,
     mining_cfg: MiningConfig,
     link_cfg: LinkConfig,
     repair_cfg: RepairConfig,
     hauling_cfg: HaulingConfig,
+    upgrading_cfg: UpgradingConfig,
     /// Haulers (P3.3): transfers into a container and the energy they moved; takes that found
     /// nothing left (an earlier take this tick emptied the target: billed for nothing).
     stored: u32,
@@ -935,6 +940,18 @@ struct World {
     orders_at: Vec<(u32, Tile)>,
     refuse_tiles: Vec<Tile>,
     refuse_sends_until: u32,
+    /// Every take of the tick from a store (P3.4): the tick, the taker's role, the target's row,
+    /// the amount asked (`None`: all that fits), the taker's free room and the target's energy at
+    /// the tick's start. Kept only while `log_takes` is on.
+    takes_log: Vec<(u32, Role, TargetRow, Option<u32>, u32, u32)>,
+    log_takes: bool,
+    /// Every transfer into a structure while `log_takes` is on: the tick, the role, the target.
+    fills_log: Vec<(u32, Role, TargetRow)>,
+    /// The tick's start, for the game side's checks (V187, V192): each creep's energy, each
+    /// store's and each loose object's.
+    start_creeps: Vec<u32>,
+    start_stores: Vec<u32>,
+    start_loose: Vec<u32>,
     /// Billed intents and calls since the start (V34): creep intents, spawn orders, sites, sends.
     billed: u64,
     refused_sites: u32,
@@ -1013,12 +1030,14 @@ impl World {
             opening: Opening::default(),
             mining: Mining::default(),
             hauling: Hauling::default(),
+            upgrading: Upgrading::default(),
             placement: Placement::default(),
             cfg: OPENING_MMO,
             mining_cfg: MINING_MMO,
             link_cfg: LINK_MMO,
             repair_cfg: REPAIR_MMO,
             hauling_cfg: HAULING_MMO,
+            upgrading_cfg: UPGRADING_MMO,
             stored: 0,
             stored_energy: 0,
             empty_takes: 0,
@@ -1043,6 +1062,12 @@ impl World {
             orders_at: Vec::new(),
             refuse_tiles: Vec::new(),
             refuse_sends_until: 0,
+            takes_log: Vec::new(),
+            log_takes: false,
+            fills_log: Vec::new(),
+            start_creeps: Vec::new(),
+            start_stores: Vec::new(),
+            start_loose: Vec::new(),
             billed: 0,
             refused_sites: 0,
             standard: true,
@@ -1311,11 +1336,13 @@ impl World {
         self.opening.begin(&self.snap);
         self.mining.begin(&self.snap);
         self.hauling.begin(&self.snap);
+        self.upgrading.begin(&self.snap);
         let mut commit = Commit::default();
         let cfg = self.cfg;
         let mining_cfg = self.mining_cfg;
         let link_cfg = self.link_cfg;
         let hauling_cfg = self.hauling_cfg;
+        let upgrading_cfg = self.upgrading_cfg;
         let controller_container = (hauling_cfg.enabled && hauling_cfg.place_container)
             .then_some(hauling_cfg.container_level);
         // The Critical `mining` job, then `hauling`, then `opening` (rustedscreep-wasm's order).
@@ -1362,12 +1389,46 @@ impl World {
                 )
                 .expect("hauling");
         }
+        // The Critical `upgrading` job (P3.4), for the rooms with a controller store or upgraders.
+        {
+            let mining = &self.mining;
+            self.upgrading.select(|room| {
+                mining.plan(room).is_some_and(|p| p.controller_store)
+                    || !mining.receivers(room).is_empty()
+            });
+        }
+        for unit in 0..self.upgrading.unit_count() {
+            let room = self.upgrading.unit_room(unit).expect("room");
+            let cap = self.opening.cap(room);
+            let receivers = self.mining.receivers(room).to_vec();
+            self.upgrading
+                .plan_room(
+                    unit,
+                    &self.snap,
+                    &mut self.movement,
+                    &mut self.spawner,
+                    &upgrading_cfg,
+                    &mcfg,
+                    self.mining.plan(room),
+                    &receivers,
+                    self.hauling.plan(room),
+                    Crew {
+                        miners: self.mining.stats(room).map_or(0, |s| s.miners),
+                        haulers: self.hauling.stats(room).map_or(0, |s| s.haulers),
+                    },
+                    self.opening.plan(room),
+                    cap,
+                    &mut commit,
+                )
+                .expect("upgrading");
+        }
         for unit in 0..self.opening.room_count() {
             let room = self.opening.room_name(unit).expect("room");
             let mined = self.mining.mined(room).to_vec();
             let tiles = self.mining.mine_tiles(room).to_vec();
             let receivers = self.mining.receivers(room).to_vec();
             let haul = self.hauling.view(room);
+            let upgrade = self.upgrading.view(room);
             self.opening
                 .plan_room(
                     unit,
@@ -1382,6 +1443,7 @@ impl World {
                     &tiles,
                     &receivers,
                     &haul,
+                    &upgrade,
                     &mut commit,
                 )
                 .expect("plan");
@@ -1415,6 +1477,22 @@ impl World {
                     &mut commit,
                 )
                 .expect("hauling work");
+        }
+        // The Standard `upgrading work` job (P3.4).
+        for unit in 0..self.upgrading.work_count() * u32::from(self.standard) {
+            let room = self.upgrading.work_room_name(unit).expect("room");
+            let taken = self.opening.taken(room).to_vec();
+            self.upgrading
+                .work_room(
+                    unit,
+                    &self.snap,
+                    &mut self.movement,
+                    &mut self.buffer,
+                    &mcfg,
+                    &taken,
+                    &mut commit,
+                )
+                .expect("upgrading work");
         }
         // The Standard `links` job (P3.2).
         for unit in 0..self.mining.send_count() * u32::from(self.standard) {
@@ -1477,6 +1555,58 @@ impl World {
             Some(Outcome::Ok)
         });
         issued.sort_by_key(|&(actor, _, intent)| (actor, intent.action() as u8));
+        self.start_creeps = self.creeps.iter().map(|c| c.energy).collect();
+        self.start_stores = self.stores.iter().map(|s| s.energy).collect();
+        self.start_loose = self
+            .loose
+            .iter()
+            .map(|l| match l {
+                Loose::Pile { amount, .. } => *amount,
+                Loose::Tomb { energy, .. } | Loose::Container { energy, .. } => *energy,
+            })
+            .collect();
+        if self.log_takes {
+            for &(actor, target, intent) in &issued {
+                if let (CreepIntent::Transfer { .. }, Some(t @ TargetRow::Structure(_))) =
+                    (intent, target)
+                {
+                    self.fills_log
+                        .push((self.time, self.creeps[actor].identity.role, t));
+                }
+                let asked = match intent {
+                    CreepIntent::Withdraw { amount, .. }
+                    | CreepIntent::WithdrawObject { amount, .. } => amount,
+                    CreepIntent::Pickup { .. } => None,
+                    _ => continue,
+                };
+                let Some(t) = target else {
+                    continue;
+                };
+                let held = match t {
+                    TargetRow::Structure(row) => match self.struct_rows[row as usize] {
+                        StructRow::Store(i) => self.stores[i].energy,
+                        StructRow::Controller => 0,
+                    },
+                    TargetRow::Object(row) => match self.obj_rows[row as usize] {
+                        ObjRow::Loose(i) => match &self.loose[i] {
+                            Loose::Pile { amount, .. } => *amount,
+                            Loose::Tomb { energy, .. } | Loose::Container { energy, .. } => *energy,
+                        },
+                        _ => 0,
+                    },
+                    TargetRow::Creep(_) => 0,
+                };
+                let c = &self.creeps[actor];
+                self.takes_log.push((
+                    self.time,
+                    c.identity.role,
+                    t,
+                    asked,
+                    c.capacity() - c.energy,
+                    held,
+                ));
+            }
+        }
         for (actor, target, intent) in issued {
             let outcome = self.apply(actor, target, intent, &mut dest, &mut upgraded);
             if !outcome.recorded() {
@@ -1691,7 +1821,7 @@ impl World {
                 self.stored_energy += u64::from(amount);
                 Outcome::Ok
             }
-            (CreepIntent::Withdraw { .. }, Some(TargetRow::Structure(row))) => {
+            (CreepIntent::Withdraw { amount: asked, .. }, Some(TargetRow::Structure(row))) => {
                 let StructRow::Store(i) = self.struct_rows[row as usize] else {
                     return fail;
                 };
@@ -1706,13 +1836,25 @@ impl World {
                 if s.energy == 0 {
                     return Outcome::Failed(ErrorCode::NotEnough);
                 }
-                let amount = s.energy.min(free);
+                // An explicit amount above the free space is refused, or above the stock at the
+                // tick's start (V192, V220).
+                if asked.is_some_and(|a| a > free) {
+                    return Outcome::Failed(ErrorCode::Full);
+                }
+                if asked.is_some_and(|a| a > self.start_stores[i]) {
+                    return Outcome::Failed(ErrorCode::NotEnough);
+                }
+                let amount = s.energy.min(asked.unwrap_or(free));
                 s.energy -= amount;
                 self.creeps[actor].energy += amount;
                 self.link_takes += 1;
                 Outcome::Ok
             }
             (CreepIntent::UpgradeController { .. }, Some(TargetRow::Structure(_))) => {
+                // The game side refuses a creep that held no energy at the tick's start (V187).
+                if self.start_creeps[actor] == 0 {
+                    return Outcome::Failed(ErrorCode::NotEnough);
+                }
                 if !near(c.at, self.controller_at, 3) || c.energy == 0 {
                     return Outcome::Failed(ErrorCode::NotInRange);
                 }
@@ -1747,6 +1889,10 @@ impl World {
             }
             (CreepIntent::Pickup { .. }, Some(TargetRow::Object(row)))
             | (CreepIntent::WithdrawObject { .. }, Some(TargetRow::Object(row))) => {
+                let asked = match intent {
+                    CreepIntent::WithdrawObject { amount, .. } => amount,
+                    _ => None,
+                };
                 let ObjRow::Loose(i) = self.obj_rows[row as usize] else {
                     return fail;
                 };
@@ -1760,8 +1906,16 @@ impl World {
                 if !near(c.at, at, 1) || free == 0 {
                     return Outcome::Failed(ErrorCode::NotInRange);
                 }
+                // An explicit amount above the free space is refused, or above the stock at the
+                // tick's start (V192).
+                if asked.is_some_and(|a| a > free) {
+                    return Outcome::Failed(ErrorCode::Full);
+                }
+                if asked.is_some_and(|a| a > self.start_loose[i]) {
+                    return Outcome::Failed(ErrorCode::NotEnough);
+                }
                 // Emptied by an earlier take this tick: the processor clamps to what is left.
-                let amount = (*have).min(free);
+                let amount = (*have).min(asked.unwrap_or(free));
                 *have -= amount;
                 self.creeps[actor].energy += amount;
                 if amount == 0 {
@@ -2156,6 +2310,13 @@ impl World {
         self.creeps
             .iter()
             .filter(|c| c.identity.role == Role::Hauler)
+            .count()
+    }
+
+    fn upgraders(&self) -> usize {
+        self.creeps
+            .iter()
+            .filter(|c| c.identity.role == Role::Upgrader)
             .count()
     }
 
@@ -3768,10 +3929,12 @@ fn a_container_off_the_mining_tiles_is_never_repaired() {
 /// gatherers wait at the controller link instead (P3.2), set between `repair.walk_pct` and
 /// `repair.start_pct`: under repair, but over a creep life (three decay steps, still above the walk
 /// share) no worker is sent to it from outside repair range. Set below `repair.walk_pct`, it is
-/// repaired back above that share within a creep life.
+/// repaired back above that share within a creep life. Upgraders off (P3.4): with them the workers
+/// take from the nearest container, this one too, and repair it from there.
 #[test]
 fn a_linked_container_waits_for_the_walk_share() {
     let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.upgrading_cfg = UPGRADING_OFF;
     let mut linked = None;
     for _ in 0..24 {
         w.run(500);
@@ -3982,6 +4145,8 @@ fn repairs_keep_a_container_that_would_decay_away() {
 fn steady_haul(level: u8, hauling: HaulingConfig) -> (u32, u64) {
     let mut w = World::new(level, SPAWN_ENERGY_CAPACITY);
     w.hauling_cfg = hauling;
+    // Haulers alone, as measured before P3.4's upgraders (`upgraders_raise_the_upgrade_rate`).
+    w.upgrading_cfg = UPGRADING_OFF;
     w.run(6000);
     let (p, b) = (w.progress, w.billed);
     w.run(12_000);
@@ -4016,8 +4181,8 @@ fn haulers_raise_the_upgrade_rate() {
 /// starts at RCL4 places the controller container on a free tile 2 from the controller (off the
 /// controller link's tile, not next to a source), builds it, and gets the plan's haulers: CARRY and
 /// MOVE parts only, at most `max_per_source` a source. They fill the spawns and extensions and
-/// carry the rest into the container; the workers take it there, are sized with no walk, and fill
-/// nothing while a hauler hauls a mined source.
+/// carry the rest into the container; the workers (from P3.4 the upgraders) take it there, the
+/// workers are sized with no walk, and fill nothing while a hauler hauls a mined source.
 #[test]
 fn haulers_carry_a_sources_energy_to_the_controller_container() {
     let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
@@ -4064,7 +4229,10 @@ fn haulers_carry_a_sources_energy_to_the_controller_container() {
             .creeps
             .iter()
             .filter(|c| {
-                c.identity.role == Role::Worker && c.spawning == 0 && c.at.range(tile_of(at)) <= 1
+                // The workers, or from P3.4 the upgraders, that take the container's energy.
+                matches!(c.identity.role, Role::Worker | Role::Upgrader)
+                    && c.spawning == 0
+                    && c.at.range(tile_of(at)) <= 1
             })
             .count();
     }
@@ -4074,7 +4242,10 @@ fn haulers_carry_a_sources_energy_to_the_controller_container() {
         "no take found its energy taken (the haulers' claims)"
     );
     assert!(w.stored_energy - energy >= u64::from(CARRY_CAPACITY));
-    assert!(takes_there > 0, "workers came to the container");
+    assert!(
+        takes_there > 0,
+        "workers or upgraders came to the container"
+    );
     let (_, plan, _, _) = w.opening.room_states().next().expect("room");
     let plan = plan.expect("plan");
     assert!(
@@ -4333,4 +4504,952 @@ fn the_view_redirects_only_hauled_sources() {
         HaulView::default().redirect(mined(pos(8, 30), None)).link,
         None
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Upgraders (P3.4)
+
+const UPGRADING_OFF: UpgradingConfig = UpgradingConfig {
+    enabled: false,
+    ..UPGRADING_MMO
+};
+
+/// Uses: SOURCE_ENERGY_CAPACITY, CREEP_LIFE_TIME, ENERGY_REGEN_TIME. A source's yield over a creep
+/// life: its capacity once every regeneration window (V184), for a creep's life (V170).
+#[test]
+fn a_sources_yield_per_life_from_constants() {
+    let windows = CREEP_LIFE_TIME / ENERGY_REGEN_TIME;
+    assert_eq!(
+        yield_per_life(SOURCE_ENERGY_CAPACITY),
+        u64::from(SOURCE_ENERGY_CAPACITY * windows)
+    );
+    assert_eq!(yield_per_life(0), 0);
+}
+
+/// Uses: CARRY_CAPACITY, UPGRADE_CONTROLLER_POWER, MAX_CREEP_SIZE. An upgrader's load is more than
+/// one tick's upgrade, with the fewest CARRY parts that do it.
+#[test]
+fn an_upgraders_carry_outlasts_one_upgrade() {
+    for work in 1..MAX_CREEP_SIZE {
+        let carry = upgrader_carry(work);
+        let tick = work * UPGRADE_CONTROLLER_POWER;
+        assert!(carry * CARRY_CAPACITY > tick, "{work} WORK");
+        assert!(
+            (carry - 1) * CARRY_CAPACITY <= tick,
+            "{work} WORK: the fewest"
+        );
+    }
+}
+
+/// Uses: CREEP_LIFE_TIME, CREEP_SPAWN_TIME, UPGRADE_CONTROLLER_POWER, MOVE_POWER, MOVE_COST_PLAIN.
+/// What one upgrader upgrades over a life: its WORK parts' upgrade for the life left after its
+/// spawning and its walk out, which only the WORK parts weigh (V54, V55); and what `n` of them
+/// upgrade of a budget once their bodies are paid.
+#[test]
+fn an_upgraders_upgrade_from_constants() {
+    let trip = Trip {
+        tiles: 13,
+        cost: 13 * MOVE_COST_PLAIN,
+    };
+    for (work, carry, moves) in [(1, 1, 1), (9, 1, 1), (15, 1, 3), (40, 1, 9)] {
+        let walk = trip
+            .tiles
+            .max((trip.cost * work).div_ceil(MOVE_POWER * moves));
+        let spawn = (work + carry + moves) * CREEP_SPAWN_TIME;
+        let want = u64::from(work * UPGRADE_CONTROLLER_POWER * (CREEP_LIFE_TIME - walk - spawn));
+        assert_eq!(
+            upgrader_upgrade(work, carry, moves, trip),
+            Some(want),
+            "{work}/{carry}/{moves}"
+        );
+    }
+    assert_eq!(upgrader_upgrade(5, 1, 0, trip), None, "no MOVE part");
+    // Bodies first, then up to what they upgrade.
+    assert_eq!(upgraded(10_000, 2, 1000, 3000), 6000);
+    assert_eq!(upgraded(10_000, 2, 1000, 5000), 8000);
+    assert_eq!(upgraded(1500, 2, 1000, 5000), 0);
+}
+
+/// Every upgrader body that fits `energy`, `MAX_CREEP_SIZE` and `max_work` with every count within
+/// the caps, by brute force: (energy not upgraded, upgraders, energy for all of them, MOVE parts).
+fn upgrader_options(
+    budget: u64,
+    trip: Trip,
+    energy: u32,
+    max_creeps: u32,
+    max_work: Option<u32>,
+) -> Vec<(u64, u32, u64, u32)> {
+    let mut out = Vec::new();
+    for work in 1..MAX_CREEP_SIZE {
+        let carry = upgrader_carry(work);
+        for moves in 1..=MAX_CREEP_SIZE.saturating_sub(work + carry) {
+            let cost =
+                work * Part::Work.cost() + carry * Part::Carry.cost() + moves * Part::Move.cost();
+            if cost > energy || max_work.is_some_and(|m| work > m) {
+                continue;
+            }
+            let upgrade = upgrader_upgrade(work, carry, moves, trip).expect("upgrade");
+            let most = max_work.map_or(max_creeps, |m| (m / work).min(max_creeps));
+            for n in 1..=most {
+                out.push((
+                    budget - upgraded(budget, n, cost, upgrade),
+                    n,
+                    u64::from(n) * u64::from(cost),
+                    moves,
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The room's spawn and extension energy at `rcl` with every spawn and extension the level allows
+/// (V175).
+/// Uses: SPAWN_ENERGY_CAPACITY, CONTROLLER_STRUCTURES, EXTENSION_ENERGY_CAPACITY.
+fn level_energy(rcl: u32) -> u32 {
+    StructureType::Spawn.controller_structures(rcl) * SPAWN_ENERGY_CAPACITY
+        + StructureType::Extension.controller_structures(rcl) * extension_energy_capacity(rcl)
+}
+
+/// Property test over budgets (up to two keeper sources' yield), trips (road, plain and swamp
+/// tiles), post counts and the room capacities of every level: an upgrader plan's body is WORK, then
+/// `upgrader_carry` CARRY, then MOVE parts, costs at most the energy and holds at most
+/// MAX_CREEP_SIZE parts; its count is within the posts; of every body and count that fit it
+/// upgrades the most of the budget (`upgraded`), then has the fewest upgraders, then the least
+/// energy for all of them, then the fewest MOVE parts; uncapped it leaves no more of the budget
+/// than one body's worth unspent; at level 8 its WORK parts stay within
+/// CONTROLLER_MAX_UPGRADE_PER_TICK; and an empty budget, no post, too little energy or a budget
+/// below one body gives none.
+/// Uses: BODYPART_COST, MOVE_COST_ROAD, MOVE_COST_PLAIN, MOVE_COST_SWAMP, MAX_CREEP_SIZE,
+/// CONTROLLER_MAX_UPGRADE_PER_TICK, UPGRADE_CONTROLLER_POWER, SOURCE_ENERGY_CAPACITY,
+/// SOURCE_ENERGY_KEEPER_CAPACITY, SPAWN_ENERGY_CAPACITY, CONTROLLER_STRUCTURES,
+/// EXTENSION_ENERGY_CAPACITY.
+#[test]
+fn upgrader_plans_fit_upgrade_the_most_and_take_the_fewest() {
+    let mut energies: Vec<u32> = (1..=8u32)
+        .map(level_energy)
+        .chain([0, 199, 200, 201, 650])
+        .collect();
+    energies.sort_unstable();
+    let cap = CONTROLLER_MAX_UPGRADE_PER_TICK / UPGRADE_CONTROLLER_POWER;
+    let budgets = [
+        1,
+        yield_per_life(SOURCE_ENERGY_NEUTRAL_CAPACITY),
+        yield_per_life(SOURCE_ENERGY_CAPACITY),
+        2 * yield_per_life(SOURCE_ENERGY_CAPACITY),
+        2 * yield_per_life(SOURCE_ENERGY_KEEPER_CAPACITY),
+    ];
+    for budget in budgets {
+        for tiles in [0u32, 5, 20, 45] {
+            for rate in [MOVE_COST_ROAD, MOVE_COST_PLAIN, MOVE_COST_SWAMP] {
+                let trip = Trip {
+                    tiles,
+                    cost: tiles * rate,
+                };
+                for (max_creeps, max_work) in [(1, None), (7, None), (7, Some(cap))] {
+                    for &energy in &energies {
+                        let options = upgrader_options(budget, trip, energy, max_creeps, max_work);
+                        let case = format!("{budget} {tiles} {rate} {max_creeps} {energy}");
+                        let Some((body, n)) =
+                            upgrader_plan(budget, trip, energy, max_creeps, max_work)
+                        else {
+                            assert!(
+                                options.iter().all(|o| o.0 == budget),
+                                "{case}: none upgrades anything"
+                            );
+                            continue;
+                        };
+                        let work = count(&body, Part::Work);
+                        let carry = count(&body, Part::Carry);
+                        let moves = count(&body, Part::Move);
+                        assert!(body.cost() <= energy, "{case}");
+                        assert!(body.len() <= MAX_CREEP_SIZE as usize, "{case}");
+                        assert_eq!(carry, upgrader_carry(work), "{case}");
+                        assert!(work >= 1 && moves >= 1, "{case}");
+                        assert_eq!(body.parts()[0], Part::Work, "WORK first");
+                        assert_eq!(body.parts()[work as usize], Part::Carry, "then CARRY");
+                        assert!(n >= 1 && n <= max_creeps, "{case}");
+                        if let Some(m) = max_work {
+                            assert!(n * work <= m, "{case}: level 8's cap");
+                        }
+                        let upgrade = upgrader_upgrade(work, carry, moves, trip).expect("upgrade");
+                        let done = upgraded(budget, n, body.cost(), upgrade);
+                        assert!(done > 0, "{case}");
+                        let paid = u64::from(n) * u64::from(body.cost());
+                        if n < max_creeps && max_work.is_none() {
+                            assert!(
+                                budget - paid - done <= u64::from(body.cost()) + upgrade,
+                                "{case}: less than one body's worth unspent"
+                            );
+                        }
+                        let best = options.iter().copied().min().expect("an option");
+                        let got = (budget - done, n, paid, moves);
+                        assert_eq!(got, best, "{case}");
+                    }
+                }
+            }
+        }
+    }
+    let trip = Trip {
+        tiles: 10,
+        cost: 10 * MOVE_COST_PLAIN,
+    };
+    let unit = Part::Work.cost() + Part::Carry.cost() + Part::Move.cost();
+    assert_eq!(upgrader_plan(0, trip, 1000, 3, None), None, "no budget");
+    assert_eq!(upgrader_plan(1000, trip, 1000, 0, None), None, "no post");
+    assert_eq!(
+        upgrader_plan(1000, trip, unit - 1, 3, None),
+        None,
+        "too little energy"
+    );
+    assert_eq!(
+        upgrader_plan(u64::from(unit), trip, 1000, 3, None),
+        None,
+        "a budget that only pays for a body"
+    );
+    assert!(upgrader_plan(u64::from(unit) + 1, trip, unit, 3, None).is_some());
+}
+
+/// The budget the scenario room's plan holds at RCL5 (one source sent by links, one hauled), from
+/// constants: both sources' yield over a creep life (`yield_per_life`), less the links' loss on the
+/// sent one (`link_loss`, LINK_LOSS_RATIO); and every other creep's body: its miners and haulers as
+/// their plans give them, and `min_workers` workers of at most `upgrading.worker_repeats` repeats.
+/// Without a miner nothing is counted.
+/// Uses: SOURCE_ENERGY_CAPACITY, CREEP_LIFE_TIME, ENERGY_REGEN_TIME, LINK_LOSS_RATIO, BODYPART_COST.
+#[test]
+fn the_budget_counts_the_flowing_sources_less_every_other_body() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.run(8000);
+    let room = w.room;
+    let (_, plan, stats) = w.upgrading.room_states().next().expect("room");
+    let plan = plan.expect("a plan").clone();
+    assert!(stats.takes);
+    let mine = w.mining.plan(room).expect("mining plan");
+    let haul = w.hauling.plan(room).expect("hauling plan");
+    assert_eq!(
+        mine.sources.iter().filter(|s| s.linked).count(),
+        1,
+        "one sent"
+    );
+    let y = yield_per_life(SOURCE_ENERGY_CAPACITY);
+    assert_eq!(plan.delivered, 2 * y - u64::from(link_loss(y as u32)));
+    let miners: u64 = mine
+        .sources
+        .iter()
+        .filter_map(|s| s.body)
+        .map(|b| u64::from(b.cost()))
+        .sum();
+    let haulers: u64 = haul
+        .sources
+        .iter()
+        .filter_map(|s| s.body.map(|b| u64::from(b.cost()) * u64::from(s.want)))
+        .sum();
+    let worker = Body::scaled(
+        &WORKER_PATTERN,
+        plan.capacity,
+        UPGRADING_MMO.worker_repeats as u8,
+    )
+    .expect("a worker");
+    let workers = u64::from(OPENING_MMO.min_workers) * u64::from(worker.cost());
+    assert_eq!(plan.upkeep, miners + haulers + workers);
+    assert_eq!(plan.sources.len(), 2);
+    let sources = [
+        (place(room, w.sources[0].at), SOURCE_ENERGY_CAPACITY),
+        (place(room, w.sources[1].at), SOURCE_ENERGY_CAPACITY),
+    ];
+    let ways = Ways {
+        container: true,
+        link: true,
+        crew: Crew {
+            miners: 2,
+            haulers: 1,
+        },
+    };
+    assert_eq!(
+        delivered(Some(mine), Some(haul), &sources, ways),
+        plan.delivered
+    );
+    let none = Ways {
+        crew: Crew::default(),
+        ..ways
+    };
+    assert_eq!(
+        delivered(Some(mine), Some(haul), &sources, none),
+        0,
+        "no miner"
+    );
+    assert!(delivering(Some(mine), Some(haul), none).is_empty());
+    let unhauled = Ways {
+        crew: Crew {
+            miners: 2,
+            haulers: 0,
+        },
+        ..ways
+    };
+    assert_eq!(
+        delivered(Some(mine), Some(haul), &sources, unhauled),
+        y - u64::from(link_loss(y as u32)),
+        "no hauler: only the sent source"
+    );
+}
+
+/// Uses: UPGRADE_CONTROLLER_POWER, CARRY_CAPACITY, `RECEIVER_RANGE`. A room at RCL5 (its controller
+/// container, then its links): the plan's upgraders come, WORK parts first and `upgrader_carry`
+/// CARRY parts, and stand each on its own post, a walkable tile within upgrading range of the
+/// controller next to a store; the posts are every such tile but the `free_tiles` nearest the spawn;
+/// the opening keeps `min_workers` workers of at most `worker_repeats` repeats; no intent fails.
+#[test]
+fn upgraders_take_the_controllers_energy_from_their_posts() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.run(9000);
+    assert_eq!(w.failed, 0);
+    let room = w.room;
+    let (_, plan, stats) = w.upgrading.room_states().next().expect("room");
+    let plan = plan.expect("a plan").clone();
+    assert!(stats.takes && plan.want >= 1);
+    let body = plan.body.expect("a body");
+    assert!(body.cost() <= plan.capacity);
+    // The posts, by brute force over the room: every walkable tile within 3 of the controller
+    // next to a store, off the mining and link tiles, but the `free_tiles` next to the first store
+    // nearest the spawn.
+    let controller = place(room, w.controller_at);
+    let mine = w.mining.plan(room).expect("mining plan");
+    let spawn = mine.spawn.expect("a spawn");
+    let reserved: Vec<Position> = mine
+        .sources
+        .iter()
+        .flat_map(|s| [s.tile, s.link])
+        .chain([mine.controller_link])
+        .flatten()
+        .collect();
+    let mut candidates = Vec::new();
+    for x in 1..=48u8 {
+        for y in 1..=48u8 {
+            let t = tile(x, y);
+            let p = place(room, t);
+            let near_store = plan.stores.iter().any(|&s| tile_of(s).range(t) <= 1);
+            if t.range(w.controller_at) > 3 || w.blocked(t) || !near_store {
+                continue;
+            }
+            if reserved.contains(&p) && !plan.stores.contains(&p) {
+                continue;
+            }
+            assert!(p != controller);
+            candidates.push(p);
+        }
+    }
+    let access = tile_of(plan.stores[0]);
+    let mut by_access: Vec<Position> = candidates
+        .iter()
+        .copied()
+        .filter(|&p| tile_of(p).range(access) <= 1)
+        .collect();
+    by_access.sort_by_key(|&p| (tile_of(p).range(tile_of(spawn)), tile_key_of(p)));
+    let free: Vec<Position> = by_access
+        .iter()
+        .copied()
+        .take(UPGRADING_MMO.free_tiles as usize)
+        .collect();
+    assert_eq!(free.len(), UPGRADING_MMO.free_tiles as usize);
+    let mut want: Vec<Position> = candidates
+        .into_iter()
+        .filter(|p| !free.contains(p))
+        .collect();
+    let mut got = plan.posts.clone();
+    want.sort_by_key(|&p| tile_key_of(p));
+    got.sort_by_key(|&p| tile_key_of(p));
+    assert_eq!(got, want, "the posts");
+    assert!(
+        free.iter().all(|p| !plan.posts.contains(p)),
+        "free next to the store"
+    );
+    // Its upgraders: the plan's bodies (or an earlier plan's), each settled one on its own post.
+    let upgraders: Vec<&SimCreep> = w
+        .creeps
+        .iter()
+        .filter(|c| c.identity.role == Role::Upgrader)
+        .collect();
+    assert_eq!(upgraders.len() as u32, plan.want);
+    let mut seen = Vec::new();
+    for c in &upgraders {
+        let work = count(&c.body, Part::Work);
+        assert_eq!(count(&c.body, Part::Carry), upgrader_carry(work));
+        assert!(count(&c.body, Part::Move) >= 1);
+        let walk = plan
+            .trip
+            .and_then(|t| walk_ticks(t, work, count(&c.body, Part::Move)))
+            .expect("a walk");
+        if c.spawning == 0 && w.time - c.born > 2 * walk + 10 {
+            let at = place(room, c.at);
+            assert!(plan.posts.contains(&at), "on a post: {:?}", c.at);
+            assert!(!seen.contains(&at), "one each");
+            seen.push(at);
+        }
+    }
+    assert!(!seen.is_empty());
+    // The opening's workers: `min_workers`, small.
+    assert_eq!(w.want(), OPENING_MMO.min_workers);
+    for c in w.creeps.iter().filter(|c| c.identity.role == Role::Worker) {
+        assert!(
+            count(&c.body, Part::Work) <= UPGRADING_MMO.worker_repeats,
+            "{:?}",
+            c.body
+        );
+    }
+}
+
+/// Upgraders pay at every level the scenario room is run at: more upgrade progress from tick 6000
+/// to 18000 than with them off, and fewer billed intents at RCL3 and RCL4. Measured 2026-11-17
+/// over six starts (the spawn's energy at the start 300 to 50) and ticks 6000 to 30000: RCL3
+/// +8.8% (+8.3% to +9.1%), RCL4 +6.0% (+5.4% to +8.5%), RCL5 +9.2% (+8.8% to +10.3%), RCL6
+/// +6.4% (+5.4% to +8.3%); billed intents −9.8%, −7.7%, +10.1%, +1.4%. A fresh room reaches RCL4
+/// in 16935 ticks against 17537 and RCL5 in 47156 against 49804.
+#[test]
+fn upgraders_raise_the_upgrade_rate() {
+    let steady = |level: u8, cfg: UpgradingConfig| {
+        let mut w = World::new(level, SPAWN_ENERGY_CAPACITY);
+        w.upgrading_cfg = cfg;
+        w.run(6000);
+        let (p, b) = (w.progress, w.billed);
+        w.run(12_000);
+        assert_eq!(w.failed, 0);
+        (w.progress - p, w.billed - b)
+    };
+    for level in [3, 4, 5, 6] {
+        let (with, with_billed) = steady(level, UPGRADING_MMO);
+        let (without, without_billed) = steady(level, UPGRADING_OFF);
+        assert!(with > without, "RCL{level}: {with} against {without}");
+        if level <= 4 {
+            assert!(
+                with_billed < without_billed,
+                "RCL{level}: {with_billed} against {without_billed}"
+            );
+        }
+    }
+}
+
+/// With `upgrading.enabled` off no upgrader is ordered, the view never gives the controller's energy
+/// away, and the workers keep their full bodies.
+#[test]
+fn upgraders_off_order_none() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.upgrading_cfg = UPGRADING_OFF;
+    for _ in 0..6000 {
+        w.step();
+        assert!(!w.upgrading.view(w.room).takes);
+    }
+    assert_eq!(w.upgraders(), 0);
+    assert!(
+        w.spawned
+            .iter()
+            .all(|(_, b)| b.count(Part::Work) <= b.count(Part::Carry) || b.count(Part::Carry) <= 1)
+    );
+    assert!(w.spawned.iter().any(|(_, b)| {
+        b.count(Part::Work) > UPGRADING_MMO.worker_repeats as usize
+            && b.count(Part::Work) == b.count(Part::Carry)
+    }));
+    assert_eq!(w.failed, 0);
+}
+
+/// With mining off no energy reaches the controller, so no upgrader is ordered and the workers keep
+/// upgrading (a room whose stores stand but whose miners never come must not shrink its workers).
+#[test]
+fn a_room_without_miners_keeps_its_workers() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    w.mining_cfg = MiningConfig {
+        enabled: false,
+        ..MINING_MMO
+    };
+    for _ in 0..6000 {
+        w.step();
+        assert!(!w.upgrading.view(w.room).takes);
+    }
+    assert_eq!(w.upgraders(), 0);
+    assert!(w.want() > OPENING_MMO.min_workers);
+    assert_eq!(w.failed, 0);
+}
+
+/// Two runs that once gave a billed no-op: a worker's fill (no amount) took the room a hauler had
+/// claimed in the same extension (RCL4 with 2-repeat workers, a start of 50 energy); an upgrader's
+/// withdraw (no amount) emptied the controller link before a worker's claimed take (RCL6, a start of
+/// 200). The workers now leave a hauler's fills alone, and an upgrader withdraws only what it claims.
+#[test]
+fn workers_haulers_and_upgraders_never_take_the_same_energy() {
+    for (level, energy, ticks) in [(4u8, 50, 11_000), (6, 200, 26_000)] {
+        let mut w = World::new(level, energy);
+        w.run(ticks);
+        assert_eq!(w.failed, 0, "RCL{level}");
+        assert!(w.upgraders() >= 1);
+    }
+}
+
+/// After a global reset (upgrading's state lost) the upgraders take posts again, one each, those on
+/// a post the one they stand on (none moves), and go on upgrading.
+#[test]
+fn a_reset_keeps_the_upgraders_at_their_posts() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.run(8000);
+    let (_, plan, _) = w.upgrading.room_states().next().expect("room");
+    let posts = plan.expect("a plan").posts.clone();
+    let settled: Vec<(u128, Tile)> = w
+        .creeps
+        .iter()
+        .filter(|c| c.identity.role == Role::Upgrader && c.spawning == 0)
+        .filter(|c| posts.contains(&place(w.room, c.at)))
+        .map(|c| (c.key, c.at))
+        .collect();
+    assert!(settled.len() >= 2, "two upgraders at RCL5");
+    // Two of them swap posts: after the reset each keeps the one it stands on, whatever the ids.
+    let (a, b) = (settled[0], settled[1]);
+    for c in w.creeps.iter_mut() {
+        if c.key == a.0 {
+            c.at = b.1;
+        } else if c.key == b.0 {
+            c.at = a.1;
+        }
+    }
+    let settled: Vec<(u128, Tile)> = [(a.0, b.1), (b.0, a.1)]
+        .into_iter()
+        .chain(settled[2..].iter().copied())
+        .collect();
+    w.upgrading = Upgrading::default();
+    let before = w.progress;
+    w.step();
+    for &(key, at) in &settled {
+        let c = w.creeps.iter().find(|c| c.key == key).expect("alive");
+        assert_eq!(c.at, at, "it keeps the post it stands on");
+    }
+    w.run(100);
+    let (_, plan, stats) = w.upgrading.room_states().next().expect("room");
+    let posts = plan.expect("a plan").posts.clone();
+    assert!(stats.upgrades >= 1);
+    assert!(w.progress > before);
+    let mut seen = Vec::new();
+    for c in w
+        .creeps
+        .iter()
+        .filter(|c| c.identity.role == Role::Upgrader && c.spawning == 0)
+    {
+        let at = place(w.room, c.at);
+        if posts.contains(&at) {
+            assert!(!seen.contains(&at), "one each");
+            seen.push(at);
+        }
+    }
+    assert!(!seen.is_empty());
+    assert_eq!(w.failed, 0);
+}
+
+/// With the Standard tier off the Critical `upgrading` job still plans and orders upgraders (one
+/// that dies is replaced), and none of them withdraws, upgrades or moves (that is the Standard
+/// job's): the controller gains nothing and the settled ones stay put.
+#[test]
+fn critical_upgrading_goes_on_with_the_standard_tier_off() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.run(6000);
+    w.standard = false;
+    w.log_takes = true;
+    let mut settled: Vec<(u128, Tile)> = w
+        .creeps
+        .iter()
+        .filter(|c| c.identity.role == Role::Upgrader && c.spawning == 0)
+        .map(|c| (c.key, c.at))
+        .collect();
+    assert!(!settled.is_empty());
+    // One dies: its replacement is ordered all the same.
+    let (gone, _) = settled.remove(0);
+    w.creeps.retain(|c| c.key != gone);
+    let ordered = w.spawned.len();
+    let progress = w.progress;
+    w.run(300);
+    assert!(
+        w.spawned[ordered..]
+            .iter()
+            .any(|(_, b)| b.count(Part::Work) > b.count(Part::Carry)),
+        "a replacement upgrader"
+    );
+    let (_, plan, stats) = w.upgrading.room_states().next().expect("room");
+    assert!(stats.takes);
+    assert_eq!(stats.upgraders, plan.expect("a plan").want);
+    assert_eq!(w.progress, progress, "no upgrade");
+    assert!(
+        w.takes_log.iter().all(|t| t.1 != Role::Upgrader),
+        "no upgrader withdraw"
+    );
+    for c in w
+        .creeps
+        .iter()
+        .filter(|c| c.identity.role == Role::Upgrader)
+    {
+        if let Some(&(_, at)) = settled.iter().find(|b| b.0 == c.key) {
+            assert_eq!(c.at, at, "no Standard move");
+        }
+    }
+    assert_eq!(w.failed, 0);
+}
+
+/// Uses: MAX_CREEP_SIZE, CREEP_SPAWN_TIME (`upgrading.crew_grace_ticks`). With upgraders at work,
+/// the room's only hauler dying, then both its miners, hands nothing back: until the replacements
+/// show (the tick after their orders), the upgraders still take the controller's energy, both plans
+/// stay as they were, and no worker beyond `min_workers` is wanted.
+#[test]
+fn a_crew_gap_keeps_the_upgraders_taking() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.run(8000);
+    let room = w.room;
+    assert_eq!(w.haulers(), 1, "one hauled source at RCL5");
+    let before = w.upgrading.room_states().next().expect("room").1.cloned();
+    assert!(before.is_some() && w.upgrading.view(room).takes);
+    let workers_spawned = |w: &World| {
+        w.spawned
+            .iter()
+            .filter(|(_, b)| b.count(Part::Work) == b.count(Part::Carry))
+            .count()
+    };
+    for role in [Role::Hauler, Role::Miner] {
+        w.creeps.retain(|c| c.identity.role != role);
+        let spawned = workers_spawned(&w);
+        for _ in 0..20 {
+            w.step();
+            assert!(w.upgrading.view(room).takes, "{role:?} gone at {}", w.time);
+            assert_eq!(w.want(), OPENING_MMO.min_workers);
+            let now = w.upgrading.room_states().next().expect("room").1.cloned();
+            assert_eq!(now, before, "the plan stays");
+        }
+        assert_eq!(workers_spawned(&w), spawned, "no worker for the gap");
+    }
+    assert_eq!(w.failed, 0);
+}
+
+/// Once mining stops for good (switched off, its miners gone), the grace runs out and the
+/// controller's energy goes back to the workers.
+#[test]
+fn the_crew_grace_runs_out() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.run(8000);
+    assert!(w.upgrading.view(w.room).takes);
+    w.mining_cfg = MiningConfig {
+        enabled: false,
+        ..MINING_MMO
+    };
+    w.creeps.retain(|c| c.identity.role != Role::Miner);
+    w.run(UPGRADING_MMO.crew_grace_ticks);
+    assert!(w.upgrading.view(w.room).takes, "within the grace");
+    w.run(2);
+    assert!(!w.upgrading.view(w.room).takes, "after it");
+    assert_eq!(w.failed, 0);
+}
+
+/// The plan wanting upgraders hands the controller's energy over only once the room has one
+/// (spawning counts): until then the workers keep their sources and their upgrading.
+#[test]
+fn the_energy_is_handed_over_with_the_first_upgrader() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    let mut waited = 0;
+    for _ in 0..8000 {
+        w.step();
+        let (_, plan, stats) = w.upgrading.room_states().next().expect("room");
+        let wants = plan.is_some_and(|p| p.want > 0 && p.body.is_some());
+        if stats.upgraders > 0 {
+            assert!(wants && stats.takes, "taken with the first one");
+            assert!(
+                waited > 0,
+                "the plan wanted upgraders before one was ordered"
+            );
+            assert!(w.upgrading.view(w.room).takes);
+            return;
+        }
+        assert!(!stats.takes, "no upgrader yet at {}", w.time);
+        assert!(!w.upgrading.view(w.room).takes);
+        if wants {
+            waited += 1;
+        }
+    }
+    panic!("no upgrader within 8000 ticks");
+}
+
+/// Posts stand only around the stores a counted source feeds: with the link network off at RCL5
+/// both sources are hauled, so a controller link standing by the controller gets no post of its
+/// own, and every post is next to the container.
+#[test]
+fn posts_stand_only_by_fed_stores() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.link_cfg = LinkConfig {
+        enabled: false,
+        ..LINK_MMO
+    };
+    w.run(9000);
+    let room = w.room;
+    let mine = w.mining.plan(room).expect("mining plan");
+    let container = mine.controller_container.expect("a container tile");
+    assert!(
+        !w.mining.receivers(room).is_empty(),
+        "a controller link stands"
+    );
+    let (_, plan, _) = w.upgrading.room_states().next().expect("room");
+    let plan = plan.expect("a plan");
+    assert_eq!(plan.stores, vec![container]);
+    assert!(!plan.posts.is_empty());
+    for &p in &plan.posts {
+        assert!(tile_of(p).range(tile_of(container)) <= 1, "{p:?}");
+    }
+    assert_eq!(w.failed, 0);
+    // Both sources sent through links at RCL6: the container is fed by no one and gets no post.
+    let mut w = World::new(6, SPAWN_ENERGY_CAPACITY);
+    w.link_cfg = LinkConfig {
+        source_links: 2,
+        ..LINK_MMO
+    };
+    let mut linked = false;
+    for _ in 0..30 {
+        w.run(1000);
+        linked = w
+            .mining
+            .plan(w.room)
+            .is_some_and(|m| m.sources.iter().all(|s| s.linked));
+        if linked {
+            break;
+        }
+    }
+    assert!(linked, "both sources linked within 30000 ticks");
+    w.run(50);
+    let room = w.room;
+    let container = w.mining.plan(room).and_then(|m| m.controller_container);
+    let (_, plan, _) = w.upgrading.room_states().next().expect("room");
+    let plan = plan.expect("a plan");
+    assert!(!plan.stores.is_empty());
+    assert!(
+        container.is_none_or(|c| !plan.stores.contains(&c)),
+        "no post by a dry container"
+    );
+    let links: Vec<Position> = w.mining.receivers(room).iter().map(|r| r.pos).collect();
+    assert!(plan.stores.iter().all(|s| links.contains(s)));
+    assert_eq!(w.failed, 0);
+}
+
+/// Uses: CARRY_CAPACITY (the stores' sizes). Every upgrader withdraw asks for an explicit amount,
+/// at most its free room and what its store held at the tick's start less the free room of every
+/// worker that took from that store this tick (`Opening::taken`), so whichever the engine runs
+/// first, no take finds the store emptied (RCL5 and RCL6 runs: controller links and the container).
+#[test]
+fn an_upgrader_never_takes_a_workers_claim() {
+    for (level, energy) in [(5u8, 300), (6, 200)] {
+        let mut w = World::new(level, energy);
+        w.log_takes = true;
+        w.run(12_000);
+        let mut checked = 0;
+        for &(time, role, target, asked, free, held) in &w.takes_log {
+            if role != Role::Upgrader {
+                continue;
+            }
+            let amount = asked.expect("an explicit amount");
+            assert!(
+                amount >= 1 && amount <= free,
+                "t{time}: {amount} of {free} free"
+            );
+            let workers: u32 = w
+                .takes_log
+                .iter()
+                .filter(|t| t.0 == time && t.1 == Role::Worker && t.2 == target)
+                .map(|t| t.4)
+                .sum();
+            assert!(
+                amount + workers <= held,
+                "t{time}: {amount} and the workers' {workers} from {held}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "RCL{level}: upgraders withdrew");
+        assert_eq!(w.failed, 0);
+    }
+}
+
+/// An upgrader withdraws from the first store next to it whose energy left covers its free room
+/// (the links come first), else from the one with the most: a link with a few energy left does not
+/// cost it a small withdraw now and another next tick while the container holds plenty.
+#[test]
+fn an_upgrader_picks_a_store_that_covers_its_take() {
+    use super::upgrading::{Store, pick_store};
+    // Any handles: the pick reads only the places and the energy.
+    let mut w = World::new(1, SPAWN_ENERGY_CAPACITY);
+    w.step();
+    let link = w.snap.structures.handles()[0];
+    let container = w.snap.objects.handles()[0];
+    let room = w.room;
+    let at = place(room, tile(25, 10));
+    let near_link = (Store::Link(link), place(room, tile(24, 10)), 0u32);
+    let near_box = (Store::Container(container), place(room, tile(26, 11)), 0u32);
+    let far_box = (
+        Store::Container(container),
+        place(room, tile(28, 10)),
+        CONTAINER_CAPACITY,
+    );
+    let with = |link: u32, container: u32| {
+        [
+            (near_link.0, near_link.1, link),
+            (near_box.0, near_box.1, container),
+            far_box,
+        ]
+    };
+    let free = CARRY_CAPACITY;
+    assert_eq!(
+        pick_store(&with(free, 500), at, free),
+        Some(0),
+        "the link covers it"
+    );
+    assert_eq!(
+        pick_store(&with(10, 500), at, free),
+        Some(1),
+        "the container does"
+    );
+    assert_eq!(
+        pick_store(&with(10, 30), at, free),
+        Some(1),
+        "neither: the most"
+    );
+    assert_eq!(
+        pick_store(&with(30, 30), at, free),
+        Some(0),
+        "a tie: the link"
+    );
+    assert_eq!(pick_store(&with(0, 0), at, free), None, "nothing near");
+}
+
+/// With hauling off at RCL5 the linked source alone engages the upgraders; the other source's
+/// workers, whose energy the upgraders do not count, keep upgrading with it (they would otherwise
+/// sit on full stores), so the room upgrades about as much as with upgraders off. Measured
+/// 2026-11-17 (ticks 6000 to 18000): RCL5 −1.3% and −2.9%, RCL6 +0.6% and +3.3% (starts of 300
+/// and 50).
+#[test]
+fn an_uncounted_sources_workers_keep_upgrading() {
+    let run = |cfg: UpgradingConfig| {
+        let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+        w.hauling_cfg = HAULING_OFF;
+        w.upgrading_cfg = cfg;
+        w.run(6000);
+        let p = w.progress;
+        let mut upgrades = 0;
+        for _ in 0..12_000 {
+            w.step();
+            let (_, _, _, stats) = w.opening.room_states().next().expect("room");
+            upgrades += stats.tasks[6];
+        }
+        assert_eq!(w.failed, 0);
+        (w.progress - p, upgrades, w.upgrading.view(w.room).takes)
+    };
+    let (with, upgrades, takes) = run(UPGRADING_MMO);
+    let (without, _, _) = run(UPGRADING_OFF);
+    assert!(takes, "the linked source engages the upgraders");
+    assert!(upgrades > 0, "the workers still upgrade");
+    assert!(with * 20 >= without * 19, "{with} against {without}");
+}
+
+/// An upgrader withdraws by its own body, not the plan's: each one's WORK parts are taken from the
+/// plan's body when it is first seen, and stay when the plan's body changes under it (here a larger
+/// `worker_repeats` raises the workers' bodies in the budget and shrinks the upgraders').
+#[test]
+fn an_upgrader_keeps_its_own_work_parts() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    w.run(8000);
+    let own = |w: &World| -> Vec<(u32, Option<u32>)> {
+        w.creeps
+            .iter()
+            .filter(|c| c.identity.role == Role::Upgrader)
+            .filter_map(|c| {
+                let h = w.snap.creeps.handle_of(ObjectKey(c.key))?;
+                Some((count(&c.body, Part::Work), w.upgrading.work_parts(h)))
+            })
+            .collect()
+    };
+    let before = own(&w);
+    assert!(!before.is_empty());
+    for &(work, seen) in &before {
+        assert_eq!(seen, Some(work), "as ordered");
+    }
+    let plan_work = |w: &World| {
+        let (_, plan, _) = w.upgrading.room_states().next().expect("room");
+        plan.and_then(|p| p.body).map(|b| count(&b, Part::Work))
+    };
+    let was = plan_work(&w);
+    w.upgrading_cfg.worker_repeats = 16;
+    w.run(2);
+    assert_ne!(plan_work(&w), was, "the plan's body changed");
+    for (work, seen) in own(&w) {
+        if before.iter().any(|b| b.0 == work) {
+            assert_eq!(seen, Some(work), "still its own");
+        }
+    }
+}
+
+/// Uses: EXTENSION_ENERGY_CAPACITY. No worker transfers into a spawn or extension a hauler's
+/// transfer goes into on the same tick: with the miners gone (and none ordered, so the workers fill
+/// too and nothing drains the room), every spawn and extension full but one, every hauler holding a
+/// fifth of its room, one of them and a full worker next to it, the worker leaves it to the hauler
+/// (its no-amount transfer would fill all the room and leave the hauler's billed for nothing).
+#[test]
+fn a_worker_never_fills_where_a_hauler_transfers() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    w.run(8000);
+    w.mining_cfg = MiningConfig {
+        enabled: false,
+        ..MINING_MMO
+    };
+    w.creeps.retain(|c| c.identity.role != Role::Miner);
+    let target = w
+        .stores
+        .iter()
+        .position(|s| s.kind == StructureType::Extension)
+        .expect("an extension");
+    let at = w.stores[target].at;
+    for (k, s) in w.stores.iter_mut().enumerate() {
+        if s.spawn_energy() {
+            s.energy = if k == target { 0 } else { s.capacity };
+        }
+    }
+    let mut free_tiles = at
+        .neighbors()
+        .map(|(_, t)| t)
+        .filter(|&t| !w.blocked(t) && !w.creeps.iter().any(|c| c.at == t));
+    let (ht, wt) = (
+        free_tiles.next().expect("a tile"),
+        free_tiles.next().expect("another"),
+    );
+    let part = extension_energy_capacity(4) / 5;
+    for c in w
+        .creeps
+        .iter_mut()
+        .filter(|c| c.identity.role == Role::Hauler)
+    {
+        c.energy = part;
+    }
+    let hauler = w
+        .creeps
+        .iter()
+        .position(|c| c.identity.role == Role::Hauler && c.spawning == 0)
+        .expect("a hauler");
+    let worker = w
+        .creeps
+        .iter()
+        .position(|c| c.identity.role == Role::Worker && c.spawning == 0)
+        .expect("a worker");
+    w.creeps[hauler].at = ht;
+    w.creeps[worker].at = wt;
+    w.creeps[worker].energy = w.creeps[worker].capacity();
+    w.log_takes = true;
+    w.step();
+    let into = |role: Role| {
+        w.fills_log
+            .iter()
+            .filter(|f| f.1 == role)
+            .map(|f| f.2)
+            .collect::<Vec<_>>()
+    };
+    assert!(!into(Role::Hauler).is_empty(), "the hauler filled");
+    for t in into(Role::Worker) {
+        assert!(
+            !into(Role::Hauler).contains(&t),
+            "a worker and a hauler into {t:?}"
+        );
+    }
+    assert_eq!(w.failed, 0);
 }

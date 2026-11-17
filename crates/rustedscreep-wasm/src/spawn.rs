@@ -93,11 +93,12 @@ const ACT_JOB: &str = "spawn act";
 
 /// The pattern a console request of `role` repeats, or `None` for a role the console does not
 /// spawn: a miner's body comes from its source (`economy::mining`, P3.1), a hauler's from its
-/// source's yield and trip (`economy::hauling`, P3.3).
+/// source's yield and trip (`economy::hauling`, P3.3), an upgrader's from the energy that reaches
+/// the controller (`economy::upgrading`, P3.4).
 fn pattern(role: Role) -> Option<&'static [Part]> {
     match role {
         Role::Worker => Some(&WORKER_PATTERN),
-        Role::Miner | Role::Hauler => None,
+        Role::Miner | Role::Hauler | Role::Upgrader => None,
     }
 }
 
@@ -288,6 +289,9 @@ impl SpawnGlue {
                     let mut text = String::from(match found {
                         Some(Role::Hauler) => {
                             "rustedscreep spawn: the hauling job sizes and orders haulers; console roles:"
+                        }
+                        Some(Role::Upgrader) => {
+                            "rustedscreep spawn: the upgrading job sizes and orders upgraders; console roles:"
                         }
                         Some(_) => {
                             "rustedscreep spawn: the mining job sizes and orders miners; console roles:"

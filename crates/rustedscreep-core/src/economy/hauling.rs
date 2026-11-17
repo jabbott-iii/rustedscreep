@@ -220,9 +220,12 @@ pub struct HaulView<'a> {
     pub fills: bool,
     /// Energy the haulers take this tick, per object: no worker should take it too. Unit: energy.
     pub taken: &'a [(ObjectHandle, u32)],
-    /// Room the haulers fill this tick, per spawn or extension: a worker that fills too (in a
-    /// recovery, or while no source is hauled) leaves it to them. Unit: energy.
-    pub filled: &'a [(StructureHandle, u32)],
+    /// Room the haulers fill this tick, per spawn or extension, and whether a hauler's transfer
+    /// into it goes out this tick (one is next to it): a worker that fills too (in a recovery, or
+    /// while no source is hauled) leaves the room claimed to them, and the whole structure while a
+    /// transfer goes out (a worker's transfer, with no amount, would fill all it finds and leave
+    /// the hauler's, processed after it, billed for nothing; P3.4). Unit: energy.
+    pub filled: &'a [(StructureHandle, u32, bool)],
 }
 
 impl HaulView<'_> {
@@ -247,7 +250,7 @@ struct HaulRoom {
     hauled: Vec<Position>,
     fills: bool,
     taken: Vec<(ObjectHandle, u32)>,
-    filled: Vec<(StructureHandle, u32)>,
+    filled: Vec<(StructureHandle, u32, bool)>,
     /// Targets movement found no way to, each skipped until the tick given
     /// (`movement.route_retry_ticks` later). At most [`UNREACHABLE_MAX`], oldest dropped first.
     unreachable: Vec<(Position, u32)>,
@@ -430,6 +433,16 @@ impl Hauling {
                 taken: &r.taken,
                 filled: &r.filled,
             })
+    }
+
+    /// `room`'s plan, from its last run (P3.4's upgraders count its haulers).
+    pub fn plan(&self, room: RoomName) -> Option<&HaulPlan> {
+        self.room(room).and_then(|r| r.plan.as_ref())
+    }
+
+    /// `room`'s counters, from its last run.
+    pub fn stats(&self, room: RoomName) -> Option<&HaulStats> {
+        self.room(room).map(|r| &r.stats)
     }
 
     /// Each room's plan and counters, by name.
@@ -1004,10 +1017,14 @@ impl Hauling {
                     let claim = energy.min(f.2);
                     f.2 = f.2.saturating_sub(energy);
                     let h = f.0;
+                    let now = range(at, f.1) <= NEAR;
                     if let Some(r) = self.rooms.get_mut(ri) {
                         match r.filled.iter_mut().find(|x| x.0 == h) {
-                            Some(x) => x.1 = x.1.saturating_add(claim),
-                            None => r.filled.push((h, claim)),
+                            Some(x) => {
+                                x.1 = x.1.saturating_add(claim);
+                                x.2 |= now;
+                            }
+                            None => r.filled.push((h, claim, now)),
                         }
                     }
                     HaulTask::Fill(h)

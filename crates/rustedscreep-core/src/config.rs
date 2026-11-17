@@ -21,8 +21,8 @@ pub mod overrides;
 use core::fmt;
 
 use rustedscreep_consts::{
-    CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, LINK_CAPACITY, MOVE_COST_PLAIN, MOVE_COST_ROAD,
-    MOVE_COST_SWAMP,
+    CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, LINK_CAPACITY, MAX_CREEP_SIZE,
+    MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP,
 };
 
 /// How the loader recovers after a trap or an aborted tick (ADR-003).
@@ -405,7 +405,8 @@ pub struct OpeningConfig {
     /// others, until its store is empty; the guard ends `CONTROLLER_DOWNGRADE_RESTORE` above it.
     /// Unit: ticks.
     pub downgrade_guard_ticks: u32,
-    /// Workers that upgrade while others build, once filling the spawns is covered. Unit: creeps.
+    /// Workers that upgrade while others build, once filling the spawns is covered; none while
+    /// the room's upgraders take the controller's energy (P3.4). Unit: creeps.
     pub min_upgraders: u32,
     /// A room whose controller progress, sources' energy (harvesting) and construction progress all
     /// stood still this long while it had workers is reported and planned again. Unit: ticks.
@@ -553,6 +554,41 @@ pub const HAULING_MMO: HaulingConfig = HaulingConfig {
     margin_pct: 0,
 };
 
+/// Upgraders (ROADMAP P3.4): WORK-heavy creeps at posts next to the controller container and the
+/// controller links, sized to the energy that reaches the controller. `docs/TUNING.md` gives each
+/// one's rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpgradingConfig {
+    /// Requests upgraders for a room whose controller container or controller link stands and gets
+    /// a source's energy (hauled or sent), sized to that energy less every other creep's body
+    /// (`economy::upgrading`); the opening's workers then size no worker for those sources. Off, no
+    /// new upgrader is requested; live ones keep upgrading, and the workers upgrade again.
+    pub enabled: bool,
+    /// Posts next to the first fed store (the controller container while a counted source is
+    /// hauled) that no upgrader takes, the ones nearest the spawn: room for the haulers that unload
+    /// into the container and the workers that take from it. An upgrader at its post is never
+    /// shoved off it. Unit: tiles.
+    pub free_tiles: u32,
+    /// The most `WORKER_PATTERN` repeats a worker gets while upgraders take the controller's
+    /// energy: the room's workers then only build, repair and fill, and their bodies come out of
+    /// the upgraders' budget. Unit: repeats.
+    pub worker_repeats: u32,
+    /// A room's miner, or hauler, counts toward the upgraders' budget for this long after the room
+    /// last had one (spawning ones count): a replacement is ordered only once the creep is gone,
+    /// and shows from the tick after its order, so without it each death would hand the
+    /// controller's energy back to the workers for a tick or more and rebuild both plans. Unit:
+    /// ticks.
+    pub crew_grace_ticks: u32,
+}
+
+/// Upgrading values for the official MMO.
+pub const UPGRADING_MMO: UpgradingConfig = UpgradingConfig {
+    enabled: true,
+    free_tiles: 2,
+    worker_repeats: 2,
+    crew_grace_ticks: MAX_CREEP_SIZE * CREEP_SPAWN_TIME,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -570,6 +606,7 @@ pub struct Config {
     pub links: LinkConfig,
     pub repair: RepairConfig,
     pub hauling: HaulingConfig,
+    pub upgrading: UpgradingConfig,
 }
 
 /// A server profile: a name and its values.
@@ -596,6 +633,7 @@ pub const MMO: Profile = Profile {
         links: LINK_MMO,
         repair: REPAIR_MMO,
         hauling: HAULING_MMO,
+        upgrading: UPGRADING_MMO,
     },
 };
 
@@ -756,7 +794,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 78;
+pub const FIELD_COUNT: usize = 82;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1003,6 +1041,17 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(hauling, "HaulingConfig", container_level, 1, 8, true),
     number!(hauling, "HaulingConfig", max_per_source, 1, 10, true),
     number!(hauling, "HaulingConfig", margin_pct, 0, 100, true),
+    flag!(upgrading, "UpgradingConfig", enabled, true),
+    number!(upgrading, "UpgradingConfig", free_tiles, 0, 8, true),
+    number!(upgrading, "UpgradingConfig", worker_repeats, 1, 16, true),
+    number!(
+        upgrading,
+        "UpgradingConfig",
+        crew_grace_ticks,
+        1,
+        CREEP_LIFE_TIME,
+        true
+    ),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -1205,6 +1254,7 @@ mod tests {
             links: _,
             repair: _,
             hauling: _,
+            upgrading: _,
         } = MMO.config;
         let SpawnConfig { hold_ticks: _ } = SPAWN_MMO;
         let OpeningConfig {
@@ -1241,7 +1291,13 @@ mod tests {
             max_per_source: _,
             margin_pct: _,
         } = HAULING_MMO;
-        let expected: [(&str, &[&str]); 13] = [
+        let UpgradingConfig {
+            enabled: _,
+            free_tiles: _,
+            worker_repeats: _,
+            crew_grace_ticks: _,
+        } = UPGRADING_MMO;
+        let expected: [(&str, &[&str]); 14] = [
             (
                 "loader",
                 &[
@@ -1356,6 +1412,15 @@ mod tests {
                     "container_level",
                     "max_per_source",
                     "margin_pct",
+                ],
+            ),
+            (
+                "upgrading",
+                &[
+                    "enabled",
+                    "free_tiles",
+                    "worker_repeats",
+                    "crew_grace_ticks",
                 ],
             ),
         ];
