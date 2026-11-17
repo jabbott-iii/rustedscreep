@@ -7,7 +7,15 @@
 //! container on the miner's tile or onto a pile there (V183, V193). The opening's workers leave a
 //! source whose miner is next to it alone and take its energy off the tile ([`Mined`]); the
 //! container the miner stands on is placed by `economy::placement` (ADR-023) from
-//! [`Mining::container_needs`]. P3.3 adds the haulers that replace the workers' carrying.
+//! [`Mining::container_needs`]. `economy::hauling`'s haulers (P3.3) carry it from there.
+//!
+//! The controller container (ADR-025): the plan also holds a tile within upgrading range of the
+//! controller where the haulers unload and the workers take: a container or container site within
+//! [`RECEIVER_RANGE`] of the controller that no source's mining tile holds, else a free tile at
+//! [`CONTROLLER_LINK_RANGE`], nearest the spawn by path, under the link tiles' rules (but a
+//! container blocks no move, so its neighbours need not stay connected), off the link tiles and
+//! not next to a source or a mineral. [`Mining::container_needs`] lists it after the mining tiles
+//! once a source with no link pays for its miner, from the level the caller asks for.
 //!
 //! Links (ADR-024): the plan holds a controller link tile and a source link tile per mining tile;
 //! `economy::placement` places them from [`Mining::link_needs`]. A miner of a source with a built
@@ -130,6 +138,9 @@ pub struct MineSource {
     /// Its source link's tile (ADR-024): a link or a link site next to `tile`, else the tile picked
     /// for one; `None` without a mining tile or a tile that qualifies.
     pub link: Option<Position>,
+    /// A built link that can pass the energy on stands next to `tile` and the network runs: its
+    /// miner gets a CARRY part and sends through the link, so no hauler carries it (P3.3).
+    pub linked: bool,
 }
 
 /// A room's mining plan: built again when movement's grid version, the room's capacity, its first
@@ -141,7 +152,8 @@ pub struct MinePlan {
     pub capacity: u32,
     /// The room's first spawn by id; no spawn, no tiles.
     pub spawn: Option<Position>,
-    /// Containers and container sites next to the sources. Unit: structures and sites.
+    /// Containers and container sites next to the sources or within [`RECEIVER_RANGE`] of the
+    /// controller. Unit: structures and sites.
     pub containers: u32,
     pub controller: Option<Position>,
     /// The room's links and link sites, and of them the built links. Unit: structures and sites.
@@ -156,6 +168,11 @@ pub struct MinePlan {
     /// controller, else the tile picked for one at [`CONTROLLER_LINK_RANGE`], nearest the spawn by
     /// path; `None` when none qualifies.
     pub controller_link: Option<Position>,
+    /// The controller container's tile (ADR-025, module docs); `None` when none qualifies.
+    pub controller_container: Option<Position>,
+    /// A container or a container site stands on that tile (the plan's key counts them, so a new
+    /// one or one gone rebuilds the plan).
+    pub controller_store: bool,
     pub sources: Vec<MineSource>,
 }
 
@@ -436,10 +453,16 @@ impl Mining {
         self.room(room).map_or(&[], |r| r.mined.as_slice())
     }
 
-    /// The mining tiles of `room`'s plan, one per source that has one (P3.5: the containers on them
-    /// are the ones the workers repair), whether or not a miner stands there this tick.
+    /// The mining tiles of `room`'s plan, one per source that has one, and its controller container's
+    /// tile (ADR-025) (P3.5: the containers on them are the ones the workers repair), whether or not
+    /// a miner stands there this tick.
     pub fn mine_tiles(&self, room: RoomName) -> &[Position] {
         self.room(room).map_or(&[], |r| r.tiles.as_slice())
+    }
+
+    /// `room`'s plan, from its last run (none before the room's grid is known).
+    pub fn plan(&self, room: RoomName) -> Option<&MinePlan> {
+        self.room(room).and_then(|r| r.plan.as_ref())
     }
 
     /// The controller links of `room` from its run this tick (P3.2).
@@ -447,8 +470,9 @@ impl Mining {
         self.room(room).map_or(&[], |r| r.receivers.as_slice())
     }
 
-    /// The mining tiles of `room` that need a container site, from its run this tick (none while
-    /// `mining.place_containers` is off).
+    /// The tiles of `room` that need a container site, from its run this tick: the mining tiles
+    /// (none while `mining.place_containers` is off), then the controller container's (ADR-025;
+    /// only while the run was asked for it).
     pub fn container_needs(&self, room: RoomName) -> &[Tile] {
         self.room(room).map_or(&[], |r| r.containers.as_slice())
     }
@@ -606,7 +630,9 @@ impl Mining {
     /// Room `unit`'s tick (module docs, step 2). `cap`, the most energy the opening's watchdog saw
     /// the room hold while it never filled (`Watchdog::cap`), holds back a miner that costs more.
     /// `refused` are the room's tiles the placement gave up on (`Placement::refused_tiles`): the
-    /// plan picks no link tile there.
+    /// plan picks no link tile or controller container tile there. `controller_container` asks for
+    /// the controller container's site from that level on (ADR-025: haulers and their container
+    /// site on, `hauling.container_level`; `None` asks for none).
     ///
     /// Uses: `HARVEST_POWER` and [`miner_work`] (a miner's harvest a tick), `LINK_CAPACITY` (a
     /// link's room), `CONTROLLER_STRUCTURES` (`StructureType::controller_structures`: the links the
@@ -624,6 +650,7 @@ impl Mining {
         mcfg: &MovementConfig,
         cap: Option<u32>,
         refused: &[Tile],
+        controller_container: Option<u32>,
         commit: &mut Commit,
     ) -> Result<(), Fault> {
         let ri = usize::try_from(unit).map_err(|_| Fault::new("unit out of range", unit))?;
@@ -862,6 +889,17 @@ impl Mining {
                 r.unreachable.push((target, until));
             }
         }
+        // The controller container's site (ADR-025), after the mining tiles', from the level asked
+        // for, once a source that sends no energy through a link pays for its miner.
+        if controller_container.is_some_and(|l| u32::from(found.level) >= l)
+            && let Some(c) = plan.and_then(|p| p.controller_container)
+            && !stores.contains(&c)
+            && plan_sources
+                .iter()
+                .any(|s| s.tile.is_some() && s.body.is_some() && !s.linked)
+        {
+            r.containers.push(Tile::of(c));
+        }
         // The sends are the Standard `links` job's (`send_room`): the room is a unit when a
         // source link may send to a controller link this tick.
         r.links.clear();
@@ -1082,8 +1120,18 @@ impl Mining {
             return;
         };
         let near_source = |p: &Position| self.sources.iter().any(|s| range(*p, s.1) <= NEAR);
-        let containers =
-            u32::try_from(self.stores.iter().filter(|p| near_source(p)).count()).unwrap_or(0);
+        let near_controller = |p: &Position| {
+            found
+                .controller
+                .is_some_and(|c| range(*p, c) <= RECEIVER_RANGE)
+        };
+        let containers = u32::try_from(
+            self.stores
+                .iter()
+                .filter(|p| near_source(p) || near_controller(p))
+                .count(),
+        )
+        .unwrap_or(0);
         let links = u32::try_from(self.link_spots.len()).unwrap_or(u32::MAX);
         let built = u32::try_from(self.links.len()).unwrap_or(u32::MAX);
         let spawn = found.spawn;
@@ -1158,6 +1206,7 @@ impl Mining {
                 trip,
                 body: None,
                 link: None,
+                linked: false,
             });
         }
         // The link tiles (ADR-024), the controller link first.
@@ -1197,6 +1246,36 @@ impl Mining {
         if let Some(c) = controller_link {
             planned.push(Tile::of(c));
         }
+        // The controller container (ADR-025, module docs), off the link tiles planned so far.
+        let near_source = |p: Position| self.sources.iter().any(|s| range(p, s.1) <= NEAR);
+        let controller_container = found.controller.and_then(|c| {
+            let existing = self
+                .stores
+                .iter()
+                .copied()
+                .filter(|&p| range(p, c) <= RECEIVER_RANGE && !near_source(p))
+                .min_by_key(|&p| (range(p, c), tile_key(p)));
+            existing.or_else(|| {
+                let ok = |t: Tile| {
+                    reached
+                        && link_tile_ok(t, grid, profile.road != profile.plain, profile.road)
+                        && !refused.contains(&t)
+                        && !self.occupied.iter().any(|&(o, _)| o == t)
+                        && !mining.contains(&t)
+                        && !planned.contains(&t)
+                        && !self.statics.iter().any(|&s| t.range(s) <= NEAR)
+                        && self.field.distance(t) != UNREACHED
+                };
+                let ct = Tile::of(c);
+                let best = (0..rustedscreep_consts::ROOM_AREA)
+                    .filter_map(Tile::from_index)
+                    .filter(|&t| t.range(ct) == CONTROLLER_LINK_RANGE && ok(t))
+                    .min_by_key(|&t| (self.field.distance(t), t.index()));
+                best.and_then(|t| place(name, t))
+            })
+        });
+        let container_tile = controller_container.map(Tile::of);
+        let controller_store = controller_container.is_some_and(|c| self.stores.contains(&c));
         for s in &mut sources {
             let Some(tile) = s.tile else {
                 continue;
@@ -1219,6 +1298,7 @@ impl Mining {
                             && !self.occupied.iter().any(|&(o, _)| o == t)
                             && !mining.contains(&t)
                             && !planned.contains(&t)
+                            && Some(t) != container_tile
                             && self.field.distance(t) != UNREACHED
                             && keeps_neighbours_connected(t, |n| {
                                 blocks(n, grid, &self.occupied, &planned)
@@ -1255,6 +1335,7 @@ impl Mining {
                         .iter()
                         .any(|l| range(l.pos, t) <= NEAR && passes(l))
                 });
+            s.linked = linked;
             s.body = s.trip.and_then(|t| {
                 if linked {
                     miner_body_with(source_capacity, t, capacity, 1)
@@ -1276,11 +1357,14 @@ impl Mining {
                 level: found.level,
                 refused: refused_n,
                 controller_link,
+                controller_container,
+                controller_store,
                 sources,
             });
             r.tiles.clear();
             if let Some(p) = &r.plan {
                 r.tiles.extend(p.sources.iter().filter_map(|s| s.tile));
+                r.tiles.extend(p.controller_container);
             }
         }
     }

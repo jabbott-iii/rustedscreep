@@ -38,13 +38,13 @@ use super::placement::{
     CONTROLLER_CLEAR, EDGE_MARGIN, Placement, SPAWN_CLEAR, extensions_in, next_extension,
 };
 use super::sizing::{
-    Round, Trip, carry_round, miner_body, miner_work, walk_ticks, worker_body, worker_round,
-    workers_for_source,
+    Round, Trip, carry_round, haul_round, hauler_plan, haulers_for, miner_body, miner_work,
+    walk_ticks, worker_body, worker_round, workers_for_source,
 };
 use super::*;
 use crate::config::{
-    CACHE_MMO, LINK_MMO, LinkConfig, MINING_MMO, MMO, MOVEMENT_MMO, MiningConfig, OPENING_MMO,
-    OpeningConfig, REPAIR_MMO, RepairConfig, SPAWN_MMO,
+    CACHE_MMO, HAULING_MMO, HaulingConfig, LINK_MMO, LinkConfig, MINING_MMO, MMO, MOVEMENT_MMO,
+    MiningConfig, OPENING_MMO, OpeningConfig, REPAIR_MMO, RepairConfig, SPAWN_MMO,
 };
 use crate::intents::{ActLog, CreepIntent, IntentBuffer, Outcome, Target, TargetRow};
 use crate::movement::{
@@ -336,6 +336,245 @@ fn a_carry_round_takes_one_tick_at_the_source() {
     }
 }
 
+/// Uses: MOVE_POWER, MOVE_COST_PLAIN, MOVE_COST_SWAMP, CARRY_CAPACITY, EXTENSION_ENERGY_CAPACITY. A
+/// hauler's round: one tick to take, the walk loaded with every CARRY part weighing, a transfer a
+/// tick of at most a fill's capacity with a step between two, and the walk back empty with none
+/// (V54).
+#[test]
+fn a_haul_round_from_constants() {
+    for tiles in [1u32, 8, 20] {
+        for rate in [MOVE_COST_PLAIN, MOVE_COST_SWAMP] {
+            let trip = Trip {
+                tiles,
+                cost: tiles * rate,
+            };
+            for (carry, moves) in [(5u32, 5u32), (10, 5), (4, 1)] {
+                let mut parts = vec![Part::Carry; carry as usize];
+                parts.extend(vec![Part::Move; moves as usize]);
+                let body = Body::new(&parts).expect("body");
+                let loaded = tiles.max((trip.cost * carry).div_ceil(MOVE_POWER * moves));
+                for rcl in [2u32, 7, 8] {
+                    let unload = extension_energy_capacity(rcl);
+                    let fills = (carry * CARRY_CAPACITY).div_ceil(unload);
+                    // Empty, nothing weighs: one tile a tick.
+                    assert_eq!(
+                        haul_round(&body, trip, unload),
+                        Some(loaded + tiles + 1 + (2 * fills - 1)),
+                        "{carry} CARRY {moves} MOVE, {tiles} tiles at {rate}, RCL{rcl}"
+                    );
+                }
+                // A sink that takes a whole load: one transfer.
+                assert_eq!(
+                    haul_round(&body, trip, carry * CARRY_CAPACITY),
+                    Some(loaded + tiles + 2)
+                );
+            }
+        }
+    }
+    let trip = Trip {
+        tiles: 10,
+        cost: 10 * MOVE_COST_PLAIN,
+    };
+    let no_carry = Body::new(&[Part::Move, Part::Move]).expect("body");
+    assert_eq!(
+        haul_round(&no_carry, trip, CARRY_CAPACITY),
+        None,
+        "no CARRY"
+    );
+    let no_move = Body::new(&[Part::Carry]).expect("body");
+    assert_eq!(haul_round(&no_move, trip, CARRY_CAPACITY), None, "no MOVE");
+    // A WORK part weighs both ways.
+    let worker = Body::new(&[Part::Work, Part::Carry, Part::Move]).expect("body");
+    assert_eq!(
+        haul_round(&worker, trip, CARRY_CAPACITY),
+        Some(
+            trip.tiles.max((trip.cost * 2).div_ceil(MOVE_POWER))
+                + trip.tiles.max(trip.cost.div_ceil(MOVE_POWER))
+                + 2
+        )
+    );
+}
+
+/// Uses: CARRY_CAPACITY, ENERGY_REGEN_TIME, SOURCE_ENERGY_CAPACITY. The least count whose loads per
+/// round cover the source's yield over a round with the margin: `n` covers it and `n - 1` does not.
+#[test]
+fn haulers_carry_a_sources_yield_with_the_margin() {
+    let covers = |n: u32, capacity: u32, carry: u32, round: u32, margin: u32| {
+        u128::from(n) * u128::from(carry * CARRY_CAPACITY) * u128::from(ENERGY_REGEN_TIME) * 100
+            >= u128::from(capacity) * u128::from(round) * u128::from(100 + margin)
+    };
+    for capacity in [
+        SOURCE_ENERGY_NEUTRAL_CAPACITY,
+        SOURCE_ENERGY_CAPACITY,
+        SOURCE_ENERGY_KEEPER_CAPACITY,
+    ] {
+        for carry in [1u32, 5, 16, 25] {
+            for round in [3u32, 42, 120, 400] {
+                for margin in [0u32, 10, 100] {
+                    let n = haulers_for(capacity, carry, round, margin);
+                    assert!(n >= 1);
+                    assert!(covers(n, capacity, carry, round, margin));
+                    assert!(!covers(n - 1, capacity, carry, round, margin));
+                }
+            }
+        }
+    }
+    assert_eq!(haulers_for(0, 5, 42, 10), 0, "an empty source");
+    assert_eq!(
+        haulers_for(SOURCE_ENERGY_CAPACITY, 0, 42, 10),
+        0,
+        "no CARRY"
+    );
+}
+
+/// Every hauler body that fits `energy`, by brute force: (haulers, energy for all of them, MOVE
+/// parts, CARRY parts). Uses: BODYPART_COST, MAX_CREEP_SIZE, MOVE_POWER, CARRY_CAPACITY.
+fn hauler_options(
+    capacity: u32,
+    trip: Trip,
+    energy: u32,
+    margin: u32,
+    unload: u32,
+) -> Vec<(u32, u64, u32, u32)> {
+    let mut out = Vec::new();
+    // A hauler holds at most a container's whole load.
+    for carry in 1..=(CONTAINER_CAPACITY / CARRY_CAPACITY).min(MAX_CREEP_SIZE - 1) {
+        for moves in 1..=MAX_CREEP_SIZE - carry {
+            let cost = carry * Part::Carry.cost() + moves * Part::Move.cost();
+            if cost > energy {
+                continue;
+            }
+            let loaded = trip
+                .tiles
+                .max((trip.cost * carry).div_ceil(MOVE_POWER * moves));
+            let round = loaded + trip.tiles + 2 * (carry * CARRY_CAPACITY).div_ceil(unload).max(1);
+            let n = haulers_for(capacity, carry, round, margin);
+            out.push((n, u64::from(n) * u64::from(cost), moves, carry));
+        }
+    }
+    out
+}
+
+/// Property test over source capacities, trips (road, plain and swamp tiles), margins and the room
+/// capacities of every level: a hauler plan's body is CARRY parts then MOVE parts, costs at most the
+/// energy and holds at most MAX_CREEP_SIZE parts; its count carries the yield (`haulers_for` of its
+/// own round); it has the fewest haulers of every body that fits, then the least energy for all of
+/// them, then the fewest MOVE parts; and more energy never asks for more haulers.
+/// Uses: BODYPART_COST, MOVE_COST_ROAD, MOVE_COST_PLAIN, MOVE_COST_SWAMP, MAX_CREEP_SIZE,
+/// SPAWN_ENERGY_CAPACITY, CONTROLLER_STRUCTURES, EXTENSION_ENERGY_CAPACITY.
+#[test]
+fn hauler_plans_fit_and_take_the_fewest() {
+    let mut energies: Vec<u32> = (1..=8u32)
+        .map(|rcl| {
+            SPAWN_ENERGY_CAPACITY
+                + StructureType::Extension.controller_structures(rcl)
+                    * extension_energy_capacity(rcl)
+        })
+        .chain([0, 99, 100, 101, 449, 551, 1000])
+        .collect();
+    energies.sort_unstable();
+    for capacity in [
+        SOURCE_ENERGY_NEUTRAL_CAPACITY,
+        SOURCE_ENERGY_CAPACITY,
+        SOURCE_ENERGY_KEEPER_CAPACITY,
+    ] {
+        for tiles in [0u32, 1, 7, 20, 45] {
+            for rate in [MOVE_COST_ROAD, MOVE_COST_PLAIN, MOVE_COST_SWAMP] {
+                let trip = Trip {
+                    tiles,
+                    cost: tiles * rate,
+                };
+                for (margin, unload) in [
+                    (0u32, extension_energy_capacity(2)),
+                    (HAULING_MMO.margin_pct, extension_energy_capacity(7)),
+                    (50, extension_energy_capacity(8)),
+                ] {
+                    let mut last: Option<u32> = None;
+                    for &energy in &energies {
+                        let options = hauler_options(capacity, trip, energy, margin, unload);
+                        let Some((body, n)) = hauler_plan(capacity, trip, energy, margin, unload)
+                        else {
+                            assert!(options.is_empty(), "{capacity} {tiles} {rate} {energy}");
+                            continue;
+                        };
+                        let carry = count(&body, Part::Carry);
+                        let moves = count(&body, Part::Move);
+                        assert!(body.cost() <= energy);
+                        assert!(body.len() <= MAX_CREEP_SIZE as usize);
+                        assert!(carry >= 1 && moves >= 1);
+                        assert!(
+                            carry * CARRY_CAPACITY <= CONTAINER_CAPACITY,
+                            "a whole load fits"
+                        );
+                        assert_eq!(body.len() as u32, carry + moves, "only CARRY and MOVE");
+                        let first_move = body.parts().iter().position(|&p| p == Part::Move);
+                        assert_eq!(first_move, Some(carry as usize), "CARRY first");
+                        let round = haul_round(&body, trip, unload).expect("round");
+                        assert_eq!(n, haulers_for(capacity, carry, round, margin));
+                        let best = options
+                            .iter()
+                            .map(|o| (o.0, o.1, o.2))
+                            .min()
+                            .expect("an option");
+                        let got = (n, u64::from(n) * u64::from(body.cost()), moves);
+                        assert_eq!(got, best, "{capacity} {tiles} {rate} {energy} {margin}");
+                        if let Some(prev) = last {
+                            assert!(n <= prev, "more energy, no more haulers");
+                        }
+                        last = Some(n);
+                    }
+                }
+            }
+        }
+    }
+    let trip = Trip {
+        tiles: 10,
+        cost: 10 * MOVE_COST_PLAIN,
+    };
+    assert_eq!(
+        hauler_plan(0, trip, 1000, 10, CARRY_CAPACITY),
+        None,
+        "an empty source"
+    );
+}
+
+/// The counts TUNING cites for `HaulingConfig::max_per_source`, against brute force: at RCL2's full
+/// capacity a source of SOURCE_ENERGY_CAPACITY 20 plain tiles from its sink takes two haulers and 40
+/// tiles away four (the cap's default), and at RCL4's 10 tiles away one.
+/// Uses: SPAWN_ENERGY_CAPACITY, CONTROLLER_STRUCTURES, EXTENSION_ENERGY_CAPACITY, MOVE_COST_PLAIN.
+#[test]
+fn hauler_counts_by_level() {
+    let energy = |rcl: u32| {
+        SPAWN_ENERGY_CAPACITY
+            + StructureType::Extension.controller_structures(rcl) * extension_energy_capacity(rcl)
+    };
+    let margin = HAULING_MMO.margin_pct;
+    let plain = |tiles: u32| Trip {
+        tiles,
+        cost: tiles * MOVE_COST_PLAIN,
+    };
+    let fewest = |trip: Trip, e: u32, unload: u32| {
+        hauler_options(SOURCE_ENERGY_CAPACITY, trip, e, margin, unload)
+            .iter()
+            .map(|o| o.0)
+            .min()
+            .expect("an option")
+    };
+    for (rcl, tiles, want) in [(2, 20, 2), (2, 40, HAULING_MMO.max_per_source), (4, 10, 1)] {
+        let unload = extension_energy_capacity(rcl);
+        let (_, n) = hauler_plan(
+            SOURCE_ENERGY_CAPACITY,
+            plain(tiles),
+            energy(rcl),
+            margin,
+            unload,
+        )
+        .expect("a plan");
+        assert_eq!(n, fewest(plain(tiles), energy(rcl), unload));
+        assert_eq!(n, want, "RCL{rcl}, {tiles} tiles");
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Watchdog
 
@@ -518,6 +757,13 @@ fn a_room_that_stands_still_is_reported_once() {
 
 const ROOM: &str = "W1N1";
 
+/// Haulers and the controller container off (P3.3): the economy as it was before them.
+const HAULING_OFF: HaulingConfig = HaulingConfig {
+    enabled: false,
+    place_container: false,
+    ..HAULING_MMO
+};
+
 fn tile(x: u8, y: u8) -> Tile {
     Tile::new(x, y).expect("in room")
 }
@@ -644,11 +890,21 @@ struct World {
     spawner: Spawner,
     opening: Opening,
     mining: Mining,
+    hauling: Hauling,
     placement: Placement,
     cfg: OpeningConfig,
     mining_cfg: MiningConfig,
     link_cfg: LinkConfig,
     repair_cfg: RepairConfig,
+    hauling_cfg: HaulingConfig,
+    /// Haulers (P3.3): transfers into a container and the energy they moved; takes that found
+    /// nothing left (an earlier take this tick emptied the target: billed for nothing).
+    stored: u32,
+    stored_energy: u64,
+    empty_takes: u32,
+    /// Takes by haulers and the energy they moved.
+    hauler_takes: u32,
+    hauler_taken: u64,
     /// Repairs (P3.5): calls that repaired, hits added, energy spent, and calls at full hits (billed
     /// for nothing); containers that decayed away.
     repairs: u32,
@@ -756,11 +1012,18 @@ impl World {
             spawner: Spawner::default(),
             opening: Opening::default(),
             mining: Mining::default(),
+            hauling: Hauling::default(),
             placement: Placement::default(),
             cfg: OPENING_MMO,
             mining_cfg: MINING_MMO,
             link_cfg: LINK_MMO,
             repair_cfg: REPAIR_MMO,
+            hauling_cfg: HAULING_MMO,
+            stored: 0,
+            stored_energy: 0,
+            empty_takes: 0,
+            hauler_takes: 0,
+            hauler_taken: 0,
             repairs: 0,
             repaired: 0,
             repair_energy: 0,
@@ -1047,11 +1310,15 @@ impl World {
         self.spawner.begin(&self.snap);
         self.opening.begin(&self.snap);
         self.mining.begin(&self.snap);
+        self.hauling.begin(&self.snap);
         let mut commit = Commit::default();
         let cfg = self.cfg;
         let mining_cfg = self.mining_cfg;
         let link_cfg = self.link_cfg;
-        // The Critical `mining` job, then `opening` (rustedscreep-wasm's order).
+        let hauling_cfg = self.hauling_cfg;
+        let controller_container = (hauling_cfg.enabled && hauling_cfg.place_container)
+            .then_some(hauling_cfg.container_level);
+        // The Critical `mining` job, then `hauling`, then `opening` (rustedscreep-wasm's order).
         for unit in 0..self.mining.room_count() {
             let room = self.mining.room_name(unit);
             let cap = room.and_then(|room| self.opening.cap(room));
@@ -1070,15 +1337,37 @@ impl World {
                     &mcfg,
                     cap,
                     &refused,
+                    controller_container,
                     &mut commit,
                 )
                 .expect("mining");
+        }
+        for unit in 0..self.hauling.room_count() {
+            let room = self.hauling.room_name(unit).expect("room");
+            let cap = self.opening.cap(room);
+            let mined = self.mining.mined(room).to_vec();
+            self.hauling
+                .plan_room(
+                    unit,
+                    &self.snap,
+                    &mut self.movement,
+                    &mut self.spawner,
+                    &mut self.buffer,
+                    &hauling_cfg,
+                    &mcfg,
+                    self.mining.plan(room),
+                    &mined,
+                    cap,
+                    &mut commit,
+                )
+                .expect("hauling");
         }
         for unit in 0..self.opening.room_count() {
             let room = self.opening.room_name(unit).expect("room");
             let mined = self.mining.mined(room).to_vec();
             let tiles = self.mining.mine_tiles(room).to_vec();
             let receivers = self.mining.receivers(room).to_vec();
+            let haul = self.hauling.view(room);
             self.opening
                 .plan_room(
                     unit,
@@ -1092,6 +1381,7 @@ impl World {
                     &mined,
                     &tiles,
                     &receivers,
+                    &haul,
                     &mut commit,
                 )
                 .expect("plan");
@@ -1113,6 +1403,19 @@ impl World {
                 )
                 .expect("work");
         }
+        // The Standard `hauling work` job (P3.3).
+        for unit in 0..self.hauling.work_count() * u32::from(self.standard) {
+            self.hauling
+                .work_room(
+                    unit,
+                    &self.snap,
+                    &mut self.movement,
+                    &mut self.buffer,
+                    &mcfg,
+                    &mut commit,
+                )
+                .expect("hauling work");
+        }
         // The Standard `links` job (P3.2).
         for unit in 0..self.mining.send_count() * u32::from(self.standard) {
             self.mining
@@ -1121,7 +1424,11 @@ impl World {
         }
         // The Optional placement job (ADR-020, ADR-023, ADR-024).
         self.placement.begin(&self.snap);
-        if cfg.place_extensions || mining_cfg.place_containers || link_cfg.place_links {
+        if cfg.place_extensions
+            || mining_cfg.place_containers
+            || link_cfg.place_links
+            || controller_container.is_some()
+        {
             for unit in 0..self.placement.room_count() {
                 let room = self.placement.room_name(unit).expect("room");
                 let containers = self.mining.container_needs(room).to_vec();
@@ -1356,6 +1663,34 @@ impl World {
                 self.creeps[actor].energy -= amount;
                 Outcome::Ok
             }
+            (
+                CreepIntent::Transfer {
+                    target: Target::Object(_),
+                    ..
+                },
+                Some(TargetRow::Object(row)),
+            ) => {
+                // Into a container (P3.3): the processor clamps to its room (V191).
+                let ObjRow::Loose(i) = self.obj_rows[row as usize] else {
+                    return fail;
+                };
+                let Loose::Container { at, energy, .. } = &mut self.loose[i] else {
+                    return fail;
+                };
+                if !near(c.at, *at, 1) {
+                    return Outcome::Failed(ErrorCode::NotInRange);
+                }
+                let free = CONTAINER_CAPACITY - *energy;
+                if free == 0 {
+                    return Outcome::Failed(ErrorCode::Full);
+                }
+                let amount = c.energy.min(free);
+                *energy += amount;
+                self.creeps[actor].energy -= amount;
+                self.stored += 1;
+                self.stored_energy += u64::from(amount);
+                Outcome::Ok
+            }
             (CreepIntent::Withdraw { .. }, Some(TargetRow::Structure(row))) => {
                 let StructRow::Store(i) = self.struct_rows[row as usize] else {
                     return fail;
@@ -1429,6 +1764,13 @@ impl World {
                 let amount = (*have).min(free);
                 *have -= amount;
                 self.creeps[actor].energy += amount;
+                if amount == 0 {
+                    self.empty_takes += 1;
+                }
+                if c.identity.role == Role::Hauler {
+                    self.hauler_takes += 1;
+                    self.hauler_taken += u64::from(amount);
+                }
                 Outcome::Ok
             }
             (CreepIntent::RepairObject { .. }, Some(TargetRow::Object(row))) => {
@@ -1807,6 +2149,13 @@ impl World {
         self.creeps
             .iter()
             .filter(|c| c.identity.role == Role::Miner)
+            .count()
+    }
+
+    fn haulers(&self) -> usize {
+        self.creeps
+            .iter()
+            .filter(|c| c.identity.role == Role::Hauler)
             .count()
     }
 
@@ -3013,7 +3362,8 @@ fn two_source_links_share_the_receivers_room() {
         source_links: 2,
         ..LINK_MMO
     };
-    w.run(4 * CREEP_LIFE_TIME);
+    // Five lives: with haulers the room keeps fewer workers, which build its sites later.
+    w.run(5 * CREEP_LIFE_TIME);
     assert_eq!(w.placed_links.len(), 3);
     let plan = mine_plan(&w);
     let senders: Vec<Tile> = plan
@@ -3200,6 +3550,9 @@ const WORN_TILE: (u8, u8) = (9, 29);
 /// `hits`, its next decay step `CONTAINER_DECAY_TIME_OWNED` − 1 ticks away (V214).
 fn worn_container_world(hits: u32) -> World {
     let mut w = World::new(3, SPAWN_ENERGY_CAPACITY);
+    // P3.5's rules where the workers gather at the mining tiles: haulers off (with them a mining
+    // tile's container is repaired as a linked source's is, `a_hauled_rooms_containers_are_kept`).
+    w.hauling_cfg = HAULING_OFF;
     let key = w.key();
     let at = tile(WORN_TILE.0, WORN_TILE.1);
     let decay_at = w.time + CONTAINER_DECAY_TIME_OWNED;
@@ -3241,6 +3594,17 @@ fn hits_at(w: &World, at: Tile) -> Option<u32> {
 /// The worn container's hits, or `None` once it is gone.
 fn worn_hits(w: &World) -> Option<u32> {
     hits_at(w, tile(WORN_TILE.0, WORN_TILE.1))
+}
+
+/// Sets the energy of the container at `at`.
+fn set_container_energy(w: &mut World, at: Tile, to: u32) {
+    for l in &mut w.loose {
+        if let Loose::Container { at: a, energy, .. } = l
+            && *a == at
+        {
+            *energy = to;
+        }
+    }
 }
 
 /// Sets the hits of the container at `at`, and its next decay step `CONTAINER_DECAY_TIME_OWNED` − 1
@@ -3411,13 +3775,11 @@ fn a_linked_container_waits_for_the_walk_share() {
     let mut linked = None;
     for _ in 0..24 {
         w.run(500);
-        let (_, plan, _, _) = w.opening.room_states().next().expect("room");
-        let source = plan.and_then(|p| p.sources.iter().find(|s| s.linked).map(|s| s.pos));
+        // The source a link carries (the opening's `linked` also marks a hauled one, P3.3).
         let (_, mine, _) = w.mining.room_states().next().expect("room");
-        linked = source.and_then(|src| {
-            mine.and_then(|m| m.sources.iter().find(|s| s.source == src))
-                .and_then(|s| s.tile)
-        });
+        linked = mine
+            .and_then(|m| m.sources.iter().find(|s| s.linked))
+            .and_then(|s| s.tile);
         if linked.is_some_and(|t| hits_at(&w, tile_of(t)).is_some()) {
             break;
         }
@@ -3457,6 +3819,7 @@ fn a_linked_container_waits_for_the_walk_share() {
 #[test]
 fn a_repairer_keeps_its_container() {
     let mut w = World::new(3, SPAWN_ENERGY_CAPACITY);
+    w.hauling_cfg = HAULING_OFF;
     w.cfg = OpeningConfig {
         min_upgraders: 0,
         place_extensions: false,
@@ -3489,7 +3852,11 @@ fn a_repairer_keeps_its_container() {
         born: 0,
     });
     w.step();
-    let tiles = w.mining.mine_tiles(home).to_vec();
+    let tiles: Vec<Position> = mine_plan(&w)
+        .sources
+        .iter()
+        .filter_map(|s| s.tile)
+        .collect();
     assert_eq!(tiles.len(), 2, "two mining tiles");
     let hits = share(REPAIR_MMO.walk_pct) - CONTAINER_DECAY;
     for &t in &tiles {
@@ -3605,4 +3972,365 @@ fn repairs_keep_a_container_that_would_decay_away() {
     assert_eq!(on.containers_lost, 0);
     assert!(on.repairs > 0);
     assert_eq!(on.repair_noops, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Haulers (P3.3, ADR-025)
+
+/// Upgrade progress from tick 6000 to 18000 of a room that starts at `level`, and the billed
+/// intents over the same ticks, with `hauling`.
+fn steady_haul(level: u8, hauling: HaulingConfig) -> (u32, u64) {
+    let mut w = World::new(level, SPAWN_ENERGY_CAPACITY);
+    w.hauling_cfg = hauling;
+    w.run(6000);
+    let (p, b) = (w.progress, w.billed);
+    w.run(12_000);
+    assert_eq!(w.failed, 0);
+    (w.progress - p, w.billed - b)
+}
+
+/// Haulers pay at every level the scenario room is run at (ADR-025 "As built"): more upgrade
+/// progress from tick 6000 to 18000 than with them off, and fewer billed intents at RCL3 and RCL4,
+/// where the workers walked most. Measured 2026-11-17 over six starts (the spawn's energy at the
+/// start 300 to 50) and ticks 6000 to 30000: RCL3 +5.1% (+4.2% to +5.6%), RCL4 +2.8% (+2.1% to
+/// +3.5%), RCL5 +6.1% (+5.8% to +6.7%), RCL6 +10.4% (+8.5% to +11.0%); from tick 0, with the
+/// container's cost, +3.4%, +1.9%, +4.5%, +8.1%; billed intents −13.4%, −13.8%, +0.3%, +4.9%. This
+/// start, ticks 6000 to 18000: RCL3 26398 against 21259, RCL4 166506 against 158934, RCL5 172881
+/// against 162057, RCL6 176017 against 161955.
+#[test]
+fn haulers_raise_the_upgrade_rate() {
+    for level in [3, 4, 5, 6] {
+        let (with, with_billed) = steady_haul(level, HAULING_MMO);
+        let (without, without_billed) = steady_haul(level, HAULING_OFF);
+        assert!(with > without, "RCL{level}: {with} against {without}");
+        if level <= 4 {
+            assert!(
+                with_billed < without_billed,
+                "RCL{level}: {with_billed} against {without_billed}"
+            );
+        }
+    }
+}
+
+/// Uses: CONTAINER_CAPACITY, CARRY_CAPACITY, `CONTROLLER_LINK_RANGE`. A room that
+/// starts at RCL4 places the controller container on a free tile 2 from the controller (off the
+/// controller link's tile, not next to a source), builds it, and gets the plan's haulers: CARRY and
+/// MOVE parts only, at most `max_per_source` a source. They fill the spawns and extensions and
+/// carry the rest into the container; the workers take it there, are sized with no walk, and fill
+/// nothing while a hauler hauls a mined source.
+#[test]
+fn haulers_carry_a_sources_energy_to_the_controller_container() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    w.run(4000);
+    let plan = mine_plan(&w);
+    let at = plan
+        .controller_container
+        .expect("a controller container tile");
+    let ct = w.controller_at;
+    assert_eq!(tile_of(at).range(ct), CONTROLLER_LINK_RANGE);
+    assert!(Some(at) != plan.controller_link);
+    assert!(w.sources.iter().all(|s| tile_of(at).range(s.at) > 1));
+    assert!(hits_at(&w, tile_of(at)).is_some(), "built");
+    assert!(
+        w.mining.mine_tiles(w.room).contains(&at),
+        "repaired with the mining tiles"
+    );
+    let (_, haul, stats) = w.hauling.room_states().next().expect("room");
+    let haul = haul.expect("a hauling plan");
+    assert_eq!(haul.container, at);
+    assert_eq!(haul.sources.len(), 2, "both sources hauled at RCL4");
+    for s in &haul.sources {
+        assert!(s.want >= 1 && s.want <= HAULING_MMO.max_per_source);
+        let body = s.body.expect("a body");
+        assert_eq!(
+            body.len(),
+            body.count(Part::Carry) + body.count(Part::Move),
+            "CARRY and MOVE only"
+        );
+    }
+    let want: u32 = haul.sources.iter().map(|s| s.want).sum();
+    assert_eq!(stats.want, want);
+    let (stored, energy) = (w.stored, w.stored_energy);
+    let mut takes_there = 0;
+    for _ in 0..2000 {
+        w.step();
+        let (_, _, _, os) = w.opening.room_states().next().expect("room");
+        let (_, _, hs) = w.hauling.room_states().next().expect("room");
+        assert!(hs.haulers <= want, "no more haulers than the plan wants");
+        if hs.hauled > 0 {
+            assert_eq!(os.tasks[2], 0, "no worker fills while a hauler hauls");
+        }
+        takes_there += w
+            .creeps
+            .iter()
+            .filter(|c| {
+                c.identity.role == Role::Worker && c.spawning == 0 && c.at.range(tile_of(at)) <= 1
+            })
+            .count();
+    }
+    assert!(w.stored > stored, "the haulers stored into the container");
+    assert_eq!(
+        w.empty_takes, 0,
+        "no take found its energy taken (the haulers' claims)"
+    );
+    assert!(w.stored_energy - energy >= u64::from(CARRY_CAPACITY));
+    assert!(takes_there > 0, "workers came to the container");
+    let (_, plan, _, _) = w.opening.room_states().next().expect("room");
+    let plan = plan.expect("plan");
+    assert!(
+        plan.sources.iter().all(|s| s.linked),
+        "hauled: sized with no walk"
+    );
+    assert!(w.loose.iter().all(|l| match l {
+        Loose::Container { energy, .. } => *energy <= CONTAINER_CAPACITY,
+        _ => true,
+    }));
+    assert_eq!(w.failed, 0);
+}
+
+/// Uses: CARRY_CAPACITY. An empty hauler and an empty worker both next to a hauled source's
+/// container that holds exactly the hauler's load: the hauler takes it, and the worker is not
+/// offered what the hauler claimed (`HaulView::taken`), so no take finds its energy gone (a billed
+/// no-op in the engine).
+#[test]
+fn a_hauler_and_a_worker_never_take_the_same_energy() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    w.run(4000);
+    let (_, haul, _) = w.hauling.room_states().next().expect("room");
+    let tile = tile_of(haul.expect("a hauling plan").sources[0].tile);
+    let h = w
+        .creeps
+        .iter()
+        .position(|c| c.identity.role == Role::Hauler && c.spawning == 0)
+        .expect("a hauler");
+    let k = w
+        .creeps
+        .iter()
+        .position(|c| c.identity.role == Role::Worker && c.spawning == 0)
+        .expect("a worker");
+    let free: Vec<Tile> = tile
+        .neighbors()
+        .map(|(_, t)| t)
+        .filter(|&t| {
+            !w.blocked(t)
+                && w.sources.iter().all(|s| s.at != t)
+                && w.creeps.iter().all(|c| c.at != t)
+        })
+        .take(2)
+        .collect();
+    assert_eq!(free.len(), 2, "two free tiles next to the mining tile");
+    let load = w.creeps[h].capacity();
+    w.creeps[h].at = free[0];
+    w.creeps[h].energy = 0;
+    w.creeps[k].at = free[1];
+    w.creeps[k].energy = 0;
+    for l in &mut w.loose {
+        match l {
+            Loose::Container { at, energy, .. } if *at == tile => *energy = load,
+            _ => {}
+        }
+    }
+    w.loose
+        .retain(|l| !matches!(l, Loose::Pile { at, .. } if *at == tile));
+    let empty = w.empty_takes;
+    w.step();
+    assert_eq!(w.creeps[h].energy, load, "the hauler took its load");
+    assert_eq!(w.empty_takes, empty, "the worker was not sent for it");
+    assert_eq!(w.failed, 0);
+}
+
+/// Uses: CONTAINER_CAPACITY. Behind a full mining container the miner's overflow makes a small pile
+/// on the tile every tick (V183, V193): the haulers still take whole loads (the container's, or a
+/// pile's once it holds one), not one billed pickup a tick of each new pile. Over a creep life with
+/// both containers full at the start, every hauler take moves at least half the smallest hauler's
+/// load on average.
+#[test]
+fn haulers_take_whole_loads_behind_a_full_container() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    w.run(4000);
+    let tiles: Vec<Tile> = mine_plan(&w)
+        .sources
+        .iter()
+        .filter_map(|s| s.tile.map(tile_of))
+        .collect();
+    for &t in &tiles {
+        set_container_energy(&mut w, t, CONTAINER_CAPACITY);
+    }
+    let smallest = w
+        .creeps
+        .iter()
+        .filter(|c| c.identity.role == Role::Hauler)
+        .map(SimCreep::capacity)
+        .min()
+        .expect("a hauler");
+    let (takes, taken) = (w.hauler_takes, w.hauler_taken);
+    w.run(CREEP_LIFE_TIME);
+    let n = u64::from(w.hauler_takes - takes);
+    assert!(n > 0);
+    assert!(
+        (w.hauler_taken - taken) / n >= u64::from(smallest / 2),
+        "{} energy in {n} takes",
+        w.hauler_taken - taken
+    );
+    assert_eq!(w.failed, 0);
+}
+
+/// A hauled source whose miner is gone leaves the haulers nothing to fill with: the view no longer
+/// says the haulers fill, so the workers fill the drained spawns and extensions again.
+#[test]
+fn workers_fill_again_when_no_hauler_can() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    w.run(4000);
+    assert!(w.hauling.view(w.room).fills);
+    w.mining_cfg.enabled = false;
+    w.creeps.retain(|c| c.identity.role != Role::Miner);
+    for s in &mut w.stores {
+        if s.spawn_energy() {
+            s.energy = 0;
+        }
+    }
+    w.step();
+    assert!(w.haulers() > 0, "the haulers are still there");
+    assert!(!w.hauling.view(w.room).fills, "no source is mined");
+    let mut fills = 0;
+    for _ in 0..100 {
+        w.step();
+        let (_, _, _, os) = w.opening.room_states().next().expect("room");
+        fills += os.tasks[2];
+    }
+    assert!(fills > 0, "the workers filled");
+    assert_eq!(w.failed, 0);
+}
+
+/// With `hauling.enabled` and `hauling.place_container` off, no container is placed by the
+/// controller and no hauler is ordered.
+#[test]
+fn haulers_off_place_no_container_and_order_none() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    w.hauling_cfg = HAULING_OFF;
+    w.run(4000);
+    let at = mine_plan(&w)
+        .controller_container
+        .expect("the tile is planned all the same");
+    assert!(hits_at(&w, tile_of(at)).is_none(), "no container there");
+    assert!(w.sites.iter().all(|s| s.at != tile_of(at)), "no site there");
+    assert_eq!(w.haulers(), 0);
+    assert!(
+        w.spawned.iter().all(|(_, b)| b.count(Part::Work) > 0),
+        "no CARRY-and-MOVE body"
+    );
+    assert_eq!(w.stored, 0);
+}
+
+/// Uses: CONTAINER_HITS, CONTAINER_DECAY, CONTAINER_DECAY_TIME_OWNED, CREEP_LIFE_TIME, and
+/// `repair.walk_pct`. In a hauled room no gatherer comes to the mining tiles' containers, so they
+/// are repaired as a linked source's is (P3.5: one walking worker below `repair.walk_pct`), and the
+/// controller container, which the workers stand by, within range: over ten creep lives none is
+/// lost and none falls a decay step below the walk share.
+#[test]
+fn a_hauled_rooms_containers_are_kept() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    let mut lowest = CONTAINER_HITS;
+    for _ in 0..10 * CREEP_LIFE_TIME {
+        w.step();
+        for l in &w.loose {
+            if let Loose::Container { hits, .. } = l {
+                lowest = lowest.min(*hits);
+            }
+        }
+    }
+    assert!(w.haulers() > 0);
+    assert_eq!(w.containers_lost, 0);
+    assert!(
+        lowest + CONTAINER_DECAY >= share(REPAIR_MMO.walk_pct),
+        "lowest {lowest}"
+    );
+    assert!(w.repairs > 0);
+    assert_eq!(w.failed, 0);
+}
+
+/// A global reset forgets every hauler's source and mode; the next ticks give them back from their
+/// stores and the plan's wants, so no hauler is ordered beyond the plan and they keep storing.
+#[test]
+fn a_reset_keeps_the_haulers_hauling() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    w.run(4000);
+    let before = w.haulers();
+    assert!(before > 0);
+    w.hauling = Hauling::default();
+    let stored = w.stored;
+    w.run(1000);
+    let (_, plan, _) = w.hauling.room_states().next().expect("room");
+    let want: u32 = plan.expect("plan").sources.iter().map(|s| s.want).sum();
+    assert!(w.haulers() as u32 <= want);
+    assert!(w.stored > stored, "storing again after the reset");
+    assert_eq!(w.failed, 0);
+}
+
+/// With the Standard tier off (a low bucket), haulers still take and fill (Critical): the room's
+/// spawns and extensions fill again after a spawn drained them; nothing goes into the controller
+/// container, whose transfers are hauling (Standard).
+#[test]
+fn critical_hauling_goes_on_with_the_standard_tier_off() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    w.run(4000);
+    assert!(w.haulers() > 0);
+    w.standard = false;
+    for s in &mut w.stores {
+        if s.spawn_energy() {
+            s.energy = 0;
+        }
+    }
+    let stored = w.stored;
+    let mut full = false;
+    for _ in 0..CREEP_LIFE_TIME {
+        w.step();
+        let e = w.room_energy();
+        if e.available == e.capacity {
+            full = true;
+            break;
+        }
+    }
+    assert!(full, "refilled with Standard off: {:?}", w.room_energy());
+    assert_eq!(w.stored, stored, "no transfer into the container");
+    assert_eq!(w.failed, 0);
+}
+
+/// A hauled source's energy goes to the controller container for the opening; a linked one keeps
+/// its link, and a source with no working hauler its tile.
+#[test]
+fn the_view_redirects_only_hauled_sources() {
+    let room: RoomName = ROOM.parse().expect("room");
+    let pos = |x, y| place(room, tile(x, y));
+    let hauled = [pos(8, 30)];
+    let view = HaulView {
+        container: Some(pos(24, 10)),
+        hauled: &hauled,
+        fills: true,
+        taken: &[],
+        filled: &[],
+    };
+    let mined = |source, link| Mined {
+        source,
+        tile: pos(9, 29),
+        link,
+    };
+    assert_eq!(
+        view.redirect(mined(pos(8, 30), None)).link,
+        Some(pos(24, 10))
+    );
+    assert_eq!(
+        view.redirect(mined(pos(8, 30), Some(pos(25, 10)))).link,
+        Some(pos(25, 10)),
+        "a link carries it"
+    );
+    assert_eq!(
+        view.redirect(mined(pos(42, 20), None)).link,
+        None,
+        "not hauled"
+    );
+    assert_eq!(
+        HaulView::default().redirect(mined(pos(8, 30), None)).link,
+        None
+    );
 }

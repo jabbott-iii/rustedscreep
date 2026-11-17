@@ -23,6 +23,12 @@
 //! upgrading.
 //! A task kept from the last tick goes first, so assignments do not flip.
 //!
+//! Haulers (P3.3, `economy::hauling`): a source whose haulers work this tick is treated as a linked
+//! one ([`HaulView::redirect`]): its gatherers take its energy at the controller container and its
+//! workers are sized with no walk; energy the haulers take this tick is not offered to gatherers,
+//! nor room they fill to fillers; and while a hauler hauls a mined source no worker fills, except in
+//! a recovery.
+//!
 //! Distances are Chebyshev ranges; only sizing measures paths (movement's grid). State lives in the
 //! heap: a global reset loses the modes, sources and tasks, and the next tick rebuilds them from the
 //! stores (a worker with energy works, an empty one gathers). Nothing is read from or written to
@@ -32,6 +38,7 @@ use rustedscreep_consts::{
     BUILD_POWER, CONTAINER_HITS, HARVEST_POWER, Position, ResourceType, RoomName, StructureType,
 };
 
+use super::hauling::HaulView;
 use super::mining::{Mined, Receiver};
 use super::sizing::{Trip, carry_round, worker_body, worker_round, workers_for_source};
 use super::watchdog::{Event, Observation, Watchdog};
@@ -54,6 +61,11 @@ pub const PRIORITY_NORMAL: u8 = 100;
 /// (`isNearTo`) (V108, V182, V185, V187, V190, V192).
 const WORK_RANGE: u8 = 3;
 const NEAR: u8 = 1;
+
+/// How close a gatherer waits to a controller link or the controller container (P3.3): off the
+/// tiles next to it, which the workers taking a load and the haulers unloading need; a worker that
+/// waits next to it could not be shoved off without leaving its goal.
+const WAIT_RANGE: u8 = 2;
 
 /// What a worker does this tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,9 +181,12 @@ pub struct SourcePlan {
     /// Its miner was next to it when the plan was built (P3.1): workers take its energy off the
     /// miner's tile ([`carry_round`]) instead of harvesting it.
     pub mined: bool,
-    /// Its miner sent its energy to a controller link when the plan was built (P3.2): workers take
-    /// it next to the link, within upgrading range of the controller, so their round has no walk.
+    /// Its miner sent its energy to a controller link (P3.2), or its haulers carried it to the
+    /// controller container (P3.3, `hauled`), when the plan was built: workers take it there,
+    /// within upgrading range of the controller, so their round has no walk.
     pub linked: bool,
+    /// Of `linked`, its haulers carried it.
+    pub hauled: bool,
 }
 
 /// A room's plan: built again when movement's grid version, the room's energy capacity or the
@@ -184,10 +199,11 @@ pub struct Plan {
     /// objects were all seen is built again once they are.
     pub controller: bool,
     pub sources: Vec<SourcePlan>,
-    /// The mined sources the plan was built with, by index in `sources` (bit `i`), and of them the
-    /// linked ones.
+    /// The mined sources the plan was built with, by index in `sources` (bit `i`), of them the
+    /// linked ones (a link or haulers carry them), and of those the hauled ones.
     pub mined: u32,
     pub linked: u32,
+    pub hauled: u32,
     /// Workers the room spawns up to: the sources' sum within `min_workers..=max_workers` (0 when
     /// no source has an open tile). Unit: creeps.
     pub want: u32,
@@ -264,6 +280,8 @@ struct Facts {
     links: Vec<(StructureHandle, Position, u32, bool)>,
     /// Sources whose miner is next to them this tick (`economy::mining`, P3.1).
     mined: Vec<Mined>,
+    /// Sources whose haulers work this tick (P3.3, [`HaulView::hauled`]).
+    hauled: Vec<Position>,
     /// Containers on the mining plan's tiles (P3.5): handle, place, hits. Others in the room (a
     /// previous owner's, say) are never repaired; their energy is still taken (`loose`).
     containers: Vec<(ObjectHandle, Position, u32)>,
@@ -404,8 +422,9 @@ impl Opening {
     }
 
     /// The Critical half of room `unit`'s tick (module docs, step 2). `mined` lists the room's
-    /// sources whose miner is next to them this tick (`Mining::mined`; empty without miners), and
-    /// `mine_tiles` the mining plan's tiles (`Mining::mine_tiles`), whose containers are repaired.
+    /// sources whose miner is next to them this tick (`Mining::mined`; empty without miners),
+    /// `mine_tiles` the mining plan's tiles (`Mining::mine_tiles`), whose containers are repaired,
+    /// and `haul` what the room's haulers do this tick (`Hauling::view`; the default without).
     #[allow(clippy::too_many_arguments)]
     pub fn plan_room(
         &mut self,
@@ -420,6 +439,7 @@ impl Opening {
         mined: &[Mined],
         mine_tiles: &[Position],
         receivers: &[Receiver],
+        haul: &HaulView<'_>,
         commit: &mut Commit,
     ) -> Result<(), Fault> {
         let ri = usize::try_from(unit).map_err(|_| Fault::new("unit out of range", unit))?;
@@ -431,7 +451,7 @@ impl Opening {
             (r.name, r.row, r.members)
         };
         let row = row.ok_or(Fault::new("room not in this tick", unit))?;
-        self.gather_facts(snap, name, mined, mine_tiles, receivers);
+        self.gather_facts(snap, name, mined, mine_tiles, receivers, haul);
         self.ensure_plan(ri, snap, row, movement, cfg, mcfg, commit);
         let want = self
             .rooms
@@ -513,10 +533,11 @@ impl Opening {
             self.replan(ri);
         }
 
-        // The spawn request.
+        // The spawn request. Below `min_workers` a room spawns at the energy it holds so someone
+        // fills its spawns, unless its haulers do (P3.3).
         let kind = if working == 0 || recovering {
             (EnergyBudget::Available, PRIORITY_RECOVERY)
-        } else if working < cfg.min_workers {
+        } else if working < cfg.min_workers && !haul.fills {
             (EnergyBudget::Available, PRIORITY_LOW)
         } else if let Some(cap) = cap {
             (EnergyBudget::UpTo(cap), PRIORITY_NORMAL)
@@ -537,7 +558,8 @@ impl Opening {
             });
         }
 
-        // Modes and tasks, then the Critical tasks' intents and moves.
+        // Modes and tasks, then the Critical tasks' intents and moves. Working haulers fill the
+        // room (P3.3), except in a recovery.
         self.assign(
             ri,
             snap,
@@ -546,6 +568,7 @@ impl Opening {
             rcfg,
             guard && !state.upgrade_blocked,
             state,
+            !haul.fills || recovering,
         );
         self.source_left.clear();
         self.source_left
@@ -700,8 +723,9 @@ impl Opening {
         }
     }
 
-    /// Reads what room `name` holds this tick, its mined sources, the containers on its mining
-    /// tiles and its controller links, into `self.facts`.
+    /// Reads what room `name` holds this tick, its mined sources (a hauled one's energy at the
+    /// controller container), the containers on its mining tiles and its controller links, into
+    /// `self.facts`; energy the haulers take this tick is left out.
     fn gather_facts(
         &mut self,
         snap: &Snapshot,
@@ -709,6 +733,7 @@ impl Opening {
         mined: &[Mined],
         mine_tiles: &[Position],
         receivers: &[Receiver],
+        haul: &HaulView<'_>,
     ) {
         let f = &mut self.facts;
         f.controller = None;
@@ -718,9 +743,15 @@ impl Opening {
         f.loose.clear();
         f.links.clear();
         f.mined.clear();
+        f.hauled.clear();
+        f.hauled.extend_from_slice(haul.hauled);
         f.containers.clear();
-        f.mined
-            .extend(mined.iter().filter(|m| m.source.room_name() == name));
+        f.mined.extend(
+            mined
+                .iter()
+                .filter(|m| m.source.room_name() == name)
+                .map(|&m| haul.redirect(m)),
+        );
         f.links.extend(
             receivers
                 .iter()
@@ -741,7 +772,11 @@ impl Opening {
             match kind {
                 StructureType::Controller => f.controller = Some((h, pos)),
                 StructureType::Spawn | StructureType::Extension if free > 0 => {
-                    f.fills.push((h, pos, free));
+                    // Less what the haulers fill this tick (P3.3).
+                    let filled = haul.filled.iter().find(|x| x.0 == h).map_or(0, |x| x.1);
+                    if free > filled {
+                        f.fills.push((h, pos, free - filled));
+                    }
                 }
                 _ => {}
             }
@@ -768,7 +803,12 @@ impl Opening {
                     let key = ob.key_of(h).map_or(u128::MAX, |k| k.0);
                     f.sites.push((h, pos, t, amount, total, key));
                 }
-                k if k.holds_energy() && amount > 0 => f.loose.push((h, pos, k, amount)),
+                k if k.holds_energy() && amount > 0 => {
+                    let taken = haul.taken.iter().find(|t| t.0 == h).map_or(0, |t| t.1);
+                    if amount > taken {
+                        f.loose.push((h, pos, k, amount - taken));
+                    }
+                }
                 _ => {}
             }
         }
@@ -800,16 +840,17 @@ impl Opening {
         };
         let controller = self.facts.controller.is_some();
         let seen = self.facts.sources.len();
-        let mask = |linked: bool| {
+        let mask = |linked: bool, hauled: bool| {
             self.facts
                 .sources
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| {
-                    self.facts
-                        .mined
-                        .iter()
-                        .any(|m| m.source == s.1 && (!linked || m.link.is_some()))
+                    self.facts.mined.iter().any(|m| {
+                        m.source == s.1
+                            && (!linked || m.link.is_some())
+                            && (!hauled || self.facts.hauled.contains(&s.1))
+                    })
                 })
                 .fold(0u32, |bits, (i, _)| {
                     bits | u32::try_from(i)
@@ -818,7 +859,7 @@ impl Opening {
                         .unwrap_or(0)
                 })
         };
-        let (mined, linked) = (mask(false), mask(true));
+        let (mined, linked, hauled) = (mask(false, false), mask(true, false), mask(true, true));
         if r.plan.as_ref().is_some_and(|p| {
             p.version == version
                 && p.capacity == capacity
@@ -826,6 +867,7 @@ impl Opening {
                 && p.sources.len() == seen
                 && p.mined == mined
                 && p.linked == linked
+                && p.hauled == hauled
         }) {
             return;
         }
@@ -846,6 +888,7 @@ impl Opening {
             let bit = u32::try_from(i).ok().and_then(|i| 1u32.checked_shl(i));
             let is_mined = bit.is_some_and(|bit| mined & bit != 0);
             let is_linked = bit.is_some_and(|bit| linked & bit != 0);
+            let is_hauled = bit.is_some_and(|bit| hauled & bit != 0);
             let at = Tile::of(pos);
             let open = at.neighbors().filter(|&(_, t)| grid.walkable(t)).count();
             let open = u32::try_from(open).unwrap_or(0);
@@ -885,7 +928,32 @@ impl Opening {
                 trip,
                 mined: is_mined,
                 linked: is_linked,
+                hauled: is_hauled,
             });
+        }
+        // Sources whose workers take next to the controller (linked, or hauled, P3.3) share one
+        // pool: their workers make the same round with no walk, so the pool is sized as one source
+        // of their summed capacity and tiles, and split over them in order, rather than rounded up
+        // per source.
+        let pooled = |p: &SourcePlan| p.linked && p.trip.is_some();
+        if sources.iter().filter(|p| pooled(p)).count() > 1
+            && let Some(b) = body.as_ref()
+            && let Some(round) = carry_round(b, Trip { tiles: 0, cost: 0 })
+        {
+            let (cap_sum, open_sum) = sources
+                .iter()
+                .zip(&self.facts.sources)
+                .filter(|(p, _)| pooled(p))
+                .fold((0u32, 0u32), |(c, o), (p, s)| {
+                    (c.saturating_add(s.3), o.saturating_add(p.open))
+                });
+            let total = workers_for_source(cap_sum, open_sum, b, round);
+            let n = u32::try_from(sources.iter().filter(|p| pooled(p)).count()).unwrap_or(1);
+            let (each, extra) = (total / n.max(1), total % n.max(1));
+            for (k, p) in sources.iter_mut().filter(|p| pooled(p)).enumerate() {
+                let k = u32::try_from(k).unwrap_or(u32::MAX);
+                p.want = each + u32::from(k < extra);
+            }
         }
         let sum = sources.iter().fold(0u32, |s, p| s.saturating_add(p.want));
         let want = if sum == 0 {
@@ -901,6 +969,7 @@ impl Opening {
                 sources,
                 mined,
                 linked,
+                hauled,
                 want,
             });
         }
@@ -917,6 +986,7 @@ impl Opening {
         rcfg: &RepairConfig,
         guard: bool,
         controller: crate::snapshot::ControllerState,
+        fill: bool,
     ) {
         let now = self.time;
         // This tick's unreachable targets: every worker skips them.
@@ -1091,9 +1161,9 @@ impl Opening {
         workers.clear();
         assigned.clear();
         left.clear();
-        // Spawns and extensions that cannot be reached take no energy.
+        // Spawns and extensions that cannot be reached take no energy; none while haulers fill.
         let blocked = &self.blocked;
-        self.facts.fills.retain(|f| !blocked.contains(&f.1));
+        self.facts.fills.retain(|f| fill && !blocked.contains(&f.1));
         for k in 0..self.order.len() {
             let Some(&i) = self.order.get(k) else {
                 continue;
@@ -1431,8 +1501,13 @@ impl Opening {
             (o, l) => o.or(l),
         };
         if let Some(tile) = w.source.and_then(|p| self.mined_tile(p)) {
+            // At a controller link or the controller container (P3.3) the other one serves as well:
+            // both are within upgrading range.
+            let receiver = |p: Position| f.mined.iter().any(|m| m.link == Some(p));
+            let serves =
+                |p: Position| range(at, p) <= range(at, tile) || (receiver(tile) && receiver(p));
             return take
-                .filter(|t| range(at, t.1) <= range(at, tile))
+                .filter(|t| serves(t.1))
                 .map(|t| t.0)
                 .or_else(|| open(tile).then_some(Task::Wait(tile)));
         }
@@ -1555,7 +1630,10 @@ impl Opening {
                     Some(CreepIntent::UpgradeController { target: controller }),
                 )
             }),
-            Task::Wait(tile) => Some((tile, NEAR, None)),
+            Task::Wait(tile) => {
+                let receiver = self.facts.mined.iter().any(|m| m.link == Some(tile));
+                Some((tile, if receiver { WAIT_RANGE } else { NEAR }, None))
+            }
             Task::Idle => None,
         };
         let Some((target, reach, intent)) = plan else {

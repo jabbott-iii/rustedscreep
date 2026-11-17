@@ -26,17 +26,21 @@ pub enum Role {
     Worker,
     /// A static miner: stands on its source's mining tile and harvests (P3.1).
     Miner,
+    /// A hauler: carries a mined source's energy to the spawns, the extensions and the controller
+    /// container (P3.3).
+    Hauler,
 }
 
 impl Role {
     /// Every role, in a fixed order.
-    pub const ALL: [Self; 2] = [Self::Worker, Self::Miner];
+    pub const ALL: [Self; 3] = [Self::Worker, Self::Miner, Self::Hauler];
 
     /// The first byte of the role's creep names. Never change or reuse one (see the module docs).
     pub const fn code(self) -> u8 {
         match self {
             Self::Worker => b'w',
             Self::Miner => b'm',
+            Self::Hauler => b'h',
         }
     }
 
@@ -48,6 +52,7 @@ impl Role {
         match self {
             Self::Worker => "worker",
             Self::Miner => "miner",
+            Self::Hauler => "hauler",
         }
     }
 
@@ -323,6 +328,12 @@ mod tests {
         }
         let codes: std::collections::HashSet<u8> = Role::ALL.iter().map(|r| r.code()).collect();
         assert_eq!(codes.len(), Role::ALL.len(), "codes are unique");
-        assert_eq!(Role::from_name("hauler"), None);
+        assert_eq!(Role::from_name("nobody"), None);
+        // The codes creeps alive today carry (a persisted format, module docs).
+        assert_eq!(
+            Role::ALL.map(Role::code),
+            [b'w', b'm', b'h'],
+            "never change or reuse a code"
+        );
     }
 }

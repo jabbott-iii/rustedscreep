@@ -1,5 +1,6 @@
 //! The RCL1–3 opening's glue (ROADMAP P2.4, over `rustedscreep_core::economy::Opening`), static
-//! mining's (P3.1, `economy::Mining`) and the link network's (P3.2): the scheduler jobs, the
+//! mining's (P3.1, `economy::Mining`), the link network's (P3.2) and hauling's (P3.3,
+//! `economy::Hauling`): the scheduler jobs, the
 //! watchdogs' log lines and notifications, the early rescan after a room's own sites change, the
 //! link sends, and the `rustedscreep.opening()` console summary.
 //!
@@ -7,16 +8,21 @@
 //!   source's mining tile, its miner's spawn request, transfer into its source link, harvest and
 //!   move, the sources the workers leave to it or take from the controller link, and the tiles that
 //!   need a container or a link site.
-//! - `links` (Standard, P3.2), after `opening work`: per owned room with a source link that may
+//! - `hauling` (Critical, P3.3), after `mining` and before `opening`: per owned room the haulers'
+//!   plan, their spawn requests, and their takes at the mining tiles, waits and fills.
+//! - `hauling work` (Standard, P3.3), after `opening work`: per owned room with a hauler to store
+//!   this tick, its transfers into the controller container (hauling).
+//! - `links` (Standard, P3.2), after `hauling work`: per owned room with a source link that may
 //!   send, its sends to the controller link (moving energy is hauling, which CLAUDE.md puts in
 //!   Standard; when the tier is off the source link fills and the container takes the harvest).
 //! - `opening` (Critical), after `mining` and before the `spawn` job: per owned room
 //!   the plan, the watchdog, the spawn request, every worker's task, and the intents and moves of
 //!   harvesting, taking energy, filling spawns and extensions, and the downgrade guard's upgrade.
 //! - `opening work` (Standard), after the persistence loads: building and upgrading.
-//! - `opening placement` (Optional, after the constants self-check; ADR-020, ADR-023, ADR-024): per
-//!   owned room, one tile to place a site on (`economy::placement`): a mining tile's container while
-//!   `mining.place_containers` is on, else a link tile while `links.place_links` is on and the level
+//! - `opening placement` (Optional, after the constants self-check; ADR-020, ADR-023, ADR-024,
+//!   ADR-025): per owned room, one tile to place a site on (`economy::placement`): a mining tile's
+//!   container while `mining.place_containers` is on, or the controller container's while
+//!   `hauling.place_container` is on, else a link tile while `links.place_links` is on and the level
 //!   allows another link, else, while `opening.place_extensions` is on and the room has a spawn and
 //!   fewer extensions and extension sites than its level allows, an extension. The act step calls
 //!   `Room.createConstructionSite(x, y, type)` for it, after the spawn orders and before the creep
@@ -30,10 +36,11 @@
 use std::fmt::Write as _;
 
 use rustedscreep_core::config::{
-    LinkConfig, MiningConfig, MovementConfig, OpeningConfig, RepairConfig, SchedulerConfig,
+    HaulingConfig, LinkConfig, MiningConfig, MovementConfig, OpeningConfig, RepairConfig,
+    SchedulerConfig,
 };
 use rustedscreep_core::economy::placement::Placement;
-use rustedscreep_core::economy::{Event, Mining, Opening, Task};
+use rustedscreep_core::economy::{Event, HaulTask, Hauling, Mining, Opening, Task};
 use rustedscreep_core::intents::{ActLog, IntentBuffer, Outcome, error_name};
 use rustedscreep_core::movement::Movement;
 use rustedscreep_core::scheduler::{
@@ -75,6 +82,18 @@ const MINE_JOB: Job = Job {
     tier: Tier::Critical,
 };
 
+/// The haulers' takes and fills keep the spawns filled, Critical (as the opening's filling).
+const HAUL_JOB: Job = Job {
+    name: "hauling",
+    tier: Tier::Critical,
+};
+
+/// The haulers' transfers into the controller container are hauling, Standard (CLAUDE.md).
+const HAUL_WORK_JOB: Job = Job {
+    name: "hauling work",
+    tier: Tier::Standard,
+};
+
 /// Harvesting and filling the spawns are Critical (CLAUDE.md).
 const PLAN_JOB: Job = Job {
     name: "opening",
@@ -110,8 +129,11 @@ const LINK_JOB: &str = "link sends";
 pub struct OpeningGlue {
     core: Opening,
     mining: Mining,
+    hauling: Hauling,
     placement: Placement,
     mine_job: JobState,
+    haul_job: JobState,
+    haul_work_job: JobState,
     plan_job: JobState,
     work_job: JobState,
     send_job: JobState,
@@ -137,6 +159,7 @@ impl OpeningGlue {
     pub fn begin(&mut self, snapshot: &Snapshot, movement: &mut Movement) {
         self.core.begin(snapshot);
         self.mining.begin(snapshot);
+        self.hauling.begin(snapshot);
         self.placement.begin(snapshot);
         self.sites_now.clear();
         let objects = &snapshot.objects;
@@ -162,10 +185,11 @@ impl OpeningGlue {
         self.started = true;
     }
 
-    /// The Critical `mining` job, then the Critical `opening` job: one unit per owned room each.
-    /// Run them after movement's first reads and before the `spawn` job, which plans the requests
-    /// they make. A miner's request is held back while it costs more than the opening's watchdog
-    /// caps the room's bodies at (from the opening's last run).
+    /// The Critical `mining` job, then the Critical `hauling` job, then the Critical `opening` job:
+    /// one unit per owned room each. Run them after movement's first reads and before the `spawn`
+    /// job, which plans the requests they make. A miner's or a hauler's request is held back while
+    /// it costs more than the opening's watchdog caps the room's bodies at (from the opening's last
+    /// run).
     #[allow(clippy::too_many_arguments)]
     pub fn plan<C: Clock>(
         &mut self,
@@ -178,16 +202,21 @@ impl OpeningGlue {
         mining_cfg: &MiningConfig,
         link_cfg: &LinkConfig,
         repair_cfg: &RepairConfig,
+        hauling_cfg: &HaulingConfig,
         mcfg: &MovementConfig,
     ) {
         let Self {
             core,
             mining,
+            hauling,
             placement,
             mine_job,
+            haul_job,
             plan_job,
             ..
         } = self;
+        let controller_container = (hauling_cfg.enabled && hauling_cfg.place_container)
+            .then_some(hauling_cfg.container_level);
         let mines = mining.room_count();
         if mines > 0 {
             tick.run_units(&MINE_JOB, mine_job, mines, |unit, commit| {
@@ -195,8 +224,40 @@ impl OpeningGlue {
                 let cap = room.and_then(|room| core.cap(room));
                 let refused = room.map_or(&[][..], |room| placement.refused_tiles(room));
                 mining.plan_room(
-                    unit, snapshot, movement, spawner, buffer, mining_cfg, link_cfg, mcfg, cap,
-                    refused, commit,
+                    unit,
+                    snapshot,
+                    movement,
+                    spawner,
+                    buffer,
+                    mining_cfg,
+                    link_cfg,
+                    mcfg,
+                    cap,
+                    refused,
+                    controller_container,
+                    commit,
+                )
+            });
+        }
+        let hauls = hauling.room_count();
+        if hauls > 0 {
+            tick.run_units(&HAUL_JOB, haul_job, hauls, |unit, commit| {
+                let room = hauling.room_name(unit);
+                let cap = room.and_then(|room| core.cap(room));
+                let plan = room.and_then(|room| mining.plan(room));
+                let mined = room.map_or(&[][..], |room| mining.mined(room));
+                hauling.plan_room(
+                    unit,
+                    snapshot,
+                    movement,
+                    spawner,
+                    buffer,
+                    hauling_cfg,
+                    mcfg,
+                    plan,
+                    mined,
+                    cap,
+                    commit,
                 )
             });
         }
@@ -209,14 +270,16 @@ impl OpeningGlue {
             let mined = room.map_or(&[][..], |room| mining.mined(room));
             let tiles = room.map_or(&[][..], |room| mining.mine_tiles(room));
             let receivers = room.map_or(&[][..], |room| mining.receivers(room));
+            let haul = room.map(|room| hauling.view(room)).unwrap_or_default();
             core.plan_room(
                 unit, snapshot, movement, spawner, buffer, cfg, repair_cfg, mcfg, mined, tiles,
-                receivers, commit,
+                receivers, &haul, commit,
             )
         });
     }
 
-    /// The Standard `opening work` job: one unit per owned room.
+    /// The Standard `opening work` job (one unit per owned room), then the Standard `hauling work`
+    /// job (one per room with a hauler to store this tick; none, and no clock reading, without).
     pub fn work<C: Clock>(
         &mut self,
         tick: &mut TickCpu<'_, C>,
@@ -225,14 +288,25 @@ impl OpeningGlue {
         buffer: &mut IntentBuffer,
         mcfg: &MovementConfig,
     ) {
-        let count = self.core.room_count();
-        if count == 0 {
-            return;
+        let Self {
+            core,
+            hauling,
+            work_job,
+            haul_work_job,
+            ..
+        } = self;
+        let count = core.room_count();
+        if count > 0 {
+            tick.run_units(&WORK_JOB, work_job, count, |unit, commit| {
+                core.work_room(unit, snapshot, movement, buffer, mcfg, commit)
+            });
         }
-        let Self { core, work_job, .. } = self;
-        tick.run_units(&WORK_JOB, work_job, count, |unit, commit| {
-            core.work_room(unit, snapshot, movement, buffer, mcfg, commit)
-        });
+        let hauls = hauling.work_count();
+        if hauls > 0 {
+            tick.run_units(&HAUL_WORK_JOB, haul_work_job, hauls, |unit, commit| {
+                hauling.work_room(unit, snapshot, movement, buffer, mcfg, commit)
+            });
+        }
     }
 
     /// The Standard `links` job (P3.2): one unit per owned room whose `mining` run found a source
@@ -251,8 +325,9 @@ impl OpeningGlue {
     }
 
     /// The Optional `opening placement` job: one unit per owned room, while
-    /// `opening.place_extensions`, `mining.place_containers` or `links.place_links` is on (the mining
-    /// job lists no container tile or link tile while the switch for it is off).
+    /// `opening.place_extensions`, `mining.place_containers`, `links.place_links` or
+    /// `hauling.place_container` is on (the mining job lists no container tile or link tile while
+    /// the switch for it is off).
     #[allow(clippy::too_many_arguments)]
     pub fn place<C: Clock>(
         &mut self,
@@ -262,10 +337,14 @@ impl OpeningGlue {
         cfg: &OpeningConfig,
         mining_cfg: &MiningConfig,
         link_cfg: &LinkConfig,
+        hauling_cfg: &HaulingConfig,
         mcfg: &MovementConfig,
     ) {
         let count = self.placement.room_count();
-        let any = cfg.place_extensions || mining_cfg.place_containers || link_cfg.place_links;
+        let any = cfg.place_extensions
+            || mining_cfg.place_containers
+            || link_cfg.place_links
+            || (hauling_cfg.enabled && hauling_cfg.place_container);
         if !any || count == 0 {
             return;
         }
@@ -465,7 +544,9 @@ impl OpeningGlue {
                         if s.mined {
                             text.push_str(" mined");
                         }
-                        if s.linked {
+                        if s.hauled {
+                            text.push_str(" hauled");
+                        } else if s.linked {
                             text.push_str(" linked");
                         }
                     }
@@ -511,6 +592,7 @@ impl OpeningGlue {
              {fallbacks}, stalls {stalls}"
         );
         self.mining_summary(&mut text);
+        self.hauling_summary(&mut text);
         let p = self.placement.totals();
         let skipped: usize = self.placement.refused().map(|(_, n)| n).sum();
         let _ = write!(
@@ -526,6 +608,67 @@ impl OpeningGlue {
             l.ordered, l.sent, l.failed, l.energy
         );
         text
+    }
+
+    /// The hauling part of the summary (P3.3): per owned room its haulers and their tasks, this
+    /// tick's requests, the controller container, and per hauled source the plan's trip, body and
+    /// count.
+    fn hauling_summary(&self, text: &mut String) {
+        text.push_str(" | hauling:");
+        for (room, plan, stats) in self.hauling.room_states() {
+            let _ = write!(
+                text,
+                " {room}: haulers {} of {} (working {}, requested {}, hauled sources {})",
+                stats.haulers, stats.want, stats.working, stats.requested, stats.hauled
+            );
+            let mut first = true;
+            for (&n, kind) in stats.tasks.iter().zip(HaulTask::KINDS) {
+                if n > 0 {
+                    let _ = write!(text, "{} {kind} {n}", if first { ", tasks" } else { "," });
+                    first = false;
+                }
+            }
+            let Some(p) = plan else {
+                text.push_str(if stats.container {
+                    ", no plan yet;"
+                } else {
+                    ", no controller container;"
+                });
+                continue;
+            };
+            let _ = write!(
+                text,
+                ", controller container ({},{})",
+                p.container.x().u8(),
+                p.container.y().u8()
+            );
+            for s in &p.sources {
+                let _ = write!(
+                    text,
+                    ", source ({},{}) trip {} tiles cost {}",
+                    s.source.x().u8(),
+                    s.source.y().u8(),
+                    s.trip.tiles,
+                    s.trip.cost
+                );
+                match s.body {
+                    Some(b) => {
+                        let _ = write!(
+                            text,
+                            " want {} of {} CARRY {} MOVE ({} energy)",
+                            s.want,
+                            b.count(Part::Carry),
+                            b.count(Part::Move),
+                            b.cost()
+                        );
+                    }
+                    None => {
+                        let _ = write!(text, " no hauler at capacity {}", p.capacity);
+                    }
+                }
+            }
+            text.push(';');
+        }
     }
 
     /// The mining part of the summary: per owned room its miners, the sources they mine, this

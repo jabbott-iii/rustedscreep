@@ -1,11 +1,12 @@
 //! Worker sizing for the opening (ROADMAP P2.4): how long one worker's round takes between a source
-//! and the controller, and how many workers keep a source busy; and the static miner's body
-//! (P3.1). The P3 body solver and hauler math replace the worker sizing; the formulas stay simple
-//! on purpose and are lower bounds where noted.
+//! and the controller, and how many workers keep a source busy; the static miner's body (P3.1);
+//! and the haulers' bodies and counts from a source's yield and trip (P3.3). The P3 body solver
+//! replaces the worker sizing; the formulas stay simple on purpose and are lower bounds where
+//! noted.
 
 use rustedscreep_consts::{
-    CARRY_CAPACITY, ENERGY_REGEN_TIME, HARVEST_POWER, MAX_CREEP_SIZE, MOVE_POWER, Part,
-    UPGRADE_CONTROLLER_POWER,
+    CARRY_CAPACITY, CONTAINER_CAPACITY, ENERGY_REGEN_TIME, HARVEST_POWER, MAX_CREEP_SIZE,
+    MOVE_POWER, Part, UPGRADE_CONTROLLER_POWER,
 };
 
 use crate::spawning::{Body, WORKER_PATTERN};
@@ -191,4 +192,131 @@ pub fn miner_body_with(capacity: u32, trip: Trip, energy: u32, carry: u32) -> Op
         *part = if i < work { Part::Work } else { Part::Carry };
     }
     Body::new(parts.get(..len)?)
+}
+
+/// A hauler's round (P3.3): one tick next to the mining tile to take a load, `trip` with every CARRY
+/// part full, the ticks to hand the load over, and `trip` back empty. Loaded, each full CARRY part
+/// weighs one; empty, only the parts that are neither MOVE nor CARRY do (V54). Handing over is one
+/// `transfer` a tick (V191) into fills that each take at most `unload` (the level's extension
+/// capacity, `EXTENSION_ENERGY_CAPACITY`), `ceil(load / unload)` of them (at least one), with a step
+/// to the next fill between two: `2 × ceil(load / unload) − 1` ticks, the most a load can take (a
+/// load the controller container takes goes in one tick; fills side by side need no step). The tick
+/// at each end is the act step's: a hauler's task is chosen again each tick, so it walks on from
+/// the tick after its take or its last transfer. `None` without a CARRY or a MOVE part. The walks
+/// are lower bounds, as [`walk_ticks`] is; the unloading an upper one. Unit: ticks.
+///
+/// Uses: `CARRY_CAPACITY`, [`walk_ticks`].
+pub fn haul_round(body: &Body, trip: Trip, unload: u32) -> Option<u32> {
+    let carry = count(body, Part::Carry);
+    let moves = count(body, Part::Move);
+    if carry == 0 {
+        return None;
+    }
+    let len = u32::try_from(body.len()).ok()?;
+    let others = len.saturating_sub(moves).saturating_sub(carry);
+    round_ticks(trip, others, carry, moves, unload)
+}
+
+/// [`haul_round`] for a body of `others` parts that make fatigue, `carry` CARRY and `moves` MOVE
+/// parts.
+fn round_ticks(trip: Trip, others: u32, carry: u32, moves: u32, unload: u32) -> Option<u32> {
+    let loaded = walk_ticks(trip, others.saturating_add(carry), moves)?;
+    let empty = walk_ticks(trip, others, moves)?;
+    let fills = carry
+        .saturating_mul(CARRY_CAPACITY)
+        .div_ceil(unload.max(1))
+        .max(1);
+    // The take, then a transfer a fill and a step between two.
+    Some(
+        loaded
+            .saturating_add(empty)
+            .saturating_add(fills.saturating_mul(2)),
+    )
+}
+
+/// Haulers of `carry` CARRY parts each, every one making a round of `round` ticks, that carry what a
+/// source of `capacity` yields with `margin_pct` to spare: the least `n` with `n × carry ×
+/// CARRY_CAPACITY × ENERGY_REGEN_TIME × 100 ≥ capacity × round × (100 + margin_pct)` (the source
+/// yields `capacity` every `ENERGY_REGEN_TIME` ticks, V184, and each hauler moves one full load a
+/// round). 0 for an empty capacity or no CARRY part. Unit: creeps.
+///
+/// Uses: `CARRY_CAPACITY`, `ENERGY_REGEN_TIME`.
+pub fn haulers_for(capacity: u32, carry: u32, round: u32, margin_pct: u32) -> u32 {
+    if capacity == 0 || carry == 0 {
+        return 0;
+    }
+    // In u64: a source's capacity, a round and the margin stay far below its range.
+    let need = u64::from(capacity)
+        .saturating_mul(u64::from(round.max(1)))
+        .saturating_mul(100u64.saturating_add(u64::from(margin_pct)));
+    let per = u64::from(carry)
+        .saturating_mul(u64::from(CARRY_CAPACITY))
+        .saturating_mul(u64::from(ENERGY_REGEN_TIME))
+        .saturating_mul(100);
+    u32::try_from(need.div_ceil(per.max(1))).unwrap_or(u32::MAX)
+}
+
+/// The haulers for a source of `capacity` whose loads travel `trip` and are handed over at most
+/// `unload` a transfer ([`haul_round`]), in a room whose spawns and extensions hold at most
+/// `energy` (P3.3): a body of CARRY then MOVE parts and how many of it carry the source's yield with
+/// `margin_pct` to spare ([`haulers_for`]). Among the bodies that cost
+/// at most `energy` and hold at most `MAX_CREEP_SIZE` parts it takes the fewest haulers (each step a
+/// hauler takes and each load it takes and hands over is a billed intent, and the steps per energy
+/// carried fall as its CARRY parts grow: fewer, larger haulers carry the same energy for fewer
+/// intents), then the least energy for all of them, then the fewest MOVE parts. MOVE parts past
+/// the ones that bring the loaded walk down to `trip.tiles` save nothing. `None` for an empty
+/// capacity, or when one CARRY and one MOVE cost more than `energy`. A hauler holds at most what a
+/// container does (`CONTAINER_CAPACITY`), since it takes whole loads.
+///
+/// Uses: `BODYPART_COST` (`Part::cost`), `MAX_CREEP_SIZE`, `CONTAINER_CAPACITY`, `CARRY_CAPACITY`,
+/// [`haul_round`], [`haulers_for`].
+pub fn hauler_plan(
+    capacity: u32,
+    trip: Trip,
+    energy: u32,
+    margin_pct: u32,
+    unload: u32,
+) -> Option<(Body, u32)> {
+    if capacity == 0 {
+        return None;
+    }
+    let carry_cost = Part::Carry.cost();
+    let move_cost = Part::Move.cost();
+    // (haulers, energy for all of them, MOVE parts, CARRY parts)
+    let mut best: Option<(u32, u64, u32, u32)> = None;
+    let most = CONTAINER_CAPACITY
+        .checked_div(CARRY_CAPACITY)
+        .unwrap_or(0)
+        .min(MAX_CREEP_SIZE.saturating_sub(1));
+    for carry in 1..=most {
+        let fixed = carry_cost.saturating_mul(carry);
+        if fixed.saturating_add(move_cost) > energy {
+            break;
+        }
+        for moves in 1..=MAX_CREEP_SIZE.saturating_sub(carry) {
+            let cost = fixed.saturating_add(move_cost.saturating_mul(moves));
+            if cost > energy {
+                break;
+            }
+            let Some(round) = round_ticks(trip, 0, carry, moves, unload) else {
+                break;
+            };
+            let n = haulers_for(capacity, carry, round, margin_pct);
+            let key = (n, u64::from(n) * u64::from(cost), moves, carry);
+            if best.is_none_or(|b| (key.0, key.1, key.2) < (b.0, b.1, b.2)) {
+                best = Some(key);
+            }
+            if walk_ticks(trip, carry, moves).is_some_and(|w| w <= trip.tiles) {
+                break;
+            }
+        }
+    }
+    let (n, _, moves, carry) = best?;
+    let mut parts = [Part::Move; MAX_CREEP_SIZE as usize];
+    let carry_n = usize::try_from(carry).ok()?;
+    let len = carry_n.checked_add(usize::try_from(moves).ok()?)?;
+    for part in parts.iter_mut().take(carry_n) {
+        *part = Part::Carry;
+    }
+    Some((Body::new(parts.get(..len)?)?, n))
 }

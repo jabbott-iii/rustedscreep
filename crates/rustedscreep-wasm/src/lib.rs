@@ -123,8 +123,9 @@ pub fn game_loop() {
                 let mut tick = sched.begin(&snapshot.tick, &cfg.scheduler, scheduler::GameClock);
                 // Critical: the rooms movement needs before anything in them can move, first.
                 movement.read_first(&mut tick, snapshot, js, &cfg.movement);
-                // Critical: the static miners (P3.1), the opening's workers and their spawn requests
-                // (P2.4), then the spawn plan, after the Critical jobs that request creeps (P2.3).
+                // Critical: the static miners (P3.1), the haulers (P3.3), the opening's workers and
+                // their spawn requests (P2.4), then the spawn plan, after the Critical jobs that
+                // request creeps (P2.3).
                 opening.plan(
                     &mut tick,
                     snapshot,
@@ -135,10 +136,12 @@ pub fn game_loop() {
                     &cfg.mining,
                     &cfg.links,
                     &cfg.repair,
+                    &cfg.hauling,
                     &cfg.movement,
                 );
                 spawn.plan(&mut tick, snapshot);
-                // Standard: the persistence loads, then the opening's repairing, building and upgrading.
+                // Standard: the persistence loads, then the opening's repairing, building and
+                // upgrading, then the haulers' transfers into the controller container (P3.3).
                 persist.load(&mut tick, snapshot.tick.time, runtime);
                 opening.work(
                     &mut tick,
@@ -156,8 +159,8 @@ pub fn game_loop() {
                 // the config in force after the loads (on a global's second loop the record loads in
                 // this same step, and the check usually completes in it).
                 consts.run(&mut tick, snapshot.tick.time, &runtime.get().log);
-                // Optional: the interim container, link and extension placement (ADR-023, ADR-024,
-                // ADR-020), after the self-check.
+                // Optional: the interim container, link and extension placement (ADR-023, ADR-025,
+                // ADR-024, ADR-020), after the self-check.
                 opening.place(
                     &mut tick,
                     snapshot,
@@ -165,6 +168,7 @@ pub fn game_loop() {
                     &cfg.opening,
                     &cfg.mining,
                     &cfg.links,
+                    &cfg.hauling,
                     &cfg.movement,
                 );
                 act.queue_console_say(snapshot, tick.commit());

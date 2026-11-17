@@ -233,9 +233,10 @@ export function profilerSim() {
     // periodic rescan comes every SCAN_INTERVAL loops after it: one unit, a sample before and after.
     const rescan = offset > 1 && (offset - 1) % SCAN_INTERVAL === 0 ? 1 : 0;
     // The opening (P2.4): its Critical and Standard jobs run one unit each for W1N1 on every loop, a sample before
-    // and after each (4 more than before P2.4), the mining job (P3.1) one unit on every loop (2 more), and its
-    // Optional placement job (ADR-020) one unit from the second loop (2 more).
-    const opening = 4 + 2 + (offset >= 2 ? 2 : 0);
+    // and after each (4 more than before P2.4), the mining job (P3.1) one unit on every loop (2 more), the haulers'
+    // Critical job (P3.3) one unit on every loop (2 more; their Standard job has a unit only for a room with a
+    // hauler to store), and its Optional placement job (ADR-020) one unit from the second loop (2 more).
+    const opening = 4 + 2 + 2 + (offset >= 2 ? 2 : 0);
     const reads = (closing.has(offset) && offset !== closeAt(noRawMemory.window) ? 1 : 0) + config;
     const want = { getUsed: (closing.has(offset) ? 7 : 6) + 2 * config + 2 * rescan + opening, segments: reads };
     const checking = offset <= constsLast;

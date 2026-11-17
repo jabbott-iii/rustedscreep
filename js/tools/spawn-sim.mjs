@@ -110,7 +110,7 @@ const ORDER_CMD = `rustedscreep.spawn("${ROOM}")`;
 const ROLE_CMD = `rustedscreep.spawn("${ROOM}", "worker")`;
 const NO_SPAWN_CMD = `rustedscreep.spawn("${OTHER}")`;
 const BAD_ROOM_CMD = 'rustedscreep.spawn("not a room")';
-const BAD_ROLE_CMD = `rustedscreep.spawn("${ROOM}", "hauler")`;
+const BAD_ROLE_CMD = `rustedscreep.spawn("${ROOM}", "nobody")`;
 const BAD_ARG_CMD = 'rustedscreep.spawn(5)';
 const CANCEL_CMD = 'rustedscreep.spawn()';
 const SUMMARY_CMD = 'rustedscreep.spawner()';
@@ -285,11 +285,12 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
     if (!c.isArray || JSON.stringify(c.body) !== JSON.stringify(BODY)) problems.push(`offset ${c.offset}: body ${JSON.stringify(c.body)}, expected ${JSON.stringify(BODY)}`);
   }
   // No request can be served while SpawnA is held and SpawnB busy, nor on the quiet tick (no request), nor once both
-  // are busy again: no spawn job runs, so the plain build reads the clock in its loop only for the economy's four
-  // jobs, one unit each for W1N1 with a sample before and after (8: the P3.1 static miners' Critical job, the P2.4
-  // opening's Critical and Standard jobs, and the Optional site placement of ADR-020; was 6 before P3.1 and 0
-  // before P2.4; the constants self-check is done by then; movement's next rescan is 50 ticks after the first).
-  const OPENING_SAMPLES = 8;
+  // are busy again: no spawn job runs, so the plain build reads the clock in its loop only for the economy's five
+  // jobs, one unit each for W1N1 with a sample before and after (10: the P3.1 static miners' Critical job, the P3.3
+  // haulers' Critical job, the P2.4 opening's Critical and Standard jobs, and the Optional site placement of ADR-020;
+  // was 8 before P3.3, 6 before P3.1 and 0 before P2.4; the haulers' Standard job has a unit only for a room with a
+  // hauler to store; the constants self-check is done by then; movement's next rescan is 50 ticks after the first).
+  const OPENING_SAMPLES = 10;
   const idle = [];
   for (let o = AGAIN_AT + 1; o < B_FREE; o++) idle.push(o);
   idle.push(QUIET, REARMED + 1);

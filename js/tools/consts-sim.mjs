@@ -247,8 +247,9 @@ function lowBucket(dir) {
   expectParts(replies.at(-1), ['optional off', 'tier-off skips 2,', 'rustedscreep consts: not run yet in this global'], 'low bucket');
   // The second loop's only readings are the config record load's two samples (P1.10), the opening's (P2.4): its
   // two jobs, Critical and Standard, run one unit each for the owned W1N1 with a sample before and after (was 2
-  // before P2.4), and the static miners' Critical job (P3.1), one unit for W1N1 (2 more).
-  const want = 2 + 4 + 2;
+  // before P2.4), the static miners' Critical job (P3.1), one unit for W1N1 (2 more), and the haulers' Critical job
+  // (P3.3), one unit for W1N1 (2 more; their Standard job has a unit only for a room with a hauler to store).
+  const want = 2 + 4 + 2 + 2;
   if (world.loopCalls[2]?.getUsed !== want) throw new Error(`low bucket: offset 2 made ${world.loopCalls[2]?.getUsed} getUsed calls, expected ${want}`);
   if (Object.values(counts).some((c) => c.names || c.descriptors)) throw new Error(`low bucket: the check read the global: ${JSON.stringify(counts)}`);
 }

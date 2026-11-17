@@ -516,6 +516,43 @@ pub const REPAIR_MMO: RepairConfig = RepairConfig {
     walk_pct: 50,
 };
 
+/// Haulers (ROADMAP P3.3, ADR-025): creeps that carry a mined source's energy from its mining tile
+/// to the spawns and extensions, then to the controller container. `docs/TUNING.md` gives each
+/// one's rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HaulingConfig {
+    /// Requests haulers for each mined source that sends no energy through a link, once the
+    /// room's controller container stands (`economy::hauling`). Off, no new hauler is requested;
+    /// live ones keep hauling, and the opening's workers carry once none is left.
+    pub enabled: bool,
+    /// Places the controller container's site (ADR-025) in the Optional tier, after the mining
+    /// tiles' containers, once a source's miner is paid for, the room is at `container_level` and
+    /// haulers are on. Off, haulers start only once a container stands within upgrading range of
+    /// the controller (placed by hand).
+    pub place_container: bool,
+    /// The controller level from which the controller container's site is placed: below it the
+    /// room's energy goes to its level's extensions and the mining tiles' containers first.
+    /// Unit: level.
+    pub container_level: u32,
+    /// The most haulers one source gets: past it the source's container fills and its overflow
+    /// piles, so the cap bounds the spawn time a long trip at a low capacity can take. Unit:
+    /// creeps.
+    pub max_per_source: u32,
+    /// Spare carrying the sizing adds on top of the source's yield over a hauler's round, which is
+    /// a lower bound (a walk can take a tick more per tile with rounding, and traffic). Unit:
+    /// percent.
+    pub margin_pct: u32,
+}
+
+/// Hauling values for the official MMO.
+pub const HAULING_MMO: HaulingConfig = HaulingConfig {
+    enabled: true,
+    place_container: true,
+    container_level: 3,
+    max_per_source: 4,
+    margin_pct: 0,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -532,6 +569,7 @@ pub struct Config {
     pub mining: MiningConfig,
     pub links: LinkConfig,
     pub repair: RepairConfig,
+    pub hauling: HaulingConfig,
 }
 
 /// A server profile: a name and its values.
@@ -557,6 +595,7 @@ pub const MMO: Profile = Profile {
         mining: MINING_MMO,
         links: LINK_MMO,
         repair: REPAIR_MMO,
+        hauling: HAULING_MMO,
     },
 };
 
@@ -717,7 +756,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 73;
+pub const FIELD_COUNT: usize = 78;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -959,6 +998,11 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     flag!(repair, "RepairConfig", enabled, true),
     number!(repair, "RepairConfig", start_pct, 10, 99, true),
     number!(repair, "RepairConfig", walk_pct, 5, 99, true),
+    flag!(hauling, "HaulingConfig", enabled, true),
+    flag!(hauling, "HaulingConfig", place_container, true),
+    number!(hauling, "HaulingConfig", container_level, 1, 8, true),
+    number!(hauling, "HaulingConfig", max_per_source, 1, 10, true),
+    number!(hauling, "HaulingConfig", margin_pct, 0, 100, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -1160,6 +1204,7 @@ mod tests {
             mining: _,
             links: _,
             repair: _,
+            hauling: _,
         } = MMO.config;
         let SpawnConfig { hold_ticks: _ } = SPAWN_MMO;
         let OpeningConfig {
@@ -1189,7 +1234,14 @@ mod tests {
             start_pct: _,
             walk_pct: _,
         } = REPAIR_MMO;
-        let expected: [(&str, &[&str]); 12] = [
+        let HaulingConfig {
+            enabled: _,
+            place_container: _,
+            container_level: _,
+            max_per_source: _,
+            margin_pct: _,
+        } = HAULING_MMO;
+        let expected: [(&str, &[&str]); 13] = [
             (
                 "loader",
                 &[
@@ -1296,6 +1348,16 @@ mod tests {
                 ],
             ),
             ("repair", &["enabled", "start_pct", "walk_pct"]),
+            (
+                "hauling",
+                &[
+                    "enabled",
+                    "place_container",
+                    "container_level",
+                    "max_per_source",
+                    "margin_pct",
+                ],
+            ),
         ];
         let mut total = 0;
         for (group, names) in expected {
