@@ -20,8 +20,12 @@
 //! Containers (P3.1, ADR-023): energy made on a tile (a harvest's overflow, a decayed tombstone)
 //! goes into a container there first, up to `CONTAINER_CAPACITY`, and the rest onto a pile (V193);
 //! `withdraw` takes from one (V192); a finished container site becomes one; a container refuses
-//! another site on its tile (V205). Their decay is left out (a new one lasts about 24550 ticks
-//! unrepaired in an owned room, V214, beyond every scenario here).
+//! another site on its tile (V205). A new container has `CONTAINER_HITS` and loses `CONTAINER_DECAY`
+//! hits `CONTAINER_DECAY_TIME` − 1 ticks after it is built, then every `CONTAINER_DECAY_TIME_OWNED`
+//! − 1 (an owned room); at 0 hits its energy goes onto a pile and it is gone (V214). A repair (P3.5)
+//! is refused out of range 3 or with no energy (V221); at full hits it is billed and does nothing;
+//! otherwise it adds `min(REPAIR_POWER × WORK, energy / REPAIR_COST, hits missing)` for
+//! `ceil(hits × REPAIR_COST)` energy (V222), in the processor's order after harvest (V45).
 //! Links (P3.2, ADR-024): a finished link site becomes a link holding up to `LINK_CAPACITY`; a
 //! creep's transfer into one moves `min(stock, free space)` and `withdraw` takes `min(free space,
 //! energy)`, refused when it is empty (V220); a send is checked against the tick's start (cooldown,
@@ -40,7 +44,7 @@ use super::sizing::{
 use super::*;
 use crate::config::{
     CACHE_MMO, LINK_MMO, LinkConfig, MINING_MMO, MMO, MOVEMENT_MMO, MiningConfig, OPENING_MMO,
-    OpeningConfig, SPAWN_MMO,
+    OpeningConfig, REPAIR_MMO, RepairConfig, SPAWN_MMO,
 };
 use crate::intents::{ActLog, CreepIntent, IntentBuffer, Outcome, Target, TargetRow};
 use crate::movement::{
@@ -53,13 +57,14 @@ use crate::snapshot::{
 };
 use crate::spawning::{Body, Identity, Role, Spawner, WORKER_PATTERN};
 use rustedscreep_consts::{
-    BUILD_POWER, CARRY_CAPACITY, CONTAINER_CAPACITY, CONTROLLER_DOWNGRADE_RESTORE, CREEP_LIFE_TIME,
+    BUILD_POWER, CARRY_CAPACITY, CONTAINER_CAPACITY, CONTAINER_DECAY, CONTAINER_DECAY_TIME,
+    CONTAINER_DECAY_TIME_OWNED, CONTAINER_HITS, CONTROLLER_DOWNGRADE_RESTORE, CREEP_LIFE_TIME,
     ENERGY_DECAY, ENERGY_REGEN_TIME, ErrorCode, HARVEST_POWER, LINK_CAPACITY, LINK_COOLDOWN,
     MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, MOVE_POWER, Part, Position,
-    RoomCoordinate, RoomName, SOURCE_ENERGY_CAPACITY, SOURCE_ENERGY_KEEPER_CAPACITY,
-    SOURCE_ENERGY_NEUTRAL_CAPACITY, SPAWN_ENERGY_CAPACITY, SPAWN_ENERGY_START, StructureType,
-    TOMBSTONE_DECAY_PER_PART, Terrain, UPGRADE_CONTROLLER_POWER, controller_downgrade,
-    controller_levels, extension_energy_capacity,
+    REPAIR_COST, REPAIR_POWER, RoomCoordinate, RoomName, SOURCE_ENERGY_CAPACITY,
+    SOURCE_ENERGY_KEEPER_CAPACITY, SOURCE_ENERGY_NEUTRAL_CAPACITY, SPAWN_ENERGY_CAPACITY,
+    SPAWN_ENERGY_START, StructureType, TOMBSTONE_DECAY_PER_PART, Terrain, UPGRADE_CONTROLLER_POWER,
+    controller_downgrade, controller_levels, extension_energy_capacity,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -584,11 +589,14 @@ enum Loose {
         energy: u32,
         decay_at: u32,
     },
-    /// A container (ADR-023): it holds up to `CONTAINER_CAPACITY` and never decays here.
+    /// A container (ADR-023): it holds up to `CONTAINER_CAPACITY`, and loses `CONTAINER_DECAY` hits
+    /// once the tick reaches `decay_at` − 1 (V214).
     Container {
         key: u128,
         at: Tile,
         energy: u32,
+        hits: u32,
+        decay_at: u32,
     },
 }
 
@@ -640,6 +648,16 @@ struct World {
     cfg: OpeningConfig,
     mining_cfg: MiningConfig,
     link_cfg: LinkConfig,
+    repair_cfg: RepairConfig,
+    /// Repairs (P3.5): calls that repaired, hits added, energy spent, and calls at full hits (billed
+    /// for nothing); containers that decayed away.
+    repairs: u32,
+    repaired: u64,
+    repair_energy: u64,
+    repair_noops: u32,
+    containers_lost: u32,
+    /// The container tile of every repair call that repaired.
+    repair_log: Vec<Tile>,
     /// Sites the bot's placement asked for: extensions accepted, containers accepted, links accepted
     /// (in the order placed), refused by the model.
     placed: u32,
@@ -682,6 +700,12 @@ struct World {
     struct_rows: Vec<StructRow>,
     obj_rows: Vec<ObjRow>,
     at_level_up: LevelUp,
+}
+
+/// Uses: REPAIR_COST. The hits a repair adds per energy: the engine divides the creep's energy by
+/// `REPAIR_COST` in doubles (V222), which gives exactly 100 per energy for every store up to 2000.
+fn hits_per_energy() -> u32 {
+    (1.0 / f64::from(REPAIR_COST)).round() as u32
 }
 
 fn count(body: &Body, part: Part) -> u32 {
@@ -736,6 +760,13 @@ impl World {
             cfg: OPENING_MMO,
             mining_cfg: MINING_MMO,
             link_cfg: LINK_MMO,
+            repair_cfg: REPAIR_MMO,
+            repairs: 0,
+            repaired: 0,
+            repair_energy: 0,
+            repair_noops: 0,
+            containers_lost: 0,
+            repair_log: Vec::new(),
             placed: 0,
             placed_containers: 0,
             placed_links: Vec::new(),
@@ -936,12 +967,16 @@ impl World {
         }
         self.obj_rows.clear();
         let room = self.room;
-        let push = |snap: &mut Snapshot, key: u128, kind, at: Position, amount, total| {
+        let push = |snap: &mut Snapshot, key: u128, kind, at: Position, amount, total, hits| {
             snap.objects
                 .push(
                     ObjectKey(key),
                     || Ok(ObjectStatic { kind, pos: at }),
-                    ObjectRow { amount, total },
+                    ObjectRow {
+                        amount,
+                        total,
+                        hits,
+                    },
                 )
                 .expect("object");
         };
@@ -953,6 +988,7 @@ impl World {
                 place(room, s.at),
                 s.energy,
                 SOURCE_ENERGY_CAPACITY,
+                0,
             );
             self.obj_rows.push(ObjRow::Source(i));
         }
@@ -964,18 +1000,25 @@ impl World {
                 place(room, s.at),
                 s.progress,
                 s.total,
+                0,
             );
             self.obj_rows.push(ObjRow::Site(i));
         }
         for (i, l) in self.loose.iter().enumerate() {
-            let (key, kind, at, amount) = match *l {
-                Loose::Pile { key, at, amount } => (key, ObjectKind::Energy, at, amount),
+            let (key, kind, at, amount, hits) = match *l {
+                Loose::Pile { key, at, amount } => (key, ObjectKind::Energy, at, amount, 0),
                 Loose::Tomb {
                     key, at, energy, ..
-                } => (key, ObjectKind::Tombstone, at, energy),
-                Loose::Container { key, at, energy } => (key, ObjectKind::Container, at, energy),
+                } => (key, ObjectKind::Tombstone, at, energy, 0),
+                Loose::Container {
+                    key,
+                    at,
+                    energy,
+                    hits,
+                    ..
+                } => (key, ObjectKind::Container, at, energy, hits),
             };
-            push(&mut self.snap, key, kind, place(room, at), amount, 0);
+            push(&mut self.snap, key, kind, place(room, at), amount, 0, hits);
             self.obj_rows.push(ObjRow::Loose(i));
         }
         self.snap.finish();
@@ -1034,6 +1077,7 @@ impl World {
         for unit in 0..self.opening.room_count() {
             let room = self.opening.room_name(unit).expect("room");
             let mined = self.mining.mined(room).to_vec();
+            let tiles = self.mining.mine_tiles(room).to_vec();
             let receivers = self.mining.receivers(room).to_vec();
             self.opening
                 .plan_room(
@@ -1043,8 +1087,10 @@ impl World {
                     &mut self.spawner,
                     &mut self.buffer,
                     &cfg,
+                    &self.repair_cfg,
                     &mcfg,
                     &mined,
+                    &tiles,
                     &receivers,
                     &mut commit,
                 )
@@ -1385,6 +1431,39 @@ impl World {
                 self.creeps[actor].energy += amount;
                 Outcome::Ok
             }
+            (CreepIntent::RepairObject { .. }, Some(TargetRow::Object(row))) => {
+                let ObjRow::Loose(i) = self.obj_rows[row as usize] else {
+                    return fail;
+                };
+                let Loose::Container { at, hits, .. } = &mut self.loose[i] else {
+                    return fail;
+                };
+                // The game side (V221): energy, then range.
+                if c.energy == 0 {
+                    return Outcome::Failed(ErrorCode::NotEnough);
+                }
+                if !near(c.at, *at, 3) {
+                    return Outcome::Failed(ErrorCode::NotInRange);
+                }
+                // The processor (V222): billed for nothing at full hits.
+                if *hits >= CONTAINER_HITS {
+                    self.repair_noops += 1;
+                    return Outcome::Ok;
+                }
+                let per_energy = hits_per_energy();
+                let effect = (REPAIR_POWER * work)
+                    .min(c.energy * per_energy)
+                    .min(CONTAINER_HITS - *hits);
+                let cost = c.energy.min(effect.div_ceil(per_energy));
+                *hits += effect;
+                let at = *at;
+                self.creeps[actor].energy -= cost;
+                self.repair_log.push(at);
+                self.repairs += 1;
+                self.repaired += u64::from(effect);
+                self.repair_energy += u64::from(cost);
+                Outcome::Ok
+            }
             other => panic!("the opening queued {other:?}"),
         }
     }
@@ -1577,6 +1656,8 @@ impl World {
                     key,
                     at: s.at,
                     energy: 0,
+                    hits: CONTAINER_HITS,
+                    decay_at: now + CONTAINER_DECAY_TIME,
                 });
                 continue;
             }
@@ -1673,13 +1754,30 @@ impl World {
                         *decay_at = 0;
                     }
                 }
-                Loose::Container { .. } => {}
+                // containers/tick.js (V214): the owned room's wait after each step.
+                Loose::Container {
+                    at,
+                    energy,
+                    hits,
+                    decay_at,
+                    ..
+                } => {
+                    if now >= *decay_at - 1 {
+                        *hits = hits.saturating_sub(CONTAINER_DECAY);
+                        *decay_at = now + CONTAINER_DECAY_TIME_OWNED;
+                        if *hits == 0 {
+                            dropped.push((*at, *energy));
+                            *energy = 0;
+                            self.containers_lost += 1;
+                        }
+                    }
+                }
             }
         }
         self.loose.retain(|l| match l {
             Loose::Pile { amount, .. } => *amount > 0,
             Loose::Tomb { decay_at, .. } => *decay_at > 0,
-            Loose::Container { .. } => true,
+            Loose::Container { hits, .. } => *hits > 0,
         });
         for (at, energy) in dropped {
             if energy > 0 {
@@ -2625,7 +2723,8 @@ fn ticks_to_rcl4(mining: MiningConfig, limit: u32) -> Option<u32> {
 /// The P2 gate's fresh room, on to RCL4 (`CONTROLLER_LEVELS[1..=3]`), with no manual action: with
 /// static miners and their containers (the default) it gets there sooner than the opening alone,
 /// after paying for the containers' `CONSTRUCTION_COST` and the miners at RCL2. 17334 ticks
-/// against 18643 in the scenario room (2026-11-16, P3.1).
+/// against 18643 in the scenario room (2026-11-16, P3.1); 17407 with the containers' decay and
+/// repairs (P3.5).
 #[test]
 fn static_mining_reaches_rcl4_sooner() {
     let need: u32 = (1..=3).map(|l| controller_levels(l).expect("level")).sum();
@@ -2865,7 +2964,8 @@ fn steady_progress(level: u8, links: LinkConfig) -> (u32, u64) {
 /// 2026-11-16: RCL5 162285 against 154665 progress (+4.9%), 4.83 against 5.13 billed a tick; RCL6
 /// 164133 against 156211 (+5.1%), 4.32 against 4.50. Counted from tick 0, the links' build cost
 /// (`CONSTRUCTION_COST` 5000 each) is paid back by tick 24000 at RCL5 (286491 against 286604), not
-/// yet at RCL6 (279027 against 281219).
+/// yet at RCL6 (279027 against 281219). With the containers' decay and repairs (P3.5): RCL5 160537
+/// against 152910 (+5.0%), RCL6 161762 against 151348 (+6.9%).
 #[test]
 fn links_raise_the_upgrade_rate() {
     let off = LinkConfig {
@@ -3068,4 +3168,441 @@ impl NearerOf for Tile {
             (other, self)
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Repairs (P3.5)
+
+/// Uses: CONTAINER_HITS. A container is repaired below `start_pct` of its `hitsMax`, and once under
+/// repair up to full; never at full hits.
+#[test]
+fn a_container_needs_repair_below_the_share_until_full() {
+    let pct = REPAIR_MMO.start_pct;
+    let start = u32::try_from(u64::from(CONTAINER_HITS) * u64::from(pct) / 100).expect("fits");
+    assert!(needs_repair(start - 1, pct, false));
+    assert!(!needs_repair(start, pct, false), "at the share it waits");
+    assert!(needs_repair(start, pct, true), "under repair it goes on");
+    assert!(needs_repair(CONTAINER_HITS - 1, pct, true));
+    assert!(!needs_repair(CONTAINER_HITS, pct, true), "full is done");
+    assert!(!needs_repair(CONTAINER_HITS, 99, false));
+    for pct in [10, 50, 99] {
+        let start = u32::try_from(u64::from(CONTAINER_HITS) * u64::from(pct) / 100).expect("fits");
+        assert!(needs_repair(start - 1, pct, false), "{pct}");
+        assert!(!needs_repair(start, pct, false), "{pct}");
+    }
+}
+
+/// The tile next to source 0 (8,30) that is nearest the spawn: its mining tile, where a container
+/// wins (P3.1).
+const WORN_TILE: (u8, u8) = (9, 29);
+
+/// A room at RCL3 with a full spawn and no creeps, and a container on source 0's mining tile with
+/// `hits`, its next decay step `CONTAINER_DECAY_TIME_OWNED` − 1 ticks away (V214).
+fn worn_container_world(hits: u32) -> World {
+    let mut w = World::new(3, SPAWN_ENERGY_CAPACITY);
+    let key = w.key();
+    let at = tile(WORN_TILE.0, WORN_TILE.1);
+    let decay_at = w.time + CONTAINER_DECAY_TIME_OWNED;
+    w.loose.push(Loose::Container {
+        key,
+        at,
+        energy: 0,
+        hits,
+        decay_at,
+    });
+    w
+}
+
+/// Uses: CONTAINER_HITS, CONTAINER_DECAY, CONTAINER_DECAY_TIME_OWNED, CREEP_LIFE_TIME, and
+/// `repair.start_pct`. [`worn_container_world`] at full hits after a creep life: workers settled at
+/// both sources (the placement built source 1's container meanwhile, ADR-023), and the worn
+/// container still above the share (it took fewer than `CREEP_LIFE_TIME` /
+/// `CONTAINER_DECAY_TIME_OWNED` + 1 steps), so nothing was repaired yet.
+fn settled_world() -> World {
+    let mut w = worn_container_world(CONTAINER_HITS);
+    w.run(CREEP_LIFE_TIME);
+    let steps = CREEP_LIFE_TIME / CONTAINER_DECAY_TIME_OWNED + 1;
+    assert!(!below_share(
+        CONTAINER_HITS - steps * CONTAINER_DECAY,
+        REPAIR_MMO.start_pct
+    ));
+    assert_eq!(w.repairs, 0, "above the share: no repair");
+    w
+}
+
+/// The hits of the container at `at`, or `None` once it is gone.
+fn hits_at(w: &World, at: Tile) -> Option<u32> {
+    w.loose.iter().find_map(|l| match *l {
+        Loose::Container { at: a, hits, .. } if a == at => Some(hits),
+        _ => None,
+    })
+}
+
+/// The worn container's hits, or `None` once it is gone.
+fn worn_hits(w: &World) -> Option<u32> {
+    hits_at(w, tile(WORN_TILE.0, WORN_TILE.1))
+}
+
+/// Sets the hits of the container at `at`, and its next decay step `CONTAINER_DECAY_TIME_OWNED` − 1
+/// ticks from now (V214).
+fn set_container(w: &mut World, at: Tile, to: u32) {
+    let next = w.time + CONTAINER_DECAY_TIME_OWNED;
+    for l in &mut w.loose {
+        if let Loose::Container {
+            at: a,
+            hits,
+            decay_at,
+            ..
+        } = l
+            && *a == at
+        {
+            *hits = to;
+            *decay_at = next;
+        }
+    }
+}
+
+/// The share `pct` of `CONTAINER_HITS` (`repair.start_pct`, `repair.walk_pct`). Uses: CONTAINER_HITS.
+fn share(pct: u32) -> u32 {
+    u32::try_from(u64::from(CONTAINER_HITS) * u64::from(pct) / 100).expect("fits")
+}
+
+/// Uses: CONTAINER_HITS, CONTAINER_DECAY, REPAIR_POWER, CREEP_LIFE_TIME. In a settled RCL3 room
+/// ([`settled_world`]), the container on source 0's mining tile set one decay step below
+/// `repair.start_pct` of its `hitsMax` is repaired up to full within half a creep life, by one
+/// worker at a time, each within repair range of it when it is given the task (the container stays
+/// above `repair.walk_pct`); no repair is billed at full hits (V222); the repairs add at least the
+/// hits that were missing, at most `REPAIR_POWER` per WORK part of the largest worker per call;
+/// once it is full the room has nothing under repair.
+#[test]
+fn a_worn_container_is_repaired_to_full() {
+    let start = share(REPAIR_MMO.start_pct);
+    let mut w = settled_world();
+    let worn = tile(WORN_TILE.0, WORN_TILE.1);
+    set_container(&mut w, worn, start - CONTAINER_DECAY);
+    let from = w.time;
+    let mut full_at = None;
+    let mut most_repairers = 0;
+    let repair = Task::KINDS
+        .iter()
+        .position(|&k| k == "repair")
+        .expect("kind");
+    for _ in 0..CREEP_LIFE_TIME / 2 {
+        w.step();
+        let (_, _, _, stats) = w.opening.room_states().next().expect("room");
+        most_repairers = most_repairers.max(stats.tasks[repair]);
+        assert!(!below_share(
+            worn_hits(&w).expect("there"),
+            REPAIR_MMO.walk_pct
+        ));
+        assert_eq!(
+            repairers_out_of_range(&w),
+            0,
+            "a worker walked at {}",
+            w.time
+        );
+        if worn_hits(&w) == Some(CONTAINER_HITS) {
+            full_at = Some(w.time - from);
+            break;
+        }
+    }
+    assert!(
+        full_at.is_some(),
+        "full within half a creep life: {:?}",
+        worn_hits(&w)
+    );
+    assert_eq!(most_repairers, 1, "one worker per container");
+    assert_eq!(w.repair_noops, 0, "no repair billed at full hits");
+    assert_eq!(w.failed, 0);
+    assert!(
+        w.repair_log.iter().all(|&t| t == worn),
+        "only that container"
+    );
+    // What the repairs added: the hits missing plus any decay step since.
+    assert!(w.repaired >= u64::from(CONTAINER_HITS - (start - CONTAINER_DECAY)));
+    // A call repairs at most `REPAIR_POWER` per WORK part of the largest worker.
+    let max_work = w
+        .creeps
+        .iter()
+        .filter(|c| c.identity.role == Role::Worker)
+        .map(|c| u64::from(count(&c.body, Part::Work)))
+        .max()
+        .expect("workers");
+    assert!(w.repaired <= u64::from(w.repairs) * max_work * u64::from(REPAIR_POWER));
+    // Full now: nothing under repair, and no repair task on the next tick.
+    w.step();
+    let (_, _, _, stats) = w.opening.room_states().next().expect("room");
+    assert_eq!(stats.repairing, 0);
+    // Both mining tiles' containers, source 1's built meanwhile (ADR-023).
+    let tiles = w.mining.mine_tiles(w.room).to_vec();
+    let on_tiles = w
+        .loose
+        .iter()
+        .filter(|l| matches!(**l, Loose::Container { at, .. } if tiles.contains(&w.pos(at))))
+        .count();
+    assert_eq!(stats.containers as usize, on_tiles);
+    assert_eq!(stats.tasks[repair], 0);
+}
+
+/// Workers given a repair this tick (as the snapshot placed them, before their moves) farther than
+/// repair range (3, V221) from the container at `at`, or from any container with `None`.
+fn walking_repairers(w: &World, at: Option<Tile>) -> usize {
+    let snap = &w.snap;
+    (0..snap.creeps.len())
+        .filter(|&row| {
+            let h = snap.creeps.handles()[row];
+            let Some(Task::Repair(o)) = w.opening.task(h) else {
+                return false;
+            };
+            let from = tile_of(snap.creeps.positions()[row]);
+            let to = tile_of(snap.objects.positions()[snap.objects.row_of(o).expect("row")]);
+            at.is_none_or(|t| t == to) && from.range(to) > 3
+        })
+        .count()
+}
+
+fn repairers_out_of_range(w: &World) -> usize {
+    walking_repairers(w, None)
+}
+
+/// Uses: CONTAINER_HITS, CONTAINER_DECAY, CREEP_LIFE_TIME. A container off the mining plan's tiles
+/// (a previous owner's, say) is never repaired, even below `repair.walk_pct`, and the room's
+/// summary counts only the containers on its mining tiles (the user's choice, 2026-11-16: "Mining
+/// tiles only").
+#[test]
+fn a_container_off_the_mining_tiles_is_never_repaired() {
+    let mut w = settled_world();
+    let far = tile(44, 44);
+    let key = w.key();
+    let decay_at = w.time + CONTAINER_DECAY_TIME_OWNED;
+    w.loose.push(Loose::Container {
+        key,
+        at: far,
+        energy: 0,
+        hits: share(REPAIR_MMO.walk_pct) - CONTAINER_DECAY,
+        decay_at,
+    });
+    w.run(CREEP_LIFE_TIME);
+    assert!(
+        !w.repair_log.contains(&far),
+        "repaired off the mining tiles"
+    );
+    assert!(hits_at(&w, far).expect("there") < share(REPAIR_MMO.walk_pct));
+    let (_, _, _, stats) = w.opening.room_states().next().expect("room");
+    let tiles = w.mining.mine_tiles(w.room).to_vec();
+    assert!(!tiles.contains(&w.pos(far)));
+    let on_tiles = w
+        .loose
+        .iter()
+        .filter(|l| matches!(**l, Loose::Container { at, .. } if tiles.contains(&w.pos(at))))
+        .count();
+    assert_eq!(stats.containers as usize, on_tiles);
+}
+
+/// Uses: CONTAINER_HITS, CONTAINER_DECAY, CONTAINER_DECAY_TIME_OWNED, CREEP_LIFE_TIME. At RCL5 with
+/// the link network (one source link, `links.source_links`), the linked source's container, whose
+/// gatherers wait at the controller link instead (P3.2), set between `repair.walk_pct` and
+/// `repair.start_pct`: under repair, but over a creep life (three decay steps, still above the walk
+/// share) no worker is sent to it from outside repair range. Set below `repair.walk_pct`, it is
+/// repaired back above that share within a creep life.
+#[test]
+fn a_linked_container_waits_for_the_walk_share() {
+    let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
+    let mut linked = None;
+    for _ in 0..24 {
+        w.run(500);
+        let (_, plan, _, _) = w.opening.room_states().next().expect("room");
+        let source = plan.and_then(|p| p.sources.iter().find(|s| s.linked).map(|s| s.pos));
+        let (_, mine, _) = w.mining.room_states().next().expect("room");
+        linked = source.and_then(|src| {
+            mine.and_then(|m| m.sources.iter().find(|s| s.source == src))
+                .and_then(|s| s.tile)
+        });
+        if linked.is_some_and(|t| hits_at(&w, tile_of(t)).is_some()) {
+            break;
+        }
+    }
+    let at = tile_of(linked.expect("a linked source within 12000 ticks"));
+    let walk = share(REPAIR_MMO.walk_pct);
+    // Three steps in a creep life, each `CONTAINER_DECAY`: still above the walk share.
+    set_container(&mut w, at, walk + 4 * CONTAINER_DECAY);
+    for _ in 0..CREEP_LIFE_TIME {
+        w.step();
+        assert_eq!(walking_repairers(&w, Some(at)), 0, "walked at {}", w.time);
+    }
+    let hits = hits_at(&w, at).expect("there");
+    assert!(below_share(hits, REPAIR_MMO.start_pct) && !below_share(hits, REPAIR_MMO.walk_pct));
+    let (_, _, _, stats) = w.opening.room_states().next().expect("room");
+    assert!(stats.repairing >= 1, "under repair all the same");
+    // Below the walk share: repaired back above it.
+    set_container(&mut w, at, walk - CONTAINER_DECAY);
+    let mut back = false;
+    for _ in 0..CREEP_LIFE_TIME {
+        w.step();
+        if !below_share(hits_at(&w, at).expect("there"), REPAIR_MMO.walk_pct) {
+            back = true;
+            break;
+        }
+    }
+    assert!(back, "repaired above the walk share: {:?}", hits_at(&w, at));
+    assert!(w.repair_log.contains(&at));
+    assert_eq!(w.repair_noops, 0);
+    assert_eq!(w.failed, 0);
+}
+
+/// Uses: CONTAINER_HITS, CARRY_CAPACITY. With one free worker (the spawn kept busy, nothing to fill,
+/// build or upgrade by rule) and both mining tiles' containers below `repair.walk_pct` with equal
+/// hits, the worker keeps the container it started on until its store is empty, though its own
+/// repairs make the other one the fewest (no swapping between them).
+#[test]
+fn a_repairer_keeps_its_container() {
+    let mut w = World::new(3, SPAWN_ENERGY_CAPACITY);
+    w.cfg = OpeningConfig {
+        min_upgraders: 0,
+        place_extensions: false,
+        ..OPENING_MMO
+    };
+    w.mining_cfg = MiningConfig {
+        place_containers: false,
+        ..MINING_MMO
+    };
+    for s in &mut w.stores {
+        if s.spawn_energy() {
+            s.energy = s.capacity;
+        }
+    }
+    let home = w.room;
+    // The spawn stays busy: a creep spawning for the whole test.
+    let key = w.key();
+    w.creeps.push(SimCreep {
+        key,
+        identity: Identity {
+            role: Role::Worker,
+            home,
+            serial: 1,
+        },
+        at: tile(25, 25),
+        body: repeats(1),
+        energy: 0,
+        fatigue: 0,
+        spawning: u32::MAX / 2,
+        born: 0,
+    });
+    w.step();
+    let tiles = w.mining.mine_tiles(home).to_vec();
+    assert_eq!(tiles.len(), 2, "two mining tiles");
+    let hits = share(REPAIR_MMO.walk_pct) - CONTAINER_DECAY;
+    for &t in &tiles {
+        let key = w.key();
+        w.loose.push(Loose::Container {
+            key,
+            at: tile_of(t),
+            energy: 0,
+            hits,
+            decay_at: u32::MAX / 2,
+        });
+    }
+    let key = w.key();
+    let body = repeats(4);
+    let energy = count(&body, Part::Carry) * CARRY_CAPACITY;
+    w.creeps.push(SimCreep {
+        key,
+        identity: Identity {
+            role: Role::Worker,
+            home,
+            serial: 2,
+        },
+        at: tile(25, 20),
+        body,
+        energy,
+        fatigue: 0,
+        spawning: 0,
+        born: w.time,
+    });
+    let mut targets = Vec::new();
+    for _ in 0..200 {
+        w.step();
+        let Some(h) = w.snap.creeps.handle_of(ObjectKey(key)) else {
+            continue;
+        };
+        match w.opening.task(h) {
+            Some(Task::Repair(o)) => targets.push(o),
+            _ if !targets.is_empty() => break,
+            _ => {}
+        }
+    }
+    assert!(!targets.is_empty(), "it repaired");
+    assert!(
+        targets.iter().all(|&o| o == targets[0]),
+        "it swapped containers: {targets:?}"
+    );
+    assert!(!w.repair_log.is_empty());
+    assert!(w.repair_log.iter().all(|&t| t == w.repair_log[0]));
+}
+
+/// Uses: CONTAINER_HITS, CONTAINER_DECAY, CONTAINER_DECAY_TIME_OWNED, CREEP_LIFE_TIME. In a settled
+/// room ([`settled_world`]), a container above `repair.start_pct` is not repaired, though workers
+/// with energy stand within repair range of it (its gatherers take their loads there), until a
+/// decay step takes it below the share; then it is repaired up to full.
+#[test]
+fn a_container_above_the_share_waits_for_it() {
+    let start = share(REPAIR_MMO.start_pct);
+    let mut w = settled_world();
+    let worn = tile(WORN_TILE.0, WORN_TILE.1);
+    set_container(&mut w, worn, start + CONTAINER_DECAY / 2);
+    // Its next step comes on the tick `CONTAINER_DECAY_TIME_OWNED` − 1 on (V214).
+    let mut near = 0;
+    for _ in 0..CONTAINER_DECAY_TIME_OWNED - 1 {
+        w.step();
+        let snap = &w.snap;
+        near += (0..snap.creeps.len())
+            .filter(|&row| {
+                snap.creeps.stores()[row].energy > 0
+                    && tile_of(snap.creeps.positions()[row]).range(worn) <= 3
+                    && snap.creeps.identities()[row].is_some_and(|id| id.role == Role::Worker)
+            })
+            .count();
+    }
+    assert!(near > 0, "workers with energy came within range");
+    assert_eq!(worn_hits(&w), Some(start + CONTAINER_DECAY / 2));
+    assert!(!w.repair_log.contains(&worn), "above the share: no repair");
+    w.run(1);
+    assert_eq!(worn_hits(&w), Some(start - CONTAINER_DECAY / 2), "the step");
+    let mut full = false;
+    for _ in 0..CREEP_LIFE_TIME {
+        w.step();
+        if worn_hits(&w) == Some(CONTAINER_HITS) {
+            full = true;
+            break;
+        }
+    }
+    assert!(full, "repaired to full once below: {:?}", worn_hits(&w));
+    assert_eq!(w.repair_noops, 0);
+}
+
+/// Uses: CONTAINER_DECAY, CONTAINER_DECAY_TIME_OWNED. In a settled room ([`settled_world`]), the
+/// container on source 0's mining tile set one decay step from gone is lost on that step with
+/// `repair.enabled` off (no repair call), and kept with it on: its gatherers come within range of
+/// it within the step's `CONTAINER_DECAY_TIME_OWNED` − 1 ticks.
+#[test]
+fn repairs_keep_a_container_that_would_decay_away() {
+    let run = |enabled: bool| {
+        let mut w = settled_world();
+        w.repair_cfg = RepairConfig {
+            enabled,
+            ..REPAIR_MMO
+        };
+        set_container(&mut w, tile(WORN_TILE.0, WORN_TILE.1), CONTAINER_DECAY);
+        w.run(CONTAINER_DECAY_TIME_OWNED);
+        w
+    };
+    let off = run(false);
+    assert_eq!(worn_hits(&off), None, "gone without repairs");
+    assert_eq!(off.containers_lost, 1);
+    assert_eq!(off.repairs, 0);
+    let on = run(true);
+    assert!(worn_hits(&on).is_some(), "kept with repairs");
+    assert_eq!(on.containers_lost, 0);
+    assert!(on.repairs > 0);
+    assert_eq!(on.repair_noops, 0);
 }

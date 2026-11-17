@@ -123,7 +123,7 @@ Modules:
 - [x] Link network.
 - [ ] Haulers sized from distance and throughput math.
 - [ ] Upgraders sized to the energy budget.
-- [ ] Minimal builders and repairers.
+- [x] Minimal builders and repairers.
 - [ ] Body solver from targets, with no hardcoded bodies.
 
 **Gate:**

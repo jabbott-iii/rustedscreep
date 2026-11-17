@@ -693,6 +693,10 @@ function __wbg_get_imports() {
             const ret = arg0.controller;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
+        __wbg_cooldown_8fda531aeb5efb9e: function(arg0) {
+            const ret = arg0.cooldown;
+            return ret;
+        },
         __wbg_createConstructionSite_a90a513098a438f4: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg0.createConstructionSite(arg1, arg2, __wbindgen_enum_StructureType[arg3]);
             return ret;
@@ -809,6 +813,10 @@ function __wbg_get_imports() {
             const ret = arg0.heal(arg1);
             return ret;
         }, arguments); },
+        __wbg_hits_internal_2e8a79b1c6a0434d: function(arg0) {
+            const ret = arg0.hits;
+            return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
         __wbg_id_internal_579e500196cab6ff: function(arg0) {
             const ret = arg0.id;
             return ret;
@@ -1078,6 +1086,10 @@ function __wbg_get_imports() {
             const ret = Game.time;
             return ret;
         },
+        __wbg_transferEnergy_62cd7a46deefacfe: function() { return handleError(function (arg0, arg1, arg2) {
+            const ret = arg0.transferEnergy(arg1, arg2 >>> 0);
+            return ret;
+        }, arguments); },
         __wbg_transfer_f77d375a9acac89d: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg0.transfer(arg1, __wbindgen_enum_ResourceType[arg2], arg3 === Number.MAX_SAFE_INTEGER ? undefined : arg3);
             return ret;
@@ -1989,7 +2001,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"0c1988791e55-dirty-688c5a6f","wasmCrc32":"688c5a6f","features":[]});
+const BUILD = ({"id":"6c3d56f7ba69-dirty-6c450514","wasmCrc32":"6c450514","features":[]});
 const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;

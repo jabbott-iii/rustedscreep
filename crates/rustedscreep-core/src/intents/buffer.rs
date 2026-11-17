@@ -10,8 +10,9 @@
 //!   still spawning; a target that is gone; a creep target that is spawning for `transfer`, `pull`
 //!   and a move toward it; a target out of range; a structure the method never takes. Billed no-ops,
 //!   which the API accepts and the processor skips (V109): `heal` and `rangedHeal` of a spawning
-//!   creep, a `repair` of a type without a `CONSTRUCTION_COST`, a move toward itself. And an amount
-//!   of 0, which the API reads as "all". Dropping a billed no-op also removes it as a blocker.
+//!   creep, a `repair` of a type without a `CONSTRUCTION_COST` or of a container at full hits, a
+//!   move toward itself. And an amount of 0, which the API reads as "all". Dropping a billed no-op
+//!   also removes it as a blocker.
 //! - An earlier push of the same method on the same creep: only the last push is issued. The engine
 //!   keeps the last recorded call (V34, V47); the buffer issues the last push as the creep's decision
 //!   and does not fall back to an earlier one if that call fails.
@@ -24,11 +25,15 @@
 //! V108; the snapshot's fatigue column since P2.1, V160); a move toward a creep is not, since the API
 //! skips that check for it (V108). Other state-dependent checks need snapshot columns that later
 //! modules add with the jobs that read them: a transfer into a full store is a refusal (unbilled; it
-//! must not replace an earlier push), and a repair at full hits is a billed no-op to drop (V109).
+//! must not replace an earlier push). A repair of a container at full hits, a billed no-op (V109,
+//! V222), is dropped from the snapshot's hits column since P3.5 ([`Rejected::FullHits`]); own
+//! structures have no hits column yet, so their repairs are not checked.
 //!
 //! A tick allocates nothing here once the vectors have grown to the tick's intent count.
 
-use rustedscreep_consts::{CREEP_SAY_MAX_LENGTH, Direction, Position, ResourceType, StructureType};
+use rustedscreep_consts::{
+    CONTAINER_HITS, CREEP_SAY_MAX_LENGTH, Direction, Position, ResourceType, StructureType,
+};
 
 use super::log::ActLog;
 use super::outcome::Outcome;
@@ -168,6 +173,11 @@ pub enum CreepIntent {
     Repair {
         target: StructureHandle,
     },
+    /// `repair(container)` (P3.5): a container is a room object here, since it has no owner. It
+    /// shares the `repair` slot with [`CreepIntent::Repair`]: the last push of either is issued.
+    RepairObject {
+        target: ObjectHandle,
+    },
     /// `say(message, public)`.
     Say {
         text: SayText,
@@ -195,7 +205,7 @@ impl CreepIntent {
             Self::Heal { .. } => CreepAction::Heal,
             Self::RangedHeal { .. } => CreepAction::RangedHeal,
             Self::Move { .. } | Self::MoveToward { .. } => CreepAction::Move,
-            Self::Repair { .. } => CreepAction::Repair,
+            Self::Repair { .. } | Self::RepairObject { .. } => CreepAction::Repair,
             Self::Say { .. } => CreepAction::Say,
             Self::UpgradeController { .. } => CreepAction::UpgradeController,
             Self::Pull { .. } => CreepAction::Pull,
@@ -226,7 +236,8 @@ impl CreepIntent {
             Self::WithdrawObject { target, .. }
             | Self::Harvest { target }
             | Self::Build { target }
-            | Self::Pickup { target } => Some(Target::Object(target)),
+            | Self::Pickup { target }
+            | Self::RepairObject { target } => Some(Target::Object(target)),
             Self::Drop { .. } | Self::Move { .. } | Self::Say { .. } => None,
         }
     }
@@ -245,6 +256,7 @@ impl CreepIntent {
             | Self::MoveToward { .. } => Some(1),
             Self::RangedHeal { .. }
             | Self::Repair { .. }
+            | Self::RepairObject { .. }
             | Self::UpgradeController { .. }
             | Self::Build { .. } => Some(3),
             Self::Drop { .. } | Self::Move { .. } | Self::Say { .. } => None,
@@ -280,8 +292,8 @@ pub enum Rejected {
     /// instead record an `upgradeController` intent); for `repair` a type without a
     /// `CONSTRUCTION_COST` (billed, skipped); for `upgradeController` anything but a controller
     /// (V108, V109, V113). Among room objects (P2.4): `harvest` only a source, `build` only a site,
-    /// `pickup` only a pile, `withdraw` only a tombstone, ruin or container, and `transfer` only a
-    /// container.
+    /// `pickup` only a pile, `withdraw` only a tombstone, ruin or container, and `transfer` and
+    /// `repair` only a container.
     WrongTarget,
     /// The target is farther than the method's range or in another room (`ERR_NOT_IN_RANGE`, V108,
     /// V113).
@@ -289,11 +301,14 @@ pub enum Rejected {
     /// An amount of 0: `drop`, `transfer` and `withdraw` read a falsy amount as "all" (V108), which
     /// is never what a computed 0 means. Pass `None` for "all".
     ZeroAmount,
+    /// A `repair` of a container whose hits are at its `hitsMax` (`CONTAINER_HITS`, V223) at the
+    /// tick's start: the game side accepts it and the processor skips it, billed (V221, V222).
+    FullHits,
 }
 
 impl Rejected {
     /// Every reason, in a fixed order (the order of the per-reason counters).
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Closed,
         Self::GoneActor,
         Self::NotMine,
@@ -304,6 +319,7 @@ impl Rejected {
         Self::WrongTarget,
         Self::NotInRange,
         Self::ZeroAmount,
+        Self::FullHits,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -318,6 +334,7 @@ impl Rejected {
             Self::WrongTarget => "wrong target",
             Self::NotInRange => "not in range",
             Self::ZeroAmount => "zero amount",
+            Self::FullHits => "full hits",
         }
     }
 }
@@ -527,6 +544,13 @@ impl IntentBuffer {
         if intent.amount() == Some(0) {
             return Err(Rejected::ZeroAmount);
         }
+        // The game side refuses first what it refuses (V221); the processor then skips a repair at
+        // full hits. Uses: CONTAINER_HITS, a container's `hitsMax` (V223).
+        if let (CreepIntent::RepairObject { .. }, Some(TargetRow::Object(t))) = (intent, target)
+            && snap.objects.hits().get(t as usize).copied().unwrap_or(0) >= CONTAINER_HITS
+        {
+            return Err(Rejected::FullHits);
+        }
         Ok((row_u32(row)?, target))
     }
 
@@ -657,7 +681,9 @@ const fn accepts_object(intent: &CreepIntent, kind: ObjectKind) -> bool {
             kind,
             ObjectKind::Tombstone | ObjectKind::Ruin | ObjectKind::Container
         ),
-        CreepIntent::Transfer { .. } => matches!(kind, ObjectKind::Container),
+        CreepIntent::Transfer { .. } | CreepIntent::RepairObject { .. } => {
+            matches!(kind, ObjectKind::Container)
+        }
         _ => false,
     }
 }
@@ -752,6 +778,7 @@ mod tests {
         let row = ObjectRow {
             amount: 7,
             total: 0,
+            hits: 0,
         };
         let gone_object = snap
             .objects
@@ -954,6 +981,60 @@ mod tests {
         );
     }
 
+    /// Uses: rustedscreep_consts::CONTAINER_HITS (a container's `hitsMax`, V223). A repair of a
+    /// container at full hits is dropped (billed, and the processor skips it: V222), one hit short
+    /// of it is queued and shares the repair slot with `Repair`, and the game side's refusals come
+    /// first: a full container out of range is `NotInRange` (V221).
+    #[test]
+    fn a_container_repair_at_full_hits_is_dropped() {
+        let mut snap = Snapshot::default();
+        snap.begin(TickContext::from_raw(100, 20, 500.0, 10_000));
+        let a = snap
+            .creeps
+            .push(ObjectKey(1), creep(pos(10, 10), true, false))
+            .expect("a");
+        let spawn = snap
+            .structures
+            .push(ObjectKey(2), building(StructureType::Spawn, pos(10, 9)))
+            .expect("spawn");
+        let mut put = |key, kind, at, hits| {
+            snap.objects
+                .push(
+                    ObjectKey(key),
+                    move || Ok(ObjectStatic { kind, pos: at }),
+                    ObjectRow {
+                        amount: 0,
+                        total: 0,
+                        hits,
+                    },
+                )
+                .expect("object")
+        };
+        let full = put(10, ObjectKind::Container, pos(12, 10), CONTAINER_HITS);
+        let worn = put(11, ObjectKind::Container, pos(13, 10), CONTAINER_HITS - 1);
+        let far_full = put(12, ObjectKind::Container, pos(14, 10), CONTAINER_HITS);
+        let source = put(13, ObjectKind::Source, pos(11, 11), 0);
+        snap.finish();
+        let mut buf = IntentBuffer::default();
+        let mut commit = Commit::default();
+        buf.begin(&snap);
+        let repair = |target| CreepIntent::RepairObject { target };
+        let mut push = |intent| buf.push(&snap, a, intent, &mut commit);
+        assert_eq!(push(CreepIntent::Repair { target: spawn }), Ok(Queued::New));
+        assert_eq!(push(repair(full)), Err(Rejected::FullHits));
+        assert_eq!(push(repair(far_full)), Err(Rejected::NotInRange));
+        assert_eq!(push(repair(source)), Err(Rejected::WrongTarget));
+        assert_eq!(push(repair(worn)), Ok(Queued::Replaced));
+        assert_eq!(buf.stats().rejected(Rejected::FullHits), 1);
+        let calls = issue_ok(&mut buf);
+        let row = u32::try_from(snap.objects.row_of(worn).expect("row")).expect("u32");
+        assert_eq!(
+            calls,
+            [(0, Some(TargetRow::Object(row)), repair(worn))],
+            "the last repair push is issued, at the container's row"
+        );
+    }
+
     /// Each refusal, with the API behavior it stands for (V108, V109, V113); a refused push changes
     /// nothing, so it never replaces an earlier valid intent of the same method.
     #[test]
@@ -1105,9 +1186,13 @@ mod tests {
         assert_eq!(s.rejected_total() as usize, cases.len());
         for reason in Rejected::ALL {
             let want = cases.iter().filter(|c| c.2 == reason).count();
-            // Closed has its own test, and so has Tired (`a_tired_creep_cannot_move_by_direction`),
-            // which needs a fatigued creep this world does not have.
-            if reason != Rejected::Closed && reason != Rejected::Tired {
+            // Closed has its own test, and so have Tired (`a_tired_creep_cannot_move_by_direction`),
+            // which needs a fatigued creep this world does not have, and FullHits
+            // (`a_container_repair_at_full_hits_is_dropped`), which needs a container at full hits.
+            if !matches!(
+                reason,
+                Rejected::Closed | Rejected::Tired | Rejected::FullHits
+            ) {
                 assert!(want > 0, "{} is exercised", reason.as_str());
             }
             assert_eq!(s.rejected(reason) as usize, want, "{}", reason.as_str());
@@ -1459,12 +1544,16 @@ mod tests {
             | CreepIntent::WithdrawObject { target, .. }
             | CreepIntent::Harvest { target }
             | CreepIntent::Build { target }
-            | CreepIntent::Pickup { target } => {
+            | CreepIntent::Pickup { target }
+            | CreepIntent::RepairObject { target } => {
                 let Some(&(_, at, kind)) = w.objects.iter().find(|o| o.0 == target) else {
                     return Err(Rejected::GoneTarget);
                 };
                 let ok = match intent {
-                    CreepIntent::Transfer { .. } => kind == ObjectKind::Container,
+                    // The fixture's container has 0 hits, below its `hitsMax`.
+                    CreepIntent::Transfer { .. } | CreepIntent::RepairObject { .. } => {
+                        kind == ObjectKind::Container
+                    }
                     CreepIntent::WithdrawObject { .. } => matches!(
                         kind,
                         ObjectKind::Tombstone | ObjectKind::Ruin | ObjectKind::Container
@@ -1476,7 +1565,10 @@ mod tests {
                 if !ok {
                     return Err(Rejected::WrongTarget);
                 }
-                let range = if matches!(intent, CreepIntent::Build { .. }) {
+                let range = if matches!(
+                    intent,
+                    CreepIntent::Build { .. } | CreepIntent::RepairObject { .. }
+                ) {
                     3
                 } else {
                     1
@@ -1521,7 +1613,8 @@ mod tests {
             let o = things[rng.next(things.len())];
             let amount = [None, Some(0), Some(7)][rng.next(3)];
             let d = [Direction::Top, Direction::Left, Direction::BottomRight][rng.next(3)];
-            match rng.next(17) {
+            match rng.next(18) {
+                17 => CreepIntent::RepairObject { target: o },
                 12 => CreepIntent::Harvest { target: o },
                 13 => CreepIntent::Build { target: o },
                 14 => CreepIntent::Pickup { target: o },

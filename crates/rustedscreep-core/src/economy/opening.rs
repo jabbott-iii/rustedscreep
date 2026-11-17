@@ -11,14 +11,17 @@
 //!    capacity changes), the watchdog, the spawn request, every worker's mode and task, and the
 //!    Critical tasks' intents and moves: harvesting, taking energy, filling, and the upgrade the
 //!    downgrade guard keeps.
-//! 3. The Standard job runs [`Opening::work_room`] per room: building and upgrading.
+//! 3. The Standard job runs [`Opening::work_room`] per room: repairing, building and upgrading.
 //!
 //! A worker gathers until its store is full and works until it is empty. Each tick its task is
 //! chosen again, in id order with reservations, so no two workers fetch the same energy or fill the
 //! same free space: first the gatherers (a pile, tombstone, ruin or container no farther than its
 //! source, else its source), then the workers with energy: filling until the room's free spawn
-//! energy is covered, the guard's upgrader, `min_upgraders`, building, upgrading. A task kept from
-//! the last tick goes first, so assignments do not flip.
+//! energy is covered, the guard's upgrader, `min_upgraders`, repairing the containers on the mining
+//! plan's tiles (P3.5: one worker per container below `repair.start_pct` of its `hitsMax`, until it
+//! is full, from the workers within range of it, or any below `repair.walk_pct`), building,
+//! upgrading.
+//! A task kept from the last tick goes first, so assignments do not flip.
 //!
 //! Distances are Chebyshev ranges; only sizing measures paths (movement's grid). State lives in the
 //! heap: a global reset loses the modes, sources and tasks, and the next tick rebuilds them from the
@@ -26,13 +29,13 @@
 //! `Memory`.
 
 use rustedscreep_consts::{
-    BUILD_POWER, HARVEST_POWER, Position, ResourceType, RoomName, StructureType,
+    BUILD_POWER, CONTAINER_HITS, HARVEST_POWER, Position, ResourceType, RoomName, StructureType,
 };
 
 use super::mining::{Mined, Receiver};
 use super::sizing::{Trip, carry_round, worker_body, worker_round, workers_for_source};
 use super::watchdog::{Event, Observation, Watchdog};
-use crate::config::{MovementConfig, OpeningConfig};
+use crate::config::{MovementConfig, OpeningConfig, RepairConfig};
 use crate::intents::{CreepIntent, IntentBuffer, Target};
 use crate::movement::{Dial, FlowField, Goal, MoveError, MoveTo, Movement, Tile, UNREACHED};
 use crate::scheduler::{Commit, Fault, Tier};
@@ -63,6 +66,8 @@ pub enum Task {
     /// Transfer energy to a spawn or an extension.
     Fill(StructureHandle),
     Build(ObjectHandle),
+    /// `repair` of a container (P3.5).
+    Repair(ObjectHandle),
     /// `upgradeController`; `guard` when it is the downgrade guard's upgrader (Critical).
     Upgrade {
         controller: StructureHandle,
@@ -86,7 +91,7 @@ impl Task {
             | Self::Upgrade { guard: true, .. }
             | Self::Wait(_)
             | Self::Idle => Tier::Critical,
-            Self::Build(_) | Self::Upgrade { guard: false, .. } => Tier::Standard,
+            Self::Build(_) | Self::Repair(_) | Self::Upgrade { guard: false, .. } => Tier::Standard,
         }
     }
 
@@ -96,6 +101,7 @@ impl Task {
             Self::Take(_) | Self::Withdraw(_) => "take",
             Self::Fill(_) => "fill",
             Self::Build(_) => "build",
+            Self::Repair(_) => "repair",
             Self::Upgrade { guard: true, .. } => "guard",
             Self::Upgrade { guard: false, .. } => "upgrade",
             Self::Wait(_) => "wait",
@@ -104,8 +110,8 @@ impl Task {
     }
 
     /// Every kind, in a fixed order (the order of [`RoomStats::tasks`]).
-    pub const KINDS: [&'static str; 8] = [
-        "harvest", "take", "fill", "build", "guard", "upgrade", "wait", "idle",
+    pub const KINDS: [&'static str; 9] = [
+        "harvest", "take", "fill", "build", "repair", "guard", "upgrade", "wait", "idle",
     ];
 
     fn kind_index(self) -> usize {
@@ -114,10 +120,11 @@ impl Task {
             Self::Take(_) | Self::Withdraw(_) => 1,
             Self::Fill(_) => 2,
             Self::Build(_) => 3,
-            Self::Upgrade { guard: true, .. } => 4,
-            Self::Upgrade { guard: false, .. } => 5,
-            Self::Wait(_) => 6,
-            Self::Idle => 7,
+            Self::Repair(_) => 4,
+            Self::Upgrade { guard: true, .. } => 5,
+            Self::Upgrade { guard: false, .. } => 6,
+            Self::Wait(_) => 7,
+            Self::Idle => 8,
         }
     }
 
@@ -126,7 +133,7 @@ impl Task {
         match self {
             Self::Fill(_) | Self::Upgrade { guard: true, .. } => 3,
             Self::Harvest(_) | Self::Take(_) | Self::Withdraw(_) | Self::Wait(_) => 2,
-            Self::Build(_) | Self::Upgrade { guard: false, .. } => 1,
+            Self::Build(_) | Self::Repair(_) | Self::Upgrade { guard: false, .. } => 1,
             Self::Idle => 0,
         }
     }
@@ -194,13 +201,19 @@ pub struct RoomStats {
     pub working: u32,
     pub want: u32,
     /// Workers per task, in [`Task::KINDS`] order.
-    pub tasks: [u32; 8],
+    pub tasks: [u32; Task::KINDS.len()],
     /// What this tick asked of the spawner: `None`, or the budget and priority.
     pub request: Option<(EnergyBudget, u8)>,
     pub sources: u32,
     pub sites: u32,
     /// Energy in piles, tombstones, ruins and containers. Unit: energy.
     pub loose: u32,
+    /// Containers on the mining plan's tiles (the ones the workers repair, P3.5), those under repair
+    /// (below `repair.start_pct` of `CONTAINER_HITS`, or being repaired up to full), and the fewest
+    /// hits among them (`None` without one).
+    pub containers: u32,
+    pub repairing: u32,
+    pub lowest_hits: Option<u32>,
 }
 
 struct RoomState {
@@ -217,6 +230,9 @@ struct RoomState {
     /// worker once a second one failed on it too (`None`), so one worker that can reach nothing
     /// does not close the room to the others. At most [`UNREACHABLE_MAX`], oldest dropped first.
     unreachable: Vec<(Position, u32, Option<CreepHandle>)>,
+    /// Containers under repair (P3.5): below `repair.start_pct` of their `hitsMax` once, and not
+    /// full since. A global reset forgets them; they are found again below the share.
+    repairing: Vec<ObjectHandle>,
 }
 
 /// Unreachable targets a room remembers at once.
@@ -248,6 +264,9 @@ struct Facts {
     links: Vec<(StructureHandle, Position, u32, bool)>,
     /// Sources whose miner is next to them this tick (`economy::mining`, P3.1).
     mined: Vec<Mined>,
+    /// Containers on the mining plan's tiles (P3.5): handle, place, hits. Others in the room (a
+    /// previous owner's, say) are never repaired; their energy is still taken (`loose`).
+    containers: Vec<(ObjectHandle, Position, u32)>,
 }
 
 /// The opening's state for one global.
@@ -270,6 +289,8 @@ pub struct Opening {
     working: Vec<(usize, Position, u32, Task, u8)>,
     left: Vec<(usize, Position, u32, Task, u8)>,
     assigned: Vec<(usize, Task)>,
+    /// The room's containers to repair this tick (P3.5), as in `Facts::containers`.
+    repairs: Vec<(ObjectHandle, Position, u32)>,
     /// This tick's unreachable targets of the room being run: for every worker, and for one.
     blocked: Vec<Position>,
     private: Vec<(Position, CreepHandle)>,
@@ -312,6 +333,7 @@ impl Opening {
                         stats: RoomStats::default(),
                         members: (0, 0),
                         unreachable: Vec::new(),
+                        repairing: Vec::new(),
                     },
                 ),
             }
@@ -382,7 +404,8 @@ impl Opening {
     }
 
     /// The Critical half of room `unit`'s tick (module docs, step 2). `mined` lists the room's
-    /// sources whose miner is next to them this tick (`Mining::mined`; empty without miners).
+    /// sources whose miner is next to them this tick (`Mining::mined`; empty without miners), and
+    /// `mine_tiles` the mining plan's tiles (`Mining::mine_tiles`), whose containers are repaired.
     #[allow(clippy::too_many_arguments)]
     pub fn plan_room(
         &mut self,
@@ -392,8 +415,10 @@ impl Opening {
         spawner: &mut Spawner,
         buffer: &mut IntentBuffer,
         cfg: &OpeningConfig,
+        rcfg: &RepairConfig,
         mcfg: &MovementConfig,
         mined: &[Mined],
+        mine_tiles: &[Position],
         receivers: &[Receiver],
         commit: &mut Commit,
     ) -> Result<(), Fault> {
@@ -406,7 +431,7 @@ impl Opening {
             (r.name, r.row, r.members)
         };
         let row = row.ok_or(Fault::new("room not in this tick", unit))?;
-        self.gather_facts(snap, name, mined, receivers);
+        self.gather_facts(snap, name, mined, mine_tiles, receivers);
         self.ensure_plan(ri, snap, row, movement, cfg, mcfg, commit);
         let want = self
             .rooms
@@ -518,6 +543,7 @@ impl Opening {
             snap,
             members,
             cfg,
+            rcfg,
             guard && !state.upgrade_blocked,
             state,
         );
@@ -531,7 +557,7 @@ impl Opening {
                 .iter()
                 .map(|s| (s.0, s.4.saturating_sub(s.3))),
         );
-        let mut tasks = [0u32; 8];
+        let mut tasks = [0u32; Task::KINDS.len()];
         for i in members.0..members.1 {
             if let Some(task) = self.task_of(i, snap) {
                 if let Some(t) = tasks.get_mut(task.kind_index()) {
@@ -548,6 +574,8 @@ impl Opening {
         }
         let sources = u32::try_from(self.facts.sources.len()).unwrap_or(u32::MAX);
         let sites = u32::try_from(self.facts.sites.len()).unwrap_or(u32::MAX);
+        let containers = u32::try_from(self.facts.containers.len()).unwrap_or(u32::MAX);
+        let lowest_hits = self.facts.containers.iter().map(|c| c.2).min();
         if let Some(r) = self.rooms.get_mut(ri) {
             r.stats = RoomStats {
                 time: self.time,
@@ -559,12 +587,16 @@ impl Opening {
                 sources,
                 sites,
                 loose,
+                containers,
+                repairing: u32::try_from(r.repairing.len()).unwrap_or(u32::MAX),
+                lowest_hits,
             };
         }
         Ok(())
     }
 
-    /// The Standard half of room `unit`'s tick: the building and upgrading the Critical half chose.
+    /// The Standard half of room `unit`'s tick: the repairing, building and upgrading the Critical
+    /// half chose.
     pub fn work_room(
         &mut self,
         unit: u32,
@@ -668,13 +700,14 @@ impl Opening {
         }
     }
 
-    /// Reads what room `name` holds this tick, its mined sources and its controller links, into
-    /// `self.facts`.
+    /// Reads what room `name` holds this tick, its mined sources, the containers on its mining
+    /// tiles and its controller links, into `self.facts`.
     fn gather_facts(
         &mut self,
         snap: &Snapshot,
         name: RoomName,
         mined: &[Mined],
+        mine_tiles: &[Position],
         receivers: &[Receiver],
     ) {
         let f = &mut self.facts;
@@ -685,6 +718,7 @@ impl Opening {
         f.loose.clear();
         f.links.clear();
         f.mined.clear();
+        f.containers.clear();
         f.mined
             .extend(mined.iter().filter(|m| m.source.room_name() == name));
         f.links.extend(
@@ -713,16 +747,20 @@ impl Opening {
             }
         }
         let ob = &snap.objects;
-        for ((((&h, &kind), &pos), &amount), &total) in ob
+        for (((((&h, &kind), &pos), &amount), &total), &hits) in ob
             .handles()
             .iter()
             .zip(ob.kinds())
             .zip(ob.positions())
             .zip(ob.amounts())
             .zip(ob.totals())
+            .zip(ob.hits())
         {
             if pos.room_name() != name {
                 continue;
+            }
+            if kind == ObjectKind::Container && mine_tiles.contains(&pos) {
+                f.containers.push((h, pos, hits));
             }
             match kind {
                 ObjectKind::Source => f.sources.push((h, pos, amount, total)),
@@ -869,12 +907,14 @@ impl Opening {
     }
 
     /// Every worker's mode and task for this tick (module docs).
+    #[allow(clippy::too_many_arguments)]
     fn assign(
         &mut self,
         ri: usize,
         snap: &Snapshot,
         members: (usize, usize),
         cfg: &OpeningConfig,
+        rcfg: &RepairConfig,
         guard: bool,
         controller: crate::snapshot::ControllerState,
     ) {
@@ -1173,19 +1213,40 @@ impl Opening {
                 ));
             }
         }
-        // `min_upgraders` (the guard's counts), then building, then upgrading.
-        let reachable_sites = self
-            .facts
-            .sites
-            .iter()
-            .any(|s| !self.blocked.contains(&s.1));
+        // The containers to repair (P3.5): below `repair.start_pct` of their `hitsMax`, or under
+        // repair and not full. The room remembers them before the unreachable ones are left out, so
+        // one that is cut off for a while is repaired up to full once it is reached again.
+        let mut repairs = std::mem::take(&mut self.repairs);
+        repairs.clear();
+        if rcfg.enabled {
+            let repairing = self.rooms.get(ri).map_or(&[][..], |r| &r.repairing[..]);
+            repairs.extend(
+                self.facts
+                    .containers
+                    .iter()
+                    .filter(|c| needs_repair(c.2, rcfg.start_pct, repairing.contains(&c.0)))
+                    .copied(),
+            );
+        }
+        if let Some(r) = self.rooms.get_mut(ri) {
+            r.repairing.clear();
+            r.repairing.extend(repairs.iter().map(|c| c.0));
+        }
+        repairs.retain(|c| !self.blocked.contains(&c.1));
+        // `min_upgraders` (the guard's counts), then repairing, building, upgrading.
+        let other_work = !repairs.is_empty()
+            || self
+                .facts
+                .sites
+                .iter()
+                .any(|s| !self.blocked.contains(&s.1));
         let mut upgraders = assigned
             .iter()
             .filter(|(_, t)| matches!(t, Task::Upgrade { .. }))
             .count();
         let min_upgraders = usize::try_from(cfg.min_upgraders).unwrap_or(usize::MAX);
         if let Some((c, cpos)) = upgrade {
-            while upgraders < min_upgraders && !left.is_empty() && reachable_sites {
+            while upgraders < min_upgraders && !left.is_empty() && other_work {
                 let pick = left
                     .iter()
                     .enumerate()
@@ -1212,6 +1273,58 @@ impl Opening {
                 upgraders += 1;
             }
         }
+        // One worker per container, from the workers already within repair range of it (at an
+        // unlinked source its gatherers take their loads there), or below `repair.walk_pct` any (a
+        // linked source's container, which no gatherer comes to). First last tick's repairers keep
+        // their container while they still may repair it, so none swaps between two; then each
+        // container left, fewest hits first, takes the nearest. `can_upgrade` tells whether the
+        // worker skips a target on its own.
+        let may_repair = |i: usize, at: Position, c: &(ObjectHandle, Position, u32)| {
+            can_upgrade(i, c.1) && (below_share(c.2, rcfg.walk_pct) || range(at, c.1) <= WORK_RANGE)
+        };
+        let mut k = 0;
+        while k < left.len() {
+            let Some(&(i, at, _, prev, _)) = left.get(k) else {
+                break;
+            };
+            let kept = match prev {
+                Task::Repair(h) => repairs
+                    .iter()
+                    .position(|c| c.0 == h && may_repair(i, at, c)),
+                _ => None,
+            };
+            match kept {
+                Some(j) => {
+                    let (h, ..) = repairs.swap_remove(j);
+                    left.remove(k);
+                    assigned.push((i, Task::Repair(h)));
+                }
+                None => k += 1,
+            }
+        }
+        while !left.is_empty() {
+            let Some(j) = repairs
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, c)| (c.2, tile_key(c.1)))
+                .map(|(j, _)| j)
+            else {
+                break;
+            };
+            let c = repairs.swap_remove(j);
+            let pick = left
+                .iter()
+                .enumerate()
+                .filter(|&(_, &(i, at, ..))| may_repair(i, at, &c))
+                .min_by_key(|&(_, &(i, at, ..))| (range(at, c.1), key_of(&self.members, i)))
+                .map(|(k, _)| k);
+            let h = c.0;
+            if let Some(k) = pick {
+                let (i, ..) = left.remove(k);
+                assigned.push((i, Task::Repair(h)));
+            }
+        }
+        self.repairs = repairs;
         let site = best_site(&self.facts.sites, &self.blocked);
         for &(i, _, _, prev, _) in &left {
             let handle = self.members.get(i).map(|m| m.handle);
@@ -1428,6 +1541,13 @@ impl Opening {
             Task::Build(h) => {
                 object(h).map(|(pos, _)| (pos, WORK_RANGE, Some(CreepIntent::Build { target: h })))
             }
+            Task::Repair(h) => object(h).map(|(pos, _)| {
+                (
+                    pos,
+                    WORK_RANGE,
+                    Some(CreepIntent::RepairObject { target: h }),
+                )
+            }),
             Task::Upgrade { controller, .. } => structure(controller).map(|pos| {
                 (
                     pos,
@@ -1508,6 +1628,21 @@ impl Opening {
             }
         }
     }
+}
+
+/// Whether a container with `hits` is repaired this tick (P3.5): below `start_pct` of its `hitsMax`,
+/// or `under_repair` (below it once since) and not yet full.
+///
+/// Uses: CONTAINER_HITS, a container's `hitsMax` (V223).
+pub fn needs_repair(hits: u32, start_pct: u32, under_repair: bool) -> bool {
+    hits < CONTAINER_HITS && (below_share(hits, start_pct) || under_repair)
+}
+
+/// Whether a container's `hits` are below `pct` percent of its `hitsMax`.
+///
+/// Uses: CONTAINER_HITS, a container's `hitsMax` (V223).
+pub fn below_share(hits: u32, pct: u32) -> bool {
+    u64::from(hits) < u64::from(CONTAINER_HITS) * u64::from(pct) / 100
 }
 
 /// Whether `target` is on the list of targets worker `h` skips on its own.

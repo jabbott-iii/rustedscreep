@@ -30,7 +30,7 @@
 use std::fmt::Write as _;
 
 use rustedscreep_core::config::{
-    LinkConfig, MiningConfig, MovementConfig, OpeningConfig, SchedulerConfig,
+    LinkConfig, MiningConfig, MovementConfig, OpeningConfig, RepairConfig, SchedulerConfig,
 };
 use rustedscreep_core::economy::placement::Placement;
 use rustedscreep_core::economy::{Event, Mining, Opening, Task};
@@ -177,6 +177,7 @@ impl OpeningGlue {
         cfg: &OpeningConfig,
         mining_cfg: &MiningConfig,
         link_cfg: &LinkConfig,
+        repair_cfg: &RepairConfig,
         mcfg: &MovementConfig,
     ) {
         let Self {
@@ -206,9 +207,11 @@ impl OpeningGlue {
         tick.run_units(&PLAN_JOB, plan_job, count, |unit, commit| {
             let room = core.room_name(unit);
             let mined = room.map_or(&[][..], |room| mining.mined(room));
+            let tiles = room.map_or(&[][..], |room| mining.mine_tiles(room));
             let receivers = room.map_or(&[][..], |room| mining.receivers(room));
             core.plan_room(
-                unit, snapshot, movement, spawner, buffer, cfg, mcfg, mined, receivers, commit,
+                unit, snapshot, movement, spawner, buffer, cfg, repair_cfg, mcfg, mined, tiles,
+                receivers, commit,
             )
         });
     }
@@ -473,6 +476,17 @@ impl OpeningGlue {
                 ", sites {}, loose energy {}",
                 stats.sites, stats.loose
             );
+            if stats.containers > 0 {
+                let _ = write!(
+                    text,
+                    ", containers {} (under repair {}",
+                    stats.containers, stats.repairing
+                );
+                if let Some(h) = stats.lowest_hits {
+                    let _ = write!(text, ", lowest hits {h}");
+                }
+                text.push(')');
+            }
             if let Some(since) = watch.recovering_since() {
                 let _ = write!(text, ", RECOVERING since tick {since}");
             }

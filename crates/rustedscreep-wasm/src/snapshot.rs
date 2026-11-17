@@ -22,7 +22,8 @@
 //!   `length`), 6 without, plus `energyAvailable` and `energyCapacityAvailable` when the bot owns
 //!   it (P2.3, V175), and for an owned room its controller's 3 progress and timer getters and its
 //!   room objects (P2.4, `push_objects`: 6 `find` calls and their `length`s, then per object `get`,
-//!   `id`, the id copy, its amount, and on the tick it is first seen its position and type);
+//!   `id`, the id copy, its amount, a container's `hits` (P3.5), and on the tick it is first seen
+//!   its position and type);
 //!   hostile creep: 5 (`get`, `id`, the id copy, `pos`, `__packedPos`; hostile results never
 //!   include spawning creeps, V101);
 //! - structure: 3 (`get`, `id`, the id copy), plus on the tick it is first seen `structureType`,
@@ -253,7 +254,7 @@ fn controller_state(c: &StructureController, level: u8) -> ControllerState {
 /// then per object `get`, `id` and the id copy, its position and type on the tick it is first seen
 /// (the static data), and its amount: a source's `energy` and `energyCapacity`, a site's
 /// `progress` and `progressTotal`, a pile's `amount`, a tombstone's, ruin's or container's `store`
-/// and `getUsedCapacity("energy")` (V184, V190, V196, V199).
+/// and `getUsedCapacity("energy")` (V184, V190, V196, V199), and a container's `hits` (P3.5, V223).
 fn push_objects(snapshot: &mut Snapshot, js: &mut JsWorld, finder: &Findable) {
     let list = finder.find_array(find::SOURCES.find_code());
     for i in 0..list.length() {
@@ -261,6 +262,7 @@ fn push_objects(snapshot: &mut Snapshot, js: &mut JsWorld, finder: &Findable) {
         let row = ObjectRow {
             amount: source.energy(),
             total: source.energy_capacity(),
+            hits: 0,
         };
         push_object(snapshot, js, source.into(), |_| Ok(ObjectKind::Source), row);
     }
@@ -270,6 +272,7 @@ fn push_objects(snapshot: &mut Snapshot, js: &mut JsWorld, finder: &Findable) {
         let row = ObjectRow {
             amount: site.progress(),
             total: site.progress_total(),
+            hits: 0,
         };
         let kind = |o: &RoomObject| {
             known_structure_type(o.unchecked_ref::<ConstructionSite>().structure_type())
@@ -284,6 +287,7 @@ fn push_objects(snapshot: &mut Snapshot, js: &mut JsWorld, finder: &Findable) {
         let row = ObjectRow {
             amount: pile.amount(),
             total: 0,
+            hits: 0,
         };
         let kind = |o: &RoomObject| {
             Ok(
@@ -310,9 +314,16 @@ fn push_objects(snapshot: &mut Snapshot, js: &mut JsWorld, finder: &Findable) {
     for (list, kind) in stored {
         for i in 0..list.length() {
             let object: RoomObject = list.get(i).unchecked_into();
+            // A container's `hits` (P3.5): the crate's getter reads an undefined value as 0 (V223).
+            let hits = if kind == ObjectKind::Container {
+                object.unchecked_ref::<Structure>().hits()
+            } else {
+                0
+            };
             let row = ObjectRow {
                 amount: energy_in(object.unchecked_ref()),
                 total: 0,
+                hits,
             };
             let check = |o: &RoomObject| {
                 // The filter came back empty-handed if building it failed: check the type.

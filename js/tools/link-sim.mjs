@@ -2,8 +2,9 @@
 // (crates/rustedscreep-wasm/src/opening.rs and snapshot.rs over rustedscreep-core `economy::mining` and
 // `economy::opening`; P3.2, ADR-024). W1N1 owned at RCL5, where CONTROLLER_STRUCTURES.link[5] allows two links: an
 // open plain room with walls on its border ring, a spawn and ten extensions, all full; the controller; one source
-// whose only walkable neighbour is the mining tile (walls on its other seven), with a container on that tile and a
-// source link next to it; and a controller link at CONTROLLER_LINK_RANGE (2) of the controller, so the bot places
+// whose only walkable neighbour is the mining tile (walls on its other seven), with a container on that tile, worn
+// between repair.walk_pct and repair.start_pct of CONTAINER_HITS and one hit lower on each loop (P3.5; the harness's
+// own change, not the engine's decay, to show the snapshot reads `hits` every tick), and a source link next to it; and a controller link at CONTROLLER_LINK_RANGE (2) of the controller, so the bot places
 // no link site. A miner (a bot miner name: role code m, home W1N1) with miner_work(SOURCE_ENERGY_CAPACITY) WORK, one
 // CARRY and three MOVE parts stands on the mining tile with a full store, and an empty worker (role code w) stands
 // next to the controller link. The source link holds more than the controller link has room for, so its first send
@@ -54,8 +55,11 @@
 //   idle 0), links 2 (linked 1, transfers T, sends S)` with that loop's transfer and send calls, `, controller link
 //   (x,y)`, the source's tile, trip (range to the spawn - 1 tiles, PLAIN_COST each) and ` link (x,y)`, and a body of
 //   miner_work WORK, `1 CARRY` and MOVE parts at a cost the room's capacity pays; the opening's plan shows the source
-//   mined and linked; the sites part `(0 containers, 0 links)`; and the end ` | link sends since boot: ordered O,
-//   sent S, failed F, energy E` against the harness's calls;
+//   mined and linked; the room part `, containers 1 (under repair 1, lowest hits H)` with that loop's `hits` (P3.5:
+//   the snapshot reads it every tick; under repair below repair.start_pct; the room's one worker is taken by
+//   opening.min_upgraders, so this does not test the walk rule, which the native tests do); the sites part
+//   `(0 containers, 0 links)`; and the end ` | link sends since boot: ordered O, sent S, failed F, energy E` against
+//   the harness's calls;
 // - no fault line, no incident, no link refusal line, no halt, one global.
 // npm run check runs it (row 20); standalone: node js/tools/link-sim.mjs [dir].
 import { join } from 'node:path';
@@ -69,6 +73,11 @@ const C = Object.fromEntries(ENGINE_CONSTANTS.map(([name, json]) => [name, JSON.
 const OFFSETS = [null, [0, -1], [1, -1], [1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1]];
 /** LINK_MMO.send_min (crates/rustedscreep-core/src/config.rs): LINK_CAPACITY / 4. */
 const SEND_MIN = C.LINK_CAPACITY / 4;
+/** REPAIR_MMO.start_pct and walk_pct (crates/rustedscreep-core/src/config.rs): percent of CONTAINER_HITS. */
+const REPAIR_START_PCT = 80;
+const REPAIR_WALK_PCT = 50;
+/** The container's hits at offset 0: halfway between the two shares, so it is under repair (P3.5). */
+const CONTAINER_WORN_HITS = Math.floor((C.CONTAINER_HITS * (REPAIR_START_PCT + REPAIR_WALK_PCT)) / 200);
 /** OPENING_MMO.scavenge_min (config.rs): with no send fitting a controller link, a take of this much is worth it. */
 const SCAVENGE_MIN = 50;
 /** MOVEMENT_MMO's plain cost (config.rs): a trip's cost on plain is 2 per tile. */
@@ -133,7 +142,7 @@ function makeWorld() {
     extensions: EXTENSIONS.map((e, i) => ({ id: id(10 + i), ...e, energy: C.EXTENSION_ENERGY_CAPACITY[LEVEL] })),
     source: { id: id(2), ...SOURCE, energy: C.SOURCE_ENERGY_CAPACITY, capacity: C.SOURCE_ENERGY_CAPACITY, regenAt: null },
     controller: { id: id(3), ...CONTROLLER, level: LEVEL, progress: 0, downgradeTime: T0 + C.CONTROLLER_DOWNGRADE[LEVEL], upgraded: 0 },
-    container: { id: id(4), ...MINE, energy: 0 },
+    container: { id: id(4), ...MINE, energy: 0, hits: CONTAINER_WORN_HITS },
     // In Game.structures order (V218's tie order; the two stand at different ranges of the controller).
     links: [
       { id: id(5), name: 'source link', ...SOURCE_LINK, energy: SOURCE_LINK_ENERGY, cooldown: 0 },
@@ -398,7 +407,7 @@ function sceneFor(state, offset) {
   objects.controllerLink = links[1];
   const ct = state.container;
   const container = {
-    id: ct.id, structureType: 'container', pos: pos(ct.x, ct.y), hits: C.CONTAINER_HITS, hitsMax: C.CONTAINER_HITS,
+    id: ct.id, structureType: 'container', pos: pos(ct.x, ct.y), hits: ct.hits - offset, hitsMax: C.CONTAINER_HITS,
     store: makeStore({ energy: ct.energy }, { capacity: C.CONTAINER_CAPACITY }),
   };
   const src = state.source;
@@ -728,6 +737,7 @@ export function linkSim(dir = join(ROOT, 'dist')) {
       `rustedscreep opening at tick ${T0 + o}: ${ROOM}: workers 1 of `,
       ` source ${at(SOURCE)} open 1 want `,
       ' mined linked, ',
+      `, containers 1 (under repair 1, lowest hits ${CONTAINER_WORN_HITS - o});`,
       ` | mining: ${ROOM}: miners 1 (mined 1, harvests 1, requested 0, idle 0), links 2 (linked 1, transfers ` +
         `${callsAt(o, MINER, 'transfer').length}, sends ${callsAt(o, sl.name, 'transferEnergy').length}), controller link ${at(CONTROLLER_LINK)}, ` +
         `source ${at(SOURCE)} tile ${at(MINE)} trip ${tiles} tiles cost ${tiles * PLAIN_COST} link ${at(SOURCE_LINK)} body `,

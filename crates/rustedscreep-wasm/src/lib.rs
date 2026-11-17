@@ -134,10 +134,11 @@ pub fn game_loop() {
                     &cfg.opening,
                     &cfg.mining,
                     &cfg.links,
+                    &cfg.repair,
                     &cfg.movement,
                 );
                 spawn.plan(&mut tick, snapshot);
-                // Standard: the persistence loads, then the opening's building and upgrading.
+                // Standard: the persistence loads, then the opening's repairing, building and upgrading.
                 persist.load(&mut tick, snapshot.tick.time, runtime);
                 opening.work(
                     &mut tick,

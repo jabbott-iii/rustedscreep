@@ -586,7 +586,7 @@ pub enum ObjectKind {
     /// A ruin: `amount` is the energy in its store.
     Ruin,
     /// A container (it has no owner, so `Game.structures` leaves it out): `amount` is the energy in
-    /// its store.
+    /// its store, `hits` its hits (P3.5; its `hitsMax` is `CONTAINER_HITS`, V223).
     Container,
 }
 
@@ -612,6 +612,8 @@ pub struct ObjectStatic {
 pub struct ObjectRow {
     pub amount: u32,
     pub total: u32,
+    /// A container's hits (P3.5); 0 for every other kind.
+    pub hits: u32,
 }
 
 /// Room objects the opening works with (P2.4), read in the bot's owned rooms: sources, own
@@ -624,6 +626,7 @@ pub struct RoomObjects {
     pos: Vec<Position>,
     amount: Vec<u32>,
     total: Vec<u32>,
+    hits: Vec<u32>,
 }
 
 impl RoomObjects {
@@ -634,6 +637,7 @@ impl RoomObjects {
         self.pos.clear();
         self.amount.clear();
         self.total.clear();
+        self.hits.clear();
     }
 
     pub(super) fn finish(&mut self) -> u32 {
@@ -655,6 +659,7 @@ impl RoomObjects {
         self.pos.push(data.pos);
         self.amount.push(row.amount);
         self.total.push(row.total);
+        self.hits.push(row.hits);
         Ok(handle)
     }
 
@@ -699,6 +704,11 @@ impl RoomObjects {
 
     pub fn totals(&self) -> &[u32] {
         &self.total
+    }
+
+    /// A container's hits (P3.5), 0 for every other kind ([`ObjectRow::hits`]).
+    pub fn hits(&self) -> &[u32] {
+        &self.hits
     }
 
     /// Objects first seen this tick.

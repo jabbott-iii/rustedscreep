@@ -271,7 +271,7 @@ fn call(actor: &Actor, issue: &Issue, js: &JsWorld) -> Option<Result<f64, JsValu
         CreepIntent::Pickup { .. } => actor.pickup(target()?),
         CreepIntent::Heal { .. } => actor.heal(target()?),
         CreepIntent::RangedHeal { .. } => actor.ranged_heal(target()?),
-        CreepIntent::Repair { .. } => actor.repair(target()?),
+        CreepIntent::Repair { .. } | CreepIntent::RepairObject { .. } => actor.repair(target()?),
         CreepIntent::UpgradeController { .. } => actor.upgrade_controller(target()?),
         CreepIntent::Pull { .. } => actor.pull(target()?),
     })
@@ -293,7 +293,7 @@ const fn threw(intent: &CreepIntent) -> &'static str {
         CreepIntent::Pickup { .. } => "the pickup call threw",
         CreepIntent::Heal { .. } => "the heal call threw",
         CreepIntent::RangedHeal { .. } => "the rangedHeal call threw",
-        CreepIntent::Repair { .. } => "the repair call threw",
+        CreepIntent::Repair { .. } | CreepIntent::RepairObject { .. } => "the repair call threw",
         CreepIntent::UpgradeController { .. } => "the upgradeController call threw",
         CreepIntent::Pull { .. } => "the pull call threw",
     }

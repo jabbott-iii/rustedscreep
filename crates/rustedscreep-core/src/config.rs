@@ -488,6 +488,34 @@ pub const LINK_MMO: LinkConfig = LinkConfig {
     hold_ticks: 20,
 };
 
+/// Repairs (ROADMAP P3.5): the workers repair the containers on the mining plan's tiles, the only
+/// decaying structures the bot builds before P4 (V214); containers elsewhere are never repaired
+/// (the user's choice, 2026-11-16). `docs/TUNING.md` gives each one's rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepairConfig {
+    /// Lets the opening's workers repair the containers on their room's mining tiles
+    /// (`economy::Opening`, in the Standard tier after filling, the downgrade guard and
+    /// `opening.min_upgraders`, before building). Off, no container is repaired, and an owned
+    /// room's container lasts about 24550 ticks (V214).
+    pub enabled: bool,
+    /// A container is repaired once its hits fall below this share of its `hitsMax`
+    /// (`CONTAINER_HITS`, V223), and then up to full, by one worker at a time that is already
+    /// within repair range of it. Unit: percent.
+    pub start_pct: u32,
+    /// Below this share of its `hitsMax` a container under repair also takes a worker that must walk
+    /// to it (the nearest with energy); above it only a worker already within repair range repairs
+    /// it, which at an unlinked source costs no walk (its gatherers take their loads there). At most
+    /// `start_pct`. Unit: percent.
+    pub walk_pct: u32,
+}
+
+/// Repair values for the official MMO.
+pub const REPAIR_MMO: RepairConfig = RepairConfig {
+    enabled: true,
+    start_pct: 80,
+    walk_pct: 50,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -503,6 +531,7 @@ pub struct Config {
     pub opening: OpeningConfig,
     pub mining: MiningConfig,
     pub links: LinkConfig,
+    pub repair: RepairConfig,
 }
 
 /// A server profile: a name and its values.
@@ -527,6 +556,7 @@ pub const MMO: Profile = Profile {
         opening: OPENING_MMO,
         mining: MINING_MMO,
         links: LINK_MMO,
+        repair: REPAIR_MMO,
     },
 };
 
@@ -687,7 +717,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 70;
+pub const FIELD_COUNT: usize = 73;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -926,6 +956,9 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(links, "LinkConfig", source_links, 0, 5, true),
     number!(links, "LinkConfig", send_min, 1, LINK_CAPACITY / 2, true),
     number!(links, "LinkConfig", hold_ticks, 1, CREEP_LIFE_TIME, true),
+    flag!(repair, "RepairConfig", enabled, true),
+    number!(repair, "RepairConfig", start_pct, 10, 99, true),
+    number!(repair, "RepairConfig", walk_pct, 5, 99, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -951,7 +984,7 @@ pub struct Rule {
 /// `CPU_TICK_LIMIT_MAX`: Standard switches on from the bucket at the start of the tick, and one tick
 /// is billed about tickLimit at most (the scheduler stops every tier at the ceiling and the reserve
 /// covers the rest), so a Standard tick leaves the bucket at or above the boot gate (TUNING.md).
-pub static RULES: [Rule; 8] = [
+pub static RULES: [Rule; 9] = [
     Rule {
         keys: ["loader.backoff_base_ticks", "loader.backoff_max_ticks"],
         text: "loader.backoff_base_ticks must be at most loader.backoff_max_ticks",
@@ -997,6 +1030,11 @@ pub static RULES: [Rule; 8] = [
         keys: ["persist.self_test_segment", "persist.config_segment"],
         text: "persist.self_test_segment and persist.config_segment must differ",
         holds: |c| c.persist.self_test_segment != c.persist.config_segment,
+    },
+    Rule {
+        keys: ["repair.walk_pct", "repair.start_pct"],
+        text: "repair.walk_pct must be at most repair.start_pct",
+        holds: |c| c.repair.walk_pct <= c.repair.start_pct,
     },
 ];
 
@@ -1121,6 +1159,7 @@ mod tests {
             opening: _,
             mining: _,
             links: _,
+            repair: _,
         } = MMO.config;
         let SpawnConfig { hold_ticks: _ } = SPAWN_MMO;
         let OpeningConfig {
@@ -1145,7 +1184,12 @@ mod tests {
             send_min: _,
             hold_ticks: _,
         } = LINK_MMO;
-        let expected: [(&str, &[&str]); 11] = [
+        let RepairConfig {
+            enabled: _,
+            start_pct: _,
+            walk_pct: _,
+        } = REPAIR_MMO;
+        let expected: [(&str, &[&str]); 12] = [
             (
                 "loader",
                 &[
@@ -1251,6 +1295,7 @@ mod tests {
                     "hold_ticks",
                 ],
             ),
+            ("repair", &["enabled", "start_pct", "walk_pct"]),
         ];
         let mut total = 0;
         for (group, names) in expected {

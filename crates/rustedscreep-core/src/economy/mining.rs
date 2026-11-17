@@ -236,6 +236,8 @@ struct MineRoom {
     name: RoomName,
     row: Option<usize>,
     plan: Option<MinePlan>,
+    /// The plan's mining tiles (P3.5: the containers the workers repair), set with the plan.
+    tiles: Vec<Position>,
     /// Members of [`Mining::members`] that belong to it this tick.
     members: (usize, usize),
     mined: Vec<Mined>,
@@ -354,6 +356,7 @@ impl Mining {
                         name,
                         row: Some(row),
                         plan: None,
+                        tiles: Vec::new(),
                         members: (0, 0),
                         mined: Vec::new(),
                         containers: Vec::new(),
@@ -431,6 +434,12 @@ impl Mining {
     /// it, or for a room that is not owned).
     pub fn mined(&self, room: RoomName) -> &[Mined] {
         self.room(room).map_or(&[], |r| r.mined.as_slice())
+    }
+
+    /// The mining tiles of `room`'s plan, one per source that has one (P3.5: the containers on them
+    /// are the ones the workers repair), whether or not a miner stands there this tick.
+    pub fn mine_tiles(&self, room: RoomName) -> &[Position] {
+        self.room(room).map_or(&[], |r| r.tiles.as_slice())
     }
 
     /// The controller links of `room` from its run this tick (P3.2).
@@ -1269,6 +1278,10 @@ impl Mining {
                 controller_link,
                 sources,
             });
+            r.tiles.clear();
+            if let Some(p) = &r.plan {
+                r.tiles.extend(p.sources.iter().filter_map(|s| s.tile));
+            }
         }
     }
 
