@@ -74,7 +74,7 @@ use crate::scheduler::{Commit, Fault, Tier};
 use crate::snapshot::{
     Controller, CreepHandle, ObjectHandle, ObjectKind, Snapshot, StructureHandle,
 };
-use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner, WORKER_PATTERN};
+use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner};
 
 /// The spawn priority of an upgrader request: below a hauler's (`PRIORITY_HAULER`, which brings
 /// its energy) and a room short of workers (`PRIORITY_LOW`), above the opening's normal worker
@@ -219,8 +219,10 @@ pub struct UpgradeView<'a> {
     /// gets a worker of its own, also while its miner is briefly gone (a worker spawned for that
     /// gap would live on for a creep life).
     pub sources: &'a [Position],
-    /// While `takes`, the most `WORKER_PATTERN` repeats a worker gets (`upgrading.worker_repeats`):
-    /// the workers only build, repair and fill. `u8::MAX` otherwise.
+    /// The most WORK parts a worker gets while `takes` (`upgrading.worker_repeats`): the workers
+    /// only build, repair and fill then. The opening applies it only while `takes`, and solves the
+    /// body it counts in the upgraders' budget with it always (P3.6). `u8::MAX` for a room the job
+    /// does not run.
     pub worker_repeats: u8,
 }
 
@@ -246,7 +248,7 @@ struct UpgradeRoom {
     /// left to claim), from its Critical run.
     controller: Option<(StructureHandle, Position, bool)>,
     stores: Vec<(Store, Position, u32)>,
-    /// This tick's [`UpgradeView::takes`] and [`UpgradeView::worker_repeats`].
+    /// This tick's [`UpgradeView::takes`], and `upgrading.worker_repeats` from its last run.
     takes: bool,
     worker_repeats: u8,
     /// The room's upgraders took over the controller's energy: once it had an upgrader (spawning
@@ -468,7 +470,7 @@ impl Upgrading {
                     .as_ref()
                     .filter(|_| r.takes)
                     .map_or(&[], |p| &p.sources[..]),
-                worker_repeats: if r.takes { r.worker_repeats } else { u8::MAX },
+                worker_repeats: r.worker_repeats,
             })
     }
 
@@ -940,7 +942,7 @@ impl Upgrading {
                 .map(|s| s.source)
         };
         let delivered = delivered(mine, haul, &self.sources, ways);
-        let upkeep = upkeep(mine, haul, workers, capacity, repeats(cfg));
+        let upkeep = upkeep(mine, haul, workers);
         let Some((grid, version)) = movement.room_grid(name, mcfg, commit) else {
             return;
         };
@@ -1257,17 +1259,15 @@ fn delivery(s: &MineSource, haul: Option<&HaulPlan>, ways: Ways) -> Option<bool>
 }
 
 /// The bodies, over one creep life, of every creep the room keeps but its upgraders: the mining
-/// plan's miners, the hauling plan's haulers and the opening's planned workers at `capacity`, of at
-/// most `worker_repeats` repeats of `WORKER_PATTERN` (what a worker gets while upgraders take the
-/// controller's energy, `Body::scaled`). Unit: energy.
+/// plan's miners, the hauling plan's haulers and the opening's planned workers, each of the body
+/// the opening solved for them as they are while upgraders take the controller's energy (its
+/// plan's `capped` body, P3.6). Unit: energy.
 ///
-/// Uses: `BODYPART_COST` (`Body::cost`), `Body::scaled`.
+/// Uses: `BODYPART_COST` (`Body::cost`).
 pub fn upkeep(
     mine: Option<&MinePlan>,
     haul: Option<&HaulPlan>,
     workers: Option<&WorkerPlan>,
-    capacity: u32,
-    worker_repeats: u8,
 ) -> u64 {
     let miners = mine.map_or(0, |m| {
         m.sources
@@ -1282,7 +1282,7 @@ pub fn upkeep(
             .fold(0u64, u64::saturating_add)
     });
     let workers = workers.map_or(0, |p| {
-        Body::scaled(&WORKER_PATTERN, capacity, worker_repeats)
+        p.capped
             .map_or(0, |b| u64::from(b.cost()) * u64::from(p.want))
     });
     miners.saturating_add(haulers).saturating_add(workers)
@@ -1313,7 +1313,7 @@ fn tile_key(p: Position) -> (u8, u8) {
     (p.x().u8(), p.y().u8())
 }
 
-/// `upgrading.worker_repeats` as a repeat count.
+/// `upgrading.worker_repeats` as a cap on WORK parts.
 fn repeats(cfg: &UpgradingConfig) -> u8 {
     u8::try_from(cfg.worker_repeats).unwrap_or(u8::MAX)
 }

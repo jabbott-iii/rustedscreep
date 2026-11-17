@@ -42,6 +42,7 @@ use std::fmt::Write as _;
 
 use js_sys::{Object, Reflect};
 use rustedscreep_core::config::{SchedulerConfig, SpawnConfig};
+use rustedscreep_core::economy::sizing::smallest_worker;
 use rustedscreep_core::intents::{ActLog, Outcome, error_name};
 use rustedscreep_core::scheduler::{
     Clock, Fault, FaultRecord, Job, JobState, Scheduler, TickCpu, Tier,
@@ -49,7 +50,6 @@ use rustedscreep_core::scheduler::{
 use rustedscreep_core::snapshot::{Snapshot, parse_room_name};
 use rustedscreep_core::spawning::{
     Body, BodySpec, CreepName, EnergyBudget, Identity, Role, SpawnEvent, SpawnRequest, Spawner,
-    WORKER_PATTERN,
 };
 use screeps::{Part, RoomName};
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
@@ -91,14 +91,13 @@ const JOB: Job = Job {
 /// The job name the act step's spawn faults are logged under.
 const ACT_JOB: &str = "spawn act";
 
-/// The pattern a console request of `role` repeats, or `None` for a role the console does not
-/// spawn: a miner's body comes from its source (`economy::mining`, P3.1), a hauler's from its
-/// source's yield and trip (`economy::hauling`, P3.3), an upgrader's from the energy that reaches
-/// the controller (`economy::upgrading`, P3.4).
-fn pattern(role: Role) -> Option<&'static [Part]> {
+/// Whether the console spawns `role`: a worker only. A miner's body comes from its source
+/// (`economy::mining`, P3.1), a hauler's from its source's yield and trip (`economy::hauling`,
+/// P3.3), an upgrader's from the energy that reaches the controller (`economy::upgrading`, P3.4).
+fn console_role(role: Role) -> bool {
     match role {
-        Role::Worker => Some(&WORKER_PATTERN),
-        Role::Miner | Role::Hauler | Role::Upgrader => None,
+        Role::Worker => true,
+        Role::Miner | Role::Hauler | Role::Upgrader => false,
     }
 }
 
@@ -126,10 +125,11 @@ pub struct SpawnGlue {
 }
 
 impl SpawnGlue {
-    /// Opens the tick's requests for `snapshot`, and queues the console's request. A console
-    /// request accepted on the last tick whose creep is not in this snapshot stands again (the
-    /// processor dropped the order, V173).
-    pub fn begin(&mut self, snapshot: &Snapshot) {
+    /// Opens the tick's requests for `snapshot`, and queues the console's request: a worker of the
+    /// body `worker` gives for its room (the opening's planned body, solved from the room's targets
+    /// at its capacity, P3.6), else the smallest worker. A console request accepted on the last tick
+    /// whose creep is not in this snapshot stands again (the processor dropped the order, V173).
+    pub fn begin(&mut self, snapshot: &Snapshot, worker: impl Fn(RoomName) -> Option<Body>) {
         if let Some((request, id, name)) = self.accepted.take() {
             let creeps = &snapshot.creeps;
             let born = creeps
@@ -148,13 +148,14 @@ impl SpawnGlue {
         }
         self.spawner.begin(snapshot);
         self.console_index = self.console.and_then(|c| {
+            let body = match c.role {
+                Role::Worker => worker(c.home).or_else(smallest_worker)?,
+                Role::Miner | Role::Hauler | Role::Upgrader => return None,
+            };
             self.spawner.request(SpawnRequest {
                 home: c.home,
                 role: c.role,
-                body: BodySpec::Scaled {
-                    pattern: pattern(c.role)?,
-                    max_repeats: u8::MAX,
-                },
+                body: BodySpec::Exact(body),
                 budget: EnergyBudget::Capacity,
                 priority: 0,
             })
@@ -269,8 +270,8 @@ impl SpawnGlue {
     }
 
     /// For `rustedscreep.spawn(room, role)`: from the next tick, a spawn of `room` spawns one creep
-    /// of `role` (worker when omitted), sized to the room's capacity, once the room holds its cost.
-    /// With no room it cancels the request.
+    /// of `role` (worker when omitted) of the room's planned worker body ([`Self::begin`]), once the
+    /// room holds its cost. With no room it cancels the request.
     pub fn set_console(&mut self, room: Option<&str>, role: Option<&str>) -> String {
         let Some(room) = room else {
             return match self.console.take() {
@@ -284,7 +285,7 @@ impl SpawnGlue {
         let role = match role {
             None => Role::Worker,
             Some(name) => match Role::from_name(name) {
-                Some(role) if pattern(role).is_some() => role,
+                Some(role) if console_role(role) => role,
                 found => {
                     let mut text = String::from(match found {
                         Some(Role::Hauler) => {
@@ -298,7 +299,7 @@ impl SpawnGlue {
                         }
                         None => "rustedscreep spawn: unknown role; roles:",
                     });
-                    for r in Role::ALL.into_iter().filter(|&r| pattern(r).is_some()) {
+                    for r in Role::ALL.into_iter().filter(|&r| console_role(r)) {
                         let _ = write!(text, " {}", r.as_str());
                     }
                     return text;
@@ -313,8 +314,8 @@ impl SpawnGlue {
             " (no own spawn there on the last tick: nothing spawns until one exists)"
         };
         format!(
-            "rustedscreep spawn: from the next tick, a spawn of {home} spawns one {} sized to the \
-             room's capacity, once the room holds its cost; rustedscreep.spawn() cancels{note}",
+            "rustedscreep spawn: from the next tick, a spawn of {home} spawns one {} of the room's \
+             planned body, once the room holds its cost; rustedscreep.spawn() cancels{note}",
             role.as_str()
         )
     }

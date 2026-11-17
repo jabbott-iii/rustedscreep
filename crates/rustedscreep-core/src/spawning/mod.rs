@@ -1,7 +1,7 @@
 //! The minimal spawn path (ROADMAP P2; the P5 global spawn queue replaces the planner): creep bodies
-//! ([`Body`]), creep names as identity ([`CreepName`], [`Identity`], [`Role`]), and the per-room
-//! planner ([`Spawner`]) that turns this tick's [`SpawnRequest`]s into [`SpawnOrder`]s for the act
-//! layer. All pure; rustedscreep-wasm reads the spawns, the room energy and the creep names into
+//! ([`Body`]; every job solves its bodies from its targets in `economy::sizing`, P3.6), creep names
+//! as identity ([`CreepName`], [`Identity`], [`Role`]), and the per-room planner ([`Spawner`]) that
+//! turns this tick's [`SpawnRequest`]s into [`SpawnOrder`]s for the act layer. All pure; rustedscreep-wasm reads the spawns, the room energy and the creep names into
 //! the snapshot and issues the orders as `spawnCreep` calls.
 //!
 //! One tick, as rustedscreep-wasm drives it:
@@ -22,12 +22,6 @@ pub use name::{CreepName, Identity, NAME_MAX, ORDERS_PER_TICK, Role, serial};
 pub use spawner::{
     BodySpec, EnergyBudget, SpawnEvent, SpawnOrder, SpawnRequest, SpawnStats, SpawnTotals, Spawner,
 };
-
-use rustedscreep_consts::Part;
-
-/// The bootstrap worker's pattern: one each of WORK, CARRY and MOVE, so it harvests, carries and
-/// moves a tile per tick on plain while empty (V54, V55). The P3 body solver replaces patterns.
-pub const WORKER_PATTERN: [Part; 3] = [Part::Work, Part::Carry, Part::Move];
 
 #[cfg(test)]
 mod tests;

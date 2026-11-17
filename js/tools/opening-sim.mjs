@@ -24,8 +24,11 @@
 //   non-CARRY parts + loaded CARRY parts) × 2 fatigue on plain and every creep sheds 2 per MOVE part a tick (V54,
 //   V55); piles decay (V193); a tombstone lasts TOMBSTONE_DECAY_PER_PART ticks per part of its creep (V194).
 // It checks, until the controller reaches level 2, its first extension is built and a few ticks more:
-// - the first spawnCreep comes on the global's first loop with WORKER_PATTERN once ([work, carry, move], what the
-//   spawn's energy buys) and the name `wW1N1-<base 36 of Game.time × 256>`, with exactly two arguments;
+// - the first spawnCreep comes on the global's first loop with the smallest worker ([work, carry, move]: the room has
+//   no plan before its first scan, so the recovery asks for it, P3.6) and the name `wW1N1-<base 36 of Game.time ×
+//   256>`, with exactly two arguments; every spawned body is WORK, then CARRY, then MOVE parts, one each at least;
+// - each summary's plan ends with the solved worker body (`, body W WORK C CARRY M MOVE`), within the plan's
+//   capacity, and a spawn on a loop whose summary requests at capacity has that body;
 // - the creeps call only harvest (the source), transfer (the spawn or an extension, energy), upgradeController (the
 //   controller), build (a site), move (a direction 1 to 8), pickup (a pile) and withdraw (the tombstone, energy), at
 //   most one work call and one move a creep a tick, never a move while fatigued; every call returns OK in the model,
@@ -64,7 +67,7 @@ const MIN_WORKERS = 2;
 const MAX_WORKERS = 20;
 /** MOVEMENT_MMO's plain cost (config.rs): a trip's cost on plain is 2 per tile. */
 const PLAIN_COST = 2;
-/** spawning::WORKER_PATTERN; one repeat is what SPAWN_ENERGY_CAPACITY buys (2 × 200 > 300). */
+/** economy::sizing::smallest_worker: one WORK, CARRY and MOVE part (P3.6), the first loop's recovery body. */
 const PATTERN = ['work', 'carry', 'move'];
 /** economy::placement: EDGE_MARGIN, SPAWN_CLEAR and CONTROLLER_CLEAR, the rules a picked tile must keep. */
 const EDGE_MARGIN = 3;
@@ -622,13 +625,16 @@ export function openingSim(dir = join(ROOT, 'dist')) {
   problems.push(...bad.map((l) => `log: ${l}`));
   if (world.halts || world.globals !== 1) problems.push(`halts ${world.halts}, globals ${world.globals}`);
 
-  // The first order: the global's first loop, one WORKER_PATTERN repeat, the bot's name, two arguments.
+  // The first order: the global's first loop, the smallest worker, the bot's name, two arguments.
   const first = state.spawnCalls[0];
   if (!first || first.offset !== 1 || first.args !== 2 || JSON.stringify(first.body) !== JSON.stringify(PATTERN) || first.name !== nameAt(1)) {
     problems.push(`first spawnCreep ${JSON.stringify(first)}, expected offset 1, 2 arguments, body ${JSON.stringify(PATTERN)}, name ${nameAt(1)}`);
   }
   for (const c of state.spawnCalls) {
     if (c.args !== 2 || !Array.isArray(c.body) || !c.name.startsWith(`w${ROOM}-`) || c.result !== C.OK) problems.push(`spawnCreep ${JSON.stringify(c)}`);
+    // A solved worker body (P3.6): WORK, then CARRY, then MOVE parts, one each at least.
+    const ordered = Array.isArray(c.body) && /^(work,)+(carry,)+(move,)*move$/.test(c.body.join(','));
+    if (!ordered) problems.push(`offset ${c.offset}: body ${JSON.stringify(c.body)} is not WORK, CARRY, MOVE parts in order`);
   }
 
   // The creeps' calls: methods and targets, all OK.
@@ -694,6 +700,7 @@ export function openingSim(dir = join(ROOT, 'dist')) {
   const offsets = Object.keys(summaries).map(Number);
   const tiles = range(SOURCE, CONTROLLER) - 1 - 3;
   if (results.length !== offsets.length) problems.push(`${results.length} opening summaries, expected ${offsets.length}`);
+  let atCapacity = 0;
   offsets.forEach((o, i) => {
     const r = results[i] ?? '';
     const seen = summaries[o];
@@ -711,8 +718,26 @@ export function openingSim(dir = join(ROOT, 'dist')) {
       parts.push(`workers 0 of ${MIN_WORKERS} (working 0), requesting at available energy (priority 200), no plan yet, sites 0, loose energy 0, ` +
         `RECOVERING since tick ${T0 + 1}; since boot: recoveries 1 (ended 0), guards 0, wait fallbacks 0, stalls 0`);
     } else {
-      parts.push(plan, ` trip ${tiles} tiles cost ${tiles * PLAIN_COST}, sites ${seen.sites}, loose energy ${seen.loose};`,
+      parts.push(plan, ` trip ${tiles} tiles cost ${tiles * PLAIN_COST}, body `, `, sites ${seen.sites}, loose energy ${seen.loose};`,
         'since boot: recoveries 1 (ended 1), guards 0, wait fallbacks 0, stalls 0');
+      // The solved worker body at the plan's capacity (P3.6), and a spawn this loop at capacity has it.
+      const body = / body (\d+) WORK (\d+) CARRY (\d+) MOVE, sites /.exec(r);
+      if (!body) problems.push(`opening summary at offset ${o} has no body: ${r}`);
+      else {
+        const [work, carry, move] = body.slice(1).map(Number);
+        const cost = work * C.BODYPART_COST.work + carry * C.BODYPART_COST.carry + move * C.BODYPART_COST.move;
+        if (!(work >= 1 && carry >= 1 && move >= 1) || cost > capacity || work + carry + move > C.MAX_CREEP_SIZE) {
+          problems.push(`opening summary at offset ${o}: body ${work}/${carry}/${move} (${cost} energy) at capacity ${capacity}`);
+        }
+        const call = state.spawnCalls.find((c) => c.offset === o);
+        const count = (b, part) => b.filter((p) => p === part).length;
+        if (call && r.includes('requesting at capacity') && Array.isArray(call.body)) {
+          atCapacity += 1;
+          if (count(call.body, 'work') !== work || count(call.body, 'carry') !== carry || count(call.body, 'move') !== move) {
+            problems.push(`offset ${o}: spawned ${JSON.stringify(call.body)} at capacity, the summary's body is ${work}/${carry}/${move}`);
+          }
+        }
+      }
     }
     for (const p of parts) if (!r.includes(p)) problems.push(`opening summary at offset ${o} lacks "${p}": ${r}`);
     if (o !== 1 && r.includes('RECOVERING')) problems.push(`opening summary at offset ${o} still recovering: ${r}`);
@@ -730,6 +755,8 @@ export function openingSim(dir = join(ROOT, 'dist')) {
     const planWant = Number(new RegExp(`${plan.replace(/[()]/g, '\\$&')}(\\d+)`).exec(r)?.[1]);
     if (wanted !== Math.min(Math.max(planWant, MIN_WORKERS), MAX_WORKERS)) problems.push(`summary at offset ${o}: wants ${wanted}, the plan's source wants ${planWant}`);
   });
+
+  if (!atCapacity) problems.push('no spawn at capacity on a summary loop: the body check compared nothing');
 
   // The loose energy is the total also while a worker takes it (the reservation is not subtracted: P2.4 review).
   const taking = offsets.filter((o, i) => summaries[o].scripted && /, tasks [^;]*take \d/.test(results[i] ?? ''));

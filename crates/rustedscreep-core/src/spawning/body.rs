@@ -1,6 +1,7 @@
 //! Creep bodies (ROADMAP P2, the minimal spawn path): a fixed array of at most `MAX_CREEP_SIZE`
-//! parts with its cost and spawn time, and the scaled bodies the spawn path sizes from a room's
-//! energy. The P3 body solver replaces [`Body::scaled`]; the type stays.
+//! parts with its cost and spawn time, and the scaled bodies the spawn path can size from a room's
+//! energy ([`Body::scaled`]). Since the P3 body solver (P3.6, `economy::sizing`) no job asks for a
+//! scaled pattern: every body is solved from its targets and requested exactly.
 
 use std::fmt;
 

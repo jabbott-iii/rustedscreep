@@ -414,6 +414,10 @@ pub struct OpeningConfig {
     /// Places extension sites as the level allows (ADR-020's interim pattern) in the Optional
     /// tier. Off, the opening builds only sites placed by hand.
     pub place_extensions: bool,
+    /// The worker solver (P3.6, `economy::sizing::worker_plan`) takes the fewest workers among the
+    /// bodies whose value (energy put to use over a creep life, net of their bodies) is within this
+    /// share of the room's yield and build work of the best one. Unit: percent.
+    pub body_slack_pct: u32,
 }
 
 /// Opening values for the official MMO.
@@ -426,6 +430,7 @@ pub const OPENING_MMO: OpeningConfig = OpeningConfig {
     min_upgraders: 1,
     stall_ticks: 1500,
     place_extensions: true,
+    body_slack_pct: 2,
 };
 
 /// Static mining switches (ROADMAP P3.1, ADR-023) and the P3 gate's harvest target;
@@ -569,9 +574,10 @@ pub struct UpgradingConfig {
     /// into the container and the workers that take from it. An upgrader at its post is never
     /// shoved off it. Unit: tiles.
     pub free_tiles: u32,
-    /// The most `WORKER_PATTERN` repeats a worker gets while upgraders take the controller's
-    /// energy: the room's workers then only build, repair and fill, and their bodies come out of
-    /// the upgraders' budget. Unit: repeats.
+    /// The most WORK parts a worker gets while upgraders take the controller's energy: the room's
+    /// workers then only build, repair and fill, their body is solved within it (P3.6), and their
+    /// bodies come out of the upgraders' budget. One repeat of the former 1:1:1 pattern held one
+    /// WORK part. Unit: WORK parts.
     pub worker_repeats: u32,
     /// A room's miner, or hauler, counts toward the upgraders' budget for this long after the room
     /// last had one (spawning ones count): a replacement is ordered only once the creep is gone,
@@ -794,7 +800,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 82;
+pub const FIELD_COUNT: usize = 83;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1018,6 +1024,7 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(opening, "OpeningConfig", min_upgraders, 0, 10, true),
     number!(opening, "OpeningConfig", stall_ticks, 100, 20_000, true),
     flag!(opening, "OpeningConfig", place_extensions, true),
+    number!(opening, "OpeningConfig", body_slack_pct, 0, 25, true),
     flag!(mining, "MiningConfig", enabled, true),
     flag!(mining, "MiningConfig", place_containers, true),
     number!(
@@ -1266,6 +1273,7 @@ mod tests {
             min_upgraders: _,
             stall_ticks: _,
             place_extensions: _,
+            body_slack_pct: _,
         } = OPENING_MMO;
         let MiningConfig {
             enabled: _,
@@ -1387,6 +1395,7 @@ mod tests {
                     "min_upgraders",
                     "stall_ticks",
                     "place_extensions",
+                    "body_slack_pct",
                 ],
             ),
             (

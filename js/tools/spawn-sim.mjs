@@ -6,14 +6,18 @@
 // is busy until the tick its creep leaves, CREEP_SPAWN_TIME per part after the call; once (DROP_AT) it drops an
 // accepted order silently, as the processor can (V173). It checks that:
 // - no spawnCreep is called before the console asks (`rustedscreep.spawn("W1N1")`), and none while the room holds
-//   less than the body's cost: the request is sized to the room's capacity (550: two WORK, CARRY, MOVE repeats);
+//   less than the body's cost: the request is the opening's planned worker body (P3.6, solved from the room's
+//   targets at its capacity; this room has no source, so nothing to size a worker for: the smallest worker, one
+//   WORK, CARRY and MOVE, which is also the glue's fallback with no plan, so this sim cannot tell the two apart;
+//   the live check of TEST_PLAN §8 compares a console worker with the plan's body);
 // - the first call goes to the spawn with the lower id, with exactly two arguments: the body as an array of part
 //   strings (one slice across the boundary, V178) and the name `wW1N1-<base 36 of Game.time × 256>`;
 // - a refused call (ERR_RCL_NOT_ENOUGH) holds that spawn for the next SpawnConfig::hold_ticks (20) ticks, so the
 //   other spawn takes the request on the next tick; its OK ends the console request (one info line);
 // - a second request waits while one spawn is held and the other busy (no spawn job and no clock reading on those
-//   ticks), then while the free one lacks energy, and on the tick the room is full again the spawn that worked takes
-//   it, not the lower-id one, still held (`spawner()` shows it held that tick and free the next);
+//   ticks), then while the free one lacks energy (the first order drained the room; the spawn job plans it every
+//   tick), and on the tick the room is full again, the held spawn's last, the spawn that worked takes it, not the
+//   lower-id one, still held (`spawner()` shows it held that tick and free the next);
 // - after that OK, a tick with a ready spawn (on probation), a full room and no new command makes no call: the
 //   accepted request is gone; a third request goes to the spawn on probation (the only ready one), the harness drops
 //   that order, and on the next tick the request stands again (one warning) and is spawned;
@@ -23,11 +27,12 @@
 // - ADR-018: the harness's spawnCreep writes `Memory.creeps[name]` on every OK, as the engine's runtime does (V181),
 //   and the stored Memory string never holds one of them (the bot deletes each entry in the same tick, V180), while
 //   an entry another script wrote (seeded in Memory) stays;
-// - ADR-019: with the raw Memory set to a string that does not parse (from the console), the harness's spawnCreep
-//   throws as the engine's does on a null Memory (V181); the bot logs the message, resets the raw string to `{}`
-//   (RawMemory.set, kept by the end-of-tick save, V180), notifies once and spawns on the next tick; a later throw
-//   with a usable Memory resets nothing and holds the spawn; the two throws' fault lines are the only faults; no trap
-//   or halt.
+// - ADR-019: with the raw Memory set to a string that does not parse (from the console, the tick before a request: a
+//   tick with a null Memory and no call resets nothing), the harness's spawnCreep throws as the engine's does on a
+//   null Memory (V181), on the lower-id spawn with both ready; the bot logs the message, resets the raw string to
+//   `{}` (RawMemory.set, kept by the end-of-tick save, V180), notifies once and, the spawn released, spawns from it on
+//   the next tick; a later throw with a usable Memory (the other spawn's, while the first is busy) resets nothing and
+//   holds the spawn; the two throws' fault lines are the only faults; no trap or halt.
 // The P2.4 opening reads the room every loop (its finds, the controller's getters, the creeps' stores and, while the
 // room is not full, the spawns' free energy; engine-shaped here, V189, V196, V199) but stays inert: the room has no
 // source, so its plan wants no worker and requests none, and the console's workers (bot worker names) gather nothing
@@ -52,8 +57,9 @@ const OTHER = 'W5N5';
 const T0 = 50000000;
 /** RCL2: a spawn and five 50-energy extensions (CONTROLLER_STRUCTURES, EXTENSION_ENERGY_CAPACITY). */
 const CAPACITY = 300 + 5 * 50;
-/** The worker body at that capacity: WORKER_PATTERN repeated in place, two times (400 energy). */
-const BODY = ['work', 'work', 'carry', 'carry', 'move', 'move'];
+/** The opening plan's worker body (economy::sizing::worker_plan, P3.6): with no source in the room, the smallest
+ * worker (sizing::smallest_worker), 200 energy. */
+const BODY = ['work', 'carry', 'move'];
 /** CONTROLLER_LEVELS[2] and CONTROLLER_DOWNGRADE[2] (@screeps/common 2.16.0). */
 const PROGRESS_TOTAL_2 = 45000;
 const DOWNGRADE_2 = 10000;
@@ -72,10 +78,13 @@ const AGAIN_AT = FIRST + 3;
 const BAD_ROOM_AT = AGAIN_AT + 2;
 const BAD_ROLE_AT = BAD_ROOM_AT + 1;
 const BAD_ARG_AT = BAD_ROLE_AT + 1;
-/** SpawnB, accepted at FIRST + 1, is busy until its creep leaves SPAWN_TIME ticks after the call. */
+/** SpawnB, accepted at FIRST + 1, is busy until its creep leaves SPAWN_TIME ticks after the call. That order drained
+ * the room (FILL_AT gives one body's cost), so from here the second request waits for energy with SpawnB free. */
 const B_FREE = FIRST + 1 + SPAWN_TIME;
-const REFILL_AT = B_FREE;
-const THIRD = REFILL_AT + 1;
+/** SpawnA's last held tick: the room is full again (the harness refills it on the tick before), and SpawnB takes the
+ * second request. */
+const THIRD = A_READY - 1;
+const REFILL_AT = THIRD - 1;
 const HELD_SUMMARY_AT = THIRD;
 const REFILL2_AT = THIRD;
 const QUIET = THIRD + 1;
@@ -91,16 +100,21 @@ const CANCEL2_AT = LAST_SUMMARY_AT + 1;
 const END_CANCEL_AT = CANCEL2_AT + 1;
 /** The stored Memory after the end of this tick holds every entry the bot did not delete so far. */
 const MEMORY_CHECK_AT = END_CANCEL_AT + 1;
-/** SpawnB, accepted at THIRD, is free again here; the last request and the corrupt Memory come just before. */
+/** SpawnB, accepted at THIRD, is free again here: it is busy from the quiet tick through the console's summary. */
 const B_FREE2 = THIRD + SPAWN_TIME;
-const REQUEST_AT = B_FREE2 - 2;
-const CORRUPT_AT = B_FREE2 - 1;
-const THROWN = B_FREE2;
+/** SpawnA, accepted at REARMED, is free again here, so both spawns are ready: the lower id takes the last request and
+ * throws on the null Memory. The corrupt Memory comes the tick before the request (a tick with a null Memory and no
+ * call), so the request is served on the tick after it, whatever the room holds. */
+const A_FREE = REARMED + SPAWN_TIME;
+const THROWN = A_FREE;
+const REQUEST_AT = THROWN - 1;
+const CORRUPT_AT = REQUEST_AT - 1;
+/** Released by the reset, SpawnA (still the lower id) spawns; it is busy from the next tick. */
 const RESPAWNED = THROWN + 1;
 const FINAL_SUMMARY_AT = RESPAWNED;
-/** SpawnA, accepted at REARMED, is free again here; its next call throws with a usable Memory. */
-const OTHER_THROW = REARMED + SPAWN_TIME;
-const REQUEST2_AT = OTHER_THROW - 1;
+/** While SpawnA is busy, SpawnB takes the next request and throws with a usable Memory. */
+const REQUEST2_AT = RESPAWNED + 1;
+const OTHER_THROW = REQUEST2_AT + 1;
 const HELD_AGAIN_AT = OTHER_THROW + 1;
 const TICKS = HELD_AGAIN_AT + 1;
 /** Memory at the start: another script's creep entry, which the bot must leave alone (ADR-018). */
@@ -124,7 +138,8 @@ const nameAt = (offset) => `w${ROOM}-${(BigInt(T0 + offset) << 8n).toString(36)}
 
 function makeWorld() {
   const state = {
-    energy: 250,
+    // Less than the body's cost: no call until FILL_AT.
+    energy: BODY.reduce((sum, p) => sum + COST[p], 0) - 50,
     calls: [],
     /** Return values of the spawnCreep calls, in call order (OK once they run out). */
     returns: [ERR_RCL_NOT_ENOUGH],
@@ -223,7 +238,11 @@ function advance(state, offset) {
       c.y = 26;
     }
   }
-  if ([FILL_AT, REFILL_AT, REFILL2_AT, CORRUPT_AT, REQUEST2_AT].includes(offset)) state.energy = CAPACITY;
+  // The first fill is one body's cost, so the first order drains the room and the second request waits for the
+  // refill (REFILL_AT) once SpawnB is free. The others make the room full for the quiet tick and the third request
+  // (REFILL2_AT) and for each throw (CORRUPT_AT, REQUEST2_AT).
+  if (offset === FILL_AT) state.energy = BODY_COST;
+  if ([REFILL_AT, REFILL2_AT, CORRUPT_AT, REQUEST2_AT].includes(offset)) state.energy = CAPACITY;
 }
 
 const COMMANDS = {
@@ -261,22 +280,26 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
   if (faults.length !== 2 || !faults.every((f) => f.endsWith(': the spawnCreep call threw'))) problems.push(`spawn act faults ${JSON.stringify(faults)}, expected two "the spawnCreep call threw"`);
   if (world.halts) problems.push(`${world.halts} halt(s)`);
   if (Object.keys(COMMANDS).length !== 19) problems.push('two commands share a tick');
-  if (!(RESPAWNED < REQUEST2_AT && OTHER_THROW < RESPAWNED + SPAWN_TIME)) problems.push('the scenario lost its timing: SpawnA must free while SpawnB is busy');
-  if (!(A_READY === QUIET && B_FREE < THIRD)) problems.push('the scenario lost its timing: SpawnA must become ready on the quiet tick');
-  if (!(MEMORY_CHECK_AT < REQUEST_AT && B_FREE2 < REARMED + SPAWN_TIME)) problems.push('the scenario lost its timing: SpawnB must free before SpawnA for the Memory phase');
+  if (!(AGAIN_AT + 1 < B_FREE && B_FREE <= REFILL_AT)) problems.push('the scenario lost its timing: the second request must wait on a held and a busy spawn, then on energy with SpawnB free');
+  if (!(A_READY === QUIET && THIRD + 1 === QUIET)) problems.push('the scenario lost its timing: SpawnA must become ready on the quiet tick');
+  if (!(LAST_SUMMARY_AT < B_FREE2)) problems.push('the scenario lost its timing: SpawnB must stay busy from the quiet tick through the console\'s summary');
+  if (!(END_CANCEL_AT < MEMORY_CHECK_AT && MEMORY_CHECK_AT <= CORRUPT_AT && Math.max(A_FREE, B_FREE2) <= THROWN)) problems.push('the scenario lost its timing: both spawns must be ready for the Memory phase, after the stored-Memory check');
+  if (!(RESPAWNED < REQUEST2_AT && B_FREE2 <= OTHER_THROW && HELD_AGAIN_AT < RESPAWNED + SPAWN_TIME)) problems.push('the scenario lost its timing: SpawnB must take the last request while SpawnA is busy');
 
   // The calls: the lower id refused; the other spawn the next tick, and again once it is free and the room full (the
   // lower id still held); nothing on the quiet tick; the third request to the lower id (on probation), dropped by
-  // the harness, and again on the next tick.
+  // the harness, and again on the next tick; with both spawns ready, the lower id's throw on the null Memory and, the
+  // reset having released it, its spawn on the next tick (a hold would give that call to SpawnB); SpawnB's throw with
+  // a usable Memory while SpawnA is busy.
   const want = [
     { offset: FIRST, spawn: 'SpawnA', name: nameAt(FIRST) },
     { offset: FIRST + 1, spawn: 'SpawnB', name: nameAt(FIRST + 1) },
     { offset: THIRD, spawn: 'SpawnB', name: nameAt(THIRD) },
     { offset: DROP_AT, spawn: 'SpawnA', name: nameAt(DROP_AT) },
     { offset: REARMED, spawn: 'SpawnA', name: nameAt(REARMED) },
-    { offset: THROWN, spawn: 'SpawnB', name: nameAt(THROWN) },
-    { offset: RESPAWNED, spawn: 'SpawnB', name: nameAt(RESPAWNED) },
-    { offset: OTHER_THROW, spawn: 'SpawnA', name: nameAt(OTHER_THROW) },
+    { offset: THROWN, spawn: 'SpawnA', name: nameAt(THROWN) },
+    { offset: RESPAWNED, spawn: 'SpawnA', name: nameAt(RESPAWNED) },
+    { offset: OTHER_THROW, spawn: 'SpawnB', name: nameAt(OTHER_THROW) },
   ];
   const got = state.calls.map((c) => ({ offset: c.offset, spawn: c.spawn, name: c.name }));
   if (JSON.stringify(got) !== JSON.stringify(want)) problems.push(`spawnCreep calls ${JSON.stringify(got)}, expected ${JSON.stringify(want)}`);
@@ -285,7 +308,7 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
     if (!c.isArray || JSON.stringify(c.body) !== JSON.stringify(BODY)) problems.push(`offset ${c.offset}: body ${JSON.stringify(c.body)}, expected ${JSON.stringify(BODY)}`);
   }
   // No request can be served while SpawnA is held and SpawnB busy, nor on the quiet tick (no request), nor once both
-  // are busy again: no spawn job runs, so the plain build reads the clock in its loop only for the economy's five
+  // are busy again, nor on the tick with a null Memory (no request): no spawn job runs, so the plain build reads the clock in its loop only for the economy's five
   // jobs, one unit each for W1N1 with a sample before and after (10: the P3.1 static miners' Critical job, the P3.3
   // haulers' Critical job, the P2.4 opening's Critical and Standard jobs, and the Optional site placement of ADR-020;
   // was 8 before P3.3, 6 before P3.1 and 0 before P2.4; the haulers' Standard job has a unit only for a room with a
@@ -293,10 +316,16 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
   const OPENING_SAMPLES = 10;
   const idle = [];
   for (let o = AGAIN_AT + 1; o < B_FREE; o++) idle.push(o);
-  idle.push(QUIET, REARMED + 1);
+  // The tick with a null Memory has no request either.
+  idle.push(QUIET, REARMED + 1, REQUEST_AT);
   for (const o of idle) {
     const used = world.loopCalls[o]?.getUsed;
     if (used !== OPENING_SAMPLES) problems.push(`offset ${o}: ${used} getUsed calls with no request to serve, expected ${OPENING_SAMPLES}`);
+  }
+  // While the second request waits for energy with SpawnB free, the room is planned every tick: the spawn job runs.
+  for (let o = B_FREE; o <= REFILL_AT; o++) {
+    const used = world.loopCalls[o]?.getUsed;
+    if (!(used > OPENING_SAMPLES)) problems.push(`offset ${o}: ${used} getUsed calls while the request waits for energy, expected more than ${OPENING_SAMPLES}`);
   }
   const opening = world.logs.filter((l) => l.startsWith('rustedscreep opening:'));
   if (opening.length) problems.push(`opening lines (it should stay inert): ${opening.join(' / ')}`);
@@ -349,7 +378,8 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
   if (rearm.length !== 1 || !rearm[0].endsWith(wantRearm)) problems.push(`re-arm warnings ${JSON.stringify(rearm)}, expected one "${wantRearm}"`);
 
   // Summaries: SpawnA still held on THIRD; then the quiet tick (SpawnB busy, SpawnA free); then with a request for a
-  // room without a spawn and both spawns busy.
+  // room without a spawn and both spawns busy; then on the respawn after the reset; then SpawnB held after its throw
+  // while SpawnA is busy.
   const summaries = reply(SUMMARY_CMD);
   const event = (o, outcome) => `${nameAt(o)} at tick ${T0 + o} (${BODY.length} parts, ${BODY_COST} energy): ${outcome}`;
   const wantParts = [

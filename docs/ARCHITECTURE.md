@@ -162,10 +162,11 @@ after it.
 
 Spawn path (P2.3; the P5 global queue replaces the planner): `rustedscreep_core::spawning` is pure. `Body` is 1 to `MAX_CREEP_SIZE`
 known parts with its cost (`BODYPART_COST`) and spawn time (`CREEP_SPAWN_TIME` per part, V170); `Body::scaled` is the largest body of
-whole repeats of a pattern within an energy amount, a repeat cap and the size cap (the P3 body solver replaces it). `CreepName`
+whole repeats of a pattern within an energy amount, a repeat cap and the size cap (no job asks for one since P3.6: every body is solved
+from its targets in `economy::sizing` and requested exactly). `CreepName`
 encodes and parses a creep's identity (`Role`, home room, serial from `Game.time` and the order's index in its tick, so names never
 repeat, V171, V176): the bot's only creep state, read once per creep (§3). `Spawner` takes the tick's `SpawnRequest`s (home, role,
-pattern, repeat cap, `EnergyBudget::Capacity` to wait for the room's capacity, `Available` to spawn what the room holds now, or `UpTo(cap)`
+a body (`BodySpec::Exact`, or a pattern and a repeat cap), `EnergyBudget::Capacity` to wait for the room's capacity, `Available` to spawn what the room holds now, or `UpTo(cap)`
 to wait for the largest body within a cap (P2.4's wait fallback), and a priority); `close` keeps the rooms with a request and a ready spawn as the Critical `spawn` job's units; `plan_room` gives the room's
 ready spawns, in id order with those on probation last, its requests in priority order, keeping the energy left over the orders because the runtime checks
 each call against the same tick-start `energyAvailable` and the processor silently drops a second order the first one starved
@@ -179,7 +180,13 @@ not appear on the next tick).
 RCL1–3 opening (P2.4; the P3 economy replaces it): `rustedscreep_core::economy` is pure. `sizing` gives a worker's round between a
 source and the controller (harvest a load at `HARVEST_POWER` per WORK, walk it loaded and back with the fatigue rules, V54, V55, upgrade it
 at `UPGRADE_CONTROLLER_POWER` per WORK) and the workers a source keeps busy: enough to carry away what it yields over a round
-(`SOURCE_ENERGY_CAPACITY` per `ENERGY_REGEN_TIME`), no more than its open tiles can harvest at once. `Opening` keeps one plan per owned
+(`SOURCE_ENERGY_CAPACITY` per `ENERGY_REGEN_TIME`), no more than its open tiles can harvest at once. The workers' body (P3.6,
+`sizing::worker_plan`) is solved from those targets: of the WORK, CARRY and MOVE bodies within the energy, the ones whose workers, counted
+as fractions, put the most energy to use over a creep life net of their bodies (`worker_value`: each source's yield carried on its rounds;
+when the workers' energy is by the controller, a linked source's or the builders' while upgraders take, the time of their duties too:
+the build work on the spawn-to-controller trip, the mining containers' repairs, the fills while no hauler fills), and within
+`opening.body_slack_pct` of the best the fewest workers; without upgraders a linked source's workers walk their duties empty at a
+tile a tick. A request below the plan's capacity (recovery, the wait fallback) is solved at its energy, cached per room. `Opening` keeps one plan per owned
 room (the sources' open tiles, trips and counts, from a flow field from the controller on movement's grid, built again when the grid
 version or the room's capacity changes), and per worker (own creeps whose name says `worker` and the room) a mode, a source and a
 task, in the heap. Each tick, in id order with reservations: gatherers take the nearest pile, tombstone, ruin or container with
@@ -281,7 +288,8 @@ store per build, heavy). The budget is per creep life: the yield of each source 
 plan wants haulers for it, the container stands and the room has a hauler; sent: the mining plan says `linked` and a controller link
 stands, less `link_loss`; either only while the room has a miner; a miner or hauler, spawning ones included, counts for
 `upgrading.crew_grace_ticks` after the room last had one), less every other creep's body (the mining
-plan's miners, the hauling plan's haulers, the opening's planned workers at `upgrading.worker_repeats`). `sizing::upgrader_plan` gives
+plan's miners, the hauling plan's haulers, the opening's planned workers in the body solved for them while upgraders take, at most
+`upgrading.worker_repeats` WORK parts: the plan's `capped` body, P3.6). `sizing::upgrader_plan` gives
 one body (WORK, `upgrader_carry` CARRY, MOVE) and a count that upgrade the most of it, at most one per post and, at level 8,
 `CONTROLLER_MAX_UPGRADE_PER_TICK` WORK in all. Posts are the walkable tiles within 3 of the controller next to a fed store (the
 container while a counted source is hauled, the links while one is sent; the container's own tile too), off the mining and link tiles,

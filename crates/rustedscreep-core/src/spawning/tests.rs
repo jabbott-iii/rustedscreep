@@ -9,6 +9,11 @@ use rustedscreep_consts::{
 };
 
 use super::*;
+
+/// A pattern for the spawner's scaled bodies (`BodySpec::Scaled`): one each of WORK, CARRY and
+/// MOVE. No job spawns a fixed pattern since P3.6 (`economy::sizing`); the spawner still scales
+/// one when asked.
+const WORKER_PATTERN: [Part; 3] = [Part::Work, Part::Carry, Part::Move];
 use crate::config::SPAWN_MMO;
 use crate::intents::Outcome;
 use crate::scheduler::Commit;

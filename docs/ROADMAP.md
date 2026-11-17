@@ -124,7 +124,7 @@ Modules:
 - [x] Haulers sized from distance and throughput math.
 - [x] Upgraders sized to the energy budget.
 - [x] Minimal builders and repairers.
-- [ ] Body solver from targets, with no hardcoded bodies.
+- [x] Body solver from targets, with no hardcoded bodies.
 
 **Gate:**
 - [ ] Tests derive bodies and hauler sizing from constants.

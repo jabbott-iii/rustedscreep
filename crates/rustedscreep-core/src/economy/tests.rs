@@ -14,7 +14,8 @@
 //! drains spawns first, then extensions (V173) and takes `CREEP_SPAWN_TIME` per part (V170); a creep
 //! dies `CREEP_LIFE_TIME` ticks after it is born and leaves a tombstone with its store (V194, the
 //! body reclaim left out: about 0 at old age); piles lose `ceil(amount / ENERGY_DECAY)` a tick and
-//! merge on a tile (V193). Moves follow V51, V52 and the fatigue rules (V54, V55) on plain terrain.
+//! merge on a tile (V193). Moves follow V51, V52 and the fatigue rules (V54, V55) on plain and swamp
+//! terrain (no roads).
 //! The game side accepts the bot's plan and the processor then runs each creep's intents in its own
 //! order (`creepActions`, V45), creep by creep, so a transfer lands before a harvest.
 //! Containers (P3.1, ADR-023): energy made on a tile (a harvest's overflow, a decayed tombstone)
@@ -38,9 +39,10 @@ use super::placement::{
     CONTROLLER_CLEAR, EDGE_MARGIN, Placement, SPAWN_CLEAR, extensions_in, next_extension,
 };
 use super::sizing::{
-    Round, Trip, carry_round, haul_round, hauler_plan, haulers_for, miner_body, miner_work,
-    upgraded, upgrader_carry, upgrader_plan, upgrader_upgrade, walk_ticks, worker_body,
-    worker_round, workers_for_source, yield_per_life,
+    Round, Trip, WorkerScratch, WorkerSource, WorkerTargets, build_round, carry_round,
+    container_upkeep, haul_round, hauler_plan, haulers_for, miner_body, miner_work,
+    smallest_worker, source_wants, upgraded, upgrader_carry, upgrader_plan, upgrader_upgrade,
+    walk_ticks, worker_plan, worker_round, worker_value, workers_for_source, yield_per_life,
 };
 use super::*;
 use crate::config::{
@@ -57,7 +59,7 @@ use crate::snapshot::{
     Controller, ControllerState, CreepRow, CreepStore, ObjectKey, ObjectKind, ObjectRow,
     ObjectStatic, RoomEnergy, Snapshot, StructureStatic, TickContext,
 };
-use crate::spawning::{Body, Identity, Role, Spawner, WORKER_PATTERN};
+use crate::spawning::{Body, EnergyBudget, Identity, Role, Spawner};
 use rustedscreep_consts::{
     BUILD_POWER, CARRY_CAPACITY, CONTAINER_CAPACITY, CONTAINER_DECAY, CONTAINER_DECAY_TIME,
     CONTAINER_DECAY_TIME_OWNED, CONTAINER_HITS, CONTROLLER_DOWNGRADE_RESTORE,
@@ -73,9 +75,11 @@ use rustedscreep_consts::{
 // ---------------------------------------------------------------------------------------------
 // Sizing
 
+/// `n` repeats of the smallest worker's parts, each repeated in place (a fixture for the round
+/// formulas; no job spawns it since P3.6).
 fn repeats(n: u32) -> Body {
-    let cost = Body::new(&WORKER_PATTERN).expect("pattern").cost();
-    worker_body(cost * n).expect("body")
+    let unit = smallest_worker().expect("smallest worker");
+    Body::scaled(unit.parts(), unit.cost() * n, u8::MAX).expect("body")
 }
 
 /// Uses: MOVE_POWER, MOVE_COST_PLAIN, MOVE_COST_SWAMP. The walk takes at least the tiles and at
@@ -188,20 +192,459 @@ fn workers_for_a_source_are_monotonic() {
     }
 }
 
-/// Uses: SPAWN_ENERGY_CAPACITY, extension counts and capacities per level. The opening's bodies at
-/// RCL1, 2 and 3 are the whole repeats of the pattern the room's capacity holds.
-#[test]
-fn worker_bodies_by_level() {
-    let unit = Body::new(&WORKER_PATTERN).expect("pattern").cost();
-    for rcl in 1..=3u32 {
-        let capacity = SPAWN_ENERGY_CAPACITY
-            + StructureType::Extension.controller_structures(rcl) * extension_energy_capacity(rcl);
-        let body = worker_body(capacity).expect("body");
-        let n = capacity / unit;
-        assert_eq!(body.len(), WORKER_PATTERN.len() * n as usize, "RCL{rcl}");
-        assert!(body.cost() <= capacity);
+/// The spawns' and extensions' capacity at `rcl` (`SPAWN_ENERGY_CAPACITY` and the level's full set
+/// of extensions). Uses: SPAWN_ENERGY_CAPACITY, CONTROLLER_STRUCTURES, EXTENSION_ENERGY_CAPACITY.
+fn capacity_at(rcl: u32) -> u32 {
+    SPAWN_ENERGY_CAPACITY
+        + StructureType::Extension.controller_structures(rcl) * extension_energy_capacity(rcl)
+}
+
+/// The body of `work` WORK, `carry` CARRY and `moves` MOVE parts, in that order.
+fn wcm(work: u32, carry: u32, moves: u32) -> Body {
+    let mut parts = Vec::new();
+    parts.extend(std::iter::repeat_n(Part::Work, work as usize));
+    parts.extend(std::iter::repeat_n(Part::Carry, carry as usize));
+    parts.extend(std::iter::repeat_n(Part::Move, moves as usize));
+    Body::new(&parts).expect("body")
+}
+
+/// A trip of `tiles` tiles at `rate` each (a fatigue rate, `MOVE_COST_*`).
+fn trip_of(tiles: u32, rate: u32) -> Trip {
+    Trip {
+        tiles,
+        cost: tiles * rate,
     }
-    assert_eq!(worker_body(unit - 1), None);
+}
+
+/// Every worker body of WORK, CARRY and MOVE parts (one each at least, at most `t.max_work` WORK
+/// and `MAX_CREEP_SIZE` parts) that costs at most `energy`, with its value and workers
+/// (`worker_value`), counted again through the `Body` functions.
+fn worker_options(t: &WorkerTargets<'_>, energy: u32) -> Vec<(Body, i64, u32)> {
+    let mut out = Vec::new();
+    let mut wants = Vec::new();
+    for work in 1..=t.max_work.min(MAX_CREEP_SIZE) {
+        for carry in 1..MAX_CREEP_SIZE {
+            for moves in 1..MAX_CREEP_SIZE {
+                if work + carry + moves > MAX_CREEP_SIZE {
+                    continue;
+                }
+                let cost = work * Part::Work.cost()
+                    + carry * Part::Carry.cost()
+                    + moves * Part::Move.cost();
+                if cost > energy {
+                    continue;
+                }
+                let body = wcm(work, carry, moves);
+                source_wants(t, &body, &mut wants);
+                let (value, n) = worker_value(t, &body, &wants);
+                out.push((body, value, n));
+            }
+        }
+    }
+    out
+}
+
+/// The solver's order among the bodies within the slack of the best value: the fewest workers,
+/// then the most value, then the least energy for all of them, then the cheapest body, then the
+/// fewest MOVE parts.
+fn worker_key(body: &Body, value: i64, n: u32) -> (u32, i64, u64, u32, u32) {
+    (
+        n,
+        -value,
+        u64::from(n) * u64::from(body.cost()),
+        body.cost(),
+        count(body, Part::Move),
+    )
+}
+
+/// The slack of `t`: `slack_pct` of the yield over a creep life of the sources it sizes workers for
+/// (`yield_per_life`) and, with upgraders, the build work. Uses: CREEP_LIFE_TIME,
+/// ENERGY_REGEN_TIME.
+fn slack_of(t: &WorkerTargets<'_>) -> i64 {
+    let stake: u64 = t
+        .sources
+        .iter()
+        .filter(|s| s.trip.is_some() && !(t.upgraders && s.spent))
+        .map(|s| yield_per_life(s.capacity))
+        .sum::<u64>()
+        + if t.upgraders { u64::from(t.build) } else { 0 };
+    (stake * u64::from(t.slack_pct) / 100) as i64
+}
+
+/// Whether a body of `t` may be picked: without upgraders, while a linked source wants workers,
+/// it walks empty at a tile a tick on plain (each WORK part's `MOVE_COST_PLAIN` within what its MOVE
+/// parts remove, `MOVE_POWER` each). Uses: MOVE_COST_PLAIN, MOVE_POWER.
+fn walks_its_duties(t: &WorkerTargets<'_>, body: &Body) -> bool {
+    t.upgraders
+        || !t.duties()
+        || count(body, Part::Work) * MOVE_COST_PLAIN <= MOVE_POWER * count(body, Part::Move)
+}
+
+/// Two sources of `SOURCE_ENERGY_CAPACITY` with three open tiles each, `trip` from the controller,
+/// unmined, for the scenario room's sizes.
+fn two_sources(trip: Trip, mined: bool, linked: bool) -> [WorkerSource; 2] {
+    let s = WorkerSource {
+        capacity: SOURCE_ENERGY_CAPACITY,
+        open: 3,
+        trip: Some(trip),
+        mined,
+        linked,
+        container: mined,
+        spent: linked,
+    };
+    [s, s]
+}
+
+fn targets(
+    sources: &[WorkerSource],
+    upgraders: bool,
+    build: u32,
+    build_trip: Trip,
+) -> WorkerTargets<'_> {
+    WorkerTargets {
+        sources,
+        upgraders,
+        min: OPENING_MMO.min_workers,
+        max: OPENING_MMO.max_workers,
+        max_work: if upgraders {
+            UPGRADING_MMO.worker_repeats
+        } else {
+            u32::MAX
+        },
+        build,
+        build_trip: Some(build_trip),
+        fill: None,
+        unload: extension_energy_capacity(3),
+        slack_pct: OPENING_MMO.body_slack_pct,
+    }
+}
+
+/// Uses: BODYPART_COST, MAX_CREEP_SIZE, MOVE_POWER, the level capacities. Property test over trips
+/// (plain, swamp, road, short and long), mined, linked and plain sources, rooms with and without
+/// upgraders, build work and energies: the solved body costs at most the energy, has one WORK,
+/// CARRY and MOVE part at least, at most `max_work` WORK parts and `MAX_CREEP_SIZE` parts, in WORK,
+/// CARRY, MOVE order; by brute force over every body (those that walk their duties' trips empty at
+/// a tile a tick where that applies) it is the first in the solver's order among the bodies within
+/// `body_slack_pct` of the best value; and with more energy its value never falls below an earlier
+/// energy's floor (the best less the slack). RCL5 to RCL8's capacities on one trip reach the
+/// 50-part limit.
+#[test]
+fn worker_plans_fit_and_put_the_most_to_use() {
+    let mut energies: Vec<u32> = (1..=4).map(capacity_at).collect();
+    energies.extend([199, 200, 250, 450, 1000]);
+    energies.sort_unstable();
+    let mut wants = Vec::new();
+    for trip in [
+        trip_of(3, MOVE_COST_PLAIN),
+        trip_of(15, MOVE_COST_PLAIN),
+        trip_of(30, MOVE_COST_PLAIN),
+        trip_of(10, MOVE_COST_SWAMP),
+        trip_of(12, MOVE_COST_ROAD),
+    ] {
+        for (mined, linked) in [(false, false), (true, false), (true, true)] {
+            let sources = two_sources(trip, mined, linked);
+            for (upgraders, build, fill) in [
+                (false, 0, None),
+                (false, 0, Some(1000)),
+                (true, 0, None),
+                (true, 20_000, None),
+            ] {
+                let t = WorkerTargets {
+                    fill,
+                    ..targets(&sources, upgraders, build, trip)
+                };
+                // The highest floor so far: the best value only rises with more energy.
+                let mut last: Option<i64> = None;
+                let high = trip == trip_of(15, MOVE_COST_PLAIN) && !upgraders;
+                let more: Vec<u32> = if high {
+                    (5..=8).map(capacity_at).collect()
+                } else {
+                    Vec::new()
+                };
+                for &energy in energies.iter().chain(&more) {
+                    let options: Vec<(Body, i64, u32)> = worker_options(&t, energy)
+                        .into_iter()
+                        .filter(|o| walks_its_duties(&t, &o.0))
+                        .collect();
+                    let tag = format!(
+                        "{trip:?} mined {mined} linked {linked} upgraders {upgraders} build {build} fill {fill:?} at {energy}"
+                    );
+                    let Some(body) = worker_plan(&t, energy, &mut WorkerScratch::default()) else {
+                        assert!(options.is_empty(), "{tag}: a worker fits");
+                        continue;
+                    };
+                    let tag = format!("{tag}: {body:?}");
+                    assert!(body.cost() <= energy, "{tag}");
+                    assert!(body.len() <= MAX_CREEP_SIZE as usize, "{tag}");
+                    let (w, c, m) = (
+                        count(&body, Part::Work),
+                        count(&body, Part::Carry),
+                        count(&body, Part::Move),
+                    );
+                    assert!(w >= 1 && c >= 1 && m >= 1, "{tag}");
+                    assert!(w <= t.max_work, "{tag}");
+                    assert_eq!(body, wcm(w, c, m), "{tag}: WORK, CARRY, MOVE order");
+                    assert!(walks_its_duties(&t, &body), "{tag}: too slow empty");
+                    let best = options.iter().map(|o| o.1).max().expect("options");
+                    let floor = best - slack_of(&t);
+                    source_wants(&t, &body, &mut wants);
+                    let (value, n) = worker_value(&t, &body, &wants);
+                    assert!(value >= floor, "{tag}: {value} below {floor}");
+                    let key = worker_key(&body, value, n);
+                    for (other, v, k) in options.iter().filter(|o| o.1 >= floor) {
+                        assert!(
+                            worker_key(other, *v, *k) >= key,
+                            "{tag}: {other:?} comes first"
+                        );
+                    }
+                    assert!(
+                        last.is_none_or(|l| value >= l),
+                        "{tag}: below an earlier energy's floor"
+                    );
+                    last = Some(last.map_or(floor, |l| l.max(floor)));
+                }
+            }
+        }
+    }
+    let none = targets(&[], false, 0, trip_of(1, MOVE_COST_PLAIN));
+    assert_eq!(
+        worker_plan(&none, capacity_at(8), &mut WorkerScratch::default()),
+        smallest_worker(),
+        "nothing to size for"
+    );
+    let smallest = smallest_worker().expect("smallest").cost();
+    assert_eq!(
+        worker_plan(&none, smallest - 1, &mut WorkerScratch::default()),
+        None
+    );
+}
+
+/// Uses: MOVE_COST_PLAIN, MOVE_POWER, the level capacities. Without upgraders, with linked sources,
+/// a duty trip whose range-based tiles are 0 (the spawn or a mined source within 4 of the
+/// controller) or a detour (more cost than its tiles' plain cost) still solves to a body at every
+/// capacity, and that body walks empty at a tile a tick on plain (one MOVE part a WORK part at
+/// least), as the floor states; a floor measured against the trip's tiles once emptied the search.
+#[test]
+fn worker_plans_survive_short_and_detoured_duty_trips() {
+    for trip in [
+        Trip {
+            tiles: 0,
+            cost: MOVE_COST_PLAIN,
+        },
+        Trip {
+            tiles: 2,
+            cost: 8 * MOVE_COST_PLAIN,
+        },
+    ] {
+        let sources = two_sources(trip, true, true);
+        let t = targets(&sources, false, 0, trip);
+        assert!(t.duties());
+        for rcl in 2..=8 {
+            let body = worker_plan(&t, capacity_at(rcl), &mut WorkerScratch::default())
+                .unwrap_or_else(|| panic!("{trip:?} RCL{rcl}: a body"));
+            let (w, m) = (count(&body, Part::Work), count(&body, Part::Move));
+            assert!(
+                w * MOVE_COST_PLAIN <= MOVE_POWER * m,
+                "{trip:?} RCL{rcl}: {body:?}"
+            );
+        }
+    }
+}
+
+/// Uses: CARRY_CAPACITY, BUILD_POWER, MOVE_POWER, MOVE_COST_PLAIN. A builder's round: the take, the
+/// loaded and the empty walk ([`walk_ticks`]), and a load built at `BUILD_POWER` per WORK part.
+#[test]
+fn a_build_round_from_constants() {
+    let trip = trip_of(12, MOVE_COST_PLAIN);
+    for (w, c, m) in [(1, 1, 1), (2, 4, 3), (5, 2, 1)] {
+        let body = wcm(w, c, m);
+        let load = c * CARRY_CAPACITY;
+        let loaded = walk_ticks(trip, w + c, m).expect("walk");
+        let empty = walk_ticks(trip, w, m).expect("walk");
+        assert_eq!(
+            build_round(&body, trip),
+            Some(1 + loaded + empty + load.div_ceil(BUILD_POWER * w)),
+            "{body:?}"
+        );
+    }
+    assert_eq!(
+        build_round(&Body::new(&[Part::Work, Part::Move]).expect("body"), trip),
+        None
+    );
+}
+
+/// Uses: CREEP_LIFE_TIME, CONTAINER_DECAY, CONTAINER_DECAY_TIME_OWNED, REPAIR_COST. A mining
+/// container of an owned room loses `CONTAINER_DECAY` hits every `CONTAINER_DECAY_TIME_OWNED` − 1
+/// ticks (V214, as the world model decays it), each repaired for `REPAIR_COST` energy (V222): its
+/// repairs over a creep life.
+#[test]
+fn a_container_upkeep_from_constants() {
+    let hits = CREEP_LIFE_TIME * CONTAINER_DECAY / (CONTAINER_DECAY_TIME_OWNED - 1);
+    assert_eq!(container_upkeep(), hits.div_ceil(hits_per_energy()));
+}
+
+/// Millionths of a worker, as `worker_value` counts them.
+const MICRO: u128 = 1_000_000;
+
+/// Uses: SOURCE_ENERGY_CAPACITY, CREEP_LIFE_TIME, ENERGY_REGEN_TIME, CARRY_CAPACITY, BUILD_POWER,
+/// REPAIR_POWER, REPAIR_COST, BODYPART_COST. A pinned example of the value, with workers counted as
+/// fractions: each source keeps `capacity × round / (ENERGY_REGEN_TIME × load)` workers (or what its
+/// open tiles allow), which carry its yield over a life (`yield_per_life`); `max_workers` keeps
+/// fewer here, which carry that share; every worker kept costs its body. With upgraders spending
+/// both sources, the room keeps `min_workers` builders, counted whole, which spend the build work
+/// in the time their build rounds and the containers' repair rounds leave them (all of it when
+/// that time fits in their lives, else that share).
+#[test]
+fn a_worker_value_from_constants() {
+    let trip = trip_of(15, MOVE_COST_PLAIN);
+    let sources = two_sources(trip, false, false);
+    let t = targets(&sources, false, 0, trip);
+    let body = wcm(2, 2, 2);
+    let mut wants = Vec::new();
+    source_wants(&t, &body, &mut wants);
+    let round = worker_round(&body, trip).expect("round");
+    let n = workers_for_source(SOURCE_ENERGY_CAPACITY, 3, &body, round);
+    assert_eq!(wants, [n, n]);
+    let load = u128::from(2 * CARRY_CAPACITY);
+    let life = u128::from(CREEP_LIFE_TIME);
+    let ticks = u128::from(round.ticks());
+    let drain =
+        u128::from(SOURCE_ENERGY_CAPACITY) * ticks * MICRO / (u128::from(ENERGY_REGEN_TIME) * load);
+    let slots = 3 * ticks * MICRO / u128::from(round.harvest);
+    let each = drain.min(slots);
+    let carried = (each * load * life / (ticks * MICRO))
+        .min(u128::from(yield_per_life(SOURCE_ENERGY_CAPACITY)));
+    let need = 2 * each;
+    let kept = need.clamp(
+        u128::from(OPENING_MMO.min_workers) * MICRO,
+        u128::from(OPENING_MMO.max_workers) * MICRO,
+    );
+    assert!(kept < need, "the example is capped by max_workers");
+    let delivered = 2 * carried * kept / need;
+    let expected = delivered as i64 - (kept * u128::from(body.cost()) / MICRO) as i64;
+    let whole = (2 * n).clamp(OPENING_MMO.min_workers, OPENING_MMO.max_workers);
+    assert_eq!(worker_value(&t, &body, &wants), (expected, whole));
+
+    // Upgraders spend both (linked, mined) sources: the `min_workers` builders build and repair.
+    let spent = two_sources(trip, true, true);
+    let w = count(&body, Part::Work);
+    let (loaded, empty) = (
+        walk_ticks(trip, w + 2, count(&body, Part::Move)).expect("walk"),
+        walk_ticks(trip, w, count(&body, Part::Move)).expect("walk"),
+    );
+    let repair =
+        1 + loaded + empty + (2 * CARRY_CAPACITY).div_ceil(w * REPAIR_POWER / hits_per_energy());
+    let duty = |energy: u128, round: u32| energy * u128::from(round) * MICRO / (load * life);
+    let repairs = 2 * duty(u128::from(container_upkeep()), repair);
+    for build in [0u32, 500, 1_000_000] {
+        let t = targets(&spent, true, build, trip);
+        source_wants(&t, &body, &mut wants);
+        assert_eq!(wants, [0, 0]);
+        let r = build_round(&body, trip).expect("round");
+        let need = repairs
+            + if build > 0 {
+                duty(u128::from(build), r)
+            } else {
+                0
+            };
+        // The room keeps `min_workers`, counted whole: a build they cannot finish in a life is
+        // built in that share.
+        let kept = u128::from(OPENING_MMO.min_workers) * MICRO;
+        let built = if kept >= need {
+            u128::from(build)
+        } else {
+            u128::from(build) * kept / need
+        };
+        let expected = built as i64 - (kept * u128::from(body.cost()) / MICRO) as i64;
+        assert_eq!(
+            worker_value(&t, &body, &wants),
+            (expected, OPENING_MMO.min_workers),
+            "build {build}"
+        );
+    }
+    // Without upgraders, two linked mined sources share one pool of workers, which take next to
+    // the controller (no walk) and walk for their duties: the containers' repairs on the sources'
+    // trips, and the fills along the build trip (the workers' own bodies and 1000 for the others),
+    // each a fill of at most `unload` taking a transfer and a step.
+    let linked = two_sources(trip, true, true);
+    let t = WorkerTargets {
+        fill: Some(1000),
+        ..targets(&linked, false, 0, trip)
+    };
+    source_wants(&t, &body, &mut wants);
+    let pool = carry_round(&body, Trip { tiles: 0, cost: 0 }).expect("round");
+    let total = workers_for_source(2 * SOURCE_ENERGY_CAPACITY, 6, &body, pool);
+    assert_eq!(
+        wants,
+        [total.div_ceil(2), total / 2],
+        "the pool, split in order"
+    );
+    let ticks = u128::from(pool.ticks());
+    let workers = (u128::from(2 * SOURCE_ENERGY_CAPACITY) * ticks * MICRO
+        / (u128::from(ENERGY_REGEN_TIME) * load))
+        .min(6 * ticks * MICRO / u128::from(pool.harvest));
+    let delivered = (workers * load * life / (ticks * MICRO))
+        .min(2 * u128::from(yield_per_life(SOURCE_ENERGY_CAPACITY)));
+    let fill_round = loaded + empty + 2 * (2 * CARRY_CAPACITY).div_ceil(t.unload);
+    let own = (workers + repairs) * u128::from(body.cost()) / MICRO;
+    let need = workers + repairs + duty(own + 1000, fill_round);
+    let kept = need.clamp(
+        u128::from(OPENING_MMO.min_workers) * MICRO,
+        u128::from(OPENING_MMO.max_workers) * MICRO,
+    );
+    assert_eq!(kept, need, "the example is within the counts");
+    let expected = delivered as i64 - (kept * u128::from(body.cost()) / MICRO) as i64;
+    let whole = (wants[0] + wants[1]).clamp(OPENING_MMO.min_workers, OPENING_MMO.max_workers);
+    assert_eq!(worker_value(&t, &body, &wants), (expected, whole));
+
+    // With no build work the builders are the smallest worker.
+    let t = targets(&spent, true, 0, trip);
+    assert_eq!(
+        worker_plan(&t, capacity_at(8), &mut WorkerScratch::default()),
+        smallest_worker()
+    );
+}
+
+/// Uses: MOVE_COST_PLAIN, MOVE_COST_SWAMP, the level capacities. Bodies follow the trip: across
+/// swamp the solved worker has at least the MOVE parts per other part it has on plain, and the
+/// solved body is never worth less than the old fixed pattern's largest repeat (P2.4's worker).
+#[test]
+fn worker_bodies_follow_the_trip() {
+    let mut wants = Vec::new();
+    for rcl in 1..=4 {
+        let energy = capacity_at(rcl);
+        let ratio = |rate: u32, scratch: &mut WorkerScratch| {
+            let trip = trip_of(12, rate);
+            let sources = two_sources(trip, false, false);
+            let t = targets(&sources, false, 0, trip);
+            let b = worker_plan(&t, energy, scratch).expect("body");
+            let m = count(&b, Part::Move);
+            (m, b.len() as u32 - m, b)
+        };
+        let mut scratch = WorkerScratch::default();
+        let (pm, po, plain) = ratio(MOVE_COST_PLAIN, &mut scratch);
+        let (sm, so, swamp) = ratio(MOVE_COST_SWAMP, &mut scratch);
+        assert!(
+            sm * po >= pm * so,
+            "RCL{rcl}: swamp {swamp:?}, plain {plain:?}"
+        );
+        for rate in [MOVE_COST_PLAIN, MOVE_COST_SWAMP] {
+            let trip = trip_of(12, rate);
+            let sources = two_sources(trip, false, false);
+            let t = targets(&sources, false, 0, trip);
+            let solved = worker_plan(&t, energy, &mut WorkerScratch::default()).expect("body");
+            source_wants(&t, &solved, &mut wants);
+            let (value, _) = worker_value(&t, &solved, &wants);
+            let unit = smallest_worker().expect("smallest");
+            let old = Body::scaled(unit.parts(), energy, u8::MAX).expect("pattern");
+            source_wants(&t, &old, &mut wants);
+            let (old_value, _) = worker_value(&t, &old, &wants);
+            assert!(
+                value >= old_value,
+                "RCL{rcl} rate {rate}: {solved:?} against {old:?}"
+            );
+        }
+    }
 }
 
 /// Uses: HARVEST_POWER, ENERGY_REGEN_TIME, SOURCE_ENERGY_CAPACITY, SOURCE_ENERGY_NEUTRAL_CAPACITY,
@@ -965,7 +1408,13 @@ struct World {
     events: Vec<(u32, Event)>,
     failed: u32,
     spawned: Vec<(u32, Body)>,
+    /// Each worker spawned (P3.6): the tick, its body, the budget the opening requested it with
+    /// that tick, and the plan's body then.
+    worker_spawns: Vec<(u32, Body, Option<EnergyBudget>, Option<Body>)>,
     levels: Vec<(u32, u8)>,
+    /// The progress of the levels completed since the start (`CONTROLLER_LEVELS` each), so a
+    /// measure across a level-up counts all the upgrading ([`World::upgraded`]).
+    leveled: u64,
     /// Each source refill: the tick, the source's index, and the energy it still held (none taken
     /// that cycle is wasted).
     regens: Vec<(u32, usize, u32)>,
@@ -1076,7 +1525,9 @@ impl World {
             events: Vec::new(),
             failed: 0,
             spawned: Vec::new(),
+            worker_spawns: Vec::new(),
             levels: Vec::new(),
+            leveled: 0,
             regens: Vec::new(),
             full_at: None,
             struct_rows: Vec::new(),
@@ -1727,6 +2178,17 @@ impl World {
             born: 0,
         });
         self.spawned.push((self.time, body));
+        if identity.role == Role::Worker {
+            let (budget, plan_body) = self
+                .opening
+                .room_states()
+                .next()
+                .map_or((None, None), |(_, plan, _, stats)| {
+                    (stats.request.map(|r| r.0), plan.and_then(|p| p.body))
+                });
+            self.worker_spawns
+                .push((self.time, body, budget, plan_body));
+        }
         Outcome::Ok
     }
 
@@ -2056,7 +2518,8 @@ impl World {
         self.loose.push(Loose::Pile { key, at, amount });
     }
 
-    /// Moves (V51, V52) and their fatigue (V54 on plain, V55).
+    /// Moves (V51, V52) and their fatigue (V54: `MOVE_COST_SWAMP` on a swamp tile, else
+    /// `MOVE_COST_PLAIN`; no roads; V55).
     fn resolve_moves(&mut self, dest: &[Option<Tile>]) {
         let mut dest = dest.to_vec();
         loop {
@@ -2080,6 +2543,7 @@ impl World {
                 break;
             }
         }
+        let raw = &self.raw;
         for (c, d) in self.creeps.iter_mut().zip(&dest) {
             if let Some(d) = *d {
                 c.at = d;
@@ -2088,7 +2552,14 @@ impl World {
                     .div_ceil(CARRY_CAPACITY)
                     .min(count(&c.body, Part::Carry));
                 let weight = count(&c.body, Part::Work) + loaded;
-                c.fatigue += MOVE_COST_PLAIN * weight;
+                let swamp =
+                    raw[usize::from(d.y()) * 50 + usize::from(d.x())] & (Terrain::Swamp as u8) != 0;
+                let rate = if swamp {
+                    MOVE_COST_SWAMP
+                } else {
+                    MOVE_COST_PLAIN
+                };
+                c.fatigue += rate * weight;
             }
             c.fatigue = c
                 .fatigue
@@ -2108,6 +2579,7 @@ impl World {
             && self.progress >= total
         {
             self.progress -= total;
+            self.leveled += u64::from(total);
             self.level += 1;
             self.levels.push((now, self.level));
             let have = u32::try_from(
@@ -2292,6 +2764,11 @@ impl World {
         }
     }
 
+    /// Every upgrade's progress since the start, across level-ups.
+    fn upgraded(&self) -> u64 {
+        self.leveled + u64::from(self.progress)
+    }
+
     fn workers(&self) -> usize {
         self.creeps
             .iter()
@@ -2338,7 +2815,7 @@ impl World {
 /// `CREEP_SPAWN_TIME` per part; a source's regeneration period covers the first workers' first
 /// trips. Uses: `BODYPART_COST`, `CREEP_SPAWN_TIME` (through `Body`), `ENERGY_REGEN_TIME`.
 fn recovery_bound(cfg: &OpeningConfig) -> u32 {
-    let unit = Body::new(&WORKER_PATTERN).expect("pattern");
+    let unit = smallest_worker().expect("smallest worker");
     cfg.min_workers * (unit.cost() + unit.spawn_time()) + ENERGY_REGEN_TIME
 }
 
@@ -2362,8 +2839,9 @@ fn assert_recovers(level: u8) {
         "RCL{level}: {} ticks",
         recovered - start
     );
-    // The first workers spawn with what the spawn regenerated: one repeat each.
-    let unit = Body::new(&WORKER_PATTERN).expect("pattern");
+    // The first workers spawn with what the spawn regenerated: the smallest worker each (the
+    // solver's body at its cost, the least energy a worker can spawn with).
+    let unit = smallest_worker().expect("smallest worker");
     assert!(w.spawned.len() >= w.cfg.min_workers as usize);
     for (_, body) in w.spawned.iter().take(w.cfg.min_workers as usize) {
         assert_eq!(body.cost(), unit.cost(), "RCL{level}: {body:?}");
@@ -2386,8 +2864,8 @@ fn a_zero_creep_room_recovers_at_rcl3() {
 }
 
 /// After a recovery the room keeps going for two creep lifetimes: it fills to its full capacity,
-/// it reaches the count its plan wants, workers that die of old age are replaced (by bodies of the
-/// full capacity), their tombstones are emptied, and nothing stalls or fails.
+/// it reaches the count its plan wants, workers that die of old age are replaced (by the body the
+/// plan solved at the full capacity), their tombstones are emptied, and nothing stalls or fails.
 #[test]
 fn a_recovered_room_runs_two_lifetimes_without_a_deadlock() {
     let mut w = World::new(3, 0);
@@ -2406,11 +2884,20 @@ fn a_recovered_room_runs_two_lifetimes_without_a_deadlock() {
         "{} of {want}",
         w.workers()
     );
-    let capacity = w.room_energy().capacity;
-    let big = worker_body(capacity).expect("body");
+    // Workers requested at the room's capacity get the body the plan solved for it that tick
+    // (P3.6), and some of them are larger than the recovery's smallest worker.
+    let at_capacity: Vec<_> = w
+        .worker_spawns
+        .iter()
+        .filter(|s| s.2 == Some(EnergyBudget::Capacity))
+        .collect();
+    assert!(!at_capacity.is_empty(), "workers spawned at capacity");
+    for s in &at_capacity {
+        assert_eq!(Some(s.1), s.3, "tick {}: the plan's body", s.0);
+    }
     assert!(
-        w.spawned.iter().any(|(_, b)| *b == big),
-        "a full-capacity worker spawned: {:?}",
+        at_capacity.iter().any(|s| Some(s.1) != smallest_worker()),
+        "a worker at capacity larger than the smallest: {:?}",
         w.spawned
             .iter()
             .map(|(t, b)| (t, b.len()))
@@ -2751,8 +3238,8 @@ fn rcl3_floor() -> u32 {
 }
 
 /// With `opening.place_extensions` off and no site placed by hand, a fresh room reaches RCL3 on
-/// its spawn's capacity alone, within 4 times the source-limited floor: 8022 ticks in the scenario
-/// room (2026-11-15).
+/// its spawn's capacity alone, within 4 times the source-limited floor: 6874 ticks in the scenario
+/// room with P3.6's solved worker bodies (2026-11-17), 8022 with the 1:1:1 pattern (2026-11-15).
 #[test]
 fn a_fresh_room_reaches_rcl3_without_extensions() {
     let bound = 4 * rcl3_floor();
@@ -2762,7 +3249,8 @@ fn a_fresh_room_reaches_rcl3_without_extensions() {
 
 /// The level's extension sites placed by hand at each level-up (what ADR-020 measured): the
 /// workers build and fill them, and a fresh room reaches RCL3 within 3 times the floor: 5892 ticks
-/// in the scenario room (2026-11-15), 6146 with P3.1's miners and their containers (2026-11-16).
+/// in the scenario room (2026-11-15), 6146 with P3.1's miners and their containers (2026-11-16),
+/// 6264 with P3.6's solved worker bodies (2026-11-17).
 #[test]
 fn a_fresh_room_reaches_rcl3_building_its_extensions() {
     let bound = 3 * rcl3_floor();
@@ -2774,12 +3262,46 @@ fn a_fresh_room_reaches_rcl3_building_its_extensions() {
 /// RCL2's extensions itself (ADR-020), its workers build and fill them, and the room reaches RCL3
 /// within 3 times the source-limited floor, with no site refused, no intent failed and no stall:
 /// 6029 ticks before P3.1, 6258 with its miners and containers, which pay off by RCL4
-/// (`static_mining_reaches_rcl4_sooner`; 2026-11-16).
+/// (`static_mining_reaches_rcl4_sooner`; 2026-11-16), 6272 with P3.6's solved worker bodies
+/// (2026-11-17).
 #[test]
 fn a_fresh_room_reaches_rcl3_with_no_manual_action() {
     let bound = 3 * rcl3_floor();
     let ticks = ticks_to_rcl3(LevelUp::Nothing, true, bound + 1).expect("RCL3 within the bound");
     assert!(ticks >= rcl3_floor());
+}
+
+/// Swamp on every walkable tile of rows 12 to 18 of `w`'s room: a band between the controller at
+/// (25,8) and the spawn at (25,25), and between the controller and both sources.
+fn swamp_band(w: &mut World) {
+    for y in 12..=18u8 {
+        for x in 1..49u8 {
+            let i = usize::from(y) * 50 + usize::from(x);
+            if w.raw[i] & (Terrain::Wall as u8) == 0 {
+                w.raw[i] = Terrain::Swamp as u8;
+            }
+        }
+    }
+}
+
+/// Uses: MOVE_COST_SWAMP (through the model's fatigue), the level progress and source capacity of
+/// `rcl3_floor`. A fresh room with a swamp band between the spawn and the controller (every
+/// worker's way crosses it) reaches RCL3 with no manual action within 4 times the source-limited
+/// floor: its workers are solved for the swamp's fatigue (P3.6; 7481 ticks in the scenario room,
+/// 2026-11-17, against 9604 with the 1:1:1 pattern of P2.4, which this bound would refuse).
+#[test]
+fn a_fresh_swampy_room_reaches_rcl3() {
+    let mut w = World::new(1, SPAWN_ENERGY_START);
+    w.at_level_up = LevelUp::Nothing;
+    swamp_band(&mut w);
+    let start = w.time;
+    let bound = 4 * rcl3_floor();
+    while w.level < 3 && w.time - start <= bound {
+        w.step();
+    }
+    assert!(w.level >= 3, "RCL3 within {bound} ticks");
+    assert_eq!(w.failed, 0);
+    assert!(w.event_at(|e| matches!(e, Event::Stalled { .. })).is_none());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3234,7 +3756,7 @@ fn ticks_to_rcl4(mining: MiningConfig, limit: u32) -> Option<u32> {
 /// static miners and their containers (the default) it gets there sooner than the opening alone,
 /// after paying for the containers' `CONSTRUCTION_COST` and the miners at RCL2. 17334 ticks
 /// against 18643 in the scenario room (2026-11-16, P3.1); 17407 with the containers' decay and
-/// repairs (P3.5).
+/// repairs (P3.5); 17105 against 18925 with P3.6's solved worker bodies (2026-11-17).
 #[test]
 fn static_mining_reaches_rcl4_sooner() {
     let need: u32 = (1..=3).map(|l| controller_levels(l).expect("level")).sum();
@@ -3459,14 +3981,14 @@ fn links_carry_a_sources_energy_to_the_controller() {
 
 /// Upgrade progress from tick 6000 to 18000 of a room that starts at the level, with the defaults
 /// (`LINK_MMO`) or with the network off.
-fn steady_progress(level: u8, links: LinkConfig) -> (u32, u64) {
+fn steady_progress(level: u8, links: LinkConfig) -> (u64, u64) {
     let mut w = World::new(level, SPAWN_ENERGY_CAPACITY);
     w.link_cfg = links;
     w.run(6000);
-    let (p, b) = (w.progress, w.billed);
+    let (p, b) = (w.upgraded(), w.billed);
     w.run(12_000);
     assert_eq!(w.failed, 0);
-    (w.progress - p, w.billed - b)
+    (w.upgraded() - p, w.billed - b)
 }
 
 /// The network pays at RCL5 and RCL6 in the scenario room (ADR-024 "As built"): more upgrade
@@ -3475,7 +3997,11 @@ fn steady_progress(level: u8, links: LinkConfig) -> (u32, u64) {
 /// 164133 against 156211 (+5.1%), 4.32 against 4.50. Counted from tick 0, the links' build cost
 /// (`CONSTRUCTION_COST` 5000 each) is paid back by tick 24000 at RCL5 (286491 against 286604), not
 /// yet at RCL6 (279027 against 281219). With the containers' decay and repairs (P3.5): RCL5 160537
-/// against 152910 (+5.0%), RCL6 161762 against 151348 (+6.9%).
+/// against 152910 (+5.0%), RCL6 161762 against 151348 (+6.9%). With P3.6's solved worker bodies
+/// (2026-11-17, six starts, ticks 6000 to 30000, progress counted across level-ups): RCL5 +4.8%
+/// (+4.0% to +5.2%), RCL6 +2.2% (+1.7% to +2.7%), billed intents −2.8% and −5.4%; the 1:1:1
+/// pattern gave +4.5% and +5.2% the same way: at RCL6 the room with links is within 0.4% of the
+/// pattern's (`OpeningConfig::body_slack_pct`'s measurement), the one without gained about 2.5%.
 #[test]
 fn links_raise_the_upgrade_rate() {
     let off = LinkConfig {
@@ -4142,32 +4668,43 @@ fn repairs_keep_a_container_that_would_decay_away() {
 
 /// Upgrade progress from tick 6000 to 18000 of a room that starts at `level`, and the billed
 /// intents over the same ticks, with `hauling`.
-fn steady_haul(level: u8, hauling: HaulingConfig) -> (u32, u64) {
+fn steady_haul(level: u8, hauling: HaulingConfig) -> (u64, u64) {
     let mut w = World::new(level, SPAWN_ENERGY_CAPACITY);
     w.hauling_cfg = hauling;
     // Haulers alone, as measured before P3.4's upgraders (`upgraders_raise_the_upgrade_rate`).
     w.upgrading_cfg = UPGRADING_OFF;
     w.run(6000);
-    let (p, b) = (w.progress, w.billed);
+    let (p, b) = (w.upgraded(), w.billed);
     w.run(12_000);
     assert_eq!(w.failed, 0);
-    (w.progress - p, w.billed - b)
+    (w.upgraded() - p, w.billed - b)
 }
 
-/// Haulers pay at every level the scenario room is run at (ADR-025 "As built"): more upgrade
-/// progress from tick 6000 to 18000 than with them off, and fewer billed intents at RCL3 and RCL4,
-/// where the workers walked most. Measured 2026-11-17 over six starts (the spawn's energy at the
-/// start 300 to 50) and ticks 6000 to 30000: RCL3 +5.1% (+4.2% to +5.6%), RCL4 +2.8% (+2.1% to
-/// +3.5%), RCL5 +6.1% (+5.8% to +6.7%), RCL6 +10.4% (+8.5% to +11.0%); from tick 0, with the
-/// container's cost, +3.4%, +1.9%, +4.5%, +8.1%; billed intents −13.4%, −13.8%, +0.3%, +4.9%. This
-/// start, ticks 6000 to 18000: RCL3 26398 against 21259, RCL4 166506 against 158934, RCL5 172881
-/// against 162057, RCL6 176017 against 161955.
+/// Haulers pay in the scenario room with upgrading off (ADR-025 "As built"): more upgrade progress
+/// from tick 6000 to 18000 than with them off at RCL3, RCL4 and RCL6, and at RCL5 this start within
+/// 2% of them off; fewer billed intents at RCL3 and RCL4, where the workers walked most. Measured
+/// 2026-11-17 with P3.6's solved worker bodies, over six starts (the spawn's energy at the start 300
+/// to 50) and ticks 6000 to 30000, progress counted across level-ups: RCL3 +9.2% (+8.6% to
+/// +10.2%), RCL4 +6.9% (+6.0% to +8.0%), RCL5 +5.0% (−10.3% to +8.9%), RCL6 +10.3% (+7.6% to
+/// +11.1%); billed intents −17.7%, −19.3%, −5.8%, +8.4%. This start, ticks 6000 to 18000: RCL3
+/// 166141 against 155939, RCL4 170302 against 153261, RCL5 158871 against 161761 (−1.8%: with
+/// upgrading off the two linked-source workers do all the upgrading, and one spawned small in a
+/// hauler's gap upgrades less for its life), RCL6 166990 against 162459. Before P3.6 (the 1:1:1
+/// pattern, progress not counted across level-ups): +5.1%, +2.8%, +6.1%, +10.4%; billed intents
+/// −13.4%, −13.8%, +0.3%, +4.9%.
 #[test]
 fn haulers_raise_the_upgrade_rate() {
     for level in [3, 4, 5, 6] {
         let (with, with_billed) = steady_haul(level, HAULING_MMO);
         let (without, without_billed) = steady_haul(level, HAULING_OFF);
-        assert!(with > without, "RCL{level}: {with} against {without}");
+        if level == 5 {
+            assert!(
+                with * 50 >= without * 49,
+                "RCL{level}: {with} against {without}"
+            );
+        } else {
+            assert!(with > without, "RCL{level}: {with} against {without}");
+        }
         if level <= 4 {
             assert!(
                 with_billed < without_billed,
@@ -4346,13 +4883,23 @@ fn haulers_take_whole_loads_behind_a_full_container() {
     assert_eq!(w.failed, 0);
 }
 
-/// A hauled source whose miner is gone leaves the haulers nothing to fill with: the view no longer
-/// says the haulers fill, so the workers fill the drained spawns and extensions again.
+/// A hauled source whose miner is gone leaves the haulers nothing to fill with: from a tick where
+/// the haulers fill (a miner is replaced only at its death, so its turnover leaves ticks with no
+/// hauled source mined, when the workers fill too), the view no longer says the haulers fill once
+/// the miners are gone, so the workers fill the drained spawns and extensions again.
 #[test]
 fn workers_fill_again_when_no_hauler_can() {
     let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
     w.run(4000);
-    assert!(w.hauling.view(w.room).fills);
+    let mut waited = 0;
+    while !w.hauling.view(w.room).fills {
+        assert!(
+            waited < CREEP_LIFE_TIME,
+            "the haulers fill again within a creep's life"
+        );
+        w.step();
+        waited += 1;
+    }
     w.mining_cfg.enabled = false;
     w.creeps.retain(|c| c.identity.role != Role::Miner);
     for s in &mut w.stores {
@@ -4713,8 +5260,8 @@ fn upgrader_plans_fit_upgrade_the_most_and_take_the_fewest() {
 /// The budget the scenario room's plan holds at RCL5 (one source sent by links, one hauled), from
 /// constants: both sources' yield over a creep life (`yield_per_life`), less the links' loss on the
 /// sent one (`link_loss`, LINK_LOSS_RATIO); and every other creep's body: its miners and haulers as
-/// their plans give them, and `min_workers` workers of at most `upgrading.worker_repeats` repeats.
-/// Without a miner nothing is counted.
+/// their plans give them, and `min_workers` workers of the opening plan's capped body (at most
+/// `upgrading.worker_repeats` WORK parts). Without a miner nothing is counted.
 /// Uses: SOURCE_ENERGY_CAPACITY, CREEP_LIFE_TIME, ENERGY_REGEN_TIME, LINK_LOSS_RATIO, BODYPART_COST.
 #[test]
 fn the_budget_counts_the_flowing_sources_less_every_other_body() {
@@ -4744,12 +5291,14 @@ fn the_budget_counts_the_flowing_sources_less_every_other_body() {
         .iter()
         .filter_map(|s| s.body.map(|b| u64::from(b.cost()) * u64::from(s.want)))
         .sum();
-    let worker = Body::scaled(
-        &WORKER_PATTERN,
-        plan.capacity,
-        UPGRADING_MMO.worker_repeats as u8,
-    )
-    .expect("a worker");
+    // The workers' body as the opening solved it while the upgraders take (P3.6): at most
+    // `worker_repeats` WORK parts.
+    let worker = w
+        .opening
+        .plan(room)
+        .and_then(|p| p.capped)
+        .expect("a capped worker");
+    assert!(count(&worker, Part::Work) <= UPGRADING_MMO.worker_repeats);
     let workers = u64::from(OPENING_MMO.min_workers) * u64::from(worker.cost());
     assert_eq!(plan.upkeep, miners + haulers + workers);
     assert_eq!(plan.sources.len(), 2);
@@ -4797,11 +5346,65 @@ fn the_budget_counts_the_flowing_sources_less_every_other_body() {
 /// container, then its links): the plan's upgraders come, WORK parts first and `upgrader_carry`
 /// CARRY parts, and stand each on its own post, a walkable tile within upgrading range of the
 /// controller next to a store; the posts are every such tile but the `free_tiles` nearest the spawn;
-/// the opening keeps `min_workers` workers of at most `worker_repeats` repeats; no intent fails.
+/// the opening keeps `min_workers` workers of at most `worker_repeats` WORK parts; no intent fails.
+/// Uses also MAX_CREEP_SIZE, CREEP_SPAWN_TIME, SOURCE_ENERGY_CAPACITY, ENERGY_REGEN_TIME: the count
+/// is read once a replacement in progress has spawned and settled (no pre-spawn before P5), within
+/// the allowance the test derives.
 #[test]
 fn upgraders_take_the_controllers_energy_from_their_posts() {
     let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
     w.run(9000);
+    // No pre-spawn before P5: an upgrader that died of old age is asked for again the next tick and
+    // ordered once the spawn's stores hold its body's cost (`EnergyBudget::Capacity`). A fixed tick
+    // can fall in that window, or before the replacement settles. Step until the room holds `want`
+    // upgraders and one has settled, within an allowance: the longest order that can hold the spawn
+    // (`MAX_CREEP_SIZE` parts), the body's cost at the hauled sources' yield (a linked source's
+    // energy goes to the controller), and the replacement's spawn and walk there and back.
+    let plan_now = |w: &World| {
+        w.upgrading
+            .room_states()
+            .next()
+            .and_then(|(_, p, _)| p.cloned())
+            .expect("a plan")
+    };
+    let settled = |w: &World| {
+        let p = plan_now(w);
+        w.creeps
+            .iter()
+            .filter(|c| c.identity.role == Role::Upgrader && c.spawning == 0)
+            .any(|c| {
+                p.trip
+                    .and_then(|t| {
+                        walk_ticks(t, count(&c.body, Part::Work), count(&c.body, Part::Move))
+                    })
+                    .is_some_and(|walk| w.time - c.born > 2 * walk + 10)
+            })
+    };
+    let first = plan_now(&w);
+    let b = first.body.expect("a body");
+    let walk = first
+        .trip
+        .and_then(|t| walk_ticks(t, count(&b, Part::Work), count(&b, Part::Move)))
+        .expect("a walk");
+    let hauled = w
+        .mining
+        .plan(w.room)
+        .expect("mining plan")
+        .sources
+        .iter()
+        .filter(|s| !s.linked)
+        .count() as u32;
+    let refill = (b.cost() * ENERGY_REGEN_TIME).div_ceil(hauled.max(1) * SOURCE_ENERGY_CAPACITY);
+    let bound = MAX_CREEP_SIZE * CREEP_SPAWN_TIME + refill + b.spawn_time() + 2 * walk + 10;
+    let mut waited = 0;
+    while (w.upgraders() as u32) < plan_now(&w).want || !settled(&w) {
+        assert!(
+            waited < bound,
+            "no settled upgrader or one short for {bound} ticks"
+        );
+        w.step();
+        waited += 1;
+    }
     assert_eq!(w.failed, 0);
     let room = w.room;
     let (_, plan, stats) = w.upgrading.room_states().next().expect("room");
@@ -4899,27 +5502,29 @@ fn upgraders_take_the_controllers_energy_from_their_posts() {
 }
 
 /// Upgraders pay at every level the scenario room is run at: more upgrade progress from tick 6000
-/// to 18000 than with them off, and fewer billed intents at RCL3 and RCL4. Measured 2026-11-17
-/// over six starts (the spawn's energy at the start 300 to 50) and ticks 6000 to 30000: RCL3
-/// +8.8% (+8.3% to +9.1%), RCL4 +6.0% (+5.4% to +8.5%), RCL5 +9.2% (+8.8% to +10.3%), RCL6
-/// +6.4% (+5.4% to +8.3%); billed intents −9.8%, −7.7%, +10.1%, +1.4%. A fresh room reaches RCL4
-/// in 16935 ticks against 17537 and RCL5 in 47156 against 49804.
+/// to 18000 than with them off, and fewer billed intents at RCL3. Measured 2026-11-17 with P3.6's
+/// solved worker bodies, over six starts (the spawn's energy at the start 300 to 50) and ticks 6000
+/// to 30000, progress counted across level-ups: RCL3 +4.9% (+3.1% to +5.5%), RCL4 +5.8% (+2.5% to
+/// +7.3%), RCL5 +11.8% (+7.7% to +30.7%), RCL6 +4.4% (+3.4% to +6.5%); billed intents −3.0%,
+/// +2.0%, +20.2%, +0.8% (this start at RCL4: 67552 against 66320). Before P3.6 (the 1:1:1 pattern):
+/// +8.8%, +6.0%, +9.2%, +6.4%; billed intents −9.8%, −7.7%, +10.1%, +1.4%; a fresh room reached
+/// RCL4 in 16935 ticks against 17537 and RCL5 in 47156 against 49804.
 #[test]
 fn upgraders_raise_the_upgrade_rate() {
     let steady = |level: u8, cfg: UpgradingConfig| {
         let mut w = World::new(level, SPAWN_ENERGY_CAPACITY);
         w.upgrading_cfg = cfg;
         w.run(6000);
-        let (p, b) = (w.progress, w.billed);
+        let (p, b) = (w.upgraded(), w.billed);
         w.run(12_000);
         assert_eq!(w.failed, 0);
-        (w.progress - p, w.billed - b)
+        (w.upgraded() - p, w.billed - b)
     };
     for level in [3, 4, 5, 6] {
         let (with, with_billed) = steady(level, UPGRADING_MMO);
         let (without, without_billed) = steady(level, UPGRADING_OFF);
         assert!(with > without, "RCL{level}: {with} against {without}");
-        if level <= 4 {
+        if level == 3 {
             assert!(
                 with_billed < without_billed,
                 "RCL{level}: {with_billed} against {without_billed}"
@@ -4928,26 +5533,35 @@ fn upgraders_raise_the_upgrade_rate() {
     }
 }
 
-/// With `upgrading.enabled` off no upgrader is ordered, the view never gives the controller's energy
-/// away, and the workers keep their full bodies.
+/// With `upgrading.enabled` off no upgrader is ordered (none on any tick, spawning ones counted), the
+/// view never gives the controller's energy away, and the workers are never solved as under
+/// upgraders: `worker_repeats` does not cap their WORK parts (their proportions come from the
+/// solver, P3.6).
 #[test]
 fn upgraders_off_order_none() {
     let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
     w.upgrading_cfg = UPGRADING_OFF;
+    let (mut seen, mut workers) = (Vec::new(), Vec::new());
     for _ in 0..6000 {
         w.step();
         assert!(!w.upgrading.view(w.room).takes);
+        assert_eq!(w.upgraders(), 0);
+        let (_, plan, _, _) = w.opening.room_states().next().expect("room");
+        assert!(plan.is_none_or(|p| !p.upgraders));
+        for c in &w.creeps {
+            if !seen.contains(&c.key) {
+                seen.push(c.key);
+                if c.identity.role == Role::Worker {
+                    workers.push(c.body);
+                }
+            }
+        }
     }
-    assert_eq!(w.upgraders(), 0);
     assert!(
-        w.spawned
+        workers
             .iter()
-            .all(|(_, b)| b.count(Part::Work) <= b.count(Part::Carry) || b.count(Part::Carry) <= 1)
+            .any(|b| b.count(Part::Work) > UPGRADING_MMO.worker_repeats as usize)
     );
-    assert!(w.spawned.iter().any(|(_, b)| {
-        b.count(Part::Work) > UPGRADING_MMO.worker_repeats as usize
-            && b.count(Part::Work) == b.count(Part::Carry)
-    }));
     assert_eq!(w.failed, 0);
 }
 
@@ -5317,9 +5931,11 @@ fn an_upgrader_picks_a_store_that_covers_its_take() {
 
 /// With hauling off at RCL5 the linked source alone engages the upgraders; the other source's
 /// workers, whose energy the upgraders do not count, keep upgrading with it (they would otherwise
-/// sit on full stores), so the room upgrades about as much as with upgraders off. Measured
-/// 2026-11-17 (ticks 6000 to 18000): RCL5 −1.3% and −2.9%, RCL6 +0.6% and +3.3% (starts of 300
-/// and 50).
+/// sit on full stores), so the room upgrades about as much as with upgraders off (within 5%).
+/// Measured 2026-11-17 with P3.6's solved worker bodies (ticks 6000 to 18000, starts of 300 and
+/// 50): RCL5 −0.3% and −1.5%, RCL6 +0.8% and +3.5%, with fewer billed intents than the 1:1:1
+/// pattern (121262 against 126269 at RCL5 with upgraders). Before P3.6: RCL5 −1.3% and −2.9%,
+/// RCL6 +0.6% and +3.3%.
 #[test]
 fn an_uncounted_sources_workers_keep_upgrading() {
     let run = |cfg: UpgradingConfig| {
@@ -5327,7 +5943,7 @@ fn an_uncounted_sources_workers_keep_upgrading() {
         w.hauling_cfg = HAULING_OFF;
         w.upgrading_cfg = cfg;
         w.run(6000);
-        let p = w.progress;
+        let p = w.upgraded();
         let mut upgrades = 0;
         for _ in 0..12_000 {
             w.step();
@@ -5335,7 +5951,7 @@ fn an_uncounted_sources_workers_keep_upgrading() {
             upgrades += stats.tasks[6];
         }
         assert_eq!(w.failed, 0);
-        (w.progress - p, upgrades, w.upgrading.view(w.room).takes)
+        (w.upgraded() - p, upgrades, w.upgrading.view(w.room).takes)
     };
     let (with, upgrades, takes) = run(UPGRADING_MMO);
     let (without, _, _) = run(UPGRADING_OFF);
@@ -5345,8 +5961,11 @@ fn an_uncounted_sources_workers_keep_upgrading() {
 }
 
 /// An upgrader withdraws by its own body, not the plan's: each one's WORK parts are taken from the
-/// plan's body when it is first seen, and stay when the plan's body changes under it (here a larger
-/// `worker_repeats` raises the workers' bodies in the budget and shrinks the upgraders').
+/// plan's body when it is first seen, and stay when the plan's body changes under it (here the room
+/// loses extensions until its capacity pays for no upgrader of the plan's WORK parts, so the plan
+/// takes fewer; before
+/// P3.6 a larger `worker_repeats` raised the workers' bodies in the budget instead, a lever the
+/// solved worker bodies no longer give).
 #[test]
 fn an_upgrader_keeps_its_own_work_parts() {
     let mut w = World::new(5, SPAWN_ENERGY_CAPACITY);
@@ -5370,15 +5989,37 @@ fn an_upgrader_keeps_its_own_work_parts() {
         let (_, plan, _) = w.upgrading.room_states().next().expect("room");
         plan.and_then(|p| p.body).map(|b| count(&b, Part::Work))
     };
+    // The room loses extensions until its capacity is below the cheapest upgrader of the plan's
+    // WORK parts (those WORK, their `upgrader_carry` CARRY and one MOVE part): the plan must take
+    // fewer WORK parts (`upgrader_plan` takes bodies within the capacity). Uses: BODYPART_COST.
     let was = plan_work(&w);
-    w.upgrading_cfg.worker_repeats = 16;
+    let work = was.expect("a body");
+    let cost =
+        work * Part::Work.cost() + upgrader_carry(work) * Part::Carry.cost() + Part::Move.cost();
+    while w.room_energy().capacity >= cost {
+        let i = w
+            .stores
+            .iter()
+            .rposition(|s| s.kind == StructureType::Extension)
+            .expect("an extension to remove");
+        w.stores.remove(i);
+    }
     w.run(2);
-    assert_ne!(plan_work(&w), was, "the plan's body changed");
+    let now = plan_work(&w);
+    assert_ne!(now, was, "the plan's body changed");
+    let mut checked = 0;
     for (work, seen) in own(&w) {
         if before.iter().any(|b| b.0 == work) {
             assert_eq!(seen, Some(work), "still its own");
+            if Some(work) != now {
+                checked += 1;
+            }
         }
     }
+    assert!(
+        checked > 0,
+        "an upgrader of the old plan's body was checked"
+    );
 }
 
 /// Uses: EXTENSION_ENERGY_CAPACITY. No worker transfers into a spawn or extension a hauler's

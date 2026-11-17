@@ -55,7 +55,7 @@ use rustedscreep_core::scheduler::{
     Clock, Fault, FaultRecord, Job, JobState, Scheduler, TickCpu, Tier,
 };
 use rustedscreep_core::snapshot::{ObjectKind, Snapshot};
-use rustedscreep_core::spawning::{EnergyBudget, Spawner};
+use rustedscreep_core::spawning::{Body, EnergyBudget, Spawner};
 use screeps::{Part, RoomName, StructureType};
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
@@ -178,6 +178,12 @@ pub struct OpeningGlue {
 }
 
 impl OpeningGlue {
+    /// The worker body the opening planned for `room` at its capacity on its last plan (P3.6), for
+    /// the console's spawn request.
+    pub fn worker_body(&self, room: RoomName) -> Option<Body> {
+        self.core.plan(room).and_then(|p| p.body)
+    }
+
     /// Starts the tick: the owned rooms and their workers, and an early rescan of each room whose
     /// own sites changed in number since the last tick.
     pub fn begin(&mut self, snapshot: &Snapshot, movement: &mut Movement) {
@@ -627,6 +633,16 @@ impl OpeningGlue {
                         } else if s.linked {
                             text.push_str(" linked");
                         }
+                    }
+                    // The solved worker body at the plan's capacity (P3.6).
+                    if let Some(b) = p.body {
+                        let _ = write!(
+                            text,
+                            ", body {} WORK {} CARRY {} MOVE",
+                            b.count(Part::Work),
+                            b.count(Part::Carry),
+                            b.count(Part::Move)
+                        );
                     }
                 }
             }

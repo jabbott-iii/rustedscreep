@@ -118,7 +118,7 @@ pub fn game_loop() {
                 snapshot::log_skips(skip_log, snapshot, cfg.log.skip_window_ticks);
                 probe.snapshot();
                 act.begin(snapshot);
-                spawn.begin(snapshot);
+                spawn.begin(snapshot, |room| opening.worker_body(room));
                 opening.begin(snapshot, &mut movement.core);
                 let mut tick = sched.begin(&snapshot.tick, &cfg.scheduler, scheduler::GameClock);
                 // Critical: the rooms movement needs before anything in them can move, first.

@@ -42,22 +42,27 @@
 //! `Memory`.
 
 use rustedscreep_consts::{
-    BUILD_POWER, CONTAINER_HITS, HARVEST_POWER, Position, ResourceType, RoomName, StructureType,
+    BUILD_POWER, CONTAINER_HITS, HARVEST_POWER, Part, Position, ResourceType, RoomName,
+    StructureType, extension_energy_capacity,
 };
 
 use super::hauling::HaulView;
 use super::mining::{Mined, Receiver};
-use super::sizing::{Trip, carry_round, worker_round, workers_for_source};
+use super::sizing::{
+    Trip, WorkerScratch, WorkerSource, WorkerTargets, miner_work, smallest_worker, source_wants,
+    worker_plan,
+};
 use super::upgrading::UpgradeView;
 use super::watchdog::{Event, Observation, Watchdog};
 use crate::config::{MovementConfig, OpeningConfig, RepairConfig};
 use crate::intents::{CreepIntent, IntentBuffer, Target};
 use crate::movement::{Dial, FlowField, Goal, MoveError, MoveTo, Movement, Tile, UNREACHED};
 use crate::scheduler::{Commit, Fault, Tier};
+use crate::snapshot::RoomEnergy;
 use crate::snapshot::{
     Controller, CreepHandle, ObjectHandle, ObjectKind, Snapshot, StructureHandle,
 };
-use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner, WORKER_PATTERN};
+use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner};
 
 /// Spawn priorities of the opening's requests (higher first): a room with no worker that can work,
 /// a room below `min_workers`, and the rest.
@@ -180,14 +185,16 @@ struct Worker {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourcePlan {
     pub pos: Position,
+    /// What it refills to every `ENERGY_REGEN_TIME` ticks. Unit: energy.
+    pub capacity: u32,
     /// Walkable tiles next to it on movement's grid. Unit: tiles.
     pub open: u32,
-    /// Workers it keeps busy ([`workers_for_source`]). Unit: creeps.
+    /// Workers of the plan's body it keeps busy ([`source_wants`]). Unit: creeps.
     pub want: u32,
     /// The way from it to the controller.
     pub trip: Option<Trip>,
     /// Its miner was next to it when the plan was built (P3.1): workers take its energy off the
-    /// miner's tile ([`carry_round`]) instead of harvesting it.
+    /// miner's tile ([`super::sizing::carry_round`]) instead of harvesting it.
     pub mined: bool,
     /// Its miner sent its energy to a controller link (P3.2), or its haulers carried it to the
     /// controller container (P3.3, `hauled`), when the plan was built: workers take it there,
@@ -197,8 +204,9 @@ pub struct SourcePlan {
     pub hauled: bool,
 }
 
-/// A room's plan: built again when movement's grid version, the room's energy capacity or the
-/// sources its miners mine change.
+/// A room's plan: built again when movement's grid version, the room's energy capacity, the
+/// sources its miners mine, the upgraders' state or the solver's config change, or (while the
+/// workers' energy is by the controller) its count of construction sites.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub version: u32,
@@ -217,8 +225,34 @@ pub struct Plan {
     /// worker, and the room keeps `min_workers`.
     pub upgraders: bool,
     pub upgraded: u32,
-    /// The most `WORKER_PATTERN` repeats its workers get ([`UpgradeView::worker_repeats`]).
-    pub repeats: u8,
+    /// The most WORK parts a worker gets while the upgraders take ([`UpgradeView::worker_repeats`]).
+    /// Unit: parts.
+    pub max_work: u8,
+    /// The room's own construction sites when the plan was built while the workers' energy is by
+    /// the controller (the upgraders take, or a source is linked; 0 otherwise), and what they still
+    /// needed then (one energy a progress point, V186). Unit: sites, energy.
+    pub sites: u32,
+    pub build: u32,
+    /// A builder's way from the room's first spawn, by its sites, to the controller, where it takes
+    /// its energy while the upgraders take ([`WorkerTargets::build_trip`]).
+    pub build_trip: Option<Trip>,
+    /// While no hauler fills (`hauled` is empty): the miners' WORK parts' cost, which the workers
+    /// refill besides their own bodies ([`WorkerTargets::fill`]). Unit: energy.
+    pub fill: Option<u32>,
+    /// The level's `EXTENSION_ENERGY_CAPACITY`, what one transfer into a fill takes at most. Unit:
+    /// energy.
+    pub unload: u32,
+    /// `opening.min_workers`, `opening.max_workers` and `opening.body_slack_pct` when the plan was
+    /// built: the solver reads them, so an override builds the plan again.
+    pub limits: (u32, u32, u32),
+    /// The workers' body at `capacity`, solved from the plan's targets ([`worker_plan`], P3.6);
+    /// `None` when the capacity does not pay for the smallest worker.
+    pub body: Option<Body>,
+    /// The body solved as the room's workers get it while the upgraders take: `body` when they
+    /// do, else solved with the linked sources spent, `max_work` WORK parts at most and the build
+    /// work; `None` while the upgrading job does not run for the room (`max_work` is `u8::MAX`).
+    /// The upgraders' budget counts it for every worker (`upgrading::upkeep`).
+    pub capped: Option<Body>,
     /// Workers the room spawns up to: the sources' sum within `min_workers..=max_workers` (0 when
     /// no source has an open tile). Unit: creeps.
     pub want: u32,
@@ -267,6 +301,10 @@ struct RoomState {
     /// What its workers take this tick (P3.4): each pushed pickup or withdraw's target and the
     /// taker's free room, cleared in [`Opening::begin`]. Unit: energy.
     took: Vec<(Target, u32)>,
+    /// The last body solved for a request below the plan's capacity (P3.6: a recovery's energy, or
+    /// the watchdog's cap), by that energy over [`part_step`], so a room that waits is not solved
+    /// again every tick; cleared when the plan is built again.
+    sized: Option<(u32, Option<Body>)>,
 }
 
 /// Unreachable targets a room remembers at once.
@@ -285,6 +323,8 @@ struct Member {
 #[derive(Default)]
 struct Facts {
     controller: Option<(StructureHandle, Position)>,
+    /// The room's first spawn by id: its key and place (P3.6: the builders' way).
+    spawn: Option<(u128, Position)>,
     /// Spawns and extensions with room for energy: handle, place, free space left to reserve.
     fills: Vec<(StructureHandle, Position, u32)>,
     /// Sources: handle, place, energy, capacity.
@@ -335,6 +375,9 @@ pub struct Opening {
     /// for one WORK part), so a target that is used up gets no more billed no-ops.
     source_left: Vec<(ObjectHandle, u32)>,
     site_left: Vec<(ObjectHandle, u32)>,
+    /// Scratch for the worker solver (P3.6): the plan's sources as it sees them, and the solver's.
+    worker_sources: Vec<WorkerSource>,
+    solver: WorkerScratch,
 }
 
 impl Opening {
@@ -371,6 +414,7 @@ impl Opening {
                         unreachable: Vec::new(),
                         repairing: Vec::new(),
                         took: Vec::new(),
+                        sized: None,
                     },
                 ),
             }
@@ -587,14 +631,29 @@ impl Opening {
             (EnergyBudget::Capacity, PRIORITY_NORMAL)
         };
         let request = requesting.then_some(kind);
-        if let Some((budget, priority)) = request {
+        if let Some((budget, priority)) = request
+            && let Some(body) = {
+                // A spawn of the room is free this tick: only then can a body solved below the
+                // plan's capacity be ordered, so only then is one solved.
+                let ready =
+                    snap.spawns
+                        .rows()
+                        .iter()
+                        .zip(snap.spawns.busy())
+                        .any(|(&row, &busy)| {
+                            !busy
+                                && usize::try_from(row)
+                                    .ok()
+                                    .and_then(|i| snap.structures.positions().get(i))
+                                    .is_some_and(|p| p.room_name() == name)
+                        });
+                self.request_body(ri, budget, energy, ready, cfg, commit)
+            }
+        {
             let _ = spawner.request(SpawnRequest {
                 home: name,
                 role: Role::Worker,
-                body: BodySpec::Scaled {
-                    pattern: &WORKER_PATTERN,
-                    max_repeats: upgrade.worker_repeats,
-                },
+                body: BodySpec::Exact(body),
                 budget,
                 priority,
             });
@@ -781,6 +840,7 @@ impl Opening {
     ) {
         let f = &mut self.facts;
         f.controller = None;
+        f.spawn = None;
         f.fills.clear();
         f.sources.clear();
         f.sites.clear();
@@ -812,6 +872,12 @@ impl Opening {
         {
             if pos.room_name() != name {
                 continue;
+            }
+            if kind == StructureType::Spawn {
+                let key = st.key_of(h).map_or(u128::MAX, |k| k.0);
+                if f.spawn.is_none_or(|(k, _)| key < k) {
+                    f.spawn = Some((key, pos));
+                }
             }
             match kind {
                 StructureType::Controller => f.controller = Some((h, pos)),
@@ -922,6 +988,16 @@ impl Opening {
                     .and_then(|i| 1u32.checked_shl(i))
                     .unwrap_or(0)
             });
+        // The cap applies while the upgraders take; the capped body is solved with it always.
+        let max_work = upgrade.worker_repeats;
+        // The build work sizes the workers while their energy is by the controller (the upgraders
+        // take, or a source is linked: `WorkerTargets::duties`), so a change in the sites then
+        // builds the plan again.
+        let sites = if upgraders || linked != 0 {
+            u32::try_from(self.facts.sites.len()).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
         if r.plan.as_ref().is_some_and(|p| {
             p.version == version
                 && p.capacity == capacity
@@ -932,11 +1008,12 @@ impl Opening {
                 && p.hauled == hauled
                 && p.upgraders == upgraders
                 && p.upgraded == upgraded
-                && p.repeats == upgrade.worker_repeats
+                && p.max_work == max_work
+                && p.sites == sites
+                && p.limits == (cfg.min_workers, cfg.max_workers, cfg.body_slack_pct)
         }) {
             return;
         }
-        let body = Body::scaled(&WORKER_PATTERN, capacity, upgrade.worker_repeats);
         let goal = self.facts.controller.map(|(_, pos)| Goal {
             tile: Tile::of(pos),
             range: WORK_RANGE,
@@ -948,103 +1025,170 @@ impl Opening {
             }
             None => false,
         };
-        let mut sources = Vec::with_capacity(self.facts.sources.len());
-        for (i, &(_, pos, _, source_capacity)) in self.facts.sources.iter().enumerate() {
-            let bit = u32::try_from(i).ok().and_then(|i| 1u32.checked_shl(i));
-            let is_mined = bit.is_some_and(|bit| mined & bit != 0);
-            let is_linked = bit.is_some_and(|bit| linked & bit != 0);
-            let is_hauled = bit.is_some_and(|bit| hauled & bit != 0);
-            let at = Tile::of(pos);
-            let open = at.neighbors().filter(|&(_, t)| grid.walkable(t)).count();
-            let open = u32::try_from(open).unwrap_or(0);
+        // The way from `at` to within upgrading range of the controller, when the field reaches a
+        // tile next to it: from a tile next to `at` (a worker stands next to a source).
+        let trip_from = |at: Tile| {
             let cost = at
                 .neighbors()
                 .filter(|&(_, t)| grid.walkable(t))
                 .map(|(_, t)| self.field.distance(t))
                 .filter(|&d| d != UNREACHED)
                 .min();
-            let trip = match (reached, cost, goal) {
+            match (reached, cost, goal) {
                 (true, Some(cost), Some(g)) => Some(Trip {
-                    // It stands next to the source and within range of the controller.
+                    // It stands next to `at` and within range of the controller.
                     tiles: u32::from(at.range(g.tile))
                         .saturating_sub(u32::from(NEAR) + u32::from(WORK_RANGE)),
                     cost: u32::from(cost),
                 }),
                 _ => None,
-            };
-            // At a mined source a worker takes its load off the miner's tile in one tick; at a
-            // linked one it takes it next to the controller link and upgrades from there.
-            let round = if is_mined { carry_round } else { worker_round };
-            let walk = if is_linked {
-                trip.map(|_| Trip { tiles: 0, cost: 0 })
-            } else {
-                trip
-            };
-            // The upgraders spend a linked source's energy (P3.4).
-            let want = match (body.as_ref(), walk) {
-                _ if upgraders && (is_linked || bit.is_some_and(|bit| upgraded & bit != 0)) => 0,
-                (Some(b), Some(t)) => round(b, t).map_or(0, |round| {
-                    workers_for_source(source_capacity, open, b, round)
-                }),
-                _ => 0,
-            };
+            }
+        };
+        let mut sources = Vec::with_capacity(self.facts.sources.len());
+        for (i, &(_, pos, _, source_capacity)) in self.facts.sources.iter().enumerate() {
+            let bit = u32::try_from(i).ok().and_then(|i| 1u32.checked_shl(i));
+            let at = Tile::of(pos);
+            let open = at.neighbors().filter(|&(_, t)| grid.walkable(t)).count();
             sources.push(SourcePlan {
                 pos,
-                open,
-                want,
-                trip,
-                mined: is_mined,
-                linked: is_linked,
-                hauled: is_hauled,
+                capacity: source_capacity,
+                open: u32::try_from(open).unwrap_or(0),
+                want: 0,
+                trip: trip_from(at),
+                mined: bit.is_some_and(|bit| mined & bit != 0),
+                linked: bit.is_some_and(|bit| linked & bit != 0),
+                hauled: bit.is_some_and(|bit| hauled & bit != 0),
             });
         }
-        // Sources whose workers take next to the controller (linked, or hauled, P3.3) share one
-        // pool: their workers make the same round with no walk, so the pool is sized as one source
-        // of their summed capacity and tiles, and split over them in order, rather than rounded up
-        // per source.
-        let pooled = |p: &SourcePlan| p.linked && p.trip.is_some();
-        if !upgraders
-            && sources.iter().filter(|p| pooled(p)).count() > 1
-            && let Some(b) = body.as_ref()
-            && let Some(round) = carry_round(b, Trip { tiles: 0, cost: 0 })
-        {
-            let (cap_sum, open_sum) = sources
-                .iter()
-                .zip(&self.facts.sources)
-                .filter(|(p, _)| pooled(p))
-                .fold((0u32, 0u32), |(c, o), (p, s)| {
-                    (c.saturating_add(s.3), o.saturating_add(p.open))
-                });
-            let total = workers_for_source(cap_sum, open_sum, b, round);
-            let n = u32::try_from(sources.iter().filter(|p| pooled(p)).count()).unwrap_or(1);
-            let (each, extra) = (total / n.max(1), total % n.max(1));
-            for (k, p) in sources.iter_mut().filter(|p| pooled(p)).enumerate() {
-                let k = u32::try_from(k).unwrap_or(u32::MAX);
-                p.want = each + u32::from(k < extra);
-            }
-        }
-        let sum = sources.iter().fold(0u32, |s, p| s.saturating_add(p.want));
-        // With upgraders the room still keeps `min_workers` to build, repair and fill (P3.4).
-        let want = if sum == 0 && !upgraders {
-            0
-        } else {
-            sum.clamp(cfg.min_workers.min(cfg.max_workers), cfg.max_workers)
+        // The builders' way (P3.6): the interim extensions and most sites are by the first spawn
+        // (ADR-020), the energy they take while the upgraders take is by the controller.
+        let build_trip = self
+            .facts
+            .spawn
+            .and_then(|(_, pos)| trip_from(Tile::of(pos)));
+        let build = self.facts.sites.iter().fold(0u32, |b, site| {
+            b.saturating_add(site.4.saturating_sub(site.3))
+        });
+        // While no hauler fills, the workers refill the miners' bodies too (their WORK parts, the
+        // most of them: a lower bound).
+        let fill = (hauled == 0).then(|| {
+            sources.iter().filter(|p| p.mined).fold(0u32, |e, p| {
+                e.saturating_add(Part::Work.cost().saturating_mul(miner_work(p.capacity)))
+            })
+        });
+        let level = match snap.rooms.controllers().get(row) {
+            Some(&Controller::Mine { level }) => u32::from(level),
+            _ => 0,
         };
-        if let Some(r) = self.rooms.get_mut(ri) {
-            r.plan = Some(Plan {
-                version,
-                capacity,
-                controller,
-                sources,
-                mined,
-                linked,
-                hauled,
-                upgraders,
-                upgraded,
-                repeats: upgrade.worker_repeats,
-                want,
-            });
+        let mut plan = Plan {
+            version,
+            capacity,
+            controller,
+            sources,
+            mined,
+            linked,
+            hauled,
+            upgraders,
+            upgraded,
+            max_work,
+            sites,
+            build,
+            build_trip,
+            fill,
+            unload: extension_energy_capacity(level),
+            limits: (cfg.min_workers, cfg.max_workers, cfg.body_slack_pct),
+            body: None,
+            capped: None,
+            want: 0,
+        };
+        // The bodies (P3.6): the search is the plan's heavy part with the field.
+        commit.heavy();
+        worker_sources(&plan, &mut self.worker_sources);
+        let own = targets(&plan, &self.worker_sources, cfg, upgraders);
+        plan.body = worker_plan(&own, capacity, &mut self.solver);
+        // The upgraders' budget reads it only for a room the upgrading job runs (its cap below
+        // `u8::MAX`); elsewhere the second search is skipped.
+        plan.capped = if upgraders {
+            plan.body
+        } else if max_work == u8::MAX {
+            None
+        } else {
+            let takes = targets(&plan, &self.worker_sources, cfg, true);
+            worker_plan(&takes, capacity, &mut self.solver)
+        };
+        let wants = &mut self.solver.wants;
+        wants.clear();
+        if let Some(b) = plan.body.as_ref() {
+            source_wants(&own, b, wants);
         }
+        let mut sum = 0u32;
+        for (p, &w) in plan.sources.iter_mut().zip(wants.iter()) {
+            p.want = w;
+            sum = sum.saturating_add(w);
+        }
+        // With upgraders the room still keeps `min_workers` to build, repair and fill (P3.4).
+        plan.want = own.room_want(sum);
+        if let Some(r) = self.rooms.get_mut(ri) {
+            r.plan = Some(plan);
+            r.sized = None;
+        }
+    }
+
+    /// The body room `ri` requests a worker with this tick, for `budget` and the room's `energy`
+    /// (P3.6): the plan's body at its capacity, else the body solved from the plan's targets at the
+    /// energy the budget allows (cached in [`RoomState::sized`]), else (below the smallest worker's
+    /// cost) the smallest worker, which waits for its cost. While no spawn of the room is `ready`
+    /// the last solved body (or the smallest worker) stands in, unsolved: it cannot be ordered this
+    /// tick. With no plan, the smallest worker for a recovery and none otherwise.
+    fn request_body(
+        &mut self,
+        ri: usize,
+        budget: EnergyBudget,
+        energy: RoomEnergy,
+        ready: bool,
+        cfg: &OpeningConfig,
+        commit: &mut Commit,
+    ) -> Option<Body> {
+        let Self {
+            rooms,
+            worker_sources: seen,
+            solver,
+            ..
+        } = self;
+        let r = rooms.get_mut(ri)?;
+        // With no plan (no grid yet, or a stall's plan dropped this tick) only a recovery spawns,
+        // with the smallest worker: a request at capacity waits for the plan, so no small worker
+        // is spawned for a whole life.
+        let Some(plan) = r.plan.as_ref() else {
+            return match budget {
+                EnergyBudget::Available => smallest_worker(),
+                EnergyBudget::Capacity | EnergyBudget::UpTo(_) => None,
+            };
+        };
+        let at = match budget {
+            EnergyBudget::Capacity => energy.capacity,
+            EnergyBudget::UpTo(cap) => cap.min(energy.capacity),
+            EnergyBudget::Available => energy.available.min(energy.capacity),
+        };
+        if at >= plan.capacity {
+            return plan.body.or_else(smallest_worker);
+        }
+        let key = at / part_step();
+        if let Some((k, body)) = r.sized
+            && (k == key || !ready)
+        {
+            return body.or_else(smallest_worker);
+        }
+        if !ready {
+            return smallest_worker();
+        }
+        // A solve is the heavy part of the tick's run for this room (as in `ensure_plan`).
+        commit.heavy();
+        worker_sources(plan, seen);
+        let t = targets(plan, seen, cfg, plan.upgraders);
+        let body = worker_plan(&t, at, solver);
+        r.sized = Some((key, body));
+        body.or_else(smallest_worker)
     }
 
     /// Every worker's mode and task for this tick (module docs).
@@ -1856,6 +2000,67 @@ fn best_site(
             (rank(s.2), left, s.5)
         })
         .map(|s| s.0)
+}
+
+/// The plan's sources as the worker solver sees them (P3.6), into `out`: those the upgraders spend
+/// are the linked ones and the ones they count (`upgraded`).
+fn worker_sources(plan: &Plan, out: &mut Vec<WorkerSource>) {
+    out.clear();
+    out.extend(plan.sources.iter().enumerate().map(|(i, s)| {
+        let bit = u32::try_from(i).ok().and_then(|i| 1u32.checked_shl(i));
+        WorkerSource {
+            capacity: s.capacity,
+            open: s.open,
+            trip: s.trip,
+            mined: s.mined,
+            linked: s.linked,
+            spent: s.linked || bit.is_some_and(|bit| plan.upgraded & bit != 0),
+            // A miner works from its mining tile's container (ADR-023), which the workers repair.
+            container: s.mined,
+        }
+    }));
+}
+
+/// What `plan`'s workers are sized for (P3.6), as they are while the upgraders take or not
+/// (`upgraders`): the cap on their WORK parts applies only while they do.
+fn targets<'a>(
+    plan: &Plan,
+    sources: &'a [WorkerSource],
+    cfg: &OpeningConfig,
+    upgraders: bool,
+) -> WorkerTargets<'a> {
+    WorkerTargets {
+        sources,
+        upgraders,
+        min: cfg.min_workers,
+        max: cfg.max_workers,
+        max_work: if upgraders {
+            u32::from(plan.max_work)
+        } else {
+            u32::MAX
+        },
+        build: plan.build,
+        build_trip: plan.build_trip,
+        fill: plan.fill,
+        unload: plan.unload,
+        slack_pct: cfg.body_slack_pct,
+    }
+}
+
+/// The step every worker body's cost is a multiple of: the greatest common divisor of the WORK,
+/// CARRY and MOVE costs (`BODYPART_COST`, V170), so the solver gives the same body for every energy
+/// between two multiples. Unit: energy.
+///
+/// Uses: `BODYPART_COST` (`Part::cost`).
+fn part_step() -> u32 {
+    const fn gcd(a: u32, b: u32) -> u32 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    gcd(
+        gcd(Part::Work.cost(), Part::Carry.cost()),
+        Part::Move.cost(),
+    )
+    .max(1)
 }
 
 /// Chebyshev range, or `u8::MAX` between rooms.
