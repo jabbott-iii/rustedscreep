@@ -126,10 +126,10 @@ Modules:
 - [x] Minimal builders and repairers.
 - [x] Body solver from targets, with no hardcoded bodies.
 
-**Gate:**
-- [ ] Tests derive bodies and hauler sizing from constants.
-- [ ] Measured live harvest efficiency (energy harvested per source per regen cycle against capacity) meets the target set in TUNING.
-- [ ] CPU per room per tick is recorded.
+**Gate:** passed 2026-11-17.
+- [x] Tests derive bodies and hauler sizing from constants.
+- [x] Measured live harvest efficiency (energy harvested per source per regen cycle against capacity) meets the target set in TUNING.
+- [x] CPU per room per tick is recorded.
 
 ## P4 Base planner (SPEC §3.3): ADR-007 decided here
 Modules:
