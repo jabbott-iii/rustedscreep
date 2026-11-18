@@ -3,7 +3,8 @@
 //! by measurement: a stamp/bunker planner and a distance-transform planner with min-cut ramparts.
 //!
 //! The candidates: [`bunker`] (fixed stamps, ADR-007 option a) and [`flood`] (a distance-transform
-//! core and a flood fill, with min-cut ramparts, option b). Each is a resumable run: `Run::step`
+//! core and a flood fill, with min-cut ramparts, option b, which ADR-007 chose on 2026-11-18; the
+//! bunker stays as the comparison baseline for now). Each is a resumable run: `Run::step`
 //! does one phase per call (the scheduler's [`Step`](crate::scheduler::Step)), so P4.3 can slice
 //! it across ticks in the Optional tier; `plan` runs every step at once.
 //!
