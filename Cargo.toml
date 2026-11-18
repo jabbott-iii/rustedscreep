@@ -26,6 +26,9 @@ rustc-hash = "=2.1.3"
 # fern (ADR-014). No features (log has no default features): `set_logger` needs none, STATIC_MAX_LEVEL
 # stays Trace, and the runtime level from config is `log::set_max_level` (V127, V128).
 log = "=0.4.35"
+# Benches for the planner, flow field and combat sim, native only (ADR-006: a dev-dependency of
+# rustedscreep-core, default features; MSRV 1.86, so Rust 1.100 builds it).
+criterion = "=0.8.2"
 
 [workspace.package]
 version = "0.1.0"

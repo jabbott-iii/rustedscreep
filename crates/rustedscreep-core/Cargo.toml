@@ -11,3 +11,11 @@ publish.workspace = true
 rustc-hash.workspace = true
 # Game constants and pure local types come in only through the facade (CLAUDE.md).
 rustedscreep-consts = { path = "../rustedscreep-consts" }
+
+[dev-dependencies]
+criterion.workspace = true
+
+# Native only (`cargo bench -p rustedscreep-core`); criterion supplies the harness.
+[[bench]]
+name = "planner"
+harness = false

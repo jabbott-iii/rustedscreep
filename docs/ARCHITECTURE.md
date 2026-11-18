@@ -308,6 +308,17 @@ opening then wants no worker for those sources, keeps `opening.min_workers`, cap
 `min_upgraders` to 0, and a worker with nothing else to do holds its energy unless its source is not counted. A worker also leaves
 alone a spawn or extension a hauler's transfer goes into this tick (and the room a walking hauler claimed). The view stays last tick's through a run that faults. `upgrading.enabled` turns the requests off. The summary has an `upgrading:` part (upgraders, tasks, budget, posts, body).
 
+Base planner (P4.2; ADR-007 proposed, not wired: nothing in the tick path calls it before P4.3): `rustedscreep_core::planner` is pure.
+A `PlanInput` (terrain, controller, sources in (x, y) order, mineral, a standing spawn) gives a `Layout`: every structure, road and
+rampart as an `Item` with the controller level it belongs from, sorted (level, type, tile), plus the `Roles` the economy reads by
+position (hub, storage, hub link, mining tiles, source links, the controller's container and link, the mineral container). A `Board`
+holds a run's working state and checks the site rules (V237) and the level counts (V234) on every placement. Two candidates, `bunker`
+and `flood`, each a `Run` that does one phase per `step` (`scheduler::Step`), share `sites` (the economy's tiles), `roads` (A* at the
+fatigue rates, reusing planned roads), `score` (the hub's anchor cost), `defence` and `mincut` (the minimum cut on a vertex-split graph,
+Dinic), `transform` (the Chebyshev distance transform) and `validate` (the one referee, which also measures). A `Scratch` holds the
+buffers a run reuses; a run's own state is in its `Run`, so a run stepped with a new scratch each step gives the same plan. Each run
+borrows its `PlanInput`, so P4.3 must keep the input alive across the ticks a run takes.
+
 Constants self-check (P1.11): `rustedscreep_core::consts_check` is pure. A `Globals` source gives the server's names, then one
 value's JSON text per step; `Check::step` reads them all, checks that at least one anchor constant (`OK`, `WORK`, `CREEP_LIFE_TIME`) was seen (otherwise the global holds no game constants and the check fails),
 then compares 15 groups (scalars, enum families by prefix, sets, tables entry by entry) with `rustedscreep_consts`, through a strict

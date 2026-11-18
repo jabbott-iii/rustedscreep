@@ -22,6 +22,7 @@ pub mod economy;
 pub mod intents;
 pub mod movement;
 pub mod persist;
+pub mod planner;
 pub mod profiler;
 pub mod scheduler;
 pub mod snapshot;

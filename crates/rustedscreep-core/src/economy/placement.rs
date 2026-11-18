@@ -570,7 +570,7 @@ pub fn next_extension(
 
 /// Whether the free neighbours of `t` stay one group (8-connected among themselves) once `t` is
 /// blocked: then any way through `t` can go around it, so blocking it never splits the room.
-pub(super) fn keeps_neighbours_connected(t: Tile, blocked: impl Fn(Tile) -> bool) -> bool {
+pub(crate) fn keeps_neighbours_connected(t: Tile, blocked: impl Fn(Tile) -> bool) -> bool {
     let mut free = [None; 8];
     let mut n = 0;
     for (_, nb) in t.neighbors() {
