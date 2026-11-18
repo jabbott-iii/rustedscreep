@@ -47,7 +47,8 @@ use rustedscreep_core::config::{
 };
 use rustedscreep_core::economy::placement::Placement;
 use rustedscreep_core::economy::{
-    Crew, Event, HaulTask, Hauling, Mining, Opening, Task, UpgradeTask, Upgrading,
+    Crew, Event, HaulTask, Hauling, LIFE_CYCLES, Mining, Opening, SourceHarvest, Task, UpgradeTask,
+    Upgrading,
 };
 use rustedscreep_core::intents::{ActLog, IntentBuffer, Outcome, error_name};
 use rustedscreep_core::movement::Movement;
@@ -822,7 +823,8 @@ impl OpeningGlue {
     }
 
     /// The mining part of the summary: per owned room its miners, the sources they mine, this
-    /// tick's harvests and requests, and per source its tile, the miner's walk and body.
+    /// tick's harvests and requests, and per source its tile, the miner's walk and body, and its
+    /// harvest per regeneration cycle (the P3 gate).
     fn mining_summary(&self, text: &mut String) {
         text.push_str(" | mining:");
         for (room, plan, stats) in self.mining.room_states() {
@@ -885,10 +887,36 @@ impl OpeningGlue {
                         let _ = write!(text, " no miner at capacity {}", p.capacity);
                     }
                 }
+                let harvest = self.mining.harvest(room);
+                if let Some(h) = harvest.iter().find(|h| h.source == s.source) {
+                    harvest_summary(text, h);
+                }
             }
             text.push(';');
         }
     }
+}
+
+/// One source's harvest cycles for the summary (the P3 gate, `economy::SourceHarvest`): the cycles
+/// counted since the global started; the last [`LIFE_CYCLES`] (one miner life), what they harvested
+/// of what they held and the worst of them; all of them; and the refills kept out.
+fn harvest_summary(text: &mut String, h: &SourceHarvest) {
+    let pct = |permille: u64| (permille / 10, permille % 10);
+    let _ = write!(text, ", harvest cycles {}", h.cycles);
+    if let Some((mean, worst)) = h.life() {
+        let (m, md) = pct(mean);
+        let (w, wd) = pct(worst);
+        let _ = write!(
+            text,
+            ", last {} {m}.{md}% (worst {w}.{wd}%; a life is {LIFE_CYCLES})",
+            h.recent().len()
+        );
+    }
+    if let Some(all) = h.overall() {
+        let (a, ad) = pct(all);
+        let _ = write!(text, ", all {a}.{ad}%");
+    }
+    let _ = write!(text, ", unmined {}, missed {}", h.unmined, h.missed);
 }
 
 #[cold]

@@ -3861,6 +3861,232 @@ fn a_linked_miner_adds_one_carry() {
     }
 }
 
+/// Uses: SOURCE_ENERGY_CAPACITY, HARVEST_POWER, ENERGY_REGEN_TIME, CREEP_LIFE_TIME. A source's
+/// harvest cycles: a rise over the last tick's energy is a refill, which ends a cycle that left the
+/// last tick's energy less that tick's miner harvest (at most `WORK × HARVEST_POWER`, none without
+/// one); a cycle its miner left before the end counts with what the last tick held; a cycle no
+/// miner harvested in, or one ended after a skipped tick, is kept out; a full source starts no
+/// cycle; the last `CREEP_LIFE_TIME / ENERGY_REGEN_TIME` cycles are kept, oldest first.
+#[test]
+fn source_harvest_cycles_from_constants() {
+    let room: RoomName = ROOM.parse().expect("room");
+    let at = place(room, tile(10, 10));
+    let cap = SOURCE_ENERGY_CAPACITY;
+    let power = 5 * HARVEST_POWER;
+    assert_eq!(LIFE_CYCLES as u32, CREEP_LIFE_TIME / ENERGY_REGEN_TIME);
+    let mut h = SourceHarvest::new(at);
+    // Full and unharvested: no cycle.
+    h.observe(100, cap, cap);
+    h.observe(101, cap, cap);
+    assert_eq!((h.cycles, h.unmined, h.missed), (0, 0, 0));
+    // A cycle harvested down to 25 before its last harvest: it leaves 25 - power (at least 0).
+    let mut t = 102;
+    let mut energy = cap;
+    while energy > 25 + power {
+        h.observe(t, energy, cap);
+        h.harvest(power);
+        energy -= power;
+        t += 1;
+    }
+    let before = 25;
+    h.observe(t, before, cap);
+    h.harvest(power);
+    t += 1;
+    h.observe(t, cap, cap);
+    let left = before - power.min(before);
+    assert_eq!(h.cycles, 1);
+    assert_eq!(h.recent(), &[(cap - left, cap)][..]);
+    assert_eq!(
+        (h.harvested, h.capacity),
+        (u64::from(cap - left), u64::from(cap))
+    );
+    // Its miner gone before the end: the cycle counts with what the last tick held.
+    h.observe(t + 1, cap - power, cap);
+    h.harvest(power);
+    h.observe(t + 2, 400, cap);
+    h.observe(t + 3, cap, cap);
+    assert_eq!(h.cycles, 2);
+    assert_eq!(h.recent().last(), Some(&(cap - 400, cap)));
+    // A cycle no miner harvested in, and one ended after a skipped tick, are kept out.
+    let t = t + 4;
+    h.observe(t, cap - power, cap);
+    h.observe(t + 1, cap, cap);
+    assert_eq!(h.unmined, 1);
+    h.observe(t + 2, cap - power, cap);
+    h.harvest(power);
+    h.observe(t + 4, cap, cap);
+    assert_eq!(h.missed, 1);
+    assert_eq!(h.cycles, 2);
+    // The ring keeps the last LIFE_CYCLES cycles, oldest first.
+    let mut t = t + 5;
+    for k in 0..(LIFE_CYCLES as u32 + 2) {
+        h.observe(t, k + 1, cap);
+        h.harvest(0);
+        h.observe(t + 1, cap, cap);
+        t += 2;
+    }
+    let want: Vec<(u32, u32)> = (2..LIFE_CYCLES as u32 + 2)
+        .map(|k| (cap - (k + 1), cap))
+        .collect();
+    assert_eq!(h.recent(), &want[..]);
+    assert_eq!(h.cycles, 2 + LIFE_CYCLES as u32 + 2);
+    // The life's figures over that ring: what it harvested of what it held, and its worst cycle.
+    let got: u64 = want.iter().map(|w| u64::from(w.0)).sum();
+    let held = u64::from(cap) * LIFE_CYCLES as u64;
+    let worst = u64::from(cap - (LIFE_CYCLES as u32 + 2)) * 1000 / u64::from(cap);
+    assert_eq!(h.life(), Some((got * 1000 / held, worst)));
+    assert_eq!(h.overall(), Some(h.harvested * 1000 / h.capacity));
+    assert_eq!(SourceHarvest::new(at).life(), None);
+    // After a missed refill, a cycle no miner harvests in is kept out as unmined.
+    let (cycles, unmined) = (h.cycles, h.unmined);
+    h.observe(t, cap - power, cap);
+    h.harvest(power);
+    h.observe(t + 2, cap, cap);
+    h.observe(t + 3, cap - power, cap);
+    h.observe(t + 4, cap, cap);
+    assert_eq!((h.cycles, h.unmined), (cycles, unmined + 1));
+    assert_eq!(permille(999, 1000), Some(999));
+    assert_eq!(permille(1, 3), Some(333));
+    assert_eq!(permille(1, 0), None);
+}
+
+/// The recorder against the world model's own ledger of refills (the energy each source held when
+/// it refilled, after that tick's harvests): in a room that starts at RCL4, every refill after the
+/// first tick is counted once, as a cycle or kept out, and each cycle a miner harvested to the end
+/// left what the model says. Uses: SOURCE_ENERGY_CAPACITY.
+#[test]
+fn source_harvest_matches_the_worlds_refills() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    let start = w.time;
+    w.run(6000);
+    let room = w.room;
+    let records = w.mining.harvest(room);
+    assert_eq!(records.len(), w.sources.len());
+    let mut counted = 0;
+    for (i, s) in w.sources.iter().enumerate() {
+        let rec = records
+            .iter()
+            .find(|r| r.source == place(room, s.at))
+            .expect("a record per source");
+        // The recorder sees a refill on the tick after it; the last tick's refill is still unseen.
+        let refills: Vec<u32> = w
+            .regens
+            .iter()
+            .filter(|r| r.1 == i && r.0 > start && r.0 < w.time - 1)
+            .map(|r| r.2)
+            .collect();
+        assert_eq!(
+            (rec.cycles + rec.unmined + rec.missed) as usize,
+            refills.len(),
+            "source {i}"
+        );
+        assert_eq!(rec.missed, 0, "the model skips no tick");
+        assert!(rec.cycles > 0, "source {i}: mined cycles");
+        // The last cycles, newest last, against the model's last refills: the refills kept out
+        // come before the first miner harvests, so the last ones are all counted (the cycle a
+        // miner died in among them).
+        let recent = rec.recent();
+        assert!(refills.len() >= recent.len());
+        let tail = &refills[refills.len() - recent.len()..];
+        let mut differ = 0;
+        for (&(harvested, cap), &left) in recent.iter().zip(tail) {
+            assert_eq!(cap, SOURCE_ENERGY_CAPACITY);
+            // Never higher than it was: a worker's harvest of a source whose miner is gone, on a
+            // cycle's last tick, is not seen; at most the one cycle a life the miner dies in.
+            assert!(
+                harvested <= cap - left,
+                "source {i}: {recent:?} against {tail:?}"
+            );
+            if harvested != cap - left {
+                differ += 1;
+            }
+        }
+        assert!(differ <= 1, "source {i}: {recent:?} against {tail:?}");
+        counted += rec.cycles;
+    }
+    assert!(counted > 0);
+}
+
+/// One source's miner gone for good (mining off): its record counts no cycle but the one its miner
+/// was in and keeps every later refill out as unmined, while the other source's cycles go on and
+/// match the world model's ledger (lower by at most one miner tick's take), so each harvest is
+/// credited to its own source. Uses: HARVEST_POWER, ENERGY_REGEN_TIME.
+#[test]
+fn source_harvest_follows_each_source() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    w.run(4000);
+    let room = w.room;
+    let at = |w: &World, i: usize| place(room, w.sources[i].at);
+    let rec = |w: &World, i: usize| {
+        *w.mining
+            .harvest(room)
+            .iter()
+            .find(|r| r.source == at(w, i))
+            .expect("a record")
+    };
+    // Every miner but source 1's goes, spawning ones included (one not yet given a source would
+    // take source 0 on coming out).
+    let at1 = at(&w, 1);
+    let mining1 = |w: &World| -> Vec<u128> {
+        w.creeps
+            .iter()
+            .filter(|c| c.identity.role == Role::Miner && c.spawning == 0)
+            .filter(|c| {
+                w.snap
+                    .creeps
+                    .handle_of(ObjectKey(c.key))
+                    .and_then(|h| w.mining.source_of(h))
+                    == Some(at1)
+            })
+            .map(|c| c.key)
+            .collect()
+    };
+    // A tick where source 1 has its miner (not between two of them).
+    let mut waited = 0;
+    while mining1(&w).is_empty() {
+        assert!(waited < CREEP_LIFE_TIME, "source 1 gets a miner");
+        w.step();
+        waited += 1;
+    }
+    let keep = mining1(&w);
+    let (gone, kept) = (rec(&w, 0), rec(&w, 1));
+    w.mining_cfg.enabled = false;
+    w.creeps
+        .retain(|c| c.identity.role != Role::Miner || keep.contains(&c.key));
+    let removed_at = w.time;
+    w.run(4 * ENERGY_REGEN_TIME);
+    let (gone2, kept2) = (rec(&w, 0), rec(&w, 1));
+    // Source 0: the cycle its miner was in counts, and every later refill (if a worker's harvest
+    // started one; else the source stays full) is kept out as unmined.
+    let refills0 = w
+        .regens
+        .iter()
+        .filter(|r| r.1 == 0 && r.0 > removed_at && r.0 < w.time - 1)
+        .count() as u32;
+    assert!(gone2.cycles <= gone.cycles + 1, "{gone:?} then {gone2:?}");
+    assert_eq!(
+        (gone2.cycles - gone.cycles) + (gone2.unmined - gone.unmined),
+        refills0,
+        "{gone:?} then {gone2:?}"
+    );
+    assert!(kept2.cycles >= kept.cycles + 3, "{kept:?} then {kept2:?}");
+    let lefts: Vec<u32> = w
+        .regens
+        .iter()
+        .filter(|r| r.1 == 1 && r.0 > removed_at && r.0 < w.time - 1)
+        .map(|r| r.2)
+        .collect();
+    let recent = kept2.recent();
+    let n = lefts.len().min(recent.len());
+    for (&(harvested, cap), &left) in recent[recent.len() - n..]
+        .iter()
+        .zip(&lefts[lefts.len() - n..])
+    {
+        assert!(harvested <= cap - left);
+        assert!(cap - left - harvested <= HARVEST_POWER * miner_work(cap));
+    }
+}
+
 /// The mining plan of room `w` (after a run).
 fn mine_plan(w: &World) -> MinePlan {
     w.mining

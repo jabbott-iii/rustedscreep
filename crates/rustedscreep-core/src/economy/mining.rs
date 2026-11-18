@@ -62,8 +62,8 @@
 //! tick. Nothing is read from or written to `Memory`.
 
 use rustedscreep_consts::{
-    HARVEST_POWER, INTENT_CPU_COST, LINK_CAPACITY, LINK_LOSS_RATIO, Position, ROOM_SIZE,
-    ResourceType, RoomCoordinate, RoomName, StructureType,
+    CREEP_LIFE_TIME, ENERGY_REGEN_TIME, HARVEST_POWER, INTENT_CPU_COST, LINK_CAPACITY,
+    LINK_LOSS_RATIO, Position, ROOM_SIZE, ResourceType, RoomCoordinate, RoomName, StructureType,
 };
 
 use super::placement::keeps_neighbours_connected;
@@ -249,6 +249,148 @@ pub struct LinkTotals {
     pub energy: u64,
 }
 
+/// Regeneration cycles in one creep life (`CREEP_LIFE_TIME` / `ENERGY_REGEN_TIME`, 5): the P3
+/// gate's harvest efficiency is a miner life's mean (`MiningConfig::harvest_efficiency_pct`).
+///
+/// Uses: `CREEP_LIFE_TIME`, `ENERGY_REGEN_TIME`.
+pub const LIFE_CYCLES: usize = (CREEP_LIFE_TIME / ENERGY_REGEN_TIME) as usize;
+
+/// One source's harvest per regeneration cycle, for the P3 gate (TEST_PLAN §8): what the cycle
+/// harvested, its capacity less the energy it left at the refill. A source refills to its capacity
+/// in one step after a tick's harvests (V184, V215), and nothing else raises its energy before P9's
+/// power creeps (`PWR_REGEN_SOURCE`), so a rise between two ticks' snapshots is a refill, and the
+/// energy it left is the earlier snapshot's less what that tick's harvest took: `min(energy, WORK ×
+/// HARVEST_POWER)` of the miner's harvest pushed that tick (V183), none without one. Every cycle a
+/// miner harvested in counts, the one its miner died in too (the gate's mean is over a life for
+/// that loss, TUNING); a cycle no miner harvested in (an unmined source, its workers' harvests
+/// unknown here) and one that ends after a skipped tick (no snapshot between) are counted apart
+/// and kept out of the means. The miner's take on the last tick is the plan's WORK parts ×
+/// `HARVEST_POWER` once its harvest is pushed (the snapshot holds no body): a cycle reads higher
+/// than it was by at most that when the miner's WORK parts are damaged or its harvest refused on
+/// that tick (10 of a 3000 source's cycle), and lower when someone else harvests the source then
+/// (a worker, its miner gone). In the heap: a global reset starts it again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceHarvest {
+    pub source: Position,
+    /// The last snapshot of it: the tick, its energy, and at most what that tick's miner harvest
+    /// took (0 without one).
+    last: Option<(u32, u32, u32)>,
+    /// A miner harvested it since the last refill.
+    mined: bool,
+    /// The last [`LIFE_CYCLES`] cycles counted, oldest first: (harvested, capacity), `len` of them.
+    recent: [(u32, u32); LIFE_CYCLES],
+    len: u8,
+    /// Cycles counted since the global started, and what they harvested of what they held. Unit:
+    /// cycles, energy.
+    pub cycles: u32,
+    pub harvested: u64,
+    pub capacity: u64,
+    /// Refills kept out: of a cycle no miner harvested in, and after a skipped tick.
+    pub unmined: u32,
+    pub missed: u32,
+}
+
+impl SourceHarvest {
+    pub const fn new(source: Position) -> Self {
+        Self {
+            source,
+            last: None,
+            mined: false,
+            recent: [(0, 0); LIFE_CYCLES],
+            len: 0,
+            cycles: 0,
+            harvested: 0,
+            capacity: 0,
+            unmined: 0,
+            missed: 0,
+        }
+    }
+
+    /// This tick's snapshot of the source, before any harvest: a rise over the last one ends a
+    /// cycle (struct docs).
+    pub fn observe(&mut self, now: u32, energy: u32, capacity: u32) {
+        if let Some((time, before, took)) = self.last
+            && energy > before
+        {
+            if time.saturating_add(1) != now {
+                self.missed = self.missed.saturating_add(1);
+            } else if !self.mined {
+                self.unmined = self.unmined.saturating_add(1);
+            } else {
+                let left = before.saturating_sub(took.min(before));
+                self.record(capacity.saturating_sub(left), capacity);
+            }
+            self.mined = false;
+        }
+        self.last = Some((now, energy, 0));
+    }
+
+    /// A miner's harvest of the source this tick that takes at most `power` (its WORK parts ×
+    /// `HARVEST_POWER`).
+    pub fn harvest(&mut self, power: u32) {
+        if let Some((_, _, took)) = self.last.as_mut() {
+            *took = took.saturating_add(power);
+            self.mined = true;
+        }
+    }
+
+    fn record(&mut self, harvested: u32, capacity: u32) {
+        self.cycles = self.cycles.saturating_add(1);
+        self.harvested = self.harvested.saturating_add(u64::from(harvested));
+        self.capacity = self.capacity.saturating_add(u64::from(capacity));
+        let len = usize::from(self.len);
+        if len < LIFE_CYCLES {
+            if let Some(slot) = self.recent.get_mut(len) {
+                *slot = (harvested, capacity);
+                self.len = self.len.saturating_add(1);
+            }
+        } else {
+            self.recent.rotate_left(1);
+            if let Some(slot) = self.recent.last_mut() {
+                *slot = (harvested, capacity);
+            }
+        }
+    }
+
+    /// The last cycles counted, oldest first, at most [`LIFE_CYCLES`]: (harvested, capacity).
+    pub fn recent(&self) -> &[(u32, u32)] {
+        self.recent.get(..usize::from(self.len)).unwrap_or(&[])
+    }
+
+    /// The P3 gate's figures over [`Self::recent`] (up to one miner life): what they harvested of
+    /// what they held, and the worst cycle, in permille ([`permille`]); `None` before the first
+    /// cycle. Unit: permille.
+    pub fn life(&self) -> Option<(u64, u64)> {
+        let (got, held) = self
+            .recent()
+            .iter()
+            .fold((0u64, 0u64), |(g, c), &(h, cap)| {
+                (
+                    g.saturating_add(u64::from(h)),
+                    c.saturating_add(u64::from(cap)),
+                )
+            });
+        let worst = self
+            .recent()
+            .iter()
+            .filter_map(|&(h, cap)| permille(u64::from(h), u64::from(cap)))
+            .min()?;
+        Some((permille(got, held)?, worst))
+    }
+
+    /// What every counted cycle since the global started harvested of what it held; `None`
+    /// before the first. Unit: permille.
+    pub fn overall(&self) -> Option<u64> {
+        permille(self.harvested, self.capacity)
+    }
+}
+
+/// What `harvested` is of `capacity`, in tenths of a percent, rounded down; `None` for no
+/// capacity. Unit: permille.
+pub fn permille(harvested: u64, capacity: u64) -> Option<u64> {
+    harvested.saturating_mul(1000).checked_div(capacity)
+}
+
 struct MineRoom {
     name: RoomName,
     row: Option<usize>,
@@ -271,6 +413,8 @@ struct MineRoom {
     /// (`movement.route_retry_ticks` later): the miner goes next to its source instead.
     unreachable: Vec<(Position, u32)>,
     stats: MineStats,
+    /// Each source's harvest per regeneration cycle (the P3 gate), by place.
+    harvest: Vec<SourceHarvest>,
 }
 
 /// One miner of this tick, in the order the job walks them: by room, then by id.
@@ -383,6 +527,7 @@ impl Mining {
                         controller: None,
                         unreachable: Vec::new(),
                         stats: MineStats::default(),
+                        harvest: Vec::new(),
                     },
                 ),
             }
@@ -608,6 +753,12 @@ impl Mining {
         &self.totals
     }
 
+    /// Each source's harvest per regeneration cycle in `room` (the P3 gate), since the global
+    /// started.
+    pub fn harvest(&self, room: RoomName) -> &[SourceHarvest] {
+        self.room(room).map_or(&[], |r| &r.harvest[..])
+    }
+
     /// `room`'s counters, from its last run (P3.4's upgraders count on its miners).
     pub fn stats(&self, room: RoomName) -> Option<&MineStats> {
         self.room(room).map(|r| &r.stats)
@@ -703,6 +854,19 @@ impl Mining {
         r.containers.clear();
         r.link_sites.clear();
         r.receivers.clear();
+        // Each source's snapshot for its harvest cycles (the P3 gate), before the miners harvest.
+        for &(_, pos, energy, capacity) in sources.iter() {
+            let i = match r.harvest.iter().position(|h| h.source == pos) {
+                Some(i) => i,
+                None => {
+                    r.harvest.push(SourceHarvest::new(pos));
+                    r.harvest.len() - 1
+                }
+            };
+            if let Some(h) = r.harvest.get_mut(i) {
+                h.observe(now, energy, capacity);
+            }
+        }
         let receiver = |p: Position| {
             found
                 .controller
@@ -874,6 +1038,9 @@ impl Mining {
                     .is_ok()
             {
                 stats.harvests = stats.harvests.saturating_add(1);
+                if let Some(rec) = r.harvest.iter_mut().find(|x| x.source == s.source) {
+                    rec.harvest(per_tick);
+                }
             }
             // Onto its tile, or next to the source while the tile cannot be reached.
             let blocked = |p: Position| r.unreachable.iter().any(|u| u.0 == p);

@@ -727,7 +727,9 @@ export function linkSim(dir = join(ROOT, 'dist')) {
   const results = commandResults(world, SUMMARY);
   if (results.length !== loops.length) problems.push(`${results.length} opening summaries, expected ${loops.length}`);
   const tiles = range(MINE, SPAWN) - 1;
-  const bodyRe = new RegExp(` link ${at(SOURCE_LINK).replace(/[()]/g, '\\$&')} body ${MINER_WORK} WORK 1 CARRY (\\d+) MOVE \\((\\d+) energy\\);`);
+  // The source's harvest record (the P3 gate's recorder) follows its body: no refill comes within the run (a 3000
+  // source mined at 10 a tick lasts 300 ticks), so no cycle is counted or kept out.
+  const bodyRe = new RegExp(` link ${at(SOURCE_LINK).replace(/[()]/g, '\\$&')} body ${MINER_WORK} WORK 1 CARRY (\\d+) MOVE \\((\\d+) energy\\), harvest cycles 0, unmined 0, missed 0;`);
   loops.forEach((o, k) => {
     const r = results[k] ?? '';
     const sent = state.calls.filter((c) => c.method === 'transferEnergy' && c.offset <= o);

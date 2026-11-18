@@ -225,7 +225,10 @@ it gives each miner (own creeps named `m<room>-<serial>`, `Role::Miner`) a sourc
 else the nearest free source), asks for one miner per source with none (`BodySpec::Exact`, `PRIORITY_MINER` 125, held back while it costs
 more than the opening watchdog's cap), pushes a harvest while the miner is next to its source and the source holds energy, and moves it
 onto its tile (range 0; next to the source while the tile cannot be reached). With no CARRY the harvest lands in a container on the
-miner's tile or on a pile there (V212). `Mining::mined` lists the sources whose miner is next to them and where it stands: the opening
+miner's tile or on a pile there (V212). Per source it records the harvest of each regeneration cycle for the P3 gate (`SourceHarvest`,
+heap only): a rise of the source's energy between two ticks' snapshots is a refill (V184, V215), and the cycle left the earlier
+snapshot's energy less what that tick's miner harvest could take; the last `CREEP_LIFE_TIME / ENERGY_REGEN_TIME` cycles and the
+totals go to `rustedscreep.opening()`'s `mining:` part, with the cycles no miner harvested in and those after a skipped tick apart. `Mining::mined` lists the sources whose miner is next to them and where it stands: the opening
 does not harvest them, sizes their workers with `carry_round` (one tick at the source), and its gatherers take energy there only as a
 whole load (else `Task::Wait` next to the tile), so one take replaces several. `Mining::container_needs` lists the mining tiles with no
 container and no container site once the room pays for the miner; the Optional `opening placement` job places them before any extension

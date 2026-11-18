@@ -32,8 +32,9 @@ pub use hauling::{
     HaulInput, HaulPlan, HaulSource, HaulStats, HaulTask, HaulView, Hauling, PRIORITY_HAULER,
 };
 pub use mining::{
-    CONTROLLER_LINK_RANGE, LINK_MARGIN, LinkOrder, LinkTotals, MinePlan, MineSource, MineStats,
-    Mined, Mining, PRIORITY_MINER, RECEIVER_RANGE, Receiver, link_loss,
+    CONTROLLER_LINK_RANGE, LIFE_CYCLES, LINK_MARGIN, LinkOrder, LinkTotals, MinePlan, MineSource,
+    MineStats, Mined, Mining, PRIORITY_MINER, RECEIVER_RANGE, Receiver, SourceHarvest, link_loss,
+    permille,
 };
 
 pub use opening::{
