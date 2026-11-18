@@ -30,22 +30,28 @@
 //!   container while `mining.place_containers` is on, or the controller container's while
 //!   `hauling.place_container` is on, else a link tile while `links.place_links` is on and the level
 //!   allows another link, else, while `opening.place_extensions` is on and the room has a spawn and
-//!   fewer extensions and extension sites than its level allows, an extension. The act step calls
-//!   `Room.createConstructionSite(x, y, type)` for it, after the spawn orders and before the creep
-//!   intents: one JS call per site, billed like an intent (V203).
+//!   fewer extensions and extension sites than its level allows, an extension. In a room whose
+//!   base plan is ready (P4.3, ADR-026, `planner.enabled` on) the action comes from the plan
+//!   instead (`economy::placement`'s plan path): the economy's containers and links on the plan's
+//!   tiles, then the plan's spawns, extensions and roads, or a destroy of an own structure that
+//!   stands in the plan's way; while the room's plan is being built nothing is placed there. The
+//!   act step calls `Room.createConstructionSite(x, y, type)` for a site, after the spawn orders and
+//!   before the creep intents: one JS call per site, billed like an intent (V203).
 //!
-//! JS calls of its own: those site calls, one `StructureLink.transferEnergy(target, amount)` per
-//! link send (after the sites, before the creep intents; billed, V34, V216), and `Game.notify` on a
-//! recovery or a stall (once per kind per global). Everything it reads comes from the snapshot, and
-//! its creep intents go through the buffer.
+//! JS calls of its own: those site calls; `Structure.destroy()` for a plan's destroy (ADR-026: at
+//! most one a room a tick, before the site calls, billed like an intent, V250; `issue_destroys`
+//! checks the snapshot row's type and tile first); one `StructureLink.transferEnergy(target,
+//! amount)` per link send (after the sites, before the creep intents; billed, V34, V216); and
+//! `Game.notify` on a recovery or a stall (once per kind per global). Everything it reads comes
+//! from the snapshot, and its creep intents go through the buffer.
 
 use std::fmt::Write as _;
 
 use rustedscreep_core::config::{
-    HaulingConfig, LinkConfig, MiningConfig, MovementConfig, OpeningConfig, RepairConfig,
-    SchedulerConfig, UpgradingConfig,
+    HaulingConfig, LinkConfig, MiningConfig, MovementConfig, OpeningConfig, PlannerConfig,
+    RepairConfig, SchedulerConfig, UpgradingConfig,
 };
-use rustedscreep_core::economy::placement::Placement;
+use rustedscreep_core::economy::placement::{DestroyTarget, Placement};
 use rustedscreep_core::economy::{
     Crew, Event, HaulTask, Hauling, LIFE_CYCLES, Mining, Opening, SourceHarvest, Task, UpgradeTask,
     Upgrading,
@@ -60,6 +66,7 @@ use rustedscreep_core::spawning::{Body, EnergyBudget, Spawner};
 use screeps::{Part, RoomName, StructureType};
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
+use crate::planner::PlannerGlue;
 use crate::snapshot::JsWorld;
 
 #[wasm_bindgen]
@@ -83,6 +90,15 @@ extern "C" {
     /// full link the call returns OK and is billed for nothing (V216).
     #[wasm_bindgen(method, catch, js_name = transferEnergy)]
     fn transfer_energy(this: &LinkActor, target: &JsValue, amount: u32) -> Result<f64, JsValue>;
+
+    /// A structure, for `destroy` (engine game/structures.js, V248 to V250). Bound here, not
+    /// through screeps-game-api's `Structure::destroy`, which unwraps the return code (V254).
+    type Destroyable;
+
+    /// `destroy()`: OK, ERR_NOT_OWNER, ERR_BUSY (a hostile creep in the room) or
+    /// ERR_INVALID_TARGET (V248); an OK call is billed (V250).
+    #[wasm_bindgen(method, catch, js_name = destroy)]
+    fn destroy(this: &Destroyable) -> Result<f64, JsValue>;
 }
 
 /// Harvesting is Critical (CLAUDE.md).
@@ -145,6 +161,9 @@ const SITE_JOB: &str = "opening sites";
 
 /// The job name the act step's link-send faults are logged under.
 const LINK_JOB: &str = "link sends";
+
+/// The job name the act step's destroy faults are logged under (ADR-026).
+const DESTROY_JOB: &str = "planner destroys";
 
 /// The opening's state for one global.
 #[derive(Default)]
@@ -409,24 +428,28 @@ impl OpeningGlue {
         });
     }
 
-    /// The Optional `opening placement` job: one unit per owned room, while
+    /// The Optional `opening placement` job: one unit per owned room, while `planner.enabled`,
     /// `opening.place_extensions`, `mining.place_containers`, `links.place_links` or
     /// `hauling.place_container` is on (the mining job lists no container tile or link tile while
-    /// the switch for it is off).
+    /// the switch for it is off). A room with a plan places from it (P4.3); one whose plan is being
+    /// built places nothing; the rest place as before (ADR-020, ADR-023 to ADR-025).
     #[allow(clippy::too_many_arguments)]
     pub fn place<C: Clock>(
         &mut self,
         tick: &mut TickCpu<'_, C>,
         snapshot: &Snapshot,
         movement: &mut Movement,
+        planner: &PlannerGlue,
         cfg: &OpeningConfig,
         mining_cfg: &MiningConfig,
         link_cfg: &LinkConfig,
         hauling_cfg: &HaulingConfig,
+        pcfg: &PlannerConfig,
         mcfg: &MovementConfig,
     ) {
         let count = self.placement.room_count();
-        let any = cfg.place_extensions
+        let any = pcfg.enabled
+            || cfg.place_extensions
             || mining_cfg.place_containers
             || link_cfg.place_links
             || (hauling_cfg.enabled && hauling_cfg.place_container);
@@ -444,10 +467,90 @@ impl OpeningGlue {
             let room = placement.room_name(unit);
             let containers = room.map_or(&[][..], |room| mining.container_needs(room));
             let links = room.map_or(&[][..], |room| mining.link_needs(room));
+            let view = room.map_or(
+                rustedscreep_core::economy::placement::PlanView::Off,
+                |room| planner.view(room, pcfg),
+            );
             placement.plan_room(
-                unit, snapshot, movement, mcfg, extensions, containers, links, commit,
+                unit, snapshot, movement, mcfg, extensions, containers, links, view, pcfg, commit,
             )
         });
+    }
+
+    /// The placement (P4.3's console summary reads its census and totals).
+    pub fn placement(&self) -> &Placement {
+        &self.placement
+    }
+
+    /// Calls `destroy` for this tick's off-plan structures (ADR-026) and records each outcome.
+    /// Call in the act step, before the sites. A call that throws, or an order with no JS object,
+    /// is a fault under `planner destroys`; each call is logged at info (a destroy is rare and
+    /// loses the structure's cost).
+    pub fn issue_destroys(
+        &mut self,
+        snapshot: &Snapshot,
+        js: &JsWorld,
+        log: &mut ActLog,
+        sched: &mut Scheduler,
+        cfg: &SchedulerConfig,
+    ) {
+        for index in 0..self.placement.destroys().len() {
+            let Some(&order) = self.placement.destroys().get(index) else {
+                break;
+            };
+            // A destroy cannot be undone: the row must still hold that kind on that tile.
+            let here = |p: &screeps::Position| {
+                p.room_name() == order.room
+                    && rustedscreep_core::movement::Tile::of(*p) == order.tile
+            };
+            let (object, matches): (Option<&JsValue>, bool) = match order.target {
+                DestroyTarget::Structure(row) => (
+                    js.structures.get(row).map(AsRef::as_ref),
+                    snapshot.structures.kinds().get(row) == Some(&order.kind)
+                        && snapshot.structures.positions().get(row).is_some_and(here),
+                ),
+                DestroyTarget::Object(row) => (
+                    js.objects.get(row).map(AsRef::as_ref),
+                    order.kind == StructureType::Container
+                        && snapshot.objects.kinds().get(row) == Some(&ObjectKind::Container)
+                        && snapshot.objects.positions().get(row).is_some_and(here),
+                ),
+            };
+            let Some(object) = object.filter(|_| matches) else {
+                destroy_fault(
+                    sched,
+                    cfg,
+                    snapshot,
+                    "no JS object for the structure row",
+                    index,
+                );
+                log.missing();
+                self.placement.record_destroy(index, Outcome::Unknown);
+                continue;
+            };
+            let outcome = match object.unchecked_ref::<Destroyable>().destroy() {
+                Ok(value) => Outcome::from_return(value),
+                Err(_) => {
+                    destroy_fault(sched, cfg, snapshot, "destroy threw", index);
+                    Outcome::Threw
+                }
+            };
+            log.record_structure(outcome);
+            let what = match outcome {
+                Outcome::Ok => "ok",
+                Outcome::Failed(code) => error_name(code),
+                Outcome::Unknown => "unknown return",
+                Outcome::Threw => "threw",
+            };
+            log::info!(
+                "rustedscreep planner: destroy {:?} at ({}, {}) in {} for the plan: {what}",
+                order.kind,
+                order.tile.x(),
+                order.tile.y(),
+                order.room
+            );
+            self.placement.record_destroy(index, outcome);
+        }
     }
 
     /// Calls `createConstructionSite` for this tick's picks and records each outcome (a refused
@@ -494,6 +597,8 @@ impl OpeningGlue {
                     StructureType::Container => "container",
                     StructureType::Extension => "extension",
                     StructureType::Link => "link",
+                    StructureType::Road => "road",
+                    StructureType::Spawn => "spawn",
                     _ => "construction",
                 };
                 log::info!(
@@ -998,6 +1103,24 @@ fn site_fault(
     let record = FaultRecord {
         time: snapshot.tick.time,
         job: SITE_JOB,
+        fault: Fault::new(what, u32::try_from(index).unwrap_or(u32::MAX)),
+    };
+    sched.faults_mut().record(record, cfg);
+}
+
+/// A fault of the act step's destroys (`DESTROY_JOB`), rate-limited like a job's.
+#[cold]
+#[inline(never)]
+fn destroy_fault(
+    sched: &mut Scheduler,
+    cfg: &SchedulerConfig,
+    snapshot: &Snapshot,
+    what: &'static str,
+    index: usize,
+) {
+    let record = FaultRecord {
+        time: snapshot.tick.time,
+        job: DESTROY_JOB,
         fault: Fault::new(what, u32::try_from(index).unwrap_or(u32::MAX)),
     };
     sched.faults_mut().record(record, cfg);

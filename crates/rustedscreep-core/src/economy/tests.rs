@@ -36,7 +36,7 @@
 //! link's energy at the tick's start, as the game side computes it.
 
 use super::placement::{
-    CONTROLLER_CLEAR, EDGE_MARGIN, Placement, SPAWN_CLEAR, extensions_in, next_extension,
+    CONTROLLER_CLEAR, EDGE_MARGIN, Placement, PlanView, SPAWN_CLEAR, extensions_in, next_extension,
 };
 use super::sizing::{
     Round, Trip, WorkerScratch, WorkerSource, WorkerTargets, build_round, carry_round,
@@ -47,8 +47,8 @@ use super::sizing::{
 use super::*;
 use crate::config::{
     CACHE_MMO, HAULING_MMO, HaulingConfig, LINK_MMO, LinkConfig, MINING_MMO, MMO, MOVEMENT_MMO,
-    MiningConfig, OPENING_MMO, OpeningConfig, REPAIR_MMO, RepairConfig, SPAWN_MMO, UPGRADING_MMO,
-    UpgradingConfig,
+    MiningConfig, OPENING_MMO, OpeningConfig, PLANNER_MMO, REPAIR_MMO, RepairConfig, SPAWN_MMO,
+    UPGRADING_MMO, UpgradingConfig,
 };
 use crate::intents::{ActLog, CreepIntent, IntentBuffer, Outcome, Target, TargetRow};
 use crate::movement::{
@@ -1971,6 +1971,8 @@ impl World {
                         cfg.place_extensions,
                         &containers,
                         &links,
+                        PlanView::Off,
+                        &PLANNER_MMO,
                         &mut commit,
                     )
                     .expect("placement");
@@ -6319,4 +6321,1502 @@ fn a_worker_never_fills_where_a_hauler_transfers() {
         );
     }
     assert_eq!(w.failed, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The plan path (P4.3, ADR-026)
+
+/// The placement's plan path (`Placement::plan_room` with [`PlanView::Ready`]) on a small bench:
+/// one owned room's snapshot, movement's terrain and scans, and a hand-made plan, with no world
+/// model. The bench plays the game side: an accepted site stands from the next tick (V204), and
+/// an accepted destroy is either done by the next tick or dropped by the processor (V251), as each
+/// test says.
+mod plan_path {
+    use super::{ROOM, place, tile};
+    use crate::config::{MOVEMENT_MMO, PLANNER_MMO, PlannerConfig};
+    use crate::economy::placement::{
+        APPEAR_TICKS, DestroyOrder, DestroyTarget, LOST_MAX, Placement, PlanView, SiteOrder,
+    };
+    use crate::intents::Outcome;
+    use crate::movement::{
+        Footprint, Movement, TerrainGrid, Tile, site_footprint, structure_footprint,
+    };
+    use crate::planner::build::Census;
+    use crate::planner::job::{Facts, Plan};
+    use crate::planner::rules::{allowed, earliest_level};
+    use crate::planner::{Item, Layout, Roles};
+    use crate::scheduler::Commit;
+    use crate::snapshot::{
+        Controller, CreepRow, ObjectKey, ObjectKind, ObjectRow, ObjectStatic, Snapshot,
+        StructureStatic, TickContext,
+    };
+    use rustedscreep_consts::{
+        ErrorCode, ROOM_SIZE, RoomName, SOURCE_ENERGY_CAPACITY, StructureType, Terrain,
+    };
+
+    use StructureType::{Container, Extension, Link, Road, Spawn, Storage, Tower};
+
+    const CONTROLLER_KEY: u128 = 1;
+    const SPAWN_KEY: u128 = 2;
+    const SOURCE_KEY: u128 = 3;
+    const OWN_CREEP_KEY: u128 = 4;
+    const HOSTILE_KEY: u128 = 5;
+
+    /// The plan's anchor: the room's standing spawn.
+    fn anchor() -> Tile {
+        tile(25, 25)
+    }
+
+    fn controller() -> Tile {
+        tile(25, 8)
+    }
+
+    fn source() -> Tile {
+        tile(10, 10)
+    }
+
+    /// The planned storage's tile, next to the anchor's ring.
+    fn storage_slot() -> Tile {
+        tile(27, 25)
+    }
+
+    fn item(kind: StructureType, t: Tile, level: u8) -> Item {
+        Item {
+            kind,
+            tile: t,
+            level,
+        }
+    }
+
+    /// The first controller level that allows a `kind`. Uses: `CONTROLLER_STRUCTURES` (V234).
+    fn level_of(kind: StructureType) -> u8 {
+        earliest_level(kind, 0).expect("allowed at some level")
+    }
+
+    /// Whether the room's plan is ready or still being built, or the interim placement runs (the
+    /// planner off, or no valid plan).
+    #[derive(Clone, Copy, Debug)]
+    enum View {
+        Ready,
+        Waiting,
+        Off,
+        Fallback,
+    }
+
+    struct Bench {
+        room: RoomName,
+        time: u32,
+        level: u8,
+        raw: Vec<u8>,
+        /// Own structures, the controller and the anchor spawn first: key, type, tile.
+        structures: Vec<(u128, StructureType, Tile)>,
+        /// Own construction sites: key, type, tile.
+        sites: Vec<(u128, StructureType, Tile)>,
+        /// Built roads: they have no owner, so only movement's scan shows them, never the
+        /// snapshot.
+        roads: Vec<Tile>,
+        hostile: bool,
+        next_key: u128,
+        snap: Snapshot,
+        movement: Movement,
+        placement: Placement,
+        plan: Plan,
+        pcfg: PlannerConfig,
+        /// `opening.place_extensions`, for the interim path.
+        extensions: bool,
+        container_needs: Vec<crate::economy::ContainerNeed>,
+        link_needs: Vec<crate::economy::LinkNeed>,
+    }
+
+    impl Bench {
+        /// An owned room at `level`: walls on the border ring and plain inside, the controller, the
+        /// anchor spawn, one source and one own creep (movement tracks the rooms its creeps are
+        /// in). Its plan holds the anchor spawn and `items`, with `roles`.
+        fn new(level: u8, items: Vec<Item>, roles: Roles) -> Self {
+            let wall = Terrain::Wall as u8;
+            let edge = ROOM_SIZE - 1;
+            let raw: Vec<u8> = (0..ROOM_SIZE)
+                .flat_map(|y| {
+                    (0..ROOM_SIZE).map(move |x| {
+                        if x == 0 || y == 0 || x == edge || y == edge {
+                            wall
+                        } else {
+                            0
+                        }
+                    })
+                })
+                .collect();
+            let terrain = TerrainGrid::from_row_major(&raw).expect("terrain");
+            let mut all = vec![item(Spawn, anchor(), level_of(Spawn))];
+            all.extend(items);
+            let mut layout = Layout {
+                items: all,
+                roles,
+                needs: Vec::new(),
+            };
+            layout.sort();
+            let plan = Plan {
+                layout,
+                facts: Facts {
+                    terrain,
+                    controller: controller(),
+                    sources: vec![source()],
+                    mineral: None,
+                    spawns: vec![anchor()],
+                    anchors: vec![anchor()],
+                    standing: Vec::new(),
+                    own: vec![(Spawn, anchor())],
+                },
+                anchor: anchor(),
+                ready_at: 0,
+                steps: 0,
+            };
+            Self {
+                room: ROOM.parse().expect("room"),
+                time: 10_000,
+                level,
+                raw,
+                structures: vec![
+                    (CONTROLLER_KEY, StructureType::Controller, controller()),
+                    (SPAWN_KEY, Spawn, anchor()),
+                ],
+                sites: Vec::new(),
+                roads: Vec::new(),
+                hostile: false,
+                next_key: 100,
+                snap: Snapshot::default(),
+                movement: Movement::default(),
+                placement: Placement::default(),
+                plan,
+                pcfg: PLANNER_MMO,
+                extensions: false,
+                container_needs: Vec::new(),
+                link_needs: Vec::new(),
+            }
+        }
+
+        fn key(&mut self) -> u128 {
+            self.next_key += 1;
+            self.next_key
+        }
+
+        /// Moves the room's controller to `t`, in the plan's facts and in the snapshot.
+        fn move_controller(&mut self, t: Tile) {
+            self.plan.facts.controller = t;
+            for s in &mut self.structures {
+                if s.0 == CONTROLLER_KEY {
+                    s.2 = t;
+                }
+            }
+        }
+
+        /// An own structure stands from the next snapshot.
+        fn build(&mut self, kind: StructureType, t: Tile) {
+            let key = self.key();
+            self.structures.push((key, kind, t));
+        }
+
+        /// An own site stands from the next snapshot.
+        fn site(&mut self, kind: StructureType, t: Tile) {
+            let key = self.key();
+            self.sites.push((key, kind, t));
+        }
+
+        fn take_snapshot(&mut self) {
+            let room = self.room;
+            let snap = &mut self.snap;
+            snap.begin(TickContext::from_raw(self.time, 20, 500.0, 10_000));
+            snap.rooms
+                .push(room, Controller::Mine { level: self.level });
+            for &(key, kind, t) in &self.structures {
+                let pos = place(room, t);
+                snap.structures
+                    .push(ObjectKey(key), || Ok(StructureStatic { kind, pos }))
+                    .expect("structure");
+            }
+            let creep = |at: Tile, my: bool| CreepRow {
+                pos: place(room, at),
+                my,
+                spawning: false,
+                fatigue: 0,
+            };
+            snap.creeps
+                .push(ObjectKey(OWN_CREEP_KEY), creep(tile(40, 40), true))
+                .expect("own creep");
+            if self.hostile {
+                snap.creeps
+                    .push(ObjectKey(HOSTILE_KEY), creep(tile(30, 40), false))
+                    .expect("hostile creep");
+            }
+            let mut object = |key: u128, kind: ObjectKind, t: Tile, row: ObjectRow| {
+                let pos = place(room, t);
+                snap.objects
+                    .push(ObjectKey(key), || Ok(ObjectStatic { kind, pos }), row)
+                    .expect("object");
+            };
+            object(
+                SOURCE_KEY,
+                ObjectKind::Source,
+                source(),
+                ObjectRow {
+                    amount: SOURCE_ENERGY_CAPACITY,
+                    total: SOURCE_ENERGY_CAPACITY,
+                    hits: 0,
+                },
+            );
+            for &(key, kind, t) in &self.sites {
+                let row = ObjectRow {
+                    amount: 0,
+                    total: kind.construction_cost().unwrap_or(0),
+                    hits: 0,
+                };
+                object(key, ObjectKind::Site(kind), t, row);
+            }
+            snap.finish();
+        }
+
+        /// Movement's scan of the room as the glue reads it: every structure's footprint (the
+        /// built roads' too) and the own sites' (`structure_footprint`, `site_footprint`).
+        fn footprints(&self) -> Vec<(Tile, Footprint)> {
+            let built = self
+                .structures
+                .iter()
+                .filter_map(|&(_, kind, t)| structure_footprint(kind, true, false).map(|f| (t, f)));
+            let roads = self
+                .roads
+                .iter()
+                .filter_map(|&t| structure_footprint(Road, false, false).map(|f| (t, f)));
+            let sited = self
+                .sites
+                .iter()
+                .filter_map(|&(_, kind, t)| site_footprint(kind).map(|f| (t, f)));
+            built.chain(roads).chain(sited).collect()
+        }
+
+        /// One tick's decide step: the snapshot, movement's tick (the terrain on the first, and a
+        /// scan when `scan`), then the Optional placement job. Returns the tick's orders, which
+        /// stay in the placement for the act step.
+        fn step(&mut self, view: View, scan: bool) -> (Vec<SiteOrder>, Vec<DestroyOrder>) {
+            self.time += 1;
+            self.take_snapshot();
+            self.movement.begin(&self.snap, &MOVEMENT_MMO);
+            if self.movement.room_terrain(self.room).is_none() {
+                assert!(self.movement.set_terrain(self.room, &self.raw), "terrain");
+            }
+            if scan {
+                let footprints = self.footprints();
+                self.movement.set_objects(self.room, footprints);
+            }
+            self.placement.begin(&self.snap);
+            let mut commit = Commit::default();
+            let plan = match view {
+                View::Ready => PlanView::Ready(&self.plan),
+                View::Waiting => PlanView::Waiting,
+                View::Off => PlanView::Off,
+                View::Fallback => PlanView::Fallback,
+            };
+            for unit in 0..self.placement.room_count() {
+                self.placement
+                    .plan_room(
+                        unit,
+                        &self.snap,
+                        &mut self.movement,
+                        &MOVEMENT_MMO,
+                        self.extensions,
+                        &self.container_needs,
+                        &self.link_needs,
+                        plan,
+                        &self.pcfg,
+                        &mut commit,
+                    )
+                    .expect("placement");
+            }
+            (
+                self.placement.orders().to_vec(),
+                self.placement.destroys().to_vec(),
+            )
+        }
+
+        /// The act step for this tick's sites: each call returns `outcome`; an accepted site
+        /// stands from the next tick (V204).
+        fn act_sites(&mut self, outcome: Outcome) {
+            let orders = self.placement.orders().to_vec();
+            for (i, o) in orders.iter().enumerate() {
+                self.placement.record(i, outcome);
+                if outcome == Outcome::Ok {
+                    self.site(o.kind, o.tile);
+                }
+            }
+        }
+
+        /// The act step for this tick's destroys: each call returns `outcome`; an accepted one is
+        /// gone by the next tick when `done`, else the processor dropped it (V251).
+        fn act_destroys(&mut self, outcome: Outcome, done: bool) {
+            let orders = self.placement.destroys().to_vec();
+            for (i, d) in orders.iter().enumerate() {
+                self.placement.record_destroy(i, outcome);
+                if outcome == Outcome::Ok && done {
+                    self.structures
+                        .retain(|&(_, k, t)| !(k == d.kind && t == d.tile));
+                }
+            }
+        }
+
+        /// A tick with a scan and the plan ready, every call accepted and every destroy done.
+        fn tick(&mut self) -> (Vec<SiteOrder>, Vec<DestroyOrder>) {
+            let out = self.step(View::Ready, true);
+            self.act_sites(Outcome::Ok);
+            self.act_destroys(Outcome::Ok, true);
+            out
+        }
+
+        fn looks(&self) -> u32 {
+            self.placement.totals().looks
+        }
+
+        fn census(&self) -> Option<Census> {
+            self.placement.census(self.room).copied()
+        }
+
+        fn site_order(&self, kind: StructureType, t: Tile) -> SiteOrder {
+            SiteOrder {
+                room: self.room,
+                room_row: 0,
+                tile: t,
+                kind,
+            }
+        }
+
+        /// The destroy of the own `kind` on `t`, by its row in this tick's snapshot.
+        fn destroy_of(&self, kind: StructureType, t: Tile) -> DestroyOrder {
+            let st = &self.snap.structures;
+            let at = place(self.room, t);
+            let row = st
+                .kinds()
+                .iter()
+                .zip(st.positions())
+                .position(|(&k, p)| k == kind && *p == at)
+                .expect("it stands");
+            DestroyOrder {
+                room: self.room,
+                tile: t,
+                kind,
+                target: DestroyTarget::Structure(row),
+            }
+        }
+    }
+
+    /// A room at `level` whose planned storage tile holds an own off-plan `blocker`, under `pcfg`,
+    /// with `extra` planned items.
+    fn storage_bench(
+        level: u8,
+        blocker: StructureType,
+        pcfg: PlannerConfig,
+        extra: Vec<Item>,
+    ) -> Bench {
+        let mut items = vec![item(Storage, storage_slot(), level_of(Storage))];
+        items.extend(extra);
+        let mut b = Bench::new(level, items, Roles::default());
+        b.pcfg = pcfg;
+        b.build(blocker, storage_slot());
+        b
+    }
+
+    /// The storage's gate on (the user's choice keeps it off on the MMO until P5).
+    fn storage_on() -> PlannerConfig {
+        PlannerConfig {
+            storage: true,
+            ..PLANNER_MMO
+        }
+    }
+
+    fn roads() -> [Tile; 2] {
+        [tile(22, 22), tile(23, 22)]
+    }
+
+    fn road_items() -> Vec<Item> {
+        roads()
+            .iter()
+            .map(|&t| item(Road, t, level_of(Road)))
+            .collect()
+    }
+
+    /// A free planned extension due at the room's level gets a site from the plan, and the look's
+    /// census counts the spawn built and the extension missing, then sited.
+    ///
+    /// Uses: `CONTROLLER_STRUCTURES` (through `earliest_level`: the room is at the first level
+    /// that allows an extension).
+    #[test]
+    fn a_free_due_item_gets_a_planned_site() {
+        let level = level_of(Extension);
+        let slot = tile(27, 25);
+        let mut b = Bench::new(level, vec![item(Extension, slot, level)], Roles::default());
+        let (orders, destroys) = b.tick();
+        assert_eq!(orders, vec![b.site_order(Extension, slot)]);
+        assert!(destroys.is_empty());
+        let t = *b.placement.totals();
+        assert_eq!(
+            (
+                t.picked,
+                t.planned,
+                t.containers,
+                t.links,
+                t.looks,
+                t.destroys
+            ),
+            (1, 1, 0, 0, 1, 0)
+        );
+        let due = Census {
+            due: 2,
+            built: 1,
+            ..Census::default()
+        };
+        assert_eq!(b.census(), Some(Census { missing: 1, ..due }));
+        // The site stands on the next tick (V204): placed, sited, nothing more to do.
+        let (orders, destroys) = b.tick();
+        assert!(orders.is_empty() && destroys.is_empty());
+        assert_eq!(b.placement.totals().placed, 1);
+        assert_eq!(b.census(), Some(Census { sited: 1, ..due }));
+    }
+
+    /// An own off-plan extension on the tile of a planned storage that is due and placed (its gate
+    /// on) is destroyed; never with the storage's gate off, never a spawn, never with a hostile
+    /// creep in the room, never with replacing off.
+    ///
+    /// Uses: `CONTROLLER_STRUCTURES` (through `earliest_level` and `allowed`: the storage's first
+    /// level, which allows the extension too; the first level that allows two spawns).
+    #[test]
+    fn an_off_plan_blocker_is_destroyed_only_when_allowed() {
+        let level = level_of(Storage);
+        assert!(allowed(Extension, level) > 0);
+        let mut b = storage_bench(level, Extension, storage_on(), Vec::new());
+        let (orders, destroys) = b.step(View::Ready, true);
+        assert!(orders.is_empty());
+        assert_eq!(destroys, vec![b.destroy_of(Extension, storage_slot())]);
+        assert_eq!(b.placement.totals().destroys, 1);
+
+        // The storage's gate off (the MMO's default): nothing is due on the tile.
+        const { assert!(!PLANNER_MMO.storage) };
+        let mut b = storage_bench(level, Extension, PLANNER_MMO, Vec::new());
+        let (orders, destroys) = b.step(View::Ready, true);
+        assert!(orders.is_empty() && destroys.is_empty());
+
+        // A spawn is never destroyed (at a level that allows a second one).
+        let two = earliest_level(Spawn, 1).expect("two spawns at some level");
+        let mut b = storage_bench(two.max(level), Spawn, storage_on(), Vec::new());
+        let (orders, destroys) = b.step(View::Ready, true);
+        assert!(orders.is_empty() && destroys.is_empty());
+        assert_eq!(b.census().map(|c| c.blocked), Some(1));
+
+        // Not with a hostile creep in the room; at once when it leaves.
+        let mut b = storage_bench(level, Extension, storage_on(), Vec::new());
+        b.hostile = true;
+        let (orders, destroys) = b.step(View::Ready, true);
+        assert!(orders.is_empty() && destroys.is_empty());
+        assert_eq!(b.census().map(|c| c.blocked), Some(1));
+        b.hostile = false;
+        let (_, destroys) = b.step(View::Ready, true);
+        assert_eq!(destroys, vec![b.destroy_of(Extension, storage_slot())]);
+
+        // Not with replacing off.
+        let pcfg = PlannerConfig {
+            replace: false,
+            ..storage_on()
+        };
+        let mut b = storage_bench(level, Extension, pcfg, Vec::new());
+        let (orders, destroys) = b.step(View::Ready, true);
+        assert!(orders.is_empty() && destroys.is_empty());
+        assert_eq!(b.placement.totals().destroys, 0);
+    }
+
+    /// `ERR_BUSY` from a destroy (a hostile creep or power creep the snapshot may not see, V248)
+    /// holds the room's destroys for `verify_ticks` while its sites still go out; the destroy comes
+    /// again on the tick the hold ends.
+    ///
+    /// Uses: `PLANNER_MMO.verify_ticks`, `CONTROLLER_STRUCTURES` (through `earliest_level`).
+    #[test]
+    fn a_busy_destroy_holds_destroys_but_not_sites() {
+        let level = level_of(Storage);
+        let mut b = storage_bench(level, Extension, storage_on(), road_items());
+        let verify = b.pcfg.verify_ticks;
+        assert!(
+            u32::try_from(roads().len()).expect("small") + 1 < verify,
+            "the hold outlasts the road sites"
+        );
+        let (orders, destroys) = b.step(View::Ready, true);
+        assert!(
+            orders.is_empty(),
+            "the storage's destroy goes before the roads"
+        );
+        assert_eq!(destroys, vec![b.destroy_of(Extension, storage_slot())]);
+        b.act_destroys(Outcome::Failed(ErrorCode::Busy), false);
+        let busy_at = b.time;
+        let mut sited = Vec::new();
+        while b.time + 1 < busy_at + verify {
+            let (orders, destroys) = b.tick();
+            assert!(destroys.is_empty(), "held at {}", b.time);
+            sited.extend(orders.iter().map(|o| (o.kind, o.tile)));
+        }
+        let want: Vec<_> = roads().iter().map(|&t| (Road, t)).collect();
+        assert_eq!(sited, want, "the sites went on meanwhile");
+        let (orders, destroys) = b.step(View::Ready, true);
+        assert_eq!(b.time, busy_at + verify);
+        assert!(orders.is_empty());
+        assert_eq!(destroys, vec![b.destroy_of(Extension, storage_slot())]);
+        let t = *b.placement.totals();
+        assert_eq!((t.destroys, t.destroyed, t.lost), (2, 0, 0));
+    }
+
+    /// An accepted destroy whose structure still stands `APPEAR_TICKS` later (the processor
+    /// dropped it, V251) counts as dropped, apart from the sites' `lost`; after `LOST_MAX` such
+    /// drops the room gets no more destroys, but its sites still go out, and nothing is placed
+    /// while a destroy is pending.
+    ///
+    /// Uses: `APPEAR_TICKS`, `LOST_MAX`, `PLANNER_MMO.verify_ticks`, `CONTROLLER_STRUCTURES`
+    /// (through `earliest_level`).
+    #[test]
+    fn dropped_destroys_stop_at_lost_max_and_sites_go_on() {
+        let level = level_of(Storage);
+        let mut b = storage_bench(level, Extension, storage_on(), road_items());
+        for dropped in 0..LOST_MAX {
+            let (orders, destroys) = b.step(View::Ready, true);
+            assert_eq!(b.placement.totals().destroys_dropped, dropped);
+            assert_eq!(b.placement.totals().lost, 0);
+            assert!(orders.is_empty());
+            assert_eq!(destroys, vec![b.destroy_of(Extension, storage_slot())]);
+            b.act_destroys(Outcome::Ok, false);
+            for _ in 1..APPEAR_TICKS {
+                let (orders, destroys) = b.tick();
+                assert!(
+                    orders.is_empty() && destroys.is_empty(),
+                    "pending at {}",
+                    b.time
+                );
+            }
+        }
+        // The last loss is judged on this tick: the roads go on, the destroys do not.
+        let (orders, destroys) = b.tick();
+        let t = *b.placement.totals();
+        assert_eq!(
+            (t.destroys_dropped, t.lost, t.destroys, t.destroyed),
+            (LOST_MAX, 0, LOST_MAX, LOST_MAX)
+        );
+        assert!(destroys.is_empty());
+        assert_eq!(orders, vec![b.site_order(Road, roads()[0])]);
+        let mut sited = vec![roads()[0]];
+        for _ in 0..=b.pcfg.verify_ticks {
+            let (orders, destroys) = b.tick();
+            assert!(destroys.is_empty(), "no destroy at {}", b.time);
+            sited.extend(orders.iter().map(|o| o.tile));
+        }
+        assert_eq!(sited, roads().to_vec());
+        let t = *b.placement.totals();
+        assert_eq!(
+            (t.destroys_dropped, t.lost, t.destroys, t.refused),
+            (LOST_MAX, 0, LOST_MAX, 0)
+        );
+        assert_eq!(
+            b.census(),
+            Some(Census {
+                due: 4,
+                built: 1,
+                sited: 2,
+                blocked: 1,
+                ..Census::default()
+            })
+        );
+    }
+
+    /// A quiet room: once a look finds nothing to do, no look is made while the snapshot is
+    /// unchanged until `verify_ticks` pass; a new site, or a level change, looks again at once.
+    ///
+    /// Uses: `PLANNER_MMO.verify_ticks`, `CONTROLLER_STRUCTURES` (through `earliest_level` and
+    /// `allowed`: the first level with extensions, and the next one that allows more).
+    #[test]
+    fn a_quiet_room_looks_again_on_a_change_or_after_verify_ticks() {
+        let first = level_of(Extension);
+        let next = earliest_level(Extension, allowed(Extension, first)).expect("more later");
+        let (built, later) = (tile(27, 25), tile(23, 25));
+        let items = vec![item(Extension, built, first), item(Extension, later, next)];
+        let mut b = Bench::new(first, items, Roles::default());
+        b.build(Extension, built);
+        let (orders, _) = b.tick();
+        assert!(orders.is_empty());
+        assert_eq!(b.looks(), 1);
+        let idle = b.time;
+        let verify = b.pcfg.verify_ticks;
+        while b.time + 1 < idle + verify {
+            let (orders, destroys) = b.tick();
+            assert!(orders.is_empty() && destroys.is_empty());
+            assert_eq!(b.looks(), 1, "quiet at {}", b.time);
+        }
+        b.tick();
+        assert_eq!(b.time, idle + verify);
+        assert_eq!(b.looks(), 2, "verify_ticks passed");
+        b.tick();
+        assert_eq!(b.looks(), 2);
+        // A site appears (off the plan, a manual one): a look at once, then quiet again.
+        b.site(Road, tile(30, 30));
+        b.tick();
+        assert_eq!(b.looks(), 3);
+        b.tick();
+        assert_eq!(b.looks(), 3);
+        // The level rises: a look at once, and the next level's extension goes out.
+        b.level = next;
+        let (orders, _) = b.tick();
+        assert_eq!(b.looks(), 4);
+        assert_eq!(orders, vec![b.site_order(Extension, later)]);
+    }
+
+    /// A site that goes (built) changes what only movement's scan shows (roads have no owner, so
+    /// the snapshot does not hold them): no look until movement has a scan at or after that tick;
+    /// a scan on the change's own tick counts.
+    ///
+    /// Uses: `CONTROLLER_STRUCTURES` (through `earliest_level`).
+    #[test]
+    fn a_built_site_waits_for_a_scan() {
+        let level = level_of(Extension);
+        let slot = tile(27, 25);
+        let mut b = Bench::new(level, vec![item(Extension, slot, level)], Roles::default());
+        let (orders, _) = b.tick();
+        assert_eq!(orders, vec![b.site_order(Extension, slot)]);
+        let (orders, _) = b.tick();
+        assert!(orders.is_empty(), "sited");
+        let looks = b.looks();
+        // Built: the site goes and the extension stands, with no scan on this tick or the next.
+        b.sites.clear();
+        b.build(Extension, slot);
+        for _ in 0..2 {
+            let (orders, destroys) = b.step(View::Ready, false);
+            assert!(orders.is_empty() && destroys.is_empty());
+            assert_eq!(b.looks(), looks, "no look before a scan at {}", b.time);
+        }
+        let (orders, _) = b.step(View::Ready, true);
+        assert!(orders.is_empty());
+        assert_eq!(b.looks(), looks + 1, "the scan came");
+        assert_eq!(b.census().map(|c| (c.due, c.built)), Some((2, 2)));
+        // Lost (destroyed by someone else), scanned on the same tick: a look at once, and its
+        // site goes back.
+        b.structures
+            .retain(|&(_, k, t)| !(k == Extension && t == slot));
+        let (orders, _) = b.step(View::Ready, true);
+        assert_eq!(b.looks(), looks + 2);
+        assert_eq!(orders, vec![b.site_order(Extension, slot)]);
+    }
+
+    /// The economy's container need next to a source (ADR-023 keeps its timing) goes on the plan's
+    /// mining tile for that source (`roles.mining`), before the plan's own items; once it is
+    /// sited the plan's items go on.
+    ///
+    /// Uses: `CONTROLLER_STRUCTURES` (through `allowed` and `earliest_level`: the level's
+    /// containers, the first level with an extension).
+    #[test]
+    fn a_container_need_goes_on_the_plans_mining_tile() {
+        let level = level_of(Extension);
+        assert!(allowed(Container, level) > 0);
+        // The plan's mining tile and the economy's own pick, both next to the source.
+        let (mining, need) = (tile(11, 10), tile(9, 9));
+        assert_eq!((source().range(mining), source().range(need)), (1, 1));
+        let slot = tile(27, 25);
+        let roles = Roles {
+            mining: vec![mining],
+            source_links: vec![None],
+            ..Roles::default()
+        };
+        let items = vec![
+            item(Extension, slot, level),
+            item(Container, mining, level_of(Container)),
+        ];
+        let mut b = Bench::new(level, items, roles);
+        b.container_needs = vec![crate::economy::ContainerNeed {
+            tile: need,
+            source: Some(source()),
+        }];
+        let (orders, destroys) = b.tick();
+        assert_eq!(orders, vec![b.site_order(Container, mining)]);
+        assert!(destroys.is_empty());
+        let t = *b.placement.totals();
+        assert_eq!((t.picked, t.planned, t.containers, t.links), (1, 1, 1, 0));
+        // The economy still lists its tile (it holds no container), but the plan's is sited.
+        let (orders, _) = b.tick();
+        assert_eq!(orders, vec![b.site_order(Extension, slot)]);
+        let t = *b.placement.totals();
+        assert_eq!((t.picked, t.planned, t.containers), (2, 2, 1));
+    }
+
+    /// The economy's needs go by role, not by their own tile: the controller container's need
+    /// (`source: None`) goes on the plan's controller container even when its tile is next to the
+    /// source, and a mining container's need on the plan's mining tile even when its tile is the
+    /// controller container's (two needs whose tiles the old position rule read the other way).
+    ///
+    /// Uses: `CONTROLLER_STRUCTURES` (through `allowed` and `earliest_level`).
+    #[test]
+    fn container_needs_go_on_the_plans_tile_for_their_role() {
+        use crate::economy::ContainerNeed;
+        let level = level_of(Extension);
+        assert!(allowed(Container, level) > 1);
+        let (mining, controller_container) = (tile(11, 10), tile(25, 38));
+        let roles = Roles {
+            mining: vec![mining],
+            source_links: vec![None],
+            controller_container: Some(controller_container),
+            ..Roles::default()
+        };
+        let items = vec![
+            item(Container, mining, level_of(Container)),
+            item(Container, controller_container, level_of(Container)),
+        ];
+        let mut b = Bench::new(level, items, roles);
+        b.container_needs = vec![
+            ContainerNeed {
+                tile: tile(9, 9),
+                source: None,
+            },
+            ContainerNeed {
+                tile: controller_container,
+                source: Some(source()),
+            },
+        ];
+        let (orders, destroys) = b.tick();
+        assert!(destroys.is_empty());
+        assert_eq!(orders, vec![b.site_order(Container, controller_container)]);
+        let (orders, _) = b.tick();
+        assert_eq!(orders, vec![b.site_order(Container, mining)]);
+        assert_eq!(b.placement.totals().containers, 2);
+    }
+
+    /// While the room's plan is being built (`PlanView::Waiting`) nothing is placed or destroyed
+    /// and no look is made, with a free item, a container need and a blocker all due; once the
+    /// plan is ready it places at once.
+    ///
+    /// Uses: `CONTROLLER_STRUCTURES` (through `earliest_level`).
+    #[test]
+    fn a_waiting_plan_places_nothing() {
+        let level = level_of(Storage);
+        let roles = Roles {
+            mining: vec![tile(11, 10)],
+            source_links: vec![None],
+            ..Roles::default()
+        };
+        let mut b = Bench::new(
+            level,
+            vec![
+                item(Storage, storage_slot(), level),
+                item(Extension, tile(23, 25), level_of(Extension)),
+            ],
+            roles,
+        );
+        b.pcfg = storage_on();
+        b.build(Extension, storage_slot());
+        b.container_needs = vec![crate::economy::ContainerNeed {
+            tile: tile(9, 9),
+            source: Some(source()),
+        }];
+        for _ in 0..3 {
+            let (orders, destroys) = b.step(View::Waiting, true);
+            b.act_sites(Outcome::Ok);
+            b.act_destroys(Outcome::Ok, true);
+            assert!(orders.is_empty() && destroys.is_empty());
+        }
+        assert_eq!(*b.placement.totals(), Default::default());
+        assert_eq!(b.census(), Some(Census::default()));
+        let (orders, _) = b.tick();
+        assert_eq!(orders, vec![b.site_order(Container, tile(11, 10))]);
+    }
+
+    /// A destroy the game carries out opens its replacement: the plan's item for the freed tile
+    /// gets the next site, and while that replacement is open (here its site was refused) no other
+    /// destroy goes out until `verify_ticks` have passed since.
+    ///
+    /// Uses: `PLANNER_MMO.verify_ticks`, `CONTROLLER_STRUCTURES` (through `earliest_level`).
+    #[test]
+    fn an_open_replacement_holds_the_next_destroy() {
+        let level = level_of(Storage);
+        let first = tile(23, 25);
+        let extension = vec![item(Extension, first, level_of(Extension))];
+        let mut b = storage_bench(level, Extension, storage_on(), extension);
+        // An off-plan tower on the planned extension's tile: the extension goes first.
+        b.build(Tower, first);
+        let (orders, destroys) = b.tick();
+        assert!(orders.is_empty());
+        assert_eq!(destroys, vec![b.destroy_of(Tower, first)]);
+        // Gone: the bench scans on this tick, so the look is made at once.
+        let (orders, destroys) = b.step(View::Ready, true);
+        let since = b.time;
+        assert!(destroys.is_empty());
+        assert_eq!(orders, vec![b.site_order(Extension, first)]);
+        b.act_sites(Outcome::Failed(ErrorCode::InvalidTarget));
+        let verify = b.pcfg.verify_ticks;
+        let mut came = None;
+        while came.is_none() && b.time < since + 2 * verify {
+            let (orders, destroys) = b.tick();
+            assert!(orders.is_empty(), "the refused tile is skipped");
+            if !destroys.is_empty() {
+                assert_eq!(destroys, vec![b.destroy_of(Extension, storage_slot())]);
+                came = Some(b.time);
+            }
+        }
+        let came = came.expect("the next destroy came");
+        assert!(
+            came >= since + verify,
+            "held until {}, came at {came}",
+            since + verify
+        );
+        let t = *b.placement.totals();
+        assert_eq!((t.destroys, t.destroyed, t.refused), (2, 2, 1));
+    }
+
+    /// A destroy holds the next one open only for a replacement the bot places now: the storage
+    /// gate turned off while the storage tile's blocker is being destroyed leaves nothing to hold
+    /// for, so the tower tile's blocker is destroyed on the next look, not `verify_ticks` later;
+    /// with the gate still on the hold stands until the storage is sited.
+    ///
+    /// Uses: `PLANNER_MMO.verify_ticks`, `CONTROLLER_STRUCTURES` (through `earliest_level` and
+    /// `allowed`).
+    #[test]
+    fn a_destroy_holds_only_for_a_replacement_placed_now() {
+        let level = level_of(Storage);
+        assert!(level_of(Tower) <= level && allowed(Tower, level) > 0);
+        let tower = tile(23, 25);
+        for gate_off in [true, false] {
+            let tower_item = vec![item(Tower, tower, level_of(Tower))];
+            let both = PlannerConfig {
+                towers: true,
+                ..storage_on()
+            };
+            let mut b = storage_bench(level, Extension, both, tower_item);
+            b.build(Extension, tower);
+            // The storage comes first in the plan's order (`KINDS`).
+            let (orders, destroys) = b.step(View::Ready, true);
+            assert!(orders.is_empty());
+            assert_eq!(destroys, vec![b.destroy_of(Extension, storage_slot())]);
+            b.act_destroys(Outcome::Ok, true);
+            if gate_off {
+                b.pcfg.storage = false;
+            }
+            // Gone: the next look (the bench scans every tick) clears the tower's tile at once
+            // when nothing is held, or sites the storage when its gate is still on.
+            let (orders, destroys) = b.step(View::Ready, true);
+            if gate_off {
+                assert!(orders.is_empty());
+                assert_eq!(destroys, vec![b.destroy_of(Extension, tower)]);
+            } else {
+                assert!(destroys.is_empty());
+                assert_eq!(orders, vec![b.site_order(Storage, storage_slot())]);
+            }
+        }
+    }
+
+    /// A destroy for one of the economy's links holds the next destroy only while the economy
+    /// still asks for that link: with the need gone when the destroy is done (here the need list
+    /// is emptied), the storage tile's blocker goes on the next look; with the need still there
+    /// the link is sited first.
+    ///
+    /// Uses: `CONTROLLER_STRUCTURES` (through `earliest_level` and `allowed`: the first level with
+    /// a link and a storage).
+    #[test]
+    fn an_economy_destroy_holds_only_while_its_need_stands() {
+        use crate::economy::LinkNeed;
+        let level = level_of(Link).max(level_of(Storage));
+        assert!(allowed(Link, level) > 0);
+        let m = tile(12, 11);
+        for asked in [true, false] {
+            let roles = Roles {
+                mining: vec![tile(11, 10)],
+                source_links: vec![Some(m)],
+                ..Roles::default()
+            };
+            let items = vec![
+                item(Storage, storage_slot(), level_of(Storage)),
+                item(Link, m, level_of(Link)),
+            ];
+            let mut b = Bench::new(level, items, roles);
+            b.pcfg = storage_on();
+            b.build(Extension, storage_slot());
+            b.build(Extension, m);
+            b.link_needs = vec![LinkNeed {
+                tile: tile(9, 11),
+                source: Some(source()),
+            }];
+            // The economy goes first: the blocker on its link's tile.
+            let (orders, destroys) = b.step(View::Ready, true);
+            assert!(orders.is_empty());
+            assert_eq!(destroys, vec![b.destroy_of(Extension, m)]);
+            b.act_destroys(Outcome::Ok, true);
+            if !asked {
+                b.link_needs.clear();
+            }
+            let (orders, destroys) = b.step(View::Ready, true);
+            if asked {
+                assert!(destroys.is_empty(), "held for the link");
+                assert_eq!(orders, vec![b.site_order(Link, m)]);
+            } else {
+                assert!(orders.is_empty());
+                assert_eq!(
+                    destroys,
+                    vec![b.destroy_of(Extension, storage_slot())],
+                    "nothing asks for the link, so nothing holds"
+                );
+            }
+        }
+    }
+
+    /// A destroy whose replacement is a type at the level's count holds nothing: an opening
+    /// destroy of an off-plan link on a planned extension slot, in a room at its extension count,
+    /// leaves the slot capped, so the next tower's blocker goes out a look or two later, not
+    /// `verify_ticks` later.
+    ///
+    /// Uses: `CONTROLLER_STRUCTURES` (through `earliest_level` and `allowed`: the first level with
+    /// a link, the towers and extensions it allows), `PLANNER_MMO.verify_ticks`.
+    #[test]
+    fn a_destroy_for_a_capped_type_holds_nothing() {
+        let level = level_of(Link).max(level_of(Tower));
+        let (towers, extensions) = (allowed(Tower, level), allowed(Extension, level));
+        assert!(towers >= 2 && allowed(Link, level) > 0);
+        let t = tile(35, 25);
+        let t2 = tile(40, 30);
+        assert!(t.index() < t2.index(), "the boxed-in tower comes first");
+        let ring: Vec<Tile> = t.neighbors().map(|(_, n)| n).collect();
+        let m = *ring.first().expect("a ring");
+        let mut items = vec![
+            item(Tower, t, level_of(Tower)),
+            item(Tower, t2, level_of(Tower)),
+        ];
+        items.extend(
+            ring.iter()
+                .map(|&r| item(Extension, r, level_of(Extension))),
+        );
+        let mut b = Bench::new(level, items, Roles::default());
+        b.pcfg = PlannerConfig {
+            towers: true,
+            ..PLANNER_MMO
+        };
+        // The ring: on-plan extensions but on `m`, an off-plan link there.
+        for &r in ring.iter().filter(|&&r| r != m) {
+            b.build(Extension, r);
+        }
+        b.build(Link, m);
+        b.build(Extension, t2);
+        // The rest of the level's extensions, off the plan on open ground.
+        let mut have = ring.len() as u32;
+        let mut x = 5;
+        while have < extensions {
+            b.build(Extension, tile(x, 45));
+            x += 1;
+            have += 1;
+        }
+        let (orders, destroys) = b.step(View::Ready, true);
+        assert!(orders.is_empty());
+        assert_eq!(destroys, vec![b.destroy_of(Link, m)], "the opening");
+        b.act_destroys(Outcome::Ok, true);
+        let start = b.time;
+        let mut came = None;
+        while came.is_none() && b.time < start + 5 {
+            let (_, destroys) = b.tick();
+            if destroys.contains(&b.destroy_of(Extension, t2)) {
+                came = Some(b.time);
+            }
+        }
+        let came = came.expect("the second tower's blocker went out within a few looks");
+        assert!(came < start + b.pcfg.verify_ticks);
+    }
+
+    /// A room whose plan holds only the spawn and the two roads, at the roads' first level.
+    fn road_bench() -> Bench {
+        Bench::new(level_of(Road), road_items(), Roles::default())
+    }
+
+    /// The plan's first road is picked on a scanned tick and the call accepted, but no site is ever
+    /// shown to the placement. Returns the pick's tick.
+    fn pick_unseen_road(b: &mut Bench) -> u32 {
+        let (orders, destroys) = b.step(View::Ready, true);
+        assert_eq!(orders, vec![b.site_order(Road, roads()[0])]);
+        assert!(destroys.is_empty());
+        b.placement.record(0, Outcome::Ok);
+        b.time
+    }
+
+    /// A road site built before the placement saw it (once built it has no owner, so the snapshot
+    /// never holds it): movement's scan showing the road on its tile makes the pick done, so
+    /// nothing counts as lost, the tile is not refused, and the next road goes out on that tick;
+    /// both when the road shows on the next tick and when the Optional tier skipped past
+    /// `APPEAR_TICKS` meanwhile.
+    ///
+    /// Uses: `APPEAR_TICKS`, `CONTROLLER_STRUCTURES` (through `earliest_level`).
+    #[test]
+    fn a_road_built_unseen_is_done_by_movements_scan() {
+        for skipped in [0, APPEAR_TICKS] {
+            let mut b = road_bench();
+            let at = pick_unseen_road(&mut b);
+            b.roads.push(roads()[0]);
+            b.time += skipped;
+            let (orders, destroys) = b.step(View::Ready, true);
+            assert_eq!(b.time, at + skipped + 1);
+            assert!(destroys.is_empty());
+            assert_eq!(
+                orders,
+                vec![b.site_order(Road, roads()[1])],
+                "skipped {skipped}"
+            );
+            let t = *b.placement.totals();
+            assert_eq!(
+                (t.picked, t.placed, t.lost, t.refused),
+                (2, 1, 0, 0),
+                "skipped {skipped}"
+            );
+            assert!(b.placement.refused_tiles(b.room).is_empty());
+        }
+    }
+
+    /// A road pick still unseen at its `APPEAR_TICKS` timeout while the room's last scan is older
+    /// than pick + `APPEAR_TICKS` (here one from the tick before the timeout, which does not count):
+    /// the room places nothing and asks movement for a rescan each tick until a scan newer than
+    /// that. If that scan shows the road the pick is done; if it shows nothing the pick counts as
+    /// lost then (the tile refused). Either way the next road goes out on the scan's tick.
+    ///
+    /// Uses: `APPEAR_TICKS`, `LOST_MAX`, `CONTROLLER_STRUCTURES` (through `earliest_level`).
+    #[test]
+    fn a_road_pick_at_its_timeout_waits_for_a_newer_scan() {
+        const { assert!(1 < LOST_MAX) };
+        for built in [true, false] {
+            let mut b = road_bench();
+            let at = pick_unseen_road(&mut b);
+            let timeout = at + APPEAR_TICKS;
+            // No scan until the tick before the timeout, whose scan shows no road yet.
+            while b.time + 1 < timeout {
+                let scan = b.time + 2 == timeout;
+                let (orders, destroys) = b.step(View::Ready, scan);
+                assert!(
+                    orders.is_empty() && destroys.is_empty(),
+                    "pending at {}",
+                    b.time
+                );
+            }
+            assert_eq!(b.movement.room_scanned(b.room), Some(timeout - 1));
+            // From the timeout on, the room waits for a newer scan and asks for one.
+            let wait = APPEAR_TICKS / 2;
+            while b.time + 1 < timeout + wait {
+                let (orders, destroys) = b.step(View::Ready, false);
+                assert!(
+                    orders.is_empty() && destroys.is_empty(),
+                    "waiting at {}",
+                    b.time
+                );
+                assert_ne!(b.movement.tick().stale, 0, "no rescan asked at {}", b.time);
+                assert_eq!(b.placement.totals().lost, 0);
+                assert!(b.placement.refused_tiles(b.room).is_empty());
+            }
+            assert!(
+                b.time + 1 < at + 2 * APPEAR_TICKS,
+                "the scan comes inside the wait's cap"
+            );
+            if built {
+                b.roads.push(roads()[0]);
+            }
+            let (orders, destroys) = b.step(View::Ready, true);
+            assert!(destroys.is_empty());
+            assert_eq!(
+                orders,
+                vec![b.site_order(Road, roads()[1])],
+                "built {built}"
+            );
+            assert_eq!(
+                b.placement.totals().lost,
+                u32::from(!built),
+                "built {built}"
+            );
+            let refused: Vec<Tile> = if built { Vec::new() } else { vec![roads()[0]] };
+            assert_eq!(
+                b.placement.refused_tiles(b.room).to_vec(),
+                refused,
+                "built {built}"
+            );
+        }
+    }
+
+    /// With no scan of the room after an unseen road pick, the pick waits from the tick its site is
+    /// first found gone (`APPEAR_TICKS` after the pick) for `APPEAR_TICKS` plus
+    /// `MovementConfig::rescan_min_ticks` more, then counts as lost on that tick (the tile
+    /// refused), and the room goes on with the next road.
+    ///
+    /// Uses: `APPEAR_TICKS`, `LOST_MAX`, `MOVEMENT_MMO.rescan_min_ticks`, `CONTROLLER_STRUCTURES`
+    /// (through `earliest_level`).
+    #[test]
+    fn an_unseen_road_pick_with_no_scan_is_lost_once_its_wait_runs_out() {
+        const { assert!(1 < LOST_MAX) };
+        let mut b = road_bench();
+        let at = pick_unseen_road(&mut b);
+        let cap = at + APPEAR_TICKS + APPEAR_TICKS + MOVEMENT_MMO.rescan_min_ticks;
+        while b.time + 1 < cap {
+            let (orders, destroys) = b.step(View::Ready, false);
+            assert!(
+                orders.is_empty() && destroys.is_empty(),
+                "pending at {}",
+                b.time
+            );
+            assert_eq!(b.placement.totals().lost, 0);
+        }
+        assert_eq!(b.movement.room_scanned(b.room), Some(at));
+        let (orders, destroys) = b.step(View::Ready, false);
+        assert_eq!(b.time, cap);
+        assert!(destroys.is_empty());
+        assert_eq!(b.placement.totals().lost, 1);
+        assert_eq!(b.placement.refused_tiles(b.room).to_vec(), vec![roads()[0]]);
+        assert_eq!(orders, vec![b.site_order(Road, roads()[1])]);
+    }
+
+    /// A road built during a gap in the placement longer than `2 * APPEAR_TICKS` (the Optional
+    /// tier off, say), with movement's last scan from before it was built: the first look after
+    /// the gap waits for a scan instead of counting the pick lost, then the scan judges it: the
+    /// road shown makes it done; nothing shown counts it lost.
+    ///
+    /// Uses: `APPEAR_TICKS`, `MOVEMENT_MMO.rescan_min_ticks`, `CONTROLLER_STRUCTURES` (through
+    /// `earliest_level`).
+    #[test]
+    fn a_road_built_in_a_long_gap_waits_for_a_scan_after_it() {
+        for built in [true, false] {
+            let mut b = road_bench();
+            let at = pick_unseen_road(&mut b);
+            if built {
+                b.roads.push(roads()[0]);
+            }
+            b.time += 3 * APPEAR_TICKS;
+            let (orders, destroys) = b.step(View::Ready, false);
+            assert!(orders.is_empty() && destroys.is_empty(), "built {built}");
+            assert_eq!(b.placement.totals().lost, 0, "built {built}");
+            assert_eq!(b.movement.room_scanned(b.room), Some(at));
+            const { assert!(1 < APPEAR_TICKS + MOVEMENT_MMO.rescan_min_ticks) };
+            let (orders, destroys) = b.step(View::Ready, true);
+            assert!(destroys.is_empty());
+            let t = *b.placement.totals();
+            if built {
+                assert_eq!(t.lost, 0);
+                assert!(b.placement.refused_tiles(b.room).is_empty());
+            } else {
+                assert_eq!(t.lost, 1);
+                assert_eq!(b.placement.refused_tiles(b.room).to_vec(), vec![roads()[0]]);
+            }
+            assert_eq!(
+                orders,
+                vec![b.site_order(Road, roads()[1])],
+                "built {built}"
+            );
+        }
+    }
+
+    /// The extension slot of the `ERR_RCL_NOT_ENOUGH` tests.
+    fn full_slot() -> Tile {
+        tile(27, 25)
+    }
+
+    /// A plan-path site refused for the level's count (`ERR_RCL_NOT_ENOUGH`: another owner's
+    /// structures count too, V238) holds its type, not the room: nothing counts as lost and the
+    /// tile is not refused, the room's roads go out meanwhile, and the type is offered again on
+    /// the tick `verify_ticks` have passed since the refusal.
+    ///
+    /// Uses: `PLANNER_MMO.verify_ticks`, `CONTROLLER_STRUCTURES` (through `earliest_level`).
+    #[test]
+    fn a_full_type_is_held_while_the_room_places_on() {
+        let level = level_of(Extension);
+        let mut items = vec![item(Extension, full_slot(), level)];
+        items.extend(road_items());
+        let mut b = Bench::new(level, items, Roles::default());
+        let verify = b.pcfg.verify_ticks;
+        let roads_n = u32::try_from(roads().len()).expect("small");
+        assert!(roads_n + 1 < verify, "the hold outlasts the road sites");
+        let (orders, _) = b.step(View::Ready, true);
+        assert_eq!(orders, vec![b.site_order(Extension, full_slot())]);
+        b.act_sites(Outcome::Failed(ErrorCode::RclNotEnough));
+        let full_at = b.time;
+        let t = *b.placement.totals();
+        assert_eq!((t.full, t.refused, t.lost, t.placed), (1, 1, 0, 0));
+        assert!(b.placement.refused_tiles(b.room).is_empty());
+        let mut sited = Vec::new();
+        while b.time + 1 < full_at + verify {
+            let (orders, destroys) = b.tick();
+            assert!(destroys.is_empty());
+            assert!(
+                orders.iter().all(|o| o.kind != Extension),
+                "held at {}",
+                b.time
+            );
+            sited.extend(orders.iter().map(|o| o.tile));
+        }
+        assert_eq!(sited, roads().to_vec(), "the roads went out meanwhile");
+        assert_eq!(b.census().map(|c| c.capped), Some(1));
+        let (orders, _) = b.step(View::Ready, true);
+        assert_eq!(b.time, full_at + verify);
+        assert_eq!(orders, vec![b.site_order(Extension, full_slot())]);
+        b.act_sites(Outcome::Ok);
+        let t = *b.placement.totals();
+        assert_eq!((t.full, t.lost, t.placed), (1, 0, roads_n + 1));
+    }
+
+    /// `LOST_MAX` refusals for the level's count in a row, with no site between them, do not stop
+    /// a planned room: after each hold of `verify_ticks` the type is offered again.
+    ///
+    /// Uses: `LOST_MAX`, `PLANNER_MMO.verify_ticks`, `CONTROLLER_STRUCTURES` (through
+    /// `earliest_level`).
+    #[test]
+    fn full_refusals_never_stop_a_planned_room() {
+        let level = level_of(Extension);
+        let items = vec![item(Extension, full_slot(), level)];
+        let mut b = Bench::new(level, items, Roles::default());
+        let verify = b.pcfg.verify_ticks;
+        for round in 1..=LOST_MAX {
+            let (orders, _) = b.step(View::Ready, true);
+            assert_eq!(
+                orders,
+                vec![b.site_order(Extension, full_slot())],
+                "round {round}"
+            );
+            b.act_sites(Outcome::Failed(ErrorCode::RclNotEnough));
+            assert_eq!(b.placement.totals().full, round);
+            let full_at = b.time;
+            while b.time + 1 < full_at + verify {
+                let (orders, destroys) = b.tick();
+                assert!(
+                    orders.is_empty() && destroys.is_empty(),
+                    "held at {}",
+                    b.time
+                );
+            }
+        }
+        let (orders, _) = b.step(View::Ready, true);
+        assert_eq!(
+            orders,
+            vec![b.site_order(Extension, full_slot())],
+            "not stopped"
+        );
+        let t = *b.placement.totals();
+        assert_eq!((t.full, t.refused, t.lost), (LOST_MAX, LOST_MAX, 0));
+    }
+
+    /// A level change ends a full type's hold at once: the refused extension is offered on the
+    /// first tick at the next level, long before `verify_ticks`.
+    ///
+    /// Uses: `PLANNER_MMO.verify_ticks`, `CONTROLLER_STRUCTURES` (through `earliest_level` and
+    /// `allowed`: the first level with extensions, and the next one that allows more).
+    #[test]
+    fn a_level_change_offers_a_full_type_again_at_once() {
+        let first = level_of(Extension);
+        let next = earliest_level(Extension, allowed(Extension, first)).expect("more later");
+        let mut items = vec![item(Extension, full_slot(), first)];
+        items.extend(road_items());
+        let mut b = Bench::new(first, items, Roles::default());
+        let (orders, _) = b.step(View::Ready, true);
+        assert_eq!(orders, vec![b.site_order(Extension, full_slot())]);
+        b.act_sites(Outcome::Failed(ErrorCode::RclNotEnough));
+        let full_at = b.time;
+        let (orders, _) = b.tick();
+        assert_eq!(orders, vec![b.site_order(Road, roads()[0])], "held");
+        b.level = next;
+        let (orders, _) = b.tick();
+        assert!(b.time < full_at + b.pcfg.verify_ticks);
+        assert_eq!(orders, vec![b.site_order(Extension, full_slot())]);
+        assert_eq!(b.placement.totals().full, 1);
+    }
+
+    /// On the interim path (the planner off, or no valid plan) `ERR_RCL_NOT_ENOUGH` still counts
+    /// toward `LOST_MAX`: after that many refused extension picks in a row the room gets no more
+    /// calls, and none of them counts as full.
+    ///
+    /// Uses: `LOST_MAX`, `APPEAR_TICKS`, `CONTROLLER_STRUCTURES` (through `earliest_level`).
+    #[test]
+    fn the_interim_path_counts_a_full_refusal_toward_lost_max() {
+        for view in [View::Off, View::Fallback] {
+            let mut b = Bench::new(level_of(Extension), Vec::new(), Roles::default());
+            b.extensions = true;
+            for pick in 0..LOST_MAX {
+                let (orders, destroys) = b.step(view, true);
+                assert!(destroys.is_empty());
+                assert_eq!(orders.len(), 1, "{view:?} pick {pick}");
+                assert!(orders.iter().all(|o| o.kind == Extension));
+                b.act_sites(Outcome::Failed(ErrorCode::RclNotEnough));
+            }
+            for _ in 0..APPEAR_TICKS {
+                let (orders, destroys) = b.step(view, true);
+                assert!(
+                    orders.is_empty() && destroys.is_empty(),
+                    "{view:?} stopped at {}",
+                    b.time
+                );
+            }
+            let t = *b.placement.totals();
+            assert_eq!(
+                (t.picked, t.refused, t.full, t.lost),
+                (LOST_MAX, LOST_MAX, 0, 0),
+                "{view:?}"
+            );
+        }
+    }
+
+    /// The economy's link needs go on the plan's link of their role, whatever their own tile: with
+    /// the source near the controller, a source link's need whose tile is within `RECEIVER_RANGE`
+    /// of the controller goes on the plan's link for that source (`roles.source_links`), and the
+    /// controller link's need (`source: None`) on `roles.controller_link`.
+    ///
+    /// Uses: `RECEIVER_RANGE`, `NEAR`, `CONTROLLER_STRUCTURES` (through `earliest_level`: the
+    /// first level that allows two links).
+    #[test]
+    fn a_link_need_goes_on_the_plans_link_for_its_role() {
+        use crate::economy::mining::NEAR;
+        use crate::economy::{LinkNeed, RECEIVER_RANGE};
+        let level = earliest_level(Link, 1).expect("two links at some level");
+        let controller = tile(14, 10);
+        let mining = tile(11, 10);
+        let (source_link, controller_link) = (tile(12, 11), tile(15, 11));
+        // The economy's own pick for the source's link, next to the mining tile.
+        let need = tile(12, 9);
+        assert_eq!(source().range(mining), NEAR);
+        assert!(need.range(mining) <= NEAR && source_link.range(mining) <= NEAR);
+        for t in [need, source_link, controller_link] {
+            assert!(t.range(controller) <= RECEIVER_RANGE, "{t:?}");
+        }
+        let roles = Roles {
+            mining: vec![mining],
+            source_links: vec![Some(source_link)],
+            controller_link: Some(controller_link),
+            ..Roles::default()
+        };
+        let items = vec![
+            item(Link, source_link, level),
+            item(Link, controller_link, level),
+        ];
+        let source_need = LinkNeed {
+            tile: need,
+            source: Some(source()),
+        };
+        let controller_need = LinkNeed {
+            tile: tile(15, 9),
+            source: None,
+        };
+        // The source's link alone: on the plan's source link, not the controller link.
+        let mut b = Bench::new(level, items.clone(), roles.clone());
+        b.move_controller(controller);
+        b.link_needs = vec![source_need];
+        let (orders, destroys) = b.tick();
+        assert!(destroys.is_empty());
+        assert_eq!(orders, vec![b.site_order(Link, source_link)]);
+        let t = *b.placement.totals();
+        assert_eq!((t.picked, t.planned, t.links), (1, 1, 1));
+        // Both, the controller's first (`Mining::link_needs`' order), each on its role's link; the
+        // sited controller link's need, still listed, is passed over.
+        let mut b = Bench::new(level, items, roles);
+        b.move_controller(controller);
+        b.link_needs = vec![controller_need, source_need];
+        let (orders, _) = b.tick();
+        assert_eq!(orders, vec![b.site_order(Link, controller_link)]);
+        let (orders, _) = b.tick();
+        assert_eq!(orders, vec![b.site_order(Link, source_link)]);
+        assert_eq!(b.placement.totals().links, 2);
+    }
+
+    /// A change this tick's movement scan already shows asks for no early rescan: a site built
+    /// (the site gone, its structure standing) or a destroy done, seen on a tick the room was
+    /// scanned, leaves movement's tick counters with no rescan asked (`Counts::stale`); the same
+    /// change on a tick with no scan asks for one.
+    ///
+    /// Uses: `CONTROLLER_STRUCTURES` (through `earliest_level`).
+    #[test]
+    fn a_change_this_ticks_scan_shows_asks_for_no_rescan() {
+        let level = level_of(Extension);
+        let slot = tile(27, 25);
+        for scan in [true, false] {
+            let mut b = Bench::new(level, vec![item(Extension, slot, level)], Roles::default());
+            let (orders, _) = b.tick();
+            assert_eq!(orders, vec![b.site_order(Extension, slot)]);
+            b.tick();
+            b.sites.clear();
+            b.build(Extension, slot);
+            let (orders, destroys) = b.step(View::Ready, scan);
+            assert!(orders.is_empty() && destroys.is_empty());
+            assert_eq!(
+                b.movement.tick().stale == 0,
+                scan,
+                "built, scanned {scan}: {} asked",
+                b.movement.tick().stale
+            );
+        }
+        let level = level_of(Storage);
+        for scan in [true, false] {
+            let mut b = storage_bench(level, Extension, storage_on(), Vec::new());
+            let (orders, destroys) = b.tick();
+            assert!(orders.is_empty());
+            assert_eq!(destroys, vec![b.destroy_of(Extension, storage_slot())]);
+            let (orders, _) = b.step(View::Ready, scan);
+            assert_eq!(
+                b.movement.tick().stale == 0,
+                scan,
+                "destroyed, scanned {scan}: {} asked",
+                b.movement.tick().stale
+            );
+            if scan {
+                assert_eq!(orders, vec![b.site_order(Storage, storage_slot())]);
+            }
+        }
+    }
+
+    /// A destroy the game refuses for a reason other than `ERR_BUSY` (here `ERR_NOT_OWNER`) counts
+    /// toward the room's destroy limit and never toward the sites' `lost` or `destroys_dropped`:
+    /// after `LOST_MAX` in a row the room gets no more destroys while its roads go out. A dropped
+    /// destroy (accepted, the structure still there after `APPEAR_TICKS`) shares that limit with
+    /// refused ones, and only it counts as dropped.
+    ///
+    /// Uses: `LOST_MAX`, `APPEAR_TICKS`, `PLANNER_MMO.verify_ticks`, `CONTROLLER_STRUCTURES`
+    /// (through `earliest_level`).
+    #[test]
+    fn refused_destroys_count_toward_the_destroy_limit_only() {
+        let level = level_of(Storage);
+        for dropped in [0, 1] {
+            let mut b = storage_bench(level, Extension, storage_on(), road_items());
+            for _ in 0..dropped {
+                let (orders, destroys) = b.step(View::Ready, true);
+                assert!(orders.is_empty());
+                assert_eq!(destroys, vec![b.destroy_of(Extension, storage_slot())]);
+                b.act_destroys(Outcome::Ok, false);
+                for _ in 1..APPEAR_TICKS {
+                    let (orders, destroys) = b.tick();
+                    assert!(
+                        orders.is_empty() && destroys.is_empty(),
+                        "pending at {}",
+                        b.time
+                    );
+                }
+            }
+            for refused in 0..LOST_MAX - dropped {
+                let (orders, destroys) = b.step(View::Ready, true);
+                assert!(orders.is_empty(), "the storage's destroy goes first");
+                assert_eq!(
+                    destroys,
+                    vec![b.destroy_of(Extension, storage_slot())],
+                    "dropped {dropped}, refused {refused}"
+                );
+                b.act_destroys(Outcome::Failed(ErrorCode::NotOwner), false);
+                let t = *b.placement.totals();
+                assert_eq!((t.lost, t.destroys_dropped), (0, dropped));
+            }
+            // The limit reached: no more destroys, and the roads go out.
+            let mut sited = Vec::new();
+            for _ in 0..=b.pcfg.verify_ticks {
+                let (orders, destroys) = b.tick();
+                assert!(destroys.is_empty(), "no destroy at {}", b.time);
+                sited.extend(orders.iter().map(|o| o.tile));
+            }
+            assert_eq!(sited, roads().to_vec(), "dropped {dropped}");
+            let t = *b.placement.totals();
+            assert_eq!(
+                (
+                    t.destroys,
+                    t.destroyed,
+                    t.destroys_dropped,
+                    t.lost,
+                    t.refused
+                ),
+                (LOST_MAX, dropped, dropped, 0, 0),
+                "dropped {dropped}"
+            );
+            assert_eq!(b.census().map(|c| c.blocked), Some(1));
+        }
+    }
 }

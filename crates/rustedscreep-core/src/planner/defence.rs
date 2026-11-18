@@ -36,7 +36,7 @@ impl Ramparts {
 
 /// The protected structures of the board, sorted: every obstacle except the links the roles keep at
 /// the sources and the controller.
-pub fn protected_tiles(board: &Board<'_>) -> Vec<Tile> {
+pub fn protected_tiles(board: &Board) -> Vec<Tile> {
     let r = &board.roles;
     let remote: Vec<Tile> = r
         .controller_link
@@ -159,7 +159,7 @@ pub fn levels(
 /// Places `ramparts` on the board at their [`levels`], the line from `level` (or the first level
 /// ramparts are allowed); a rampart already planned on a tile is moved down to its level.
 pub fn apply(
-    board: &mut Board<'_>,
+    board: &mut Board,
     input: &PlanInput<'_>,
     ramparts: &Ramparts,
     level: u8,
@@ -231,7 +231,7 @@ mod tests {
         };
         let first =
             crate::planner::rules::earliest_level(StructureType::Rampart, 0).expect("ramparts");
-        let level_at = |b: &Board<'_>, at: Tile| {
+        let level_at = |b: &Board, at: Tile| {
             b.items()
                 .iter()
                 .find(|i| i.kind == StructureType::Rampart && i.tile == at)

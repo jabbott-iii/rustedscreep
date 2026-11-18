@@ -7,7 +7,9 @@
 
 use rustedscreep_consts::{ROOM_AREA, StructureType};
 
-use super::layout::{Item, KINDS, Layout, MAX_LEVEL, PlanInput, Roles, kind_rank};
+use super::layout::{
+    GATES, Gate, Item, KINDS, Layout, MAX_LEVEL, PlanInput, RoadNeed, Roles, kind_rank,
+};
 use super::rules::{blocks, earliest_level, tile_allows};
 use crate::movement::{CostGrid, CostProfile, Footprint, TerrainGrid, TerrainKind, Tile};
 
@@ -17,30 +19,40 @@ const FREE: u8 = 0;
 const NATURAL: u8 = u8::MAX;
 
 /// See the module docs.
-pub struct Board<'a> {
-    terrain: &'a TerrainGrid,
+pub struct Board {
+    /// A copy of the input's terrain, so a run can outlive the input it started from (a planning
+    /// job keeps its run across ticks).
+    terrain: TerrainGrid,
     /// 0, [`NATURAL`], or `kind_rank + 1` of the costed structure on the tile (not a road or rampart).
     what: Box<[u8; ROOM_AREA]>,
     road: Box<[bool; ROOM_AREA]>,
+    /// Per tile, what its road serves ([`RoadNeed::from`]), as [`Board::place_road`] and
+    /// [`Board::lower_road`] were told.
+    road_from: Box<[[u8; GATES]; ROOM_AREA]>,
     rampart: Box<[bool; ROOM_AREA]>,
     clear: Box<[bool; ROOM_AREA]>,
     mineral: Option<Tile>,
     counts: [u32; KINDS.len()],
     items: Vec<Item>,
+    /// Containers and links that stand in the room (ADR-026): the shared steps take one for a role
+    /// when it is as good as the best free tile ([`Board::stands`]).
+    standing: Vec<(StructureType, Tile)>,
     pub roles: Roles,
 }
 
-impl<'a> Board<'a> {
-    pub fn new(input: &PlanInput<'a>) -> Self {
+impl Board {
+    pub fn new(input: &PlanInput<'_>) -> Self {
         let mut b = Self {
-            terrain: input.terrain,
+            terrain: input.terrain.clone(),
             what: Box::new([FREE; ROOM_AREA]),
             road: Box::new([false; ROOM_AREA]),
+            road_from: Box::new([[u8::MAX; GATES]; ROOM_AREA]),
             rampart: Box::new([false; ROOM_AREA]),
             clear: Box::new([false; ROOM_AREA]),
             mineral: input.mineral,
             counts: [0; KINDS.len()],
             items: Vec::new(),
+            standing: Vec::new(),
             roles: Roles::default(),
         };
         for t in input
@@ -58,7 +70,27 @@ impl<'a> Board<'a> {
     }
 
     pub fn terrain(&self) -> &TerrainGrid {
-        self.terrain
+        &self.terrain
+    }
+
+    /// Sets the standing structures the shared steps may adopt (a container or a link of the
+    /// room's; any other type is ignored).
+    pub fn set_standing(&mut self, standing: &[(StructureType, Tile)]) {
+        self.standing.clear();
+        self.standing.extend(
+            standing
+                .iter()
+                .copied()
+                .filter(|&(k, _)| matches!(k, StructureType::Container | StructureType::Link)),
+        );
+        self.standing
+            .sort_unstable_by_key(|&(k, t)| (kind_rank(k), t.index()));
+        self.standing.dedup();
+    }
+
+    /// Whether a structure of `kind` stands on `t` ([`Board::set_standing`]).
+    pub fn stands(&self, kind: StructureType, t: Tile) -> bool {
+        self.standing.contains(&(kind, t))
     }
 
     /// The terrain of `t`.
@@ -125,7 +157,7 @@ impl<'a> Board<'a> {
     }
 
     fn can_place_inner(&self, kind: StructureType, t: Tile, role: bool) -> bool {
-        if !tile_allows(self.terrain, kind, t) {
+        if !tile_allows(&self.terrain, kind, t) {
             return false;
         }
         let here = self.structure(t);
@@ -234,10 +266,37 @@ impl<'a> Board<'a> {
             .map(|i| i.level)
     }
 
+    /// Places a road on `t` from `level` (as [`Board::place_at_level`]) for a structure of
+    /// `gate` ([`RoadNeed`]).
+    pub fn place_road(&mut self, t: Tile, level: u8, gate: Gate) -> bool {
+        if !self.place_at_level(StructureType::Road, t, level) {
+            return false;
+        }
+        self.need_road(t, level, gate);
+        true
+    }
+
     /// Moves the road planned on `t` to `level` when it belongs from a later one, so a road
-    /// routed over it at `level` is whole from that level. Whether it moved.
-    pub fn lower_road(&mut self, t: Tile, level: u8) -> bool {
+    /// routed over it at `level` for a structure of `gate` is whole from that level. Whether it
+    /// moved.
+    pub fn lower_road(&mut self, t: Tile, level: u8, gate: Gate) -> bool {
+        if self.has_road(t) {
+            self.need_road(t, level, gate);
+        }
         self.lower(StructureType::Road, t, level)
+    }
+
+    /// Notes that the road on `t` serves `gate` from `level` (at least the first level roads are
+    /// allowed, as its item).
+    fn need_road(&mut self, t: Tile, level: u8, gate: Gate) {
+        let first = earliest_level(StructureType::Road, 0).unwrap_or(level);
+        if let Some(c) = self
+            .road_from
+            .get_mut(t.index())
+            .and_then(|f| f.get_mut(gate.index()))
+        {
+            *c = (*c).min(level.max(first));
+        }
     }
 
     /// Moves the `kind` (a road or a rampart) planned on `t` to `level`, or to the first level
@@ -391,14 +450,36 @@ impl<'a> Board<'a> {
                 None
             }
         });
-        grid.build(self.terrain, objects, profile);
+        grid.build(&self.terrain, objects, profile);
     }
 
-    /// The finished plan, in its canonical order.
+    /// The finished plan, in its canonical order. A road no caller said the gate of, or one
+    /// lowered past its gates' levels by [`Board::place_at_level`] or [`Board::lower`], serves the
+    /// base from its item's level, so its least need is always its item's level.
     pub fn into_layout(self) -> Layout {
+        let mut needs: Vec<RoadNeed> = self
+            .items
+            .iter()
+            .filter(|i| i.kind == StructureType::Road)
+            .map(|i| {
+                let mut from = self
+                    .road_from
+                    .get(i.tile.index())
+                    .copied()
+                    .unwrap_or([u8::MAX; GATES]);
+                if from.iter().all(|&l| l > i.level)
+                    && let Some(base) = from.get_mut(Gate::Base.index())
+                {
+                    *base = i.level;
+                }
+                RoadNeed { tile: i.tile, from }
+            })
+            .collect();
+        needs.sort_unstable_by_key(|n| n.tile.index());
         let mut layout = Layout {
             items: self.items,
             roles: self.roles,
+            needs,
         };
         layout.sort();
         layout
@@ -455,6 +536,7 @@ mod tests {
                 level: 1,
             }],
             roles: Roles::default(),
+            needs: Vec::new(),
         };
         assert!(
             validate(&input, &layout)

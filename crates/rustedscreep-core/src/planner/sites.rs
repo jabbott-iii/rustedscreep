@@ -17,6 +17,14 @@
 //!
 //! Links are placed in a fixed order, so their levels (V234) give the build order ADR-024 uses:
 //! the controller link, the source farthest from the hub, the hub link, then the other sources.
+//!
+//! Standing containers and links (ADR-026, [`Board::set_standing`]) are adopted: a mining tile's
+//! container where one is as good as the best free tile by the rules above but the later
+//! source's ground (a standing one there is the one the economy reads as this source's, and its
+//! miner stands on it), the mineral's and a source link where one is as good as the best free
+//! tile by the rules above, and a controller container or link within `RECEIVER_RANGE` that fits
+//! them, whatever its range. So a room keeps the tiles its miners, haulers and upgraders use, and a plan
+//! built again over its own containers and links comes out the same.
 
 use rustedscreep_consts::{ROOM_AREA, StructureType};
 
@@ -34,7 +42,7 @@ fn tiles() -> impl Iterator<Item = Tile> {
 /// Keeps the ground the economy works from free of obstacles: next to each source and the mineral
 /// (miners and haulers stand there) and within `CONTROLLER_CLEAR` of the controller (upgraders).
 /// Candidates call it before they place anything.
-pub fn reserve(board: &mut Board<'_>, input: &PlanInput<'_>) {
+pub fn reserve(board: &mut Board, input: &PlanInput<'_>) {
     for t in tiles() {
         let near = input
             .sources
@@ -50,7 +58,7 @@ pub fn reserve(board: &mut Board<'_>, input: &PlanInput<'_>) {
 /// The tiles some source of `sources` can be mined from alone (its only walkable neighbour that
 /// takes a container, `except` left out as if an obstacle stood there): its mining tile, whatever
 /// the plan, so a post (V174) from the start.
-pub fn forced_tiles(board: &Board<'_>, sources: &[Tile], except: Option<Tile>) -> Vec<Tile> {
+pub fn forced_tiles(board: &Board, sources: &[Tile], except: Option<Tile>) -> Vec<Tile> {
     sources
         .iter()
         .filter_map(|&x| {
@@ -68,7 +76,7 @@ pub fn forced_tiles(board: &Board<'_>, sources: &[Tile], except: Option<Tile>) -
 }
 
 /// Fills `s.field` with path costs from `hub` over the board as planned so far.
-fn measure(board: &Board<'_>, hub: Tile, s: &mut Scratch) {
+fn measure(board: &Board, hub: Tile, s: &mut Scratch) {
     board.cost_grid(&mut s.grid, fatigue());
     s.field.compute(
         &s.grid,
@@ -88,7 +96,7 @@ fn cost(s: &Scratch, t: Tile) -> Option<u16> {
 /// The mining tiles with their containers, and the controller container. Call once the core (and
 /// its hub) is placed.
 pub fn containers(
-    board: &mut Board<'_>,
+    board: &mut Board,
     input: &PlanInput<'_>,
     hub: Tile,
     s: &mut Scratch,
@@ -100,7 +108,9 @@ pub fn containers(
     for &source in input.sources {
         // `economy::mining` gives the sources their tiles in (x, y) order, the tile order, each
         // the neighbour with a container: one next to an earlier source could be read as that
-        // source's, so such tiles come last.
+        // source's, so such tiles come last. A standing container (ADR-026) goes before a tile
+        // next to a later source: the economy reads it as this source's (the earliest it is next
+        // to) and its miner stays on it, so the plan's mining tile and source link must be there.
         let shared = |n: Tile| input.sources.iter().any(|&o| o < source && o.range(n) <= 1);
         let later = |n: Tile| input.sources.iter().any(|&o| o > source && o.range(n) <= 1);
         let last_exit =
@@ -114,10 +124,12 @@ pub fn containers(
                     && !board.roles.mining.contains(&n)
             })
             .filter_map(|n| {
-                cost(s, n).map(|d| ((shared(n), last_exit(n), later(n)), d, n.index(), n))
+                let safe = (shared(n), last_exit(n));
+                let new = !board.stands(StructureType::Container, n);
+                cost(s, n).map(|d| (safe, new, later(n), d, n.index(), n))
             })
             .min()
-            .map(|(_, _, _, n)| n)
+            .map(|(_, _, _, _, _, n)| n)
             .ok_or(PlanError::NoRoom("mining tile"))?;
         board
             .place(StructureType::Container, best)
@@ -132,22 +144,36 @@ pub fn containers(
             .chain(input.mineral.iter())
             .any(|s| s.range(t) <= 1)
     };
-    let pick = |range: u8, board: &Board<'_>| {
+    let fits = |t: Tile, board: &Board| {
+        board.walkable(t)
+            && board.can_place(StructureType::Container, t)
+            && !natural_near(t)
+            && !board.roles.mining.contains(&t)
+    };
+    let pick = |range: u8, board: &Board| {
         tiles()
-            .filter(|&t| {
-                t.range(input.controller) == range
-                    && board.walkable(t)
-                    && board.can_place(StructureType::Container, t)
-                    && !natural_near(t)
-                    && !board.roles.mining.contains(&t)
-            })
+            .filter(|&t| t.range(input.controller) == range && fits(t, board))
             .filter_map(|t| cost(s, t).map(|d| (d, t.index(), t)))
             .min()
             .map(|(_, _, t)| t)
     };
-    let chosen = std::iter::once(CONTROLLER_LINK_RANGE)
-        .chain((1..=RECEIVER_RANGE).filter(|&r| r != CONTROLLER_LINK_RANGE))
-        .find_map(|r| pick(r, board))
+    // A standing container within upgrading range that fits keeps its role (ADR-026), whatever its
+    // range: the haulers and upgraders already use it (`economy::mining` reads it so).
+    let standing = tiles()
+        .filter(|&t| {
+            t.range(input.controller) <= RECEIVER_RANGE
+                && board.stands(StructureType::Container, t)
+                && fits(t, board)
+        })
+        .filter_map(|t| cost(s, t).map(|d| (d, t.index(), t)))
+        .min()
+        .map(|(_, _, t)| t);
+    let chosen = standing
+        .or_else(|| {
+            std::iter::once(CONTROLLER_LINK_RANGE)
+                .chain((1..=RECEIVER_RANGE).filter(|&r| r != CONTROLLER_LINK_RANGE))
+                .find_map(|r| pick(r, board))
+        })
         .ok_or(PlanError::NoRoom("controller container"))?;
     board
         .place(StructureType::Container, chosen)
@@ -158,7 +184,7 @@ pub fn containers(
 
 /// Whether a link on `t` keeps the ground around it one passage, leaves every spawn beside it a
 /// free neighbour that is no post (V174), and stays out of role tiles.
-fn link_fits(board: &Board<'_>, t: Tile) -> bool {
+fn link_fits(board: &Board, t: Tile) -> bool {
     board.open(t)
         && board.can_place_role(StructureType::Link, t)
         && !board.roles.mining.contains(&t)
@@ -169,7 +195,7 @@ fn link_fits(board: &Board<'_>, t: Tile) -> bool {
 
 /// Upgrade posts with feeds at `feeds`: walkable tiles within `RECEIVER_RANGE` of the controller
 /// next to one of them.
-fn posts(board: &Board<'_>, controller: Tile, feeds: &[Tile]) -> usize {
+fn posts(board: &Board, controller: Tile, feeds: &[Tile]) -> usize {
     tiles()
         .filter(|&t| {
             t.range(controller) <= RECEIVER_RANGE
@@ -183,7 +209,7 @@ fn posts(board: &Board<'_>, controller: Tile, feeds: &[Tile]) -> usize {
 /// Every link, in the build order of the module docs. `hub_link` is the tile the core keeps for
 /// it next to the storage and the hub.
 pub fn links(
-    board: &mut Board<'_>,
+    board: &mut Board,
     input: &PlanInput<'_>,
     hub: Tile,
     hub_link: Tile,
@@ -192,15 +218,22 @@ pub fn links(
     measure(board, hub, s);
     // The hub and the hub link's tile stay the core's: the hub link is placed after the first
     // source link.
-    let fits = |board: &Board<'_>, t: Tile| t != hub && t != hub_link && link_fits(board, t);
-    // The controller link: the most upgrade posts with the container, then the nearest the hub.
+    let fits = |board: &Board, t: Tile| t != hub && t != hub_link && link_fits(board, t);
+    // The controller link: a standing link within upgrading range that fits (ADR-026), else the
+    // most upgrade posts with the container, then the nearest the hub.
     let container = board.roles.controller_container;
     let controller_link = tiles()
-        .filter(|&t| t.range(input.controller) == CONTROLLER_LINK_RANGE && fits(board, t))
+        .filter(|&t| {
+            let range = t.range(input.controller);
+            let standing = board.stands(StructureType::Link, t);
+            (range == CONTROLLER_LINK_RANGE || (standing && range <= RECEIVER_RANGE))
+                && fits(board, t)
+        })
         .filter_map(|t| {
             let feeds: Vec<Tile> = container.into_iter().chain([t]).collect();
             let d = cost(s, t)?;
             Some((
+                !board.stands(StructureType::Link, t),
                 usize::MAX - posts(board, input.controller, &feeds),
                 d,
                 t.index(),
@@ -208,7 +241,7 @@ pub fn links(
             ))
         })
         .min()
-        .map(|(_, _, _, t)| t)
+        .map(|(_, _, _, _, t)| t)
         .ok_or(PlanError::NoRoom("controller link"))?;
     board
         .place_role(StructureType::Link, controller_link)
@@ -257,7 +290,13 @@ pub fn links(
                     && t.range(input.controller) > RECEIVER_RANGE
                     && !others.iter().any(|o| o.range(t) <= 1)
             })
-            .min_by_key(|&t| (t.range(source) <= 1, t.index()));
+            .min_by_key(|&t| {
+                (
+                    !board.stands(StructureType::Link, t),
+                    t.range(source) <= 1,
+                    t.index(),
+                )
+            });
         if let Some(t) = link
             && board.place_role(StructureType::Link, t).is_some()
             && let Some(slot) = board.roles.source_links.get_mut(i)
@@ -276,7 +315,7 @@ pub fn links(
 
 /// The extractor on the mineral and its container next to it, both from the extractor's level.
 pub fn mineral(
-    board: &mut Board<'_>,
+    board: &mut Board,
     input: &PlanInput<'_>,
     hub: Tile,
     s: &mut Scratch,
@@ -292,9 +331,12 @@ pub fn mineral(
         .neighbors()
         .map(|(_, n)| n)
         .filter(|&n| board.walkable(n) && board.can_place(StructureType::Container, n))
-        .filter_map(|n| cost(s, n).map(|d| (d, n.index(), n)))
+        .filter_map(|n| {
+            let new = !board.stands(StructureType::Container, n);
+            cost(s, n).map(|d| (new, d, n.index(), n))
+        })
         .min()
-        .map(|(_, _, n)| n)
+        .map(|(_, _, _, n)| n)
         .ok_or(PlanError::NoRoom("mineral container"))?;
     if !board.place_at_level(StructureType::Container, t, level) {
         return Err(PlanError::NoRoom("mineral container"));

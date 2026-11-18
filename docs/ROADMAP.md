@@ -135,7 +135,7 @@ Modules:
 Modules:
 - [x] Terrain corpus fixtures (≥ 30 rooms exported from MMO maps) in `crates/rustedscreep-core/tests/fixtures/`.
 - [x] Candidates: a stamp/bunker planner, and distance transform with min-cut ramparts. Benchmark both, then decide ADR-007 (decided 2026-11-18: (b), the flood fill with min-cut ramparts).
-- [ ] Placement of extensions, towers, labs, storage, terminal, links, roads, and ramparts. Incremental site placement per RCL, cached, with periodic verification. It keeps or replaces the interim extensions P2 placed (ADR-020) and takes over from `opening.place_extensions`.
+- [x] Placement of extensions, towers, labs, storage, terminal, links, roads, and ramparts. Incremental site placement per RCL, cached, with periodic verification. It keeps or replaces the interim extensions P2 placed (ADR-020) and takes over from `opening.place_extensions`.
 
 **Gate:**
 - [ ] The planner is deterministic and valid on the whole corpus: counts per RCL come from constants, and every structure is reachable.

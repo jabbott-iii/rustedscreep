@@ -123,6 +123,7 @@ pub fn with_min_cut(
     let mut out = Layout {
         items,
         roles: layout.roles.clone(),
+        needs: layout.needs.clone(),
     };
     out.sort();
     Ok(out)

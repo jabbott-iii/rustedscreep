@@ -103,7 +103,26 @@ pub const LINK_MARGIN: u8 = 2;
 const MOVE_PRIORITY: u8 = 4;
 
 /// Harvesting and transferring reach 1 tile (`isNearTo`, V182, V108).
-const NEAR: u8 = 1;
+pub(crate) const NEAR: u8 = 1;
+
+/// A container site the room needs (ADR-023, ADR-025, [`Mining::container_needs`]): its tile, and
+/// the source whose mining tile it is on (`None`: the controller container), so a planned room maps
+/// it to the plan's container of the same role (P4.3; two sources may share a neighbour, so the
+/// tile alone does not say which).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContainerNeed {
+    pub tile: Tile,
+    pub source: Option<Tile>,
+}
+
+/// A link site the room needs (ADR-024, [`Mining::link_needs`]): its tile, and the source whose
+/// link it is (`None`: the controller link), so a planned room maps it to the plan's link of the
+/// same role (P4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkNeed {
+    pub tile: Tile,
+    pub source: Option<Tile>,
+}
 
 /// The energy a link's send of `amount` loses on the way: `Math.ceil(amount * LINK_LOSS_RATIO)`
 /// (links/transfer.js L46, V217). The engine's ratio is the double 0.03 and the crate's the f32
@@ -400,10 +419,11 @@ struct MineRoom {
     /// Members of [`Mining::members`] that belong to it this tick.
     members: (usize, usize),
     mined: Vec<Mined>,
-    /// Mining tiles with no container and no container site, once the room pays for their miner.
-    containers: Vec<Tile>,
+    /// Mining tiles with no container and no container site, once the room pays for their miner,
+    /// then the controller container's tile (ADR-025).
+    containers: Vec<ContainerNeed>,
     /// Link tiles with no link and no link site, in the order to place them (ADR-024).
-    link_sites: Vec<Tile>,
+    link_sites: Vec<LinkNeed>,
     receivers: Vec<Receiver>,
     /// This tick's built links with what the miners promised them, and the controller, for the
     /// Standard `links` job ([`Mining::send_room`]).
@@ -615,16 +635,17 @@ impl Mining {
         self.room(room).map_or(&[], |r| r.receivers.as_slice())
     }
 
-    /// The tiles of `room` that need a container site, from its run this tick: the mining tiles
-    /// (none while `mining.place_containers` is off), then the controller container's (ADR-025;
-    /// only while the run was asked for it).
-    pub fn container_needs(&self, room: RoomName) -> &[Tile] {
+    /// The tiles of `room` that need a container site, with their roles, from its run this tick:
+    /// the mining tiles (none while `mining.place_containers` is off), then the controller
+    /// container's (ADR-025; only while the run was asked for it).
+    pub fn container_needs(&self, room: RoomName) -> &[ContainerNeed] {
         self.room(room).map_or(&[], |r| r.containers.as_slice())
     }
 
-    /// The link tiles of `room` that need a link site, in the order to place them (ADR-024): from
-    /// its run this tick, none while `links.place_links` is off or below the level that allows links.
-    pub fn link_needs(&self, room: RoomName) -> &[Tile] {
+    /// The link tiles of `room` that need a link site, with their roles, in the order to place
+    /// them (ADR-024): from its run this tick, none while `links.place_links` is off or below the
+    /// level that allows links.
+    pub fn link_needs(&self, room: RoomName) -> &[LinkNeed] {
         self.room(room).map_or(&[], |r| r.link_sites.as_slice())
     }
 
@@ -895,7 +916,10 @@ impl Mining {
             let has = |p: Position| link_spots.contains(&p);
             let controller_link = plan.and_then(|p| p.controller_link);
             if let Some(c) = controller_link.filter(|&c| !has(c)) {
-                r.link_sites.push(Tile::of(c));
+                r.link_sites.push(LinkNeed {
+                    tile: Tile::of(c),
+                    source: None,
+                });
             }
             if controller_link.is_some_and(has) || receiver_at.is_some() {
                 // The `source_links` sources farthest from the spawn (by trip, then the plan's
@@ -921,7 +945,10 @@ impl Mining {
                     if let Some((_, s)) = next
                         && let Some(l) = s.link.filter(|&l| !has(l))
                     {
-                        r.link_sites.push(Tile::of(l));
+                        r.link_sites.push(LinkNeed {
+                            tile: Tile::of(l),
+                            source: Some(Tile::of(s.source)),
+                        });
                     }
                 }
             }
@@ -953,7 +980,10 @@ impl Mining {
                 && let Some(tile) = s.tile
                 && !stores.contains(&tile)
             {
-                r.containers.push(Tile::of(tile));
+                r.containers.push(ContainerNeed {
+                    tile: Tile::of(tile),
+                    source: Some(Tile::of(s.source)),
+                });
             }
             // Its source link: the built link next to its tile, the planned one first.
             let source_link = s.tile.and_then(|tile| {
@@ -1070,7 +1100,10 @@ impl Mining {
                 .iter()
                 .any(|s| s.tile.is_some() && s.body.is_some() && !s.linked)
         {
-            r.containers.push(Tile::of(c));
+            r.containers.push(ContainerNeed {
+                tile: Tile::of(c),
+                source: None,
+            });
         }
         // The sends are the Standard `links` job's (`send_room`): the room is a unit when a
         // source link may send to a controller link this tick.

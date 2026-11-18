@@ -308,7 +308,7 @@ opening then wants no worker for those sources, keeps `opening.min_workers`, cap
 `min_upgraders` to 0, and a worker with nothing else to do holds its energy unless its source is not counted. A worker also leaves
 alone a spawn or extension a hauler's transfer goes into this tick (and the room a walking hauler claimed). The view stays last tick's through a run that faults. `upgrading.enabled` turns the requests off. The summary has an `upgrading:` part (upgraders, tasks, budget, posts, body).
 
-Base planner (P4.2; ADR-007 accepted 2026-11-18: `flood` is the planner, `bunker` the comparison baseline; not wired: nothing in the tick path calls it before P4.3): `rustedscreep_core::planner` is pure.
+Base planner (P4.2; ADR-007 accepted 2026-11-18: `flood` is the planner, `bunker` the comparison baseline; wired in P4.3, below): `rustedscreep_core::planner` is pure.
 A `PlanInput` (terrain, controller, sources in (x, y) order, mineral, a standing spawn) gives a `Layout`: every structure, road and
 rampart as an `Item` with the controller level it belongs from, sorted (level, type, tile), plus the `Roles` the economy reads by
 position (hub, storage, hub link, mining tiles, source links, the controller's container and link, the mineral container). A `Board`
@@ -316,8 +316,25 @@ holds a run's working state and checks the site rules (V237) and the level count
 and `flood`, each a `Run` that does one phase per `step` (`scheduler::Step`), share `sites` (the economy's tiles), `roads` (A* at the
 fatigue rates, reusing planned roads), `score` (the hub's anchor cost), `defence` and `mincut` (the minimum cut on a vertex-split graph,
 Dinic), `transform` (the Chebyshev distance transform) and `validate` (the one referee, which also measures). A `Scratch` holds the
-buffers a run reuses; a run's own state is in its `Run`, so a run stepped with a new scratch each step gives the same plan. Each run
-borrows its `PlanInput`, so P4.3 must keep the input alive across the ticks a run takes.
+buffers a run reuses; a run's own state is in its `Run`, so a run stepped with a new scratch each step gives the same plan. Since
+P4.3 a `Board` holds its own copy of the terrain and `flood::Run` borrows nothing: each `step` is given the input the run was made
+from, so a job keeps a run across ticks.
+
+Base planner in the tick path (P4.3, ADR-026). `planner::job::Planner` reads each owned room's `Facts` (the terrain from movement,
+the controller, sources and spawns from the snapshot, the mineral from movement's statics, the standing containers and links and their
+own sites, which `flood::Run::adopt` hands the run) and plans it once a global, one phase a step, then validates it; with several
+spawns or a spawn site each is tried as the anchor (from the highest tile down, so the room's first spawn usually goes first), and the
+valid plan that holds every standing spawn and the most of what stands is kept. The plan lives in the heap only (it is deterministic in those facts); a plan is planned again only when a spawn it did not know
+stands off its spawn tiles. Each planned road records what it serves (`layout::RoadNeed`), so `planner::build` places it only from the
+earliest level a structure it serves is placed under the config's switches. rustedscreep-wasm's
+`planner.rs` runs it as the Optional `planner` job (each step heavy, timed with two `getUsed` calls for `rustedscreep.planner()`).
+`economy::placement` reads the room's `PlanView`: while the plan is built it places nothing; with no plan it runs the interim
+placement (ADR-020, ADR-023 to ADR-025); with a plan, `by_plan` maps `economy::mining`'s container and link requests (each with
+its role, `ContainerNeed` and `LinkNeed`) to the plan's roles (`build::role_tile`), then asks `planner::build::next` over a `Ground` built from the snapshot and movement's last scan (roads
+have no owner, so they show only there; a look waits for a scan newer than the room's last built, destroyed or removed object).
+One action a room a tick: a site, or a `Structure.destroy()` of an own off-plan structure in a due item's way (one open replacement
+a room, never a spawn, never with a hostile creep; `DestroyOrder`, issued by the opening glue before the sites). A look that finds
+nothing waits until what it watched changes or `planner.verify_ticks` pass.
 
 Constants self-check (P1.11): `rustedscreep_core::consts_check` is pure. A `Globals` source gives the server's names, then one
 value's JSON text per step; `Check::step` reads them all, checks that at least one anchor constant (`OK`, `WORK`, `CREEP_LIFE_TIME`) was seen (otherwise the global holds no game constants and the check fails),

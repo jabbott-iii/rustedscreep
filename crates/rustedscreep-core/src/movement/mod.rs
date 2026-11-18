@@ -1516,6 +1516,30 @@ impl Movement {
             .flat_map(|r| r.statics.iter().map(|&(t, _)| t))
     }
 
+    /// `room`'s terrain, once read (P4.3's planner copies it into its run).
+    pub fn room_terrain(&self, room: RoomName) -> Option<&TerrainGrid> {
+        self.room_index(room)
+            .and_then(|i| self.rooms.get(i))
+            .and_then(|r| r.terrain.as_ref())
+    }
+
+    /// The tick of `room`'s last scan, if any (P4.3's placement waits for a scan newer than the
+    /// room's last change: a road's own footprint shows only in a scan).
+    pub fn room_scanned(&self, room: RoomName) -> Option<u32> {
+        self.room_index(room)
+            .and_then(|i| self.rooms.get(i))
+            .and_then(|r| r.scanned)
+    }
+
+    /// The footprints of `room`'s last scan: its structures (of every owner), own sites and
+    /// deposits, sorted by tile (P4.3's placement reads the roads and the obstacles it has no
+    /// object for).
+    pub fn room_objects(&self, room: RoomName) -> &[(Tile, Footprint)] {
+        self.room_index(room)
+            .and_then(|i| self.rooms.get(i))
+            .map_or(&[], |r| r.objects.as_slice())
+    }
+
     /// Cached flow fields.
     pub fn fields(&self) -> &FieldCache {
         &self.fields

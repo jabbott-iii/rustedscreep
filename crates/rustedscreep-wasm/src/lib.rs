@@ -24,6 +24,7 @@ mod logging;
 mod movement;
 mod opening;
 mod persist;
+mod planner;
 mod profiler;
 mod route;
 mod scheduler;
@@ -53,6 +54,8 @@ struct State {
     spawn: spawn::SpawnGlue,
     /// The RCL1–3 opening (P2.4): workers, their spawn requests, recovery and the watchdogs.
     opening: opening::OpeningGlue,
+    /// The base planner (P4.3): each owned room's plan, built in the Optional tier.
+    planner: planner::PlannerGlue,
     persist: persist::Persist,
     /// The constants self-check, once per global (P1.11).
     consts: consts_check::ConstsCheck,
@@ -104,6 +107,7 @@ pub fn game_loop() {
                     movement,
                     spawn,
                     opening,
+                    planner,
                     persist,
                     consts,
                     profiler: prof,
@@ -120,6 +124,7 @@ pub fn game_loop() {
                 act.begin(snapshot);
                 spawn.begin(snapshot, |room| opening.worker_body(room));
                 opening.begin(snapshot, &mut movement.core);
+                planner.begin(snapshot, &movement.core, &cfg.planner);
                 let mut tick = sched.begin(&snapshot.tick, &cfg.scheduler, scheduler::GameClock);
                 // Critical: the rooms movement needs before anything in them can move, first.
                 movement.read_first(&mut tick, snapshot, js, &cfg.movement);
@@ -161,16 +166,20 @@ pub fn game_loop() {
                 // the config in force after the loads (on a global's second loop the record loads in
                 // this same step, and the check usually completes in it).
                 consts.run(&mut tick, snapshot.tick.time, &runtime.get().log);
-                // Optional: the interim container, link and extension placement (ADR-023, ADR-025,
-                // ADR-024, ADR-020), after the self-check.
+                // Optional: the base planner's steps (P4.3), then the placement from each room's
+                // plan, or the interim container, link and extension placement (ADR-023, ADR-025,
+                // ADR-024, ADR-020) where a room has none; after the self-check.
+                planner.run(&mut tick, &cfg.planner);
                 opening.place(
                     &mut tick,
                     snapshot,
                     &mut movement.core,
+                    planner,
                     &cfg.opening,
                     &cfg.mining,
                     &cfg.links,
                     &cfg.hauling,
+                    &cfg.planner,
                     &cfg.movement,
                 );
                 act.queue_console_say(snapshot, tick.commit());
@@ -193,8 +202,9 @@ pub fn game_loop() {
                     &cfg.scheduler,
                     &cfg.spawn,
                 );
-                // Then the sites the placement picked (ADR-020, ADR-023, ADR-024), the link sends
-                // (P3.2), then the creep intents.
+                // Then the plan's destroys (ADR-026), the sites the placement picked (ADR-020,
+                // ADR-023, ADR-024, P4.3), the link sends (P3.2), then the creep intents.
+                opening.issue_destroys(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
                 opening.issue_sites(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
                 opening.issue_links(
                     snapshot,
@@ -341,6 +351,23 @@ pub fn opening_summary() -> String {
             Err(_) => String::from("rustedscreep opening: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep opening: state unavailable"))
+}
+
+/// Exported to JS as `plannerSummary`, for the `rustedscreep.planner()` console command: one line
+/// with each owned room's plan and its placement's last look, the totals since boot and the CPU
+/// per planner phase (P4.3).
+#[wasm_bindgen(js_name = "plannerSummary")]
+pub fn planner_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state.planner.summary(
+                &state.snapshot,
+                state.opening.placement(),
+                &state.config.get().planner,
+            ),
+            Err(_) => String::from("rustedscreep planner: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep planner: state unavailable"))
 }
 
 /// Exported to JS as `profilerSummary`, for the `rustedscreep.profiler()` console command: one line

@@ -2,7 +2,7 @@
 //!
 //! A run does one phase per [`Run::step`]:
 //! 1. Core. [`sites::reserve`], then the hub: among the tiles where the distance transform over
-//!    open, not-kept-clear ground reaches [`HUB_CLEARANCE`] (the core's own 3 × 3 where none
+//!    open, not-kept-clear ground reaches [`PlannerConfig::hub_clearance`] (the core's own 3 × 3 where none
 //!    does), the lowest [`AnchorCost`], then the larger transform value, then index. The core is
 //!    the hub (walkable, under a road: the filler's tile) with an arm on each side: the storage,
 //!    the hub link's tile (next to the storage, kept free for [`sites::links`]), a spawn and the
@@ -44,25 +44,18 @@ use rustedscreep_consts::{ROOM_AREA, StructureType};
 
 use super::board::Board;
 use super::defence;
-use super::layout::{Layout, MAX_LEVEL, PlanError, PlanInput};
+use super::layout::{GATES, Gate, Layout, MAX_LEVEL, PlanError, PlanInput};
 use super::roads;
 use super::rules::{RANGED_REACH, allowed, blocks, earliest_level, edge_tiles, tile_allows};
 use super::score::AnchorCost;
 use super::scratch::{Scratch, fatigue};
 use super::sites;
 use super::transform::distance_transform;
+use crate::config::{PLANNER_MMO, PlannerConfig};
 use crate::economy::RECEIVER_RANGE;
 use crate::economy::placement::keeps_neighbours_connected;
 use crate::movement::{Goal, Side, TerrainGrid, TerrainKind, Tile, UNREACHED};
 use crate::scheduler::Step;
-
-/// The distance-transform value (over open, not-kept-clear ground) a hub needs in a fresh room.
-/// Default 3: the 5 × 5 around the hub is open, so the core's 3 × 3 has open ground on every side
-/// for its roads and first slots. Unit: tiles (Chebyshev, the [`distance_transform`] scale).
-/// Rationale: a hub squeezed into a 3 × 3 pocket starts the fill from one side only, which
-/// spreads the base and lengthens the cut. Safe range 2 (the core alone) to 5; a room with no
-/// tile this open falls back to 2.
-pub const HUB_CLEARANCE: u8 = 3;
 
 /// The order the fill hands out its slots, nearest the hub first, to the types the core and the
 /// lab stamp do not hold (each up to its count at the top level, V234): the other spawns, then
@@ -81,15 +74,6 @@ pub const FILL_ORDER: [StructureType; 7] = [
     StructureType::Nuker,
     StructureType::Observer,
 ];
-
-/// The extra steps the fill counts to a slot within ranged reach of ground no rampart can close
-/// off ([`exposed`]: next to the exits), so it takes one only when the open ground that many
-/// steps farther is used up. Default 8, unit: steps along the network (each about one tile of
-/// walking for the filler). Rationale: a structure there needs a rampart of its own on top of the
-/// cut, which costs a rampart to build and keep repaired and leaves a weak point at the exit;
-/// 8 steps cost the filler little next to that. Safe range 0 (no preference) to 50 (only when
-/// nothing else is left); the lab stamp counts it once per exposed lab.
-pub const EXPOSED_PENALTY: u16 = 8;
 
 /// The core's 3 × 3 must fit: the distance transform's value for a 3 × 3.
 const CORE_FIT: u8 = 2;
@@ -185,7 +169,7 @@ impl Core {
     /// The core around `hub` with the arms of `a` ([`assignments`]), when it fits the board: the
     /// arms take a structure, the hub and the diagonals a road, and the hub link is far enough
     /// from the sources.
-    fn fit(board: &Board<'_>, input: &PlanInput<'_>, hub: Tile, a: [usize; 4]) -> Option<Self> {
+    fn fit(board: &Board, input: &PlanInput<'_>, hub: Tile, a: [usize; 4]) -> Option<Self> {
         let arm = |i: usize| ARMS.get(i).and_then(|&o| at(hub, o));
         let [storage, link, spawn, terminal] = a;
         let core = Self {
@@ -378,26 +362,29 @@ type CoreKey = (u32, Reverse<u8>, usize, u32, usize);
 struct Grow {
     hub: Tile,
     /// Steps along the network from the hub: a network tile's own, an offered tile's through its
-    /// parent (plus [`EXPOSED_PENALTY`] for a slot in reach of the exits).
+    /// parent (plus [`Params::exposed_penalty`] for a slot in reach of the exits).
     dist: Vec<u16>,
     /// The network tile an offered tile was reached from: a road's way back to the hub, a
     /// structure's road beside it.
     parent: Vec<Option<Tile>>,
     mark: Vec<Mark>,
     exposed: Vec<bool>,
+    /// [`Params::exposed_penalty`].
+    penalty: u16,
     heap: BinaryHeap<Reverse<(u16, usize)>>,
 }
 
 impl Grow {
     /// The network so far (every planned road, joined to the hub through roads), its distances,
     /// and its neighbours offered.
-    fn new(board: &Board<'_>, input: &PlanInput<'_>, hub: Tile) -> Self {
+    fn new(board: &Board, input: &PlanInput<'_>, hub: Tile, penalty: u16) -> Self {
         let mut g = Self {
             hub,
             dist: vec![NO_DIST; ROOM_AREA],
             parent: vec![None; ROOM_AREA],
             mark: vec![Mark::Open; ROOM_AREA],
             exposed: exposed(input),
+            penalty,
             heap: BinaryHeap::new(),
         };
         g.set_dist(hub, 0);
@@ -449,8 +436,8 @@ impl Grow {
     }
 
     /// Offers the undecided walkable neighbours of the network tile `u`, one step on (a slot in
-    /// reach of the exits [`EXPOSED_PENALTY`] steps more).
-    fn offer(&mut self, board: &Board<'_>, u: Tile) {
+    /// reach of the exits [`Params::exposed_penalty`] steps more).
+    fn offer(&mut self, board: &Board, u: Tile) {
         let p = self.dist(u).saturating_add(1);
         for (_, v) in u.neighbors() {
             if self.mark(v) != Mark::Open || !board.walkable(v) {
@@ -459,7 +446,7 @@ impl Grow {
             let slot = !lattice(self.hub, v) && board.can_place(StructureType::Extension, v);
             let exposed = slot && self.exposed.get(v.index()).copied().unwrap_or(false);
             let d = if exposed {
-                p.saturating_add(EXPOSED_PENALTY)
+                p.saturating_add(self.penalty)
             } else {
                 p
             };
@@ -473,25 +460,41 @@ impl Grow {
         }
     }
 
-    /// The grown roads some structure of `placed` (tile, level, parent) is served by, each from
-    /// the earliest level of the structures it serves, in tile order. The farthest structures
-    /// go first; a structure next to a road already kept uses it, else its parent's way back.
-    fn kept_roads(&self, placed: &[(Tile, u8, Tile)]) -> Vec<(Tile, u8)> {
-        let mut level = vec![u8::MAX; ROOM_AREA];
-        let lvl = |v: &[u8], t: Tile| v.get(t.index()).copied().unwrap_or(u8::MAX);
-        for &(t, l, access) in placed.iter().rev() {
+    /// The roads some structure of `placed` (tile, level, parent, gate) is served by, with the
+    /// earliest level each gate's structures it serves belong from, in tile order: the grown roads
+    /// kept, and the roads planned before the fill on their way back to the hub (a road planned
+    /// for one gate, the mineral's, may serve another's structures too, so it is needed for them
+    /// from their level). The farthest structures go first; a structure next to a road already
+    /// kept uses it, else its parent's way back.
+    fn kept_roads(&self, placed: &[(Tile, u8, Tile, Gate)]) -> Vec<(Tile, [u8; GATES])> {
+        let mut level = vec![[u8::MAX; GATES]; ROOM_AREA];
+        let kept = |v: &[[u8; GATES]], t: Tile| {
+            v.get(t.index())
+                .is_some_and(|l| l.iter().any(|&x| x != u8::MAX))
+        };
+        let lvl = |v: &[[u8; GATES]], t: Tile, g: usize| {
+            v.get(t.index())
+                .and_then(|l| l.get(g))
+                .copied()
+                .unwrap_or(u8::MAX)
+        };
+        for &(t, l, access, gate) in placed.iter().rev() {
+            let g = gate.index();
             let served = t
                 .neighbors()
                 .map(|(_, n)| n)
                 .filter(|&n| match self.mark(n) {
                     Mark::Road => true,
-                    Mark::Grown => lvl(&level, n) != u8::MAX,
+                    Mark::Grown => kept(&level, n),
                     _ => false,
                 })
                 .min_by_key(|&n| (self.dist(n), n.index()));
             let mut r = served.unwrap_or(access);
-            while self.mark(r) == Mark::Grown && lvl(&level, r) > l {
-                if let Some(c) = level.get_mut(r.index()) {
+            // Per gate: a road on the way already needed by that gate from `l` or earlier has
+            // its way to the hub needed from then too. The network's roads have their way back
+            // to the hub as parents ([`Grow::new`]); the hub has none.
+            while matches!(self.mark(r), Mark::Grown | Mark::Road) && lvl(&level, r, g) > l {
+                if let Some(c) = level.get_mut(r.index()).and_then(|x| x.get_mut(g)) {
                     *c = l;
                 }
                 match self.parent(r) {
@@ -502,8 +505,9 @@ impl Grow {
         }
         tiles()
             .filter_map(|t| {
-                let l = lvl(&level, t);
-                (self.mark(t) == Mark::Grown && l != u8::MAX).then_some((t, l))
+                let from = level.get(t.index()).copied()?;
+                (matches!(self.mark(t), Mark::Grown | Mark::Road) && kept(&level, t))
+                    .then_some((t, from))
             })
             .collect()
     }
@@ -539,10 +543,38 @@ fn exposed(input: &PlanInput<'_>) -> Vec<bool> {
     out
 }
 
-/// One planning run for a room, a phase per [`Run::step`].
-pub struct Run<'a> {
-    input: &'a PlanInput<'a>,
-    board: Board<'a>,
+/// The fill's tunables, from [`PlannerConfig`] (ADR-007's measurements used `PLANNER_MMO`'s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Params {
+    /// [`PlannerConfig::hub_clearance`].
+    pub hub_clearance: u8,
+    /// [`PlannerConfig::exposed_penalty`].
+    pub exposed_penalty: u16,
+}
+
+impl Params {
+    pub const fn from_config(cfg: &PlannerConfig) -> Self {
+        Self {
+            hub_clearance: cfg.hub_clearance,
+            exposed_penalty: cfg.exposed_penalty as u16,
+        }
+    }
+}
+
+impl Default for Params {
+    /// The official MMO's values ([`PLANNER_MMO`]).
+    fn default() -> Self {
+        Self::from_config(&PLANNER_MMO)
+    }
+}
+
+/// One planning run for a room, a phase per [`Run::step`]. It holds no borrow of its input, so a
+/// job can keep it across ticks; every step must be given the input the run was made from.
+pub struct Run {
+    params: Params,
+    /// The input's controller (the exits check keeps its upgrade range reached).
+    controller: Tile,
+    board: Board,
     phase: Phase,
     core: Option<Core>,
     /// The sides of the room whose exits the bare room reaches from the hub, the standing spawn in
@@ -555,10 +587,16 @@ pub struct Run<'a> {
     exempt: Vec<Tile>,
 }
 
-impl<'a> Run<'a> {
-    pub fn new(input: &'a PlanInput<'a>) -> Self {
+impl Run {
+    /// A run with the official MMO's tunables ([`Params::default`]).
+    pub fn new(input: &PlanInput<'_>) -> Self {
+        Self::with(input, Params::default())
+    }
+
+    pub fn with(input: &PlanInput<'_>, params: Params) -> Self {
         Self {
-            input,
+            params,
+            controller: input.controller,
             board: Board::new(input),
             phase: Phase::Core,
             core: None,
@@ -569,25 +607,25 @@ impl<'a> Run<'a> {
     }
 
     /// Does the next phase. `Step::Done` once the plan is complete; then [`Run::finish`].
-    pub fn step(&mut self, s: &mut Scratch) -> Result<Step, PlanError> {
+    pub fn step(&mut self, input: &PlanInput<'_>, s: &mut Scratch) -> Result<Step, PlanError> {
         match self.phase {
-            Phase::Core => self.place_core(s)?,
+            Phase::Core => self.place_core(input, s)?,
             Phase::Containers => {
                 let hub = self.core()?.hub;
-                sites::containers(&mut self.board, self.input, hub, s)?;
+                sites::containers(&mut self.board, input, hub, s)?;
             }
             Phase::Links => {
                 let core = self.core()?;
-                sites::links(&mut self.board, self.input, core.hub, core.link, s)?;
+                sites::links(&mut self.board, input, core.hub, core.link, s)?;
             }
             Phase::Mineral => {
                 let hub = self.core()?.hub;
-                sites::mineral(&mut self.board, self.input, hub, s)?;
+                sites::mineral(&mut self.board, input, hub, s)?;
             }
-            Phase::Roads => self.shared_roads(s)?,
-            Phase::Fill => self.fill(s)?,
-            Phase::Labs => self.labs(s)?,
-            Phase::Ramparts => self.ramparts(s)?,
+            Phase::Roads => self.shared_roads(input, s)?,
+            Phase::Fill => self.fill(input, s)?,
+            Phase::Labs => self.labs(input, s)?,
+            Phase::Ramparts => self.ramparts(input, s)?,
             Phase::Done => return Ok(Step::Done),
         }
         self.phase = self.phase.next();
@@ -596,6 +634,13 @@ impl<'a> Run<'a> {
         } else {
             Step::More
         })
+    }
+
+    /// Hands the run the room's standing containers and links (ADR-026), before its first step:
+    /// [`sites`] takes a standing one for a role where it is as good as the best free tile by the
+    /// role's own rules, so the miner, the haulers and the upgraders keep their tiles.
+    pub fn adopt(&mut self, standing: &[(StructureType, Tile)]) {
+        self.board.set_standing(standing);
     }
 
     /// The plan, once a step returned `Step::Done`.
@@ -628,8 +673,7 @@ impl<'a> Run<'a> {
     }
 
     /// Phase 1: the economy's ground, the hub and the core.
-    fn place_core(&mut self, s: &mut Scratch) -> Result<(), PlanError> {
-        let input = self.input;
+    fn place_core(&mut self, input: &PlanInput<'_>, s: &mut Scratch) -> Result<(), PlanError> {
         sites::reserve(&mut self.board, input);
         if let Some(t) = input.spawn
             && !self
@@ -642,7 +686,7 @@ impl<'a> Run<'a> {
         let mut core = None;
         if let Some(t) = input.spawn {
             distance_transform(|x| self.board.open(x) && !self.board.is_clear(x), &mut s.dt);
-            core = self.standing_core(t, &anchor, s);
+            core = self.standing_core(input, t, &anchor, s);
             if core.is_none() {
                 // The standing spawn cannot be a spawn arm: it stays on its own.
                 self.board
@@ -654,7 +698,7 @@ impl<'a> Run<'a> {
             Some(c) => c,
             None => {
                 distance_transform(|x| self.board.open(x) && !self.board.is_clear(x), &mut s.dt);
-                self.fresh_core(&anchor, s)
+                self.fresh_core(input, &anchor, s)
                     .ok_or(PlanError::NoRoom("core"))?
             }
         };
@@ -669,7 +713,7 @@ impl<'a> Run<'a> {
             .ok_or(PlanError::NoRoom("terminal"))?;
         for t in std::iter::once(core.hub).chain(DIAGONALS.iter().filter_map(|&d| at(core.hub, d)))
         {
-            if !b.place_at_level(StructureType::Road, t, level) {
+            if !b.place_road(t, level, Gate::Base) {
                 return Err(PlanError::NoRoom("core road"));
             }
         }
@@ -693,7 +737,13 @@ impl<'a> Run<'a> {
     }
 
     /// The core with its spawn arm on the standing spawn `t`, if one fits.
-    fn standing_core(&self, t: Tile, anchor: &AnchorCost, s: &Scratch) -> Option<Core> {
+    fn standing_core(
+        &self,
+        input: &PlanInput<'_>,
+        t: Tile,
+        anchor: &AnchorCost,
+        s: &Scratch,
+    ) -> Option<Core> {
         let dt = |x: Tile| s.dt.get(x.index()).copied().unwrap_or(0);
         let mut best: Option<(CoreKey, Core)> = None;
         for (ai, &(dx, dy)) in ARMS.iter().enumerate() {
@@ -710,7 +760,7 @@ impl<'a> Run<'a> {
                 if a.get(2) != Some(&ai) {
                     continue;
                 }
-                let Some(core) = Core::fit(&self.board, self.input, hub, a) else {
+                let Some(core) = Core::fit(&self.board, input, hub, a) else {
                     continue;
                 };
                 let key = (
@@ -730,10 +780,10 @@ impl<'a> Run<'a> {
 
     /// The core of a fresh room: the hub by [`AnchorCost`], then the larger transform value, then
     /// index; its arms with the storage, then the spawn, nearest the room's targets.
-    fn fresh_core(&self, anchor: &AnchorCost, s: &Scratch) -> Option<Core> {
+    fn fresh_core(&self, input: &PlanInput<'_>, anchor: &AnchorCost, s: &Scratch) -> Option<Core> {
         let all = assignments();
         let dt = |x: Tile| s.dt.get(x.index()).copied().unwrap_or(0);
-        for need in [HUB_CLEARANCE, CORE_FIT] {
+        for need in [self.params.hub_clearance, CORE_FIT] {
             let mut best: Option<(HubKey, Tile)> = None;
             for hub in tiles() {
                 let d = dt(hub);
@@ -749,7 +799,7 @@ impl<'a> Run<'a> {
                 }
                 if all
                     .iter()
-                    .any(|&a| Core::fit(&self.board, self.input, hub, a).is_some())
+                    .any(|&a| Core::fit(&self.board, input, hub, a).is_some())
                 {
                     best = Some((key, hub));
                 }
@@ -760,7 +810,7 @@ impl<'a> Run<'a> {
                     .iter()
                     .enumerate()
                     .filter_map(|(rank, &a)| {
-                        Core::fit(&self.board, self.input, hub, a).map(|c| (c, rank))
+                        Core::fit(&self.board, input, hub, a).map(|c| (c, rank))
                     })
                     .min_by_key(|&(c, rank)| (arm_cost(c.storage), arm_cost(c.spawn), rank))
                     .map(|(c, _)| c);
@@ -770,27 +820,27 @@ impl<'a> Run<'a> {
     }
 
     /// Phase 5: the roads every base needs, from the hub, and one to a lone standing spawn.
-    fn shared_roads(&mut self, s: &mut Scratch) -> Result<(), PlanError> {
+    fn shared_roads(&mut self, input: &PlanInput<'_>, s: &mut Scratch) -> Result<(), PlanError> {
         let hub = self.core()?.hub;
         let level = Self::road_level()?;
         let b = &mut self.board;
         for m in b.roles.mining.clone() {
-            roads::road(b, hub, m, 0, level, s)?;
+            roads::road(b, hub, m, 0, level, Gate::Base, s)?;
         }
         let cc = b
             .roles
             .controller_container
             .ok_or(PlanError::NoRoom("controller container"))?;
-        roads::road(b, hub, cc, 1, level, s)?;
+        roads::road(b, hub, cc, 1, level, Gate::Base, s)?;
         if let Some(mc) = b.roles.mineral_container {
             let extractor = earliest_level(StructureType::Extractor, 0)
                 .ok_or(PlanError::NoRoom("extractor level"))?;
-            roads::road(b, hub, mc, 0, extractor, s)?;
+            roads::road(b, hub, mc, 0, extractor, Gate::Late, s)?;
         }
-        if let Some(t) = self.input.spawn
+        if let Some(t) = input.spawn
             && self.core.is_some_and(|c| c.spawn != t)
         {
-            roads::road(b, hub, t, 1, level, s)?;
+            roads::road(b, hub, t, 1, level, Gate::Base, s)?;
         }
         Ok(())
     }
@@ -832,7 +882,7 @@ impl<'a> Run<'a> {
             return false;
         }
         let near = |x: Tile| x.neighbors().any(|(_, n)| reach.reached(n));
-        let controller = self.input.controller;
+        let controller = self.controller;
         let r = i8::try_from(RECEIVER_RANGE).unwrap_or(i8::MAX);
         let upgrade = (-r..=r)
             .flat_map(|dx| (-r..=r).map(move |dy| (dx, dy)))
@@ -849,14 +899,14 @@ impl<'a> Run<'a> {
     }
 
     /// Phase 6: the flood fill (see the module docs).
-    fn fill(&mut self, _s: &mut Scratch) -> Result<(), PlanError> {
+    fn fill(&mut self, input: &PlanInput<'_>, _s: &mut Scratch) -> Result<(), PlanError> {
         let hub = self.core()?.hub;
         let mut queue: Vec<StructureType> = Vec::new();
         for kind in FILL_ORDER {
             let want = allowed(kind, MAX_LEVEL).saturating_sub(self.board.count(kind));
             queue.extend(std::iter::repeat_n(kind, want as usize));
         }
-        let mut g = Grow::new(&self.board, self.input, hub);
+        let mut g = Grow::new(&self.board, input, hub, self.params.exposed_penalty);
         let mut reach = Reach::new();
         let board = &self.board;
         reach.run(hub, board.terrain(), |n| board.walkable(n));
@@ -879,7 +929,7 @@ impl<'a> Run<'a> {
             return Err(PlanError::NoRoom("spawn exit"));
         }
         self.exits = exits;
-        let mut placed: Vec<(Tile, u8, Tile)> = Vec::new();
+        let mut placed: Vec<(Tile, u8, Tile, Gate)> = Vec::new();
         let mut next = 0;
         while let Some(&kind) = queue.get(next) {
             let Some(Reverse((p, i))) = g.heap.pop() else {
@@ -903,7 +953,7 @@ impl<'a> Run<'a> {
                     .ok_or(PlanError::NoRoom("fill slot"))?;
                 g.set_mark(t, Mark::Taken);
                 let access = g.parent(t).ok_or(PlanError::NoRoom("fill access"))?;
-                placed.push((t, level, access));
+                placed.push((t, level, access, Gate::of(kind, t, &self.board.roles)));
                 next += 1;
             } else if road_ok {
                 g.set_mark(t, Mark::Grown);
@@ -912,17 +962,32 @@ impl<'a> Run<'a> {
                 g.set_mark(t, Mark::Taken);
             }
         }
-        for (t, level) in g.kept_roads(&placed) {
-            if !self.board.place_at_level(StructureType::Road, t, level) {
+        for (t, from) in g.kept_roads(&placed) {
+            let Some((first, gate)) = Gate::ALL
+                .into_iter()
+                .filter_map(|g| from.get(g.index()).map(|&l| (l, g)))
+                .min()
+            else {
+                continue;
+            };
+            // A road planned before the fill is only told what it serves now.
+            if !self.board.has_road(t) && !self.board.place_road(t, first, gate) {
                 return Err(PlanError::NoRoom("fill road"));
+            }
+            for g in Gate::ALL {
+                if let Some(&l) = from.get(g.index())
+                    && l != u8::MAX
+                {
+                    self.board.lower_road(t, l, g);
+                }
             }
         }
         Ok(())
     }
 
-    /// Phase 7: the lab stamp nearest the hub (counting [`EXPOSED_PENALTY`] per lab in reach of
+    /// Phase 7: the lab stamp nearest the hub (counting [`Params::exposed_penalty`] per lab in reach of
     /// the exits), with a road to it.
-    fn labs(&mut self, s: &mut Scratch) -> Result<(), PlanError> {
+    fn labs(&mut self, input: &PlanInput<'_>, s: &mut Scratch) -> Result<(), PlanError> {
         let hub = self.core()?.hub;
         self.board.cost_grid(&mut s.grid, fatigue());
         s.field.compute(
@@ -933,7 +998,7 @@ impl<'a> Run<'a> {
             },
             &mut s.dial,
         );
-        let exposed = exposed(self.input);
+        let exposed = exposed(input);
         let mut candidates: Vec<(u16, usize, bool)> = Vec::new();
         for o in tiles() {
             for mirror in [false, true] {
@@ -958,7 +1023,8 @@ impl<'a> Run<'a> {
                         .iter()
                         .filter(|l| exposed.get(l.index()).copied().unwrap_or(false))
                         .count() as u16;
-                    let key = d.saturating_add(EXPOSED_PENALTY.saturating_mul(open_to_exits));
+                    let key =
+                        d.saturating_add(self.params.exposed_penalty.saturating_mul(open_to_exits));
                     candidates.push((key, o.index(), mirror));
                 }
             }
@@ -994,32 +1060,41 @@ impl<'a> Run<'a> {
             }
             for &r in &roads {
                 if self.board.has_road(r) {
-                    self.board.lower_road(r, level);
-                } else if !self.board.place_at_level(StructureType::Road, r, level) {
+                    self.board.lower_road(r, level, Gate::Late);
+                } else if !self.board.place_road(r, level, Gate::Late) {
                     return Err(PlanError::NoRoom("lab road"));
                 }
             }
-            roads::road(&mut self.board, hub, entry, 0, level, s)?;
+            roads::road(&mut self.board, hub, entry, 0, level, Gate::Late, s)?;
             return Ok(());
         }
         Err(PlanError::NoRoom("labs"))
     }
 
     /// Phase 8: the minimum cut, its line from the first level ramparts are allowed.
-    fn ramparts(&mut self, s: &mut Scratch) -> Result<(), PlanError> {
+    fn ramparts(&mut self, input: &PlanInput<'_>, s: &mut Scratch) -> Result<(), PlanError> {
         let protect = defence::protected_tiles(&self.board);
-        let plan = defence::plan(self.input, &protect, s)?;
+        let plan = defence::plan(input, &protect, s)?;
         let level =
             earliest_level(StructureType::Rampart, 0).ok_or(PlanError::NoRoom("rampart level"))?;
-        defence::apply(&mut self.board, self.input, &plan, level)?;
+        defence::apply(&mut self.board, input, &plan, level)?;
         Ok(())
     }
 }
 
-/// Every step at once.
+/// Every step at once, with the official MMO's tunables.
 pub fn plan(input: &PlanInput<'_>, s: &mut Scratch) -> Result<Layout, PlanError> {
-    let mut run = Run::new(input);
-    while run.step(s)? == Step::More {}
+    plan_with(input, Params::default(), s)
+}
+
+/// Every step at once.
+pub fn plan_with(
+    input: &PlanInput<'_>,
+    params: Params,
+    s: &mut Scratch,
+) -> Result<Layout, PlanError> {
+    let mut run = Run::with(input, params);
+    while run.step(input, s)? == Step::More {}
     Ok(run.finish())
 }
 
@@ -1209,7 +1284,7 @@ mod tests {
         let mut s = Scratch::default();
         let mut run = Run::new(&input);
         while run.phase() != "fill" {
-            assert_eq!(run.step(&mut s), Ok(Step::More));
+            assert_eq!(run.step(&input, &mut s), Ok(Step::More));
         }
         let spawn = run
             .board
@@ -1224,7 +1299,10 @@ mod tests {
             .filter(|&n| run.board.walkable(n))
             .collect();
         run.board.roles.mining.extend(free);
-        assert_eq!(run.step(&mut s), Err(PlanError::NoRoom("spawn exit")));
+        assert_eq!(
+            run.step(&input, &mut s),
+            Err(PlanError::NoRoom("spawn exit"))
+        );
         assert!(run.exempt.is_empty());
     }
 

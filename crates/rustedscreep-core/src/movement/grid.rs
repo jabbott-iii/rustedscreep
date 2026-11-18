@@ -21,6 +21,7 @@ pub const BLOCKED: u8 = u8::MAX;
 
 /// A room's terrain in tile order (column-major), as the raw masks (`Terrain::Wall as u8`,
 /// `Terrain::Swamp as u8`; V86, V156).
+#[derive(Clone)]
 pub struct TerrainGrid {
     mask: Box<[u8; ROOM_AREA]>,
 }

@@ -21,9 +21,11 @@
 //!   buffers a run reuses.
 
 pub mod board;
+pub mod build;
 pub mod bunker;
 pub mod defence;
 pub mod flood;
+pub mod job;
 pub mod layout;
 pub mod mincut;
 pub mod roads;

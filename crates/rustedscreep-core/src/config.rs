@@ -21,8 +21,8 @@ pub mod overrides;
 use core::fmt;
 
 use rustedscreep_consts::{
-    CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, LINK_CAPACITY, MAX_CREEP_SIZE,
-    MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP,
+    CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, LINK_CAPACITY, MAX_CONSTRUCTION_SITES,
+    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP,
 };
 
 /// How the loader recovers after a trap or an aborted tick (ADR-003).
@@ -412,7 +412,9 @@ pub struct OpeningConfig {
     /// stood still this long while it had workers is reported and planned again. Unit: ticks.
     pub stall_ticks: u32,
     /// Places extension sites as the level allows (ADR-020's interim pattern) in the Optional
-    /// tier. Off, the opening builds only sites placed by hand.
+    /// tier, in a room the interim placement serves (`PlannerConfig::enabled` off, or a room with
+    /// no valid plan). A room with a ready plan places its extensions from the plan whatever this
+    /// says (P4.3, ADR-026). Off, such a room builds only sites placed by hand.
     pub place_extensions: bool,
     /// The worker solver (P3.6, `economy::sizing::worker_plan`) takes the fewest workers among the
     /// bodies whose value (energy put to use over a creep life, net of their bodies) is within this
@@ -595,6 +597,66 @@ pub const UPGRADING_MMO: UpgradingConfig = UpgradingConfig {
     crew_grace_ticks: MAX_CREEP_SIZE * CREEP_SPAWN_TIME,
 };
 
+/// The base planner (ROADMAP P4.3, ADR-007, ADR-026): each owned room with a spawn is planned once a
+/// global by `planner::flood` (Optional, a phase a step) and its sites are placed from the plan.
+/// `docs/TUNING.md` gives each one's rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannerConfig {
+    /// Plans each owned room with a spawn and places its sites from the plan
+    /// (`planner::build`): the plan's spawns, extensions and roads, and the containers and links
+    /// `economy::mining` asks for, on the plan's tiles. Off, the interim placement of ADR-020 and
+    /// ADR-023 to ADR-025 runs as before; on, it waits for the room's plan and runs only for a room
+    /// that has none.
+    pub enabled: bool,
+    /// Destroys an own structure that stands off the plan where a planned structure due at the
+    /// room's level and placed by the bot needs its tile, or that cuts one off from the plan's
+    /// first spawn (ADR-026): one at a time per room, never a spawn, never with a hostile creep in
+    /// the room. Off, such a planned structure waits.
+    pub replace: bool,
+    /// Places the storage and the hub link (nothing uses them before P5 and P6; the user's choice,
+    /// 2026-11-18). Like every gate here, off it also leaves out the plan's roads that serve only
+    /// what it gates (`planner::layout::RoadNeed`).
+    pub storage: bool,
+    /// Places the towers (nothing fills or fires them before P7).
+    pub towers: bool,
+    /// Places the ramparts (when ramparts are built is P7's, ADR-007).
+    pub ramparts: bool,
+    /// Places the terminal, the extractor and its container, the labs, the factory, the power spawn,
+    /// the nuker and the observer (nothing uses them before P9).
+    pub late: bool,
+    /// The most own construction sites a room may hold before the placement waits: one site a
+    /// tick goes out, first the economy's containers and links on the plan's tiles (ADR-023 to
+    /// ADR-025's timing), then the plan's items by type (spawns, extensions, ... roads). Unit:
+    /// sites.
+    pub max_sites: u32,
+    /// How long a room whose placement found nothing to do waits before it looks again when
+    /// nothing it watches changed (the level, the room's structures, sites and containers, the
+    /// number of footprints in movement's last scan of it). It also bounds three holds: the
+    /// room's destroys after an `ERR_BUSY`, a type refused with `ERR_RCL_NOT_ENOUGH` (or until
+    /// the level changes), and a destroy's replacement that never gets its site. Unit: ticks.
+    pub verify_ticks: u32,
+    /// The distance-transform value (over open, not-kept-clear ground) a hub needs in a fresh room
+    /// (`planner::flood`). Unit: tiles (Chebyshev).
+    pub hub_clearance: u8,
+    /// The extra steps the fill counts to a slot within ranged reach of ground no rampart can close
+    /// off (`planner::flood`). Unit: steps along the road network.
+    pub exposed_penalty: u8,
+}
+
+/// Planner values for the official MMO.
+pub const PLANNER_MMO: PlannerConfig = PlannerConfig {
+    enabled: true,
+    replace: true,
+    storage: false,
+    towers: false,
+    ramparts: false,
+    late: false,
+    max_sites: 10,
+    verify_ticks: 500,
+    hub_clearance: 3,
+    exposed_penalty: 8,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -613,6 +675,7 @@ pub struct Config {
     pub repair: RepairConfig,
     pub hauling: HaulingConfig,
     pub upgrading: UpgradingConfig,
+    pub planner: PlannerConfig,
 }
 
 /// A server profile: a name and its values.
@@ -640,6 +703,7 @@ pub const MMO: Profile = Profile {
         repair: REPAIR_MMO,
         hauling: HAULING_MMO,
         upgrading: UPGRADING_MMO,
+        planner: PLANNER_MMO,
     },
 };
 
@@ -800,14 +864,15 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 83;
+pub const FIELD_COUNT: usize = 93;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
 /// also depends on another field, [`RULES`] states it.
 ///
 /// Uses: rustedscreep_consts::{CPU_BUCKET_MAX (10000), extra::MEMORY_SEGMENT_COUNT (100),
-/// MEMORY_SEGMENT_ACTIVE_LIMIT (10), extra::MEMORY_SEGMENT_SAVE_LIMIT (10), LINK_CAPACITY (800)}
+/// MEMORY_SEGMENT_ACTIVE_LIMIT (10), extra::MEMORY_SEGMENT_SAVE_LIMIT (10), LINK_CAPACITY (800),
+/// MAX_CONSTRUCTION_SITES (100)}
 /// for the bounds named after them; the config tests check each one against its constant.
 pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(loader, "LoaderConfig", boot_bucket_min, 0, 10_000, false),
@@ -1059,6 +1124,23 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         CREEP_LIFE_TIME,
         true
     ),
+    flag!(planner, "PlannerConfig", enabled, true),
+    flag!(planner, "PlannerConfig", replace, true),
+    flag!(planner, "PlannerConfig", storage, true),
+    flag!(planner, "PlannerConfig", towers, true),
+    flag!(planner, "PlannerConfig", ramparts, true),
+    flag!(planner, "PlannerConfig", late, true),
+    number!(
+        planner,
+        "PlannerConfig",
+        max_sites,
+        1,
+        MAX_CONSTRUCTION_SITES,
+        true
+    ),
+    number!(planner, "PlannerConfig", verify_ticks, 10, 10_000, true),
+    number!(planner, "PlannerConfig", hub_clearance, 2, 5, false),
+    number!(planner, "PlannerConfig", exposed_penalty, 0, 50, false),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -1262,6 +1344,7 @@ mod tests {
             repair: _,
             hauling: _,
             upgrading: _,
+            planner: _,
         } = MMO.config;
         let SpawnConfig { hold_ticks: _ } = SPAWN_MMO;
         let OpeningConfig {
@@ -1305,7 +1388,19 @@ mod tests {
             worker_repeats: _,
             crew_grace_ticks: _,
         } = UPGRADING_MMO;
-        let expected: [(&str, &[&str]); 14] = [
+        let PlannerConfig {
+            enabled: _,
+            replace: _,
+            storage: _,
+            towers: _,
+            ramparts: _,
+            late: _,
+            max_sites: _,
+            verify_ticks: _,
+            hub_clearance: _,
+            exposed_penalty: _,
+        } = PLANNER_MMO;
+        let expected: [(&str, &[&str]); 15] = [
             (
                 "loader",
                 &[
@@ -1432,6 +1527,21 @@ mod tests {
                     "crew_grace_ticks",
                 ],
             ),
+            (
+                "planner",
+                &[
+                    "enabled",
+                    "replace",
+                    "storage",
+                    "towers",
+                    "ramparts",
+                    "late",
+                    "max_sites",
+                    "verify_ticks",
+                    "hub_clearance",
+                    "exposed_penalty",
+                ],
+            ),
         ];
         let mut total = 0;
         for (group, names) in expected {
@@ -1503,6 +1613,8 @@ mod tests {
         // Above half a link, a send needs a sender and a receiver that are both nearly at the end
         // of their store at once (the native scenario stalls at `LINK_CAPACITY`).
         assert_eq!(range("links.send_min"), (1, LINK_CAPACITY / 2));
+        // A room can hold no more sites than the player's whole limit (V200).
+        assert_eq!(range("planner.max_sites"), (1, MAX_CONSTRUCTION_SITES));
         // Every link the top level allows but the controller link.
         assert_eq!(
             range("links.source_links"),

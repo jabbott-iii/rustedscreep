@@ -23,11 +23,13 @@
 // container's store: engine-shaped here, V184, V196, V199) but stays inert: no creep has a bot worker name, and the
 // room reports no energyAvailable or energyCapacityAvailable (read as 0, as before P2.4), so its plan has no worker
 // body and wants no worker: no spawn request, no worker intent, no watchdog line. The find counts below include its
-// finds; the find with a filter (containers) is its own and is checked apart from movement's scans. Its extension
-// placement (ADR-020: RCL2 allows 5, the room has one site) calls `room.createConstructionSite` from the second
-// loop; the harness records the call, returns OK and places nothing, so the bot gives up on each tile after
-// APPEAR_TICKS (10) and picks the next, LOST_MAX (3) times, then makes no more calls for the global: three calls,
-// each on a legal tile (V200 and the placement rules), and `rustedscreep.opening()` shows them never seen.
+// finds; the find with a filter (containers) is its own and is checked apart from movement's scans. Its placement
+// (since P4.3 from the room's base plan, built in the Optional tier on the same loops; the plan's first due items are
+// its extensions: RCL2 allows 5, the room has one site) calls `room.createConstructionSite` from the second loop;
+// the harness records the call, returns OK and places nothing, so the bot gives up on each tile after APPEAR_TICKS
+// (10) and picks the next, LOST_MAX (3) times, then makes no more calls for the global: three calls, each on a legal
+// tile (V200, and ADR-020's stricter rules, which the plan's picks here also keep), and `rustedscreep.opening()`
+// shows them never seen. The plan's look asks movement for no early rescan here (no site appears or goes).
 // npm run check runs it (row 16); standalone: node js/tools/move-sim.mjs [dir].
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';

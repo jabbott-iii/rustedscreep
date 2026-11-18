@@ -925,7 +925,11 @@ mod tests {
             mineral,
             spawn: None,
         };
-        let mut layout = Layout { items, roles };
+        let mut layout = Layout {
+            items,
+            roles,
+            needs: Vec::new(),
+        };
         layout.sort();
         validate(&input, &layout).problems
     }

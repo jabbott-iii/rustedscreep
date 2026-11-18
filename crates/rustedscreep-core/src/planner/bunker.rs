@@ -46,7 +46,7 @@ use rustedscreep_consts::{MOVE_COST_PLAIN, ROOM_AREA, StructureType};
 
 use super::board::Board;
 use super::defence;
-use super::layout::{Layout, MAX_LEVEL, PlanError, PlanInput};
+use super::layout::{Gate, Layout, MAX_LEVEL, PlanError, PlanInput};
 use super::roads;
 use super::rules::{allowed, blocks, earliest_level, edge_tiles};
 use super::score::AnchorCost;
@@ -414,7 +414,7 @@ const M_LINK: u8 = 8;
 const M_AWAY: u8 = 16;
 
 /// What each tile may take now, as `M_*` bits.
-fn masks(board: &Board<'_>, input: &PlanInput<'_>) -> Vec<u8> {
+fn masks(board: &Board, input: &PlanInput<'_>) -> Vec<u8> {
     let of = |t: Tile| {
         let mut m = 0;
         if board.can_place(StructureType::Extension, t) {
@@ -594,7 +594,7 @@ struct Change<'c> {
 /// and the spawn rule ([`Board::spawn_free`]) for every spawn planned and new but the `exempt` (a
 /// standing spawn that broke it before the plan began).
 fn reach_ok(
-    board: &Board<'_>,
+    board: &Board,
     input: &PlanInput<'_>,
     hub: Tile,
     change: &Change<'_>,
@@ -641,7 +641,7 @@ fn reach_ok(
 }
 
 /// Fills `s.field` with path costs to `hub` over the plan so far.
-fn measure(board: &Board<'_>, hub: Tile, s: &mut Scratch) {
+fn measure(board: &Board, hub: Tile, s: &mut Scratch) {
     board.cost_grid(&mut s.grid, fatigue());
     s.field.compute(
         &s.grid,
@@ -676,7 +676,7 @@ fn reach_of<'r>(roads: &'r [Tile], s: &'r Scratch) -> impl Fn(Tile) -> u32 + 'r 
 /// walkable ground stays one piece, `keeps_neighbours_connected`), and every obstacle beside it
 /// left with another reached walkable neighbour (for a spawn, one that is no creep's post); a new
 /// spawn keeps the spawn rule ([`Board::spawn_free`]).
-fn single_ok(board: &Board<'_>, kind: StructureType, t: Tile, reached: &[bool]) -> bool {
+fn single_ok(board: &Board, kind: StructureType, t: Tile, reached: &[bool]) -> bool {
     let r = |n: Tile| reached.get(n.index()).copied().unwrap_or(false) && board.walkable(n);
     board.can_place(kind, t)
         && !t
@@ -726,7 +726,7 @@ enum Phase {
 /// One planning run for a room, a phase per [`Run::step`].
 pub struct Run<'a> {
     input: &'a PlanInput<'a>,
-    board: Board<'a>,
+    board: Board,
     phase: Phase,
     hub: Option<Tile>,
     hub_link: Option<Tile>,
@@ -1207,8 +1207,8 @@ impl<'a> Run<'a> {
             let t = at(hub, o, c).ok_or(PlanError::NoRoom("core"))?;
             let level = road_level(t, &placed, first);
             if self.board.has_road(t) {
-                self.board.lower_road(t, level);
-            } else if !self.board.place_at_level(StructureType::Road, t, level) {
+                self.board.lower_road(t, level, Gate::Base);
+            } else if !self.board.place_road(t, level, Gate::Base) {
                 return Err(PlanError::NoRoom("core road"));
             }
         }
@@ -1228,10 +1228,10 @@ impl<'a> Run<'a> {
         let first = first_build();
         let mining = self.board.roles.mining.clone();
         for m in mining {
-            roads::road(&mut self.board, hub, m, 0, first, s)?;
+            roads::road(&mut self.board, hub, m, 0, first, Gate::Base, s)?;
         }
         if let Some(c) = self.board.roles.controller_container {
-            roads::road(&mut self.board, hub, c, 1, first, s)?;
+            roads::road(&mut self.board, hub, c, 1, first, Gate::Base, s)?;
         }
         if let Some(c) = self.board.roles.mineral_container {
             let level = self
@@ -1240,12 +1240,12 @@ impl<'a> Run<'a> {
                 .iter()
                 .find(|i| i.kind == StructureType::Extractor)
                 .map_or(first, |i| i.level);
-            roads::road(&mut self.board, hub, c, 0, level, s)?;
+            roads::road(&mut self.board, hub, c, 0, level, Gate::Late, s)?;
         }
         if self.lone
             && let Some(t) = self.input.spawn
         {
-            roads::road(&mut self.board, hub, t, 1, first, s)?;
+            roads::road(&mut self.board, hub, t, 1, first, Gate::Base, s)?;
         }
         Ok(())
     }
@@ -1417,8 +1417,8 @@ impl<'a> Run<'a> {
         for &t in roads {
             let level = road_level(t, &placed, first);
             if self.board.has_road(t) {
-                self.board.lower_road(t, level);
-            } else if !self.board.place_at_level(StructureType::Road, t, level) {
+                self.board.lower_road(t, level, Gate::Base);
+            } else if !self.board.place_road(t, level, Gate::Base) {
                 return Err(PlanError::NoRoom("stamp road"));
             }
         }

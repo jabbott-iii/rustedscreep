@@ -28,7 +28,7 @@ fn stepping_with_a_new_scratch_each_step_gives_the_same_plan() {
         let whole = flood::plan(input, &mut Scratch::default());
         let mut run = flood::Run::new(input);
         let stepped = loop {
-            match run.step(&mut Scratch::default()) {
+            match run.step(input, &mut Scratch::default()) {
                 Ok(Step::More) => continue,
                 Ok(Step::Done) => break Ok(run.finish()),
                 Err(e) => break Err(e),
@@ -58,7 +58,7 @@ fn step_costs() {
         loop {
             let phase = run.phase();
             let t0 = Instant::now();
-            let r = run.step(s);
+            let r = run.step(input, s);
             out.push((phase, t0.elapsed().as_secs_f64() * 1e3));
             if r != Ok(Step::More) {
                 break (out, r == Ok(Step::Done));

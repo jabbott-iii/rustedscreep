@@ -14,11 +14,12 @@
 //   space (V191, V192), pickup takes min(free space, pile) (V190), upgradeController spends min(WORK ×
 //   UPGRADE_CONTROLLER_POWER, energy) as progress and levels the controller up at CONTROLLER_LEVELS[level] while its
 //   timer is within CONTROLLER_DOWNGRADE_RESTORE of full (V188), an upgrade restores the timer (V189), and build adds
-//   min(WORK × BUILD_POWER, energy, what is left) to a site, which becomes an extension with
-//   EXTENSION_ENERGY_CAPACITY[level] when done (V185, V186);
+//   min(WORK × BUILD_POWER, energy, what is left) to a site, which becomes its structure when done: an extension
+//   with EXTENSION_ENERGY_CAPACITY[level], or a road, which `room.find(FIND_STRUCTURES)` lists (no owner, so not in
+//   Game.structures) and creeps walk on (V185, V186);
 // - `room.createConstructionSite` follows the game side's checks (V200: arguments, the owner, the RCL limit of
-//   CONTROLLER_STRUCTURES, the tile, MAX_CONSTRUCTION_SITES), and the site appears on the next tick with
-//   CONSTRUCTION_COST to build;
+//   CONTROLLER_STRUCTURES counting built ones, the tile, MAX_CONSTRUCTION_SITES), and the site appears on the next
+//   tick with CONSTRUCTION_COST to build;
 // - moves resolve like the engine (V51, V52, as in js/tools/move-sim.mjs: a move into a wall, an obstacle, an own
 //   obstacle site or onto a creep that stays fails, and takes the moves behind it with it), a mover gains (non-MOVE
 //   non-CARRY parts + loaded CARRY parts) × 2 fatigue on plain and every creep sheds 2 per MOVE part a tick (V54,
@@ -36,9 +37,12 @@
 // - `Memory.creeps` holds no worker's entry after any loop, though the harness wrote one on every OK (ADR-018);
 // - the controller reaches level 2, before the first worker could die of old age (the model has no aging, so the
 //   run is bounded by CREEP_LIFE_TIME after the first worker leaves its spawn);
-// - the extension placement (ADR-020) calls createConstructionSite once a loop from the loop after the level-up,
-//   CONTROLLER_STRUCTURES.extension[2] times, each on a legal tile (inside the margin of 3, not a wall, not taken,
-//   not next to the spawn or the source, not within 3 of the controller), and none at RCL1; the workers build them;
+// - the base planner (P4.3) plans the room in the Optional tier and logs it once (`rustedscreep planner: W1N1 planned
+//   in N steps: M items, anchor (25, 20), valid`); its placement calls createConstructionSite once a loop from the
+//   loop after the level-up: first CONTROLLER_STRUCTURES.extension[2] extensions (the plan's order puts them before
+//   its roads), each on a legal tile (not a wall or the room's edge, not taken, not next to the source, not within
+//   3 of the controller), then only roads, each on a tile that is not a wall or an obstacle, never with more than
+//   PLANNER_MMO.max_sites own sites in the room, and none at RCL1; the workers build them;
 // - the opening's log lines are exactly a recovery start on the first loop (one Game.notify) and its end on the
 //   loop OPENING_MMO.min_workers workers can work, with the tick count between them;
 // - `rustedscreep.opening()` on the first loop, the loop after the recovery, every loop while the pile or the
@@ -69,10 +73,10 @@ const MAX_WORKERS = 20;
 const PLAIN_COST = 2;
 /** economy::sizing::smallest_worker: one WORK, CARRY and MOVE part (P3.6), the first loop's recovery body. */
 const PATTERN = ['work', 'carry', 'move'];
-/** economy::placement: EDGE_MARGIN, SPAWN_CLEAR and CONTROLLER_CLEAR, the rules a picked tile must keep. */
-const EDGE_MARGIN = 3;
-const SPAWN_CLEAR = 2;
+/** economy::placement::CONTROLLER_CLEAR: the plan keeps the controller's upgrade range clear of structures. */
 const CONTROLLER_CLEAR = 3;
+/** PLANNER_MMO.max_sites (crates/rustedscreep-core/src/config.rs): the most own sites the plan's placement keeps. */
+const MAX_SITES = 10;
 const ROOM = 'W1N1';
 const T0 = 50000000;
 const SPAWN = { x: 25, y: 20 };
@@ -117,6 +121,8 @@ function makeWorld() {
     /** Own construction sites: { id, x, y, type, progress, total }; and built extensions: { id, x, y, energy }. */
     sites: [],
     extensions: [],
+    /** Built roads: { id, x, y } (walkable; P4.3's plan places them). */
+    roads: [],
     /** This tick's recorded intents: creep name → { work: [method, target id, amount], move: direction }. */
     intents: new Map(),
     /** This tick's accepted spawn orders and site creations. */
@@ -335,6 +341,7 @@ function sceneFor(state, offset) {
   const sites = state.sites.map((s) => ({
     id: s.id, my: true, owner: { username: 'bot' }, structureType: s.type, progress: s.progress, progressTotal: s.total, pos: pos(s.x, s.y),
   }));
+  const roads = state.roads.map((r) => ({ id: r.id, structureType: 'road', pos: pos(r.x, r.y), hits: C.ROAD_HITS, hitsMax: C.ROAD_HITS }));
   kinds.set(controller.id, 'controller');
   kinds.set(spawn.id, 'spawn');
   kinds.set(source.id, 'source');
@@ -342,9 +349,10 @@ function sceneFor(state, offset) {
   for (const p of piles) kinds.set(p.id, 'pile');
   for (const t of tombstones) kinds.set(t.id, 'tombstone');
   for (const s of sites) kinds.set(s.id, 'site');
+  for (const r of roads) kinds.set(r.id, 'road');
   const creeps = state.creeps.map((c) => creepObject(state, c, offset, objects));
   const lists = {
-    [C.FIND_SOURCES]: [source], [C.FIND_STRUCTURES]: [spawn, controller, ...extensions], [C.FIND_DROPPED_RESOURCES]: piles,
+    [C.FIND_SOURCES]: [source], [C.FIND_STRUCTURES]: [spawn, controller, ...extensions, ...roads], [C.FIND_DROPPED_RESOURCES]: piles,
     [C.FIND_TOMBSTONES]: tombstones, [C.FIND_MY_CONSTRUCTION_SITES]: sites, [C.FIND_CONSTRUCTION_SITES]: sites,
   };
   const room = {
@@ -353,18 +361,20 @@ function sceneFor(state, offset) {
     getTerrain: () => ({ getRawBuffer: () => RAW.slice() }),
     createConstructionSite(...args) {
       const [x, y, type] = args;
-      const call = { offset, args, result: null };
+      const call = { offset, args, result: null, open: state.sites.length + state.siteOrders.length };
       state.siteCalls.push(call);
       call.result = (() => {
         // V200, in its order (the room is the bot's and nobody reserves it).
         if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0 || x > 49 || y > 49) return C.ERR_INVALID_ARGS;
         if (!C.CONSTRUCTION_COST[type]) return C.ERR_INVALID_ARGS;
-        const have = [...state.extensions.map(() => 'extension'), ...state.sites.map((s) => s.type)].filter((t) => t === type).length;
+        const built = [...state.extensions.map(() => 'extension'), ...state.roads.map(() => 'road')];
+        const have = [...built, ...state.sites.map((s) => s.type)].filter((t) => t === type).length;
         if (have >= (C.CONTROLLER_STRUCTURES[type]?.[ctl.level] ?? 0)) return C.ERR_RCL_NOT_ENOUGH;
         const here = (o) => o.x === x && o.y === y;
         // checkConstructionSite: the edge, any site, an object of the type, the terrain; the model also refuses the
         // tile of an obstacle structure or the source.
-        if (x <= 0 || y <= 0 || x >= 49 || y >= 49 || state.sites.some(here) || isObstacle(state, x, y) || state.siteOrders.some(here)) {
+        const sameType = type === 'road' && state.roads.some(here);
+        if (x <= 0 || y <= 0 || x >= 49 || y >= 49 || state.sites.some(here) || isObstacle(state, x, y) || state.siteOrders.some(here) || sameType) {
           return C.ERR_INVALID_TARGET;
         }
         if (state.sites.length + state.siteOrders.length >= C.MAX_CONSTRUCTION_SITES) return C.ERR_FULL;
@@ -438,8 +448,11 @@ function advance(state, offset) {
       c.energy -= effect;
       if (s.progress >= s.total) {
         state.sites = state.sites.filter((x) => x !== s);
-        state.extensions.push({ id: id(state.nextId++), x: s.x, y: s.y, energy: 0 });
-        state.builtAt ??= offset;
+        if (s.type === 'road') state.roads.push({ id: id(state.nextId++), x: s.x, y: s.y });
+        else if (s.type === 'extension') {
+          state.extensions.push({ id: id(state.nextId++), x: s.x, y: s.y, energy: 0 });
+          state.builtAt ??= offset;
+        } else state.errors.push(`offset ${offset}: a ${s.type} site was built, which the model does not hold`);
       }
     } else if (method === 'pickup') {
       const p = state.piles.find((x) => x.id === target);
@@ -565,13 +578,11 @@ function place(state, offset) {
   state.placed = offset;
 }
 
-/** Why a picked extension tile breaks ADR-020's rules or the engine's, if it does. */
+/** Why a planned extension's tile breaks the plan's rules or the engine's, if it does. */
 function illegalTile(state, x, y) {
   const near = (o, r) => range(o, { x, y }) <= r;
-  const high = 49 - EDGE_MARGIN;
-  if (x < EDGE_MARGIN || y < EDGE_MARGIN || x > high || y > high) return 'within the edge margin';
+  if (x <= 0 || y <= 0 || x >= 49 || y >= 49) return 'on the room\'s edge';
   if (isWall(x, y)) return 'a wall';
-  if (near(state.spawn, SPAWN_CLEAR - 1)) return 'next to the spawn';
   if (near(state.source, 1)) return 'next to the source';
   if (near(state.controller, CONTROLLER_CLEAR)) return 'within 3 of the controller';
   return null;
@@ -668,16 +679,24 @@ export function openingSim(dir = join(ROOT, 'dist')) {
     problems.push(`after ${world.ticksRun} ticks: level ${state.controller.level} (progress ${state.controller.progress}), extensions ${state.extensions.length}, sites ${JSON.stringify(state.sites)}`);
   }
 
-  // ADR-020: none at RCL1; from the loop after the level-up one call a loop (each site is seen the next loop) until
-  // the room holds CONTROLLER_STRUCTURES.extension[2] extensions and sites, each OK on a legal tile.
+  // P4.3: none at RCL1; from the loop after the level-up one call a loop (each site is seen the next loop): first the
+  // CONTROLLER_STRUCTURES.extension[2] extensions, then only roads, each OK on a legal tile, never past MAX_SITES.
   const allowedSites = C.CONTROLLER_STRUCTURES.extension[2];
-  const siteOffsets = state.siteCalls.map((c) => c.offset);
+  const siteOffsets = state.siteCalls.map((c) => c.offset).slice(0, allowedSites);
   const wantSiteOffsets = state.levelAt === null ? [] : Array.from({ length: allowedSites }, (_, k) => state.levelAt + 1 + k);
-  if (JSON.stringify(siteOffsets) !== JSON.stringify(wantSiteOffsets)) problems.push(`createConstructionSite at offsets ${JSON.stringify(siteOffsets)}, expected ${JSON.stringify(wantSiteOffsets)}`);
-  for (const { offset, args, result } of state.siteCalls) {
+  if (JSON.stringify(siteOffsets) !== JSON.stringify(wantSiteOffsets)) problems.push(`the first createConstructionSite calls at offsets ${JSON.stringify(siteOffsets)}, expected ${JSON.stringify(wantSiteOffsets)}`);
+  state.siteCalls.forEach(({ offset, args, result, open }, i) => {
     const [x, y, type, ...rest] = args;
-    const why = result !== C.OK ? `returned ${result}` : rest.length || type !== 'extension' ? 'arguments' : illegalTile(state, x, y);
+    const want = i < allowedSites ? 'extension' : 'road';
+    const why = result !== C.OK ? `returned ${result}` : rest.length || type !== want ? `arguments (expected a ${want})` :
+      open >= MAX_SITES ? `with ${open} sites open` : type === 'extension' ? illegalTile(state, x, y) : null;
     if (why) problems.push(`offset ${offset}: createConstructionSite(${args.join(', ')}): ${why}`);
+  });
+  const roadCalls = state.siteCalls.filter((c) => c.args[2] === 'road').length;
+  if (!roadCalls) problems.push('the plan placed no road site');
+  const planned = world.logs.filter((l) => l.includes('rustedscreep planner:'));
+  if (planned.length !== 1 || !new RegExp(`rustedscreep planner: ${ROOM} planned in \\d+ steps: \\d+ items, anchor \\(${SPAWN.x}, ${SPAWN.y}\\), valid$`).test(planned[0])) {
+    problems.push(`planner lines ${JSON.stringify(planned)}, expected one plan for ${ROOM} anchored on the spawn`);
   }
 
   // The watchdog's lines: the recovery's start on the first loop and its end when MIN_WORKERS can work.
@@ -780,7 +799,7 @@ export function openingSim(dir = join(ROOT, 'dist')) {
     workers: state.creeps.length, spawned: oks.length, byMethod, pickups: pickups.length, withdraws: withdraws.length,
     pileTaken: state.taken.pile, pileDecayed: state.taken.pileDecayed, placed: state.placed, taking: taking.length,
     summaries: offsets.length,
-    sites: state.siteCalls.map((c) => `${c.offset}:(${c.args[0]},${c.args[1]})`), summary: results.at(-1),
+    sites: state.siteCalls.map((c) => `${c.offset}:${c.args[2]}(${c.args[0]},${c.args[1]})`), summary: results.at(-1),
   };
 }
 
@@ -789,7 +808,7 @@ if (isMain(import.meta.url)) {
     const r = openingSim(process.argv[2]);
     console.log(`opening-sim ok: ${r.ticks} ticks; first spawnCreep at offset ${r.firstSpawn}, recovery over at offset ${r.recoveredAt}, ` +
       `level 2 at offset ${r.levelAt}, first extension at offset ${r.builtAt}; ${r.spawned} workers spawned (${r.workers} at the end); ` +
-      `calls ${JSON.stringify(r.byMethod)}; extension sites ${r.sites.join(' ')}; pile and tombstone at offset ${r.placed}: ` +
+      `calls ${JSON.stringify(r.byMethod)}; sites ${r.sites.join(' ')}; pile and tombstone at offset ${r.placed}: ` +
       `${r.pickups} pickups (${r.pileTaken} taken, ${r.pileDecayed} decayed), ${r.withdraws} withdraws; ${r.summaries} summaries ` +
       `(${r.taking} while a worker takes) | ${r.summary}`);
   } catch (e) {

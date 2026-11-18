@@ -7,6 +7,7 @@ mod common;
 
 use rustedscreep_consts::{ROOM_AREA, StructureType};
 use rustedscreep_core::movement::Tile;
+use rustedscreep_core::planner::layout::Gate;
 use rustedscreep_core::planner::validate::Problem;
 use rustedscreep_core::planner::{
     Board, PlanInput, Scratch, defence, distance_transform, roads, sites, validate,
@@ -62,17 +63,17 @@ fn shared_steps_leave_only_the_full_planners_work() {
             .unwrap_or_else(|e| panic!("{}: {e:?}", room.name));
         let mining = board.roles.mining.clone();
         for m in mining {
-            roads::road(&mut board, hub, m, 0, 2, &mut s)
+            roads::road(&mut board, hub, m, 0, 2, Gate::Base, &mut s)
                 .unwrap_or_else(|e| panic!("{}: {e:?}", room.name));
         }
         let cc = board
             .roles
             .controller_container
             .expect("controller container");
-        roads::road(&mut board, hub, cc, 1, 2, &mut s)
+        roads::road(&mut board, hub, cc, 1, 2, Gate::Base, &mut s)
             .unwrap_or_else(|e| panic!("{}: {e:?}", room.name));
         if let Some(mc) = board.roles.mineral_container {
-            roads::road(&mut board, hub, mc, 0, 6, &mut s)
+            roads::road(&mut board, hub, mc, 0, 6, Gate::Late, &mut s)
                 .unwrap_or_else(|e| panic!("{}: {e:?}", room.name));
         }
         let protect = defence::protected_tiles(&board);

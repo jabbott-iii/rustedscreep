@@ -6,7 +6,7 @@
 use rustedscreep_consts::{ROOM_AREA, StructureType};
 
 use super::board::Board;
-use super::layout::PlanError;
+use super::layout::{Gate, PlanError};
 use super::scratch::{Scratch, fatigue};
 use crate::movement::{Aim, Goal, Query, Tile, range_estimate};
 
@@ -14,14 +14,16 @@ use crate::movement::{Aim, Goal, Query, Tile, range_estimate};
 const MAX_POPS: u32 = 8 * ROOM_AREA as u32;
 
 /// Plans a road from `from` to within `range` of `to`, every new tile at `level`, and a road it
-/// reuses that belongs from a later level moved to `level`, so the route is whole from `level`.
-/// Returns how many tiles were added.
+/// reuses that belongs from a later level moved to `level`, so the route is whole from `level`;
+/// every tile of it is noted as serving `gate` from `level` ([`Board::place_road`]). Returns how
+/// many tiles were added.
 pub fn road(
-    board: &mut Board<'_>,
+    board: &mut Board,
     from: Tile,
     to: Tile,
     range: u8,
     level: u8,
+    gate: Gate,
     s: &mut Scratch,
 ) -> Result<u32, PlanError> {
     board.cost_grid(&mut s.grid, fatigue());
@@ -40,10 +42,8 @@ pub fn road(
     let mut added = 0;
     for &t in s.path.iter().chain([from].iter()) {
         if board.has_road(t) {
-            board.lower_road(t, level);
-        } else if board.can_place(StructureType::Road, t)
-            && board.place_at_level(StructureType::Road, t, level)
-        {
+            board.lower_road(t, level, gate);
+        } else if board.can_place(StructureType::Road, t) && board.place_road(t, level, gate) {
             added += 1;
         }
     }

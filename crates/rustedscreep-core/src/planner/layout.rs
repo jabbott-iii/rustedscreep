@@ -50,12 +50,90 @@ pub struct Roles {
     pub mineral_container: Option<Tile>,
 }
 
+/// What the bot uses a planned structure for, by the planner's switch that places it
+/// (`PlannerConfig`, `planner::build::Gates`; the user's choice, 2026-11-18: only what the bot
+/// uses is built). A road serves the structures it was routed to, so it is needed only from the
+/// earliest level one of them is placed ([`RoadNeed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Gate {
+    /// Always built: spawns, extensions, the economy's containers and links, roads.
+    Base,
+    /// The storage and the hub link.
+    Storage,
+    Towers,
+    /// Ramparts and walls.
+    Ramparts,
+    /// The terminal, the extractor and the mineral container, labs, the factory, the power spawn,
+    /// the nuker and the observer.
+    Late,
+}
+
+/// How many [`Gate`]s there are.
+pub const GATES: usize = 5;
+
+impl Gate {
+    /// Every gate, in index order.
+    pub const ALL: [Self; GATES] = [
+        Self::Base,
+        Self::Storage,
+        Self::Towers,
+        Self::Ramparts,
+        Self::Late,
+    ];
+
+    /// The gate of the plan's `kind` on `tile` (a container or a link is the economy's but for the
+    /// mineral container and the hub link).
+    pub fn of(kind: StructureType, tile: Tile, roles: &Roles) -> Self {
+        match kind {
+            StructureType::Spawn | StructureType::Extension | StructureType::Road => Self::Base,
+            StructureType::Container if roles.mineral_container == Some(tile) => Self::Late,
+            StructureType::Container => Self::Base,
+            StructureType::Link if roles.hub_link == Some(tile) => Self::Storage,
+            StructureType::Link => Self::Base,
+            StructureType::Storage => Self::Storage,
+            StructureType::Tower => Self::Towers,
+            StructureType::Rampart | StructureType::Wall => Self::Ramparts,
+            _ => Self::Late,
+        }
+    }
+
+    /// Its index in [`RoadNeed::from`].
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Why a planned road is there: per [`Gate`] (by [`Gate::index`]), the earliest level a structure
+/// of that gate it serves belongs from, `u8::MAX` for none. The road's item level is the least of
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoadNeed {
+    pub tile: Tile,
+    pub from: [u8; GATES],
+}
+
+impl RoadNeed {
+    /// The level the road is needed from with the gates `on` says are placed, or `None` when it
+    /// serves only gates that are off.
+    pub fn level(&self, on: impl Fn(Gate) -> bool) -> Option<u8> {
+        Gate::ALL
+            .into_iter()
+            .filter(|&g| on(g))
+            .filter_map(|g| self.from.get(g.index()).copied())
+            .filter(|&l| l != u8::MAX)
+            .min()
+    }
+}
+
 /// A room's plan. `items` are sorted by [`Item::level`], then [`kind_rank`], then tile index, so
 /// two equal plans compare equal.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Layout {
     pub items: Vec<Item>,
     pub roles: Roles,
+    /// What each planned road serves, sorted by tile index. A road missing here serves the base
+    /// ([`Gate::Base`]) from its item's level.
+    pub needs: Vec<RoadNeed>,
 }
 
 impl Layout {
@@ -76,6 +154,14 @@ impl Layout {
     /// The items of `kind`, in order.
     pub fn of(&self, kind: StructureType) -> impl Iterator<Item = &Item> + '_ {
         self.items.iter().filter(move |i| i.kind == kind)
+    }
+
+    /// What the road planned on `t` serves, if the planner said ([`Layout::needs`]).
+    pub fn road_need(&self, t: Tile) -> Option<&RoadNeed> {
+        self.needs
+            .binary_search_by_key(&t.index(), |n| n.tile.index())
+            .ok()
+            .and_then(|i| self.needs.get(i))
     }
 }
 
