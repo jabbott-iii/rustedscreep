@@ -133,7 +133,7 @@ Modules:
 
 ## P4 Base planner (SPEC §3.3): ADR-007 decided here
 Modules:
-- [ ] Terrain corpus fixtures (≥ 30 rooms exported from MMO maps) in `crates/rustedscreep-core/tests/fixtures/`.
+- [x] Terrain corpus fixtures (≥ 30 rooms exported from MMO maps) in `crates/rustedscreep-core/tests/fixtures/`.
 - [ ] Candidates: a stamp/bunker planner, and distance transform with min-cut ramparts. Benchmark both, then decide ADR-007.
 - [ ] Placement of extensions, towers, labs, storage, terminal, links, roads, and ramparts. Incremental site placement per RCL, cached, with periodic verification. It keeps or replaces the interim extensions P2 placed (ADR-020) and takes over from `opening.place_extensions`.
 

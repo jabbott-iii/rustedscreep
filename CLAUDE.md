@@ -92,6 +92,7 @@ The live server's constants are the ground truth for that server. At init, the b
 | Opening in the sandbox (the plain build from zero creeps at RCL1 to level 2 and a first extension: the recovery and its log lines, the worker calls and their targets, the `Memory` entries, the extension sites of ADR-020, a pile and a tombstone, `rustedscreep.opening()`) | `node js/tools/opening-sim.mjs` |
 | Links in the sandbox (the plain build at RCL5 with a source link and a controller link: the snapshot's link reads, the miner's transfers, the sends with their targets, amounts and cooldowns, the worker's withdraws, the summary's link fragments, a worn container under repair that no worker walks to, P3.5) | `node js/tools/link-sim.mjs` |
 | Regenerate the engine-constants fixture from an engine's `lib/constants.js` | `node js/tools/consts-fixture.mjs <path> <version>` |
+| Write the terrain corpus fixtures from saved room-terrain and room-objects responses (local files only; the fixtures' README lists the requests) | `node js/tools/rooms-fixture.mjs <dir> <shard> <YYYY-MM-DD>` |
 | Tool tests (Node) / sizes and upload budget | `npm run test` / `npm run size` |
 | Full gate (same as `/check`) | `npm run check` |
 | Stage the MMO deploy folder for the GitHub link (ask first; the user pushes) | `npm run stage` (`-- --out <dir>` for a dry run, `-- --features trap-test` for the gate's recovery test, `-- --features profiler` for the live CPU measurements) |
