@@ -6466,6 +6466,7 @@ mod plan_path {
                     anchors: vec![anchor()],
                     standing: Vec::new(),
                     own: vec![(Spawn, anchor())],
+                    prior: None,
                 },
                 anchor: anchor(),
                 ready_at: 0,

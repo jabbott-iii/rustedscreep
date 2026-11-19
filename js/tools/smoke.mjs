@@ -278,6 +278,8 @@ const SNAPSHOT_EXPECTED = {
 
 /** PERSIST_MMO.config_segment (crates/rustedscreep-core/src/config.rs): the runtime config overrides. */
 export const CONFIG_SEGMENT = 97;
+/** PERSIST_MMO.planner_segment (crates/rustedscreep-core/src/config.rs): the planner's record (ADR-027). */
+export const PLANNER_SEGMENT = 96;
 
 /**
  * What `rustedscreep.scheduler()` must report after the loops at these offsets. The fake world has CPU limit
@@ -285,8 +287,8 @@ export const CONFIG_SEGMENT = 97;
  * ceiling is 500 × (100 − 10) / 100 = 450 and the Optional cap 20 + (10000 − 9000) / 100 = 30. The first loop
  * of a global runs no Optional work (warm-up); its jobs are movement's first read of the owned room (P2.1), the
  * static miners' job for that room (P3.1: `mining`, Critical), the opening's two jobs for that room (P2.4:
- * `opening`, Critical, and `opening work`, Standard) and the persistence
- * load's one step, the config record's look-up (P1.10), each sampling the clock twice, and the two Optional jobs,
+ * `opening`, Critical, and `opening work`, Standard), each sampling the clock twice, and the persistence
+ * load's two steps, the config record's and the planner record's look-ups (P1.10, ADR-027), and the two Optional jobs,
  * the constants self-check (P1.11) and the opening's extension placement (ADR-020), are tier-off skips. Both run
  * from the second loop (see CONSTS_DONE and PLACEMENT_SAMPLES).
  */
@@ -298,9 +300,11 @@ const SCHEDULER_EXPECTED = {
     // Harvester is (P2.1, a Critical job), the static miners' job for W1N1 (P3.1, Critical: was samples 8,
     // units 4 before it), the haulers' Critical job for W1N1 (P3.3: was samples 10, units 5 before it; its
     // Standard job has no unit while no hauler stores), the opening's two jobs for W1N1 (P2.4, Critical and Standard: was samples 4,
-    // units 2 before them), and the persistence load job's one step, the config segment's look-up (P1.10).
-    // Tier-off skips 2 (was 1 before ADR-020): the constants self-check and the site placement.
-    'samples 12 (bad 0), units 6, budget stops 0, tier-off skips 2, out of order 0, faults 0',
+    // units 2 before them), and the persistence load job's two steps in one run, the config segment's
+    // look-up (P1.10) and the planner record segment's (ADR-027: was samples 12, units 6 before it, one more
+    // step and one more clock sample). Tier-off skips 2 (was 1 before ADR-020): the constants self-check and
+    // the site placement.
+    'samples 13 (bad 0), units 7, budget stops 0, tier-off skips 2, out of order 0, faults 0',
     'faults since boot 0 (this window 0)',
   ],
   4: ['(loop 3 of this global)', 'optional on (cap 30.0)', ' | clock now '],
@@ -445,10 +449,11 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [], wasmForm = 'bin
   // Readings inside loop once booted (the loader also reads the clock on the boot ticks and the first
   // loop): none without the profiler, six with it (crates/rustedscreep-wasm/src/profiler.rs), so the
   // feature compiles out and its documented count holds. The segment manager
-  // (crates/rustedscreep-wasm/src/persist.rs) wants the config record (segment CONFIG_SEGMENT, P1.10) from
-  // the global's start: the first loop (offset 1) looks it up (one RawMemory.segments read, inside the
-  // load job's one step) and activates it; the next loop reads it (one more read and the job's two clock
-  // samples; a segment never written loads as '', no overrides) and clears the set. After that no loop
+  // (crates/rustedscreep-wasm/src/persist.rs) wants the config record (segment CONFIG_SEGMENT, P1.10) and the
+  // planner's record (segment PLANNER_SEGMENT, ADR-027) from the global's start: the first loop (offset 1)
+  // looks them up (one RawMemory.segments read, inside the load job's steps) and activates them; the next
+  // loop reads them (one more read; a segment never written loads as '': no overrides, no record, so the
+  // planner plans from what stands) and clears the set. After that no loop
   // touches the segments. The constants self-check runs from offset 2 (the first loop that allows Optional work)
   // until it is done, with a sample before its job and the slicer's samples (one per batch: about 30 for the whole
   // check, how many depends on the measured cost per step; js/tools/consts-sim.mjs checks that every reading is a
@@ -474,20 +479,22 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [], wasmForm = 'bin
     throw new Error(`createConstructionSite calls ${JSON.stringify(sites)}, expected one ${JSON.stringify(SITE_CALL)} at offset ${constsLast} or ${constsLast + 1}`);
   }
   world.loopCalls.forEach((c, offset) => {
-    const wantUsed = perLoop + (offset >= 2 ? PLACEMENT_SAMPLES : 0) + (offset === 2 ? 2 : 0);
+    // The second loop's persistence load: its two steps in one run, three clock samples (two before ADR-027).
+    const wantUsed = perLoop + (offset >= 2 ? PLACEMENT_SAMPLES : 0) + (offset === 2 ? 3 : 0);
     const checking = offset >= 2 && offset <= constsLast;
     if (checking && (c.getUsed < wantUsed || c.getUsed > wantUsed + 64)) throw new Error(`offset ${offset}: ${c.getUsed} getUsed calls in loop, expected ${wantUsed} to ${wantUsed + 64} with the constants self-check`);
     if (offset >= 2 && !checking && c.getUsed !== wantUsed) throw new Error(`offset ${offset}: ${c.getUsed} getUsed calls in loop, expected ${wantUsed}`);
     const wantReads = offset === 1 || offset === 2 ? 1 : 0;
     if (c.segments !== wantReads) throw new Error(`offset ${offset}: the loop read RawMemory.segments ${c.segments} time(s), expected ${wantReads}`);
-    const wantActive = JSON.stringify({ 1: [[CONFIG_SEGMENT]], 2: [[]] }[offset] ?? []);
+    const wantActive = JSON.stringify({ 1: [[PLANNER_SEGMENT, CONFIG_SEGMENT]], 2: [[]] }[offset] ?? []);
     if (JSON.stringify(c.setActive) !== wantActive) throw new Error(`offset ${offset}: setActiveSegments calls ${JSON.stringify(c.setActive)}, expected ${wantActive}`);
   });
-  // No window closes in 9 ticks and no override is set, so no build writes a segment here. The only save
-  // is the driver's re-save of the config segment the second loop loaded (every key present is saved,
-  // V119), with the value it loaded: '' for a segment never written.
-  const wantSaves = JSON.stringify([{ offset: 2, keys: [String(CONFIG_SEGMENT)] }]);
-  if (JSON.stringify(world.segmentSaves) !== wantSaves || world.segments[CONFIG_SEGMENT] !== '' || world.segmentErrors.length) {
+  // No window closes in 9 ticks, no override is set and no plan is made, so no build writes a segment here.
+  // The only save is the driver's re-save of the two segments the second loop loaded (every key present is
+  // saved, V119), with the values it loaded: '' for segments never written.
+  const wantSaves = JSON.stringify([{ offset: 2, keys: [String(PLANNER_SEGMENT), String(CONFIG_SEGMENT)] }]);
+  const blank = world.segments[CONFIG_SEGMENT] === '' && world.segments[PLANNER_SEGMENT] === '';
+  if (JSON.stringify(world.segmentSaves) !== wantSaves || !blank || world.segmentErrors.length) {
     throw new Error(`segments: saves ${JSON.stringify(world.segmentSaves)} (expected ${wantSaves}), errors ${world.segmentErrors.join(' / ')}`);
   }
   if (world.logs.some((l) => l.startsWith('rustedscreep fault'))) throw new Error('a fault was logged with no job running');

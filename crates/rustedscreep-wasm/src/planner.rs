@@ -13,7 +13,8 @@
 //!
 //! JS calls of its own: two `Game.cpu.getUsed()` per step for the timings: nine steps per anchor
 //! tried (eight phases and the validation), one anchor in a room with one spawn and no spawn site,
-//! and at most `allowed(Spawn, 8)` (3) after a reset at RCL7 or later: all of them when the room
+//! and after a reset at RCL7 or later one when the record's anchor (ADR-027) gives a plan that
+//! holds every standing spawn, else at most `allowed(Spawn, 8)` (3): all of them when the room
 //! holds something off its plan, usually one when it holds nothing off it (the room's first spawn
 //! is usually tried first, `planner::job`). Everything else comes from the snapshot and movement's
 //! caches.
@@ -23,8 +24,9 @@ use std::fmt::Write as _;
 use rustedscreep_core::config::PlannerConfig;
 use rustedscreep_core::economy::placement::{Placement, PlanView};
 use rustedscreep_core::movement::Movement;
+use rustedscreep_core::persist::{Frame, LoadError};
 use rustedscreep_core::planner::flood::Params;
-use rustedscreep_core::planner::job::{Planner, Status};
+use rustedscreep_core::planner::job::{Loaded, Planner, Status};
 use rustedscreep_core::scheduler::{Clock, Job, JobState, TickCpu, Tier};
 use rustedscreep_core::snapshot::Snapshot;
 use screeps::RoomName;
@@ -60,6 +62,9 @@ impl PlannerGlue {
     pub fn begin(&mut self, snapshot: &Snapshot, movement: &Movement, cfg: &PlannerConfig) {
         if cfg.enabled {
             self.core.begin(snapshot, movement);
+        } else {
+            // The record drops lost rooms even while nothing is planned (ADR-027).
+            self.core.forget_unowned(snapshot);
         }
     }
 
@@ -109,12 +114,17 @@ impl PlannerGlue {
             match status {
                 Status::Ready(plan) if !self.logged.contains(&room) => {
                     log::info!(
-                        "rustedscreep planner: {room} planned in {} steps: {} items, anchor ({}, {}), \
+                        "rustedscreep planner: {room} planned in {} steps: {} items, anchor ({}, {}){}, \
                          valid",
                         plan.steps,
                         plan.layout.items.len(),
                         plan.anchor.x(),
-                        plan.anchor.y()
+                        plan.anchor.y(),
+                        if plan.facts.prior == Some(plan.anchor) {
+                            " from the record"
+                        } else {
+                            ""
+                        }
                     );
                     self.logged.push(room);
                 }
@@ -129,6 +139,43 @@ impl PlannerGlue {
                 _ => {}
             }
         }
+    }
+
+    /// The planner record's load finished (ADR-027): one log line, then the planner may plan.
+    /// Returns whether the segment held a usable record or none at all.
+    pub fn loaded(&mut self, segment: u8, frame: Result<Frame<'_>, LoadError>) -> bool {
+        let ok = self.core.loaded(frame);
+        match self.core.load_state() {
+            Some(Loaded::Record { rooms, written }) => log::info!(
+                "rustedscreep planner: record loaded from segment {segment} ({rooms} rooms, \
+                 written at {written})"
+            ),
+            Some(Loaded::Refused(why)) if self.core.writes_record() => log::warn!(
+                "rustedscreep planner: the record in segment {segment} was not used ({why}); \
+                 plans come from what stands and the record is written again"
+            ),
+            Some(Loaded::Refused(why)) => log::warn!(
+                "rustedscreep planner: the record in segment {segment} was not read ({why}); \
+                 plans come from what stands and the segment is left for the next global"
+            ),
+            _ => {}
+        }
+        ok
+    }
+
+    /// No segment keeps the planner's record: plan from what stands.
+    pub fn no_record(&mut self) {
+        self.core.no_record();
+    }
+
+    /// Whether the record changed since the last call (its segment is marked dirty then).
+    pub fn take_dirty(&mut self) -> bool {
+        self.core.take_dirty()
+    }
+
+    /// The record's payload, for the persistence writes.
+    pub fn payload(&self, out: &mut Vec<u8>) {
+        self.core.payload(out);
     }
 
     /// What `room`'s placement works from.
@@ -161,6 +208,33 @@ impl PlannerGlue {
             " (replace {}, storage {}, towers {}, ramparts {}, late {}, max sites {});",
             cfg.replace, cfg.storage, cfg.towers, cfg.ramparts, cfg.late, cfg.max_sites
         );
+        match self.core.load_state() {
+            None => text.push_str(" record: loading, no room planned yet;"),
+            Some(Loaded::Record { rooms, written }) => {
+                let _ = write!(
+                    text,
+                    " record: loaded ({rooms} rooms, written at {written}), {} now;",
+                    self.core.record().map_or(0, |r| r.entries().len())
+                );
+            }
+            Some(Loaded::Empty) => {
+                let _ = write!(
+                    text,
+                    " record: none at boot, {} rooms now;",
+                    self.core.record().map_or(0, |r| r.entries().len())
+                );
+            }
+            Some(Loaded::Off) => text.push_str(" record: no segment for it;"),
+            Some(Loaded::Refused(why)) if self.core.writes_record() => {
+                let _ = write!(text, " record: refused at boot ({why}), written again;");
+            }
+            Some(Loaded::Refused(why)) => {
+                let _ = write!(
+                    text,
+                    " record: not read at boot ({why}), left for the next global;"
+                );
+            }
+        }
         let mut any = false;
         for (room, status) in self.core.rooms() {
             any = true;
@@ -168,12 +242,17 @@ impl PlannerGlue {
                 Status::Ready(plan) => {
                     let _ = write!(
                         text,
-                        " {room}: plan ready at {} ({} steps, {} items, anchor ({}, {}))",
+                        " {room}: plan ready at {} ({} steps, {} items, anchor ({}, {}){})",
                         plan.ready_at,
                         plan.steps,
                         plan.layout.items.len(),
                         plan.anchor.x(),
-                        plan.anchor.y()
+                        plan.anchor.y(),
+                        if plan.facts.prior == Some(plan.anchor) {
+                            " from the record"
+                        } else {
+                            ""
+                        }
                     );
                     if let Some(c) = placement.census(room) {
                         let _ = write!(

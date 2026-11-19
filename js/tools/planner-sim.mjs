@@ -27,15 +27,22 @@
 //   the third destroys exactly the extension on the first tower's tile (43, 19) and places the tower's site there;
 // - every site call returns OK on a tile the harness allows, with fewer than PLANNER_MMO.max_sites sites open;
 //   every destroy returns OK;
-// - `rustedscreep.planner()` at the end: the room's plan ready with the anchor, `destroys 2 (accepted 2, dropped 0)`, and the
-//   CPU per step line (sandbox time, a stand-in for the wasm's cost on the MMO);
-// - no fault line, no incident, no halt, one global.
+// - `rustedscreep.planner()` at the end of the phases: the room's plan ready with the anchor, `destroys 2 (accepted 2,
+//   dropped 0)`, and the CPU per step line (sandbox time, a stand-in for the wasm's cost on the MMO);
+// - the planner's record (ADR-027, crates/rustedscreep-core/src/planner/record.rs) in segment PLANNER_SEGMENT: a frame
+//   of owner kind 3, schema 1, a good CRC and one entry, E7N57 anchored on (43, 21) with the containers it adopted;
+// - then a halt (a new global): the record loads (one log line), the plan comes back anchored on it ("from the record"
+//   in the planner line and the summary), and nothing is destroyed; then the record corrupted and another halt: it is
+//   refused (one warning), the room is planned from what stands, the same anchor, the record written again, and
+//   nothing is destroyed;
+// - no fault line, no incident, two halts, three globals.
 // npm run check runs it (row 21); standalone: node js/tools/planner-sim.mjs [dir].
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
 import { findFiltered, makeStore, packPos } from './lib/world.mjs';
-import { ENGINE_CONSTANTS, commandResults, simulate } from './smoke.mjs';
+import { crc32 } from './lib/crc32.mjs';
+import { ENGINE_CONSTANTS, PLANNER_SEGMENT, commandResults, simulate } from './smoke.mjs';
 
 /** @screeps/common 2.16.0, the fixture the sandbox puts on the global (smoke.mjs ENGINE_CONSTANTS). */
 const C = Object.fromEntries(ENGINE_CONSTANTS.map(([name, json]) => [name, JSON.parse(json)]));
@@ -60,7 +67,13 @@ const MAX_SITES = 10;
 const BUILD_TICKS = 3;
 /** Loops with no placement call that end a phase (more than APPEAR_TICKS and a rescan). */
 const QUIET = 40;
-const RUN = 400;
+const RUN = 900;
+/** Frame layout (rustedscreep-core persist/frame.rs, ADR-004) and the planner's record (persist::kind::PLANNER,
+ * planner::record::SCHEMA). */
+const TAG = 'rs1b';
+const KIND_PLANNER = 3;
+const RECORD_SCHEMA = 1;
+const HALT = 'Game.cpu.halt()';
 const SUMMARY = 'rustedscreep.planner()';
 const set = (key, value) => `rustedscreep.configSet(${JSON.stringify(key)}, ${JSON.stringify(value)})`;
 
@@ -110,6 +123,7 @@ function makeWorld() {
     spawnCalls: [],
     phase: 0,
     phaseAt: [0],
+    haltAt: [],
     lastCall: 0,
     minExtensions: EXTENSIONS.length,
     errors: [],
@@ -249,10 +263,43 @@ function advance(state, offset) {
   state.minExtensions = Math.min(state.minExtensions, extensions);
 }
 
+/** Decodes a frame's header and payload (persist/frame.rs). */
+function decodeFrame(text) {
+  if (typeof text !== 'string' || !text.startsWith(TAG)) return null;
+  const bytes = Buffer.from(text.slice(TAG.length), 'base64');
+  const payload = bytes.subarray(16);
+  const computed = crc32(Buffer.concat([bytes.subarray(0, 12), payload]));
+  return {
+    kind: bytes.readUInt16LE(0), schema: bytes.readUInt16LE(2), written: bytes.readUInt32LE(4),
+    length: bytes.readUInt32LE(8), crcOk: bytes.readUInt32LE(12) === computed, payload,
+  };
+}
+
+/** The record's entries (planner/record.rs): { room, anchor, adopted: [{ kind, tile }] }, or a string saying why not. */
+function decodeRecord(payload) {
+  let i = 0;
+  const u8 = () => { if (i >= payload.length) throw new Error('short'); return payload[i++]; };
+  const u16 = () => u8() | (u8() << 8);
+  try {
+    const entries = [];
+    for (let n = u16(); n > 0; n--) {
+      const room = u16();
+      const anchor = u16();
+      const adopted = [];
+      for (let k = u8(); k > 0; k--) adopted.push({ kind: u8(), tile: u16() });
+      entries.push({ room, anchor, adopted });
+    }
+    return i === payload.length ? entries : 'bytes after the last entry';
+  } catch (e) {
+    return e.message;
+  }
+}
+
 export function plannerSim(dir = join(ROOT, 'dist')) {
   const state = makeWorld();
-  let planned = false;
   let finished = false;
+  const records = [];
+  const plannedLines = (w) => w.logs.filter((l) => l.includes(`rustedscreep planner: ${ROOM} planned`)).length;
   const world = simulate(dir, {
     ticks: RUN,
     setup: (context) => {
@@ -262,13 +309,31 @@ export function plannerSim(dir = join(ROOT, 'dist')) {
     command: (w) => {
       const offset = w.ticksRun;
       advance(state, offset);
-      planned ||= w.logs.some((l) => l.includes(`rustedscreep planner: ${ROOM} planned`));
-      if (!planned || offset - Math.max(state.lastCall, state.phaseAt.at(-1)) < QUIET) return null;
+      // Phases 0 to 2 in the first global; 3 halts it; 4 in the second global; 5 corrupts the record and halts; 6 in
+      // the third global. Each waits for its global's plan and then QUIET loops with no call.
+      const want = state.phase < 3 ? 1 : state.phase < 5 ? 2 : 3;
+      const quiet = offset - Math.max(state.lastCall, state.phaseAt.at(-1)) >= QUIET;
+      if (state.phase === 3 || state.phase === 5) {
+        // The tick after a summary: the record as it stands, then the halt.
+        records.push(w.segments[PLANNER_SEGMENT]);
+        if (state.phase === 5) {
+          const t = w.segments[PLANNER_SEGMENT];
+          w.segments[PLANNER_SEGMENT] = t.slice(0, 10) + (t[10] === 'A' ? 'B' : 'A') + t.slice(11);
+        }
+        state.phase += 1;
+        state.phaseAt.push(offset);
+        state.haltAt.push(offset);
+        return HALT;
+      }
+      if (plannedLines(w) < want || !quiet) return null;
       state.phase += 1;
       state.phaseAt.push(offset);
       if (state.phase === 1) return set('planner.storage', 'true');
       if (state.phase === 2) return set('planner.towers', 'true');
-      finished = true;
+      if (state.phase === 7) {
+        finished = true;
+        records.push(w.segments[PLANNER_SEGMENT]);
+      }
       return SUMMARY;
     },
     until: () => finished,
@@ -276,12 +341,43 @@ export function plannerSim(dir = join(ROOT, 'dist')) {
   const problems = [...state.errors.slice(0, 10)];
   const bad = world.logs.filter((l) => /rustedscreep fault|incident|loader error|\[error\]|trapped/.test(l));
   problems.push(...bad.map((l) => `log: ${l}`));
-  if (world.halts || world.globals !== 1) problems.push(`halts ${world.halts}, globals ${world.globals}`);
-  if (!finished) problems.push(`not finished in ${world.ticksRun} ticks (phase ${state.phase}, planned ${planned})`);
+  if (world.halts !== 2 || world.globals !== 3) problems.push(`halts ${world.halts}, globals ${world.globals}: expected 2 and 3`);
+  if (!finished) problems.push(`not finished in ${world.ticksRun} ticks (phase ${state.phase}, planned ${plannedLines(world)})`);
 
   const lines = world.logs.filter((l) => l.includes('rustedscreep planner:') && l.includes('planned'));
-  const wantLine = new RegExp(`rustedscreep planner: ${ROOM} planned in \\d+ steps: \\d+ items, anchor \\(${SPAWN.x}, ${SPAWN.y}\\), valid$`);
-  if (lines.length !== 1 || !wantLine.test(lines[0])) problems.push(`planner lines ${JSON.stringify(lines)}`);
+  const lineFor = (from) => new RegExp(`rustedscreep planner: ${ROOM} planned in \\d+ steps: \\d+ items, anchor \\(${SPAWN.x}, ${SPAWN.y}\\)${from}, valid$`);
+  const wantLines = [lineFor(''), lineFor(' from the record'), lineFor('')];
+  if (lines.length !== 3 || !wantLines.every((re, i) => re.test(lines[i]))) problems.push(`planner lines ${JSON.stringify(lines)}`);
+
+  // The record after each global: one entry, the room anchored on the spawn, its adopted containers. The third
+  // global wrote it again after refusing the corrupted one.
+  const roomCode = packPos(ROOM, 0, 0) >>> 16;
+  const anchorCode = SPAWN.x * 50 + SPAWN.y;
+  const containerTiles = state.containers.map((c) => c.x * 50 + c.y);
+  const entriesOf = (text, which) => {
+    const f = decodeFrame(text);
+    if (!f || f.kind !== KIND_PLANNER || f.schema !== RECORD_SCHEMA || !f.crcOk || f.length !== f.payload.length) {
+      problems.push(`${which} record frame ${JSON.stringify(f && { ...f, payload: f.payload.length })}`);
+      return null;
+    }
+    const entries = decodeRecord(f.payload);
+    const e = Array.isArray(entries) ? entries[0] : null;
+    if (!e || entries.length !== 1 || e.room !== roomCode || e.anchor !== anchorCode || !e.adopted.length
+      || e.adopted.some((a) => a.kind !== 0 || !containerTiles.includes(a.tile))) {
+      problems.push(`${which} record ${JSON.stringify(entries)}: expected ${ROOM} (${roomCode}) anchored on ${anchorCode} with its containers ${containerTiles}`);
+    }
+    return f;
+  };
+  const [record1, record2, record3] = records;
+  entriesOf(record1, 'first global\'s');
+  if (record2 !== record1) problems.push('the second global rewrote a record that did not change');
+  const rewritten = entriesOf(record3, 'third global\'s');
+  if (rewritten && rewritten.written <= state.haltAt[1] + T0) problems.push(`the refused record was not written again (written at ${rewritten.written})`);
+  const loaded = world.logs.filter((l) => l.startsWith(`rustedscreep planner: record loaded from segment ${PLANNER_SEGMENT} (1 rooms, written at `));
+  if (loaded.length !== 1) problems.push(`record load lines: ${loaded.length}, expected 1`);
+  const refused = world.logs.filter((l) => l.startsWith(`rustedscreep planner: the record in segment ${PLANNER_SEGMENT} was not used (CRC-32 `));
+  if (refused.length !== 1) problems.push(`record refusal lines: ${refused.length}, expected 1`);
+  if (state.destroyCalls.some((d) => d.offset > state.haltAt[0])) problems.push(`destroys after the first global: ${JSON.stringify(state.destroyCalls)}`);
 
   const [, storageOn, towersOn, end] = state.phaseAt;
   const inPhase = (list, from, to) => list.filter((c) => c.offset > from && c.offset <= (to ?? Infinity));
@@ -310,9 +406,16 @@ export function plannerSim(dir = join(ROOT, 'dist')) {
   phase(towersOn, end, TOWER, 'tower');
   if (state.minExtensions < EXTENSIONS.length - 1) problems.push(`extensions fell to ${state.minExtensions}`);
 
-  const summary = commandResults(world, SUMMARY).at(-1) ?? '';
-  for (const part of [`${ROOM}: plan ready at `, `anchor (${SPAWN.x}, ${SPAWN.y})`, 'destroys 2 (accepted 2, dropped 0)', '| CPU per step (steps, mean, most):']) {
+  const summaries = commandResults(world, SUMMARY);
+  const summary = summaries[0] ?? '';
+  for (const part of [`${ROOM}: plan ready at `, `anchor (${SPAWN.x}, ${SPAWN.y}))`, 'destroys 2 (accepted 2, dropped 0)', '| CPU per step (steps, mean, most):', 'record: none at boot, 1 rooms now;']) {
     if (!summary.includes(part)) problems.push(`planner summary lacks "${part}": ${summary}`);
+  }
+  for (const [i, parts] of [
+    [1, ['record: loaded (1 rooms, written at ', `anchor (${SPAWN.x}, ${SPAWN.y}) from the record)`, 'destroys 0 (accepted 0, dropped 0)']],
+    [2, ['record: refused at boot (CRC-32 ', `anchor (${SPAWN.x}, ${SPAWN.y}))`, 'destroys 0 (accepted 0, dropped 0)']],
+  ]) {
+    for (const part of parts) if (!(summaries[i] ?? '').includes(part)) problems.push(`summary ${i} lacks "${part}": ${summaries[i]}`);
   }
   if (problems.length) throw new Error(`planner-sim:\n  ${problems.slice(0, 25).join('\n  ')}`);
   return {

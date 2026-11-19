@@ -3,8 +3,10 @@
 //! `rustedscreep.persistTest(bytes)`, and the `rustedscreep.persist()` summary.
 //!
 //! Owners: the runtime config overrides (`PersistConfig::config_segment`, P1.10; requested when the
-//! global starts, so the first loop looks it up and the next tick reads it after the activation) and
-//! the self-test (`PersistConfig::self_test_segment`). The manager's limits come from the config in
+//! global starts, so the first loop looks it up and the next tick reads it after the activation),
+//! the planner's record (`PersistConfig::planner_segment`, ADR-027; requested the same way, and no
+//! room is planned until its load has finished) and the self-test
+//! (`PersistConfig::self_test_segment`). The manager's limits come from the config in
 //! force (`config::Runtime`), so the overridable ones apply from the tick after a change.
 //!
 //! Each tick, in this order:
@@ -39,6 +41,7 @@ use screeps::game;
 use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 
 use crate::config::{PROFILE, Runtime};
+use crate::planner::PlannerGlue;
 
 #[wasm_bindgen]
 extern "C" {
@@ -98,6 +101,7 @@ pub struct Persist {
     test: SelfTest,
     test_id: Option<SegmentId>,
     config_id: Option<SegmentId>,
+    planner_id: Option<SegmentId>,
     /// Frame text for writes.
     text: String,
     /// Decoded frame bytes for loads.
@@ -116,8 +120,9 @@ impl Default for Persist {
         let reserved =
             SegmentId::new(ids.profiler.stats_segment).map_or(SegmentSet::EMPTY, SegmentSet::of);
         let config_id = SegmentId::new(ids.persist.config_segment);
+        let planner_id = SegmentId::new(ids.persist.planner_segment);
         let mut mgr = Segments::new(reserved);
-        if let Some(id) = config_id {
+        for id in [config_id, planner_id].into_iter().flatten() {
             mgr.request_load(id);
         }
         Self {
@@ -126,6 +131,7 @@ impl Default for Persist {
             test: SelfTest::default(),
             test_id: SegmentId::new(ids.persist.self_test_segment),
             config_id,
+            planner_id,
             text: String::new(),
             bytes: Vec::new(),
             scratch: Vec::new(),
@@ -193,10 +199,16 @@ impl Persist {
     /// The decide step's part: reads the segments due this tick, one per step of the load job, and
     /// hands each to its owner (`cfg` for the config record).
     #[inline]
-    pub fn load<C: Clock>(&mut self, tick: &mut TickCpu<'_, C>, now: u32, cfg: &mut Runtime) {
+    pub fn load<C: Clock>(
+        &mut self,
+        tick: &mut TickCpu<'_, C>,
+        now: u32,
+        cfg: &mut Runtime,
+        planner: &mut PlannerGlue,
+    ) {
         let due = self.mgr.due(now);
         if !due.is_empty() && tick.allows(LOAD.tier) {
-            self.load_due(tick, due, now, cfg);
+            self.load_due(tick, due, now, cfg, planner);
         }
     }
 
@@ -208,6 +220,7 @@ impl Persist {
         due: SegmentSet,
         now: u32,
         cfg: &mut Runtime,
+        planner: &mut PlannerGlue,
     ) {
         let segs = match read_segments() {
             Ok(s) => s,
@@ -217,7 +230,7 @@ impl Persist {
                 for id in due.iter() {
                     let limits = cfg.get().persist;
                     if let Some(err) = self.mgr.absent(id, &limits) {
-                        self.deliver(id, now, err, None, cfg);
+                        self.deliver(id, now, err, None, cfg, planner);
                     }
                 }
                 return;
@@ -227,7 +240,7 @@ impl Persist {
         let mut job = self.job;
         tick.run_steps(&LOAD, &mut job, |_, _| {
             if let Some(id) = ids.next() {
-                self.load_one(&segs, id, now, cfg);
+                self.load_one(&segs, id, now, cfg, planner);
             }
             Ok(if ids.peek().is_some() {
                 Step::More
@@ -238,7 +251,14 @@ impl Persist {
         self.job = job;
     }
 
-    fn load_one(&mut self, segs: &JsValue, id: SegmentId, now: u32, cfg: &mut Runtime) {
+    fn load_one(
+        &mut self,
+        segs: &JsValue,
+        id: SegmentId,
+        now: u32,
+        cfg: &mut Runtime,
+        planner: &mut PlannerGlue,
+    ) {
         let testing = Some(id) == self.test_id && matches!(self.test.phase(), Phase::Read { .. });
         let t0 = if testing { game::cpu::get_used() } else { 0.0 };
         let value = match Reflect::get(segs, &key(id)) {
@@ -251,7 +271,7 @@ impl Persist {
         if value.is_undefined() {
             let limits = cfg.get().persist;
             if let Some(err) = self.mgr.absent(id, &limits) {
-                self.deliver(id, now, err, None, cfg);
+                self.deliver(id, now, err, None, cfg, planner);
             }
             return;
         }
@@ -262,8 +282,8 @@ impl Persist {
             None
         };
         let ok = match text {
-            None => self.deliver(id, now, LoadError::NotText, get, cfg),
-            Some(text) => self.deliver_text(id, now, &text, get, cfg),
+            None => self.deliver(id, now, LoadError::NotText, get, cfg, planner),
+            Some(text) => self.deliver_text(id, now, &text, get, cfg, planner),
         };
         self.mgr.loaded(id, ok);
     }
@@ -276,11 +296,19 @@ impl Persist {
         text: &str,
         get: Option<u32>,
         cfg: &mut Runtime,
+        planner: &mut PlannerGlue,
     ) -> bool {
         if Some(id) == self.config_id {
             let mut bytes = std::mem::take(&mut self.bytes);
             let frame = frame::decode(text, &mut bytes).map_err(LoadError::Decode);
             let ok = cfg.loaded(id.get(), frame);
+            self.bytes = bytes;
+            return ok;
+        }
+        if Some(id) == self.planner_id {
+            let mut bytes = std::mem::take(&mut self.bytes);
+            let frame = frame::decode(text, &mut bytes).map_err(LoadError::Decode);
+            let ok = planner.loaded(id.get(), frame);
             self.bytes = bytes;
             return ok;
         }
@@ -316,9 +344,13 @@ impl Persist {
         err: LoadError,
         get: Option<u32>,
         cfg: &mut Runtime,
+        planner: &mut PlannerGlue,
     ) -> bool {
         if Some(id) == self.config_id {
             return cfg.loaded(id.get(), Err(err));
+        }
+        if Some(id) == self.planner_id {
+            return planner.loaded(id.get(), Err(err));
         }
         if Some(id) == self.test_id
             && let Some(v) = self.test.loaded(now, Err(err), get, &mut self.scratch)
@@ -331,20 +363,20 @@ impl Persist {
     /// The output step's part, after the act step: writes the dirty records the save cap allows,
     /// then sets the active set if the manager asks. Runs only while the tick runs the Standard tier.
     #[inline]
-    pub fn flush(&mut self, now: u32, standard: bool, cfg: &mut Runtime) {
+    pub fn flush(&mut self, now: u32, standard: bool, cfg: &mut Runtime, planner: &PlannerGlue) {
         let limits = &cfg.get().persist;
         if standard && (!self.mgr.dirty().is_empty() || self.mgr.plan_active(limits).is_some()) {
-            self.flush_work(now, cfg);
+            self.flush_work(now, cfg, planner);
         }
     }
 
     /// Kept out of the per-tick `loop` function: writes and activations are rare.
     #[inline(never)]
-    fn flush_work(&mut self, now: u32, cfg: &mut Runtime) {
+    fn flush_work(&mut self, now: u32, cfg: &mut Runtime, planner: &PlannerGlue) {
         let limits = cfg.get().persist;
         if !self.mgr.dirty().is_empty() {
             match read_segments() {
-                Ok(segs) => self.write(&segs, now, cfg),
+                Ok(segs) => self.write(&segs, now, cfg, planner),
                 Err(why) => {
                     self.fail(Op::Segments, now, why);
                     self.abort_test_write(now);
@@ -367,7 +399,7 @@ impl Persist {
         }
     }
 
-    fn write(&mut self, segs: &JsValue, now: u32, cfg: &mut Runtime) {
+    fn write(&mut self, segs: &JsValue, now: u32, cfg: &mut Runtime, planner: &PlannerGlue) {
         let (count, present) = match present_keys(segs) {
             Ok(k) => k,
             Err(why) => {
@@ -390,6 +422,8 @@ impl Persist {
         for id in plan.write.iter() {
             let result = if Some(id) == self.config_id {
                 self.write_config(segs, id, now, cfg)
+            } else if Some(id) == self.planner_id {
+                self.write_planner(segs, id, now, planner)
             } else if Some(id) == self.test_id {
                 self.write_test(segs, id, now)
             } else {
@@ -433,6 +467,51 @@ impl Persist {
                 WriteResult::Failed
             }
         }
+    }
+
+    /// Writes the planner's record (ADR-027). A failed JS write stays dirty and is tried again
+    /// next tick (logged once per global).
+    fn write_planner(
+        &mut self,
+        segs: &JsValue,
+        id: SegmentId,
+        now: u32,
+        planner: &PlannerGlue,
+    ) -> WriteResult {
+        self.scratch.clear();
+        planner.payload(&mut self.scratch);
+        let encoded = frame::encode(
+            kind::PLANNER,
+            rustedscreep_core::planner::record::SCHEMA,
+            now,
+            &self.scratch,
+            &mut self.text,
+        );
+        if encoded.is_err() {
+            // A room's entry is a few dozen bytes: only thousands of rooms would not fit.
+            log::warn!("rustedscreep planner: the record does not fit a segment; not written");
+            return WriteResult::Rejected;
+        }
+        match set_segment(segs, id, &self.text) {
+            Ok(()) => WriteResult::Written,
+            Err(why) => {
+                self.fail(Op::Set, now, why);
+                WriteResult::Failed
+            }
+        }
+    }
+
+    /// The planner's record changed: it is written on the next output step that runs the
+    /// Standard tier.
+    pub fn planner_changed(&mut self) {
+        if let Some(id) = self.planner_id {
+            self.mgr.mark_dirty(id);
+        }
+    }
+
+    /// Whether a segment keeps the planner's record (a valid `PersistConfig::planner_segment`).
+    pub fn has_planner_segment(&self) -> bool {
+        self.planner_id.is_some()
     }
 
     /// A console command changed the overrides: the record is written on the next output step that

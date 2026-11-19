@@ -124,6 +124,10 @@ pub fn game_loop() {
                 act.begin(snapshot);
                 spawn.begin(snapshot, |room| opening.worker_body(room));
                 opening.begin(snapshot, &mut movement.core);
+                // With no segment for the planner's record (ADR-027), plan from what stands at once.
+                if !persist.has_planner_segment() {
+                    planner.no_record();
+                }
                 planner.begin(snapshot, &movement.core, &cfg.planner);
                 let mut tick = sched.begin(&snapshot.tick, &cfg.scheduler, scheduler::GameClock);
                 // Critical: the rooms movement needs before anything in them can move, first.
@@ -149,7 +153,7 @@ pub fn game_loop() {
                 // Standard: the persistence loads, then the opening's repairing, building and
                 // upgrading, then the haulers' transfers into the controller container (P3.3), then
                 // the upgraders' withdraws and upgrades (P3.4).
-                persist.load(&mut tick, snapshot.tick.time, runtime);
+                persist.load(&mut tick, snapshot.tick.time, runtime, planner);
                 opening.work(
                     &mut tick,
                     snapshot,
@@ -170,6 +174,9 @@ pub fn game_loop() {
                 // plan, or the interim container, link and extension placement (ADR-023, ADR-025,
                 // ADR-024, ADR-020) where a room has none; after the self-check.
                 planner.run(&mut tick, &cfg.planner);
+                if planner.take_dirty() {
+                    persist.planner_changed();
+                }
                 opening.place(
                     &mut tick,
                     snapshot,
@@ -225,7 +232,7 @@ pub fn game_loop() {
                 let standard = sched
                     .last_tick()
                     .is_some_and(|r| r.budget.allows(Tier::Standard));
-                persist.flush(snapshot.tick.time, standard, runtime);
+                persist.flush(snapshot.tick.time, standard, runtime, planner);
                 scheduler::log_faults(sched);
                 if prof.finish(probe, &snapshot.tick, act.issues(), &cfg.scheduler) {
                     persist.keys_short();

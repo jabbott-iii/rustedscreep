@@ -460,6 +460,7 @@ fn facts_of(
         anchors,
         standing: by_kind(standing),
         own: by_kind(own),
+        prior: None,
     }
 }
 

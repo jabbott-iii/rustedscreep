@@ -245,11 +245,12 @@ function lowBucket(dir) {
   const replies = samplesMatch(world, 'low bucket');
   // Tier-off skips 2 (was 1 before ADR-020): the check and the opening's extension placement, both Optional.
   expectParts(replies.at(-1), ['optional off', 'tier-off skips 2,', 'rustedscreep consts: not run yet in this global'], 'low bucket');
-  // The second loop's only readings are the config record load's two samples (P1.10), the opening's (P2.4): its
+  // The second loop's only readings are the persistence load's three samples (its two steps in one run: the config
+  // record, P1.10, and the planner's record, ADR-027: was two before ADR-027), the opening's (P2.4): its
   // two jobs, Critical and Standard, run one unit each for the owned W1N1 with a sample before and after (was 2
   // before P2.4), the static miners' Critical job (P3.1), one unit for W1N1 (2 more), and the haulers' Critical job
   // (P3.3), one unit for W1N1 (2 more; their Standard job has a unit only for a room with a hauler to store).
-  const want = 2 + 4 + 2 + 2;
+  const want = 3 + 4 + 2 + 2;
   if (world.loopCalls[2]?.getUsed !== want) throw new Error(`low bucket: offset 2 made ${world.loopCalls[2]?.getUsed} getUsed calls, expected ${want}`);
   if (Object.values(counts).some((c) => c.names || c.descriptors)) throw new Error(`low bucket: the check read the global: ${JSON.stringify(counts)}`);
 }

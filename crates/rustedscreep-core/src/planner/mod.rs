@@ -28,6 +28,7 @@ pub mod flood;
 pub mod job;
 pub mod layout;
 pub mod mincut;
+pub mod record;
 pub mod roads;
 pub mod rules;
 pub mod score;

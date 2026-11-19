@@ -24,6 +24,19 @@
 //! failed for the rest of the global; `economy::placement` then runs the interim placement there.
 //! A room with no spawn waits, and reads nothing but its spawn count until one stands.
 //!
+//! The record (ADR-027, [`record`]): per owned room, the tile its plan was anchored on and the
+//! containers and links it adopted, kept in a segment across global resets. No room is planned
+//! until the record's load has finished (it comes in the Standard tier, before the Optional
+//! planner runs, on the global's first or second tick); a room's entry is tried first, even with
+//! nothing standing on its anchor, with its adopted tiles standing, and its plan is kept without
+//! trying the others when it validates and its spawn tiles hold every standing spawn. A missing or
+//! refused record leaves the rule above; an entry whose plan fails those checks stays a
+//! candidate of that rule (tried first, so it wins a tie). An entry is set when a room's plan is
+//! ready and dropped when the room is no longer owned (also while the planner is switched off,
+//! [`Planner::forget_unowned`]); either change marks the record for writing
+//! ([`Planner::take_dirty`]). A record this build refuses is written again at once; a segment
+//! whose text never arrived is left as it is, and this global writes nothing.
+//!
 //! A run owns a copy of its facts (the terrain is 2500 bytes), so nothing it borrows has to live
 //! across ticks. Rooms are planned one at a time, in name order.
 
@@ -31,9 +44,11 @@ use rustedscreep_consts::{RoomName, StructureType};
 
 use super::flood::{self, Params};
 use super::layout::{Layout, PlanError, PlanInput};
+use super::record::{self, Entry, Record, RecordError};
 use super::scratch::Scratch;
 use super::validate::validate;
 use crate::movement::{Movement, TerrainGrid, Tile};
+use crate::persist::{DecodeError, Frame, LoadError, kind};
 use crate::scheduler::Step;
 use crate::snapshot::{Controller, ObjectKind, Snapshot};
 
@@ -47,8 +62,9 @@ pub struct Facts {
     pub mineral: Option<Tile>,
     /// The standing spawns, in tile order.
     pub spawns: Vec<Tile>,
-    /// The tiles a plan may be anchored on: the standing spawns and the own spawn sites, in tile
-    /// order (the run tries them from the last).
+    /// The tiles a plan may be anchored on: the standing spawns, the own spawn sites and the
+    /// record's anchor even with nothing on it ([`Facts::with_record`]), in tile order (the run
+    /// tries the record's first, then the rest from the last).
     pub anchors: Vec<Tile>,
     /// The standing containers and links and the own sites of both (ADR-026: the economy counts a
     /// site as its store or link already), in kind then tile order.
@@ -56,6 +72,9 @@ pub struct Facts {
     /// What stands in the room that a plan may hold: the own structures but the controller, the
     /// containers and the own sites, in kind then tile order (the anchor rule's measure).
     pub own: Vec<(StructureType, Tile)>,
+    /// The anchor the room's record names (ADR-027): tried first, and its plan kept when it
+    /// validates and holds every standing spawn.
+    pub prior: Option<Tile>,
 }
 
 impl Facts {
@@ -154,7 +173,25 @@ impl Facts {
             anchors,
             standing,
             own,
+            prior: None,
         })
+    }
+
+    /// These facts with room's record `entry` (ADR-027): its anchor tried first (added to the
+    /// anchors if nothing stands on it) and its adopted containers and links standing.
+    pub fn with_record(mut self, entry: Option<&Entry>) -> Self {
+        let Some(e) = entry else {
+            return self;
+        };
+        self.prior = Some(e.anchor);
+        if let Err(i) = self.anchors.binary_search(&e.anchor) {
+            self.anchors.insert(i, e.anchor);
+        }
+        self.standing.extend(e.adopted.iter().copied());
+        self.standing
+            .sort_unstable_by_key(|&(k, t)| (super::layout::kind_rank(k), t.index()));
+        self.standing.dedup();
+        self
     }
 }
 
@@ -173,7 +210,8 @@ pub enum Missing {
 pub struct Plan {
     pub layout: Layout,
     pub facts: Facts,
-    /// The tile the plan was anchored on: a standing spawn, or an own spawn site.
+    /// The tile the plan was anchored on: a standing spawn, an own spawn site, or the record's
+    /// anchor (ADR-027).
     pub anchor: Tile,
     /// `Game.time` it was ready, and the steps it took (validation included).
     pub ready_at: u32,
@@ -186,7 +224,10 @@ type Fit = (bool, usize);
 
 struct Running {
     facts: Facts,
-    /// How many of `facts.anchors` were tried, from the last.
+    /// The anchors in the order they are tried: the record's first, then the rest from the
+    /// highest tile down.
+    order: Vec<Tile>,
+    /// How many of `order` were tried.
     spawn: usize,
     run: Option<flood::Run>,
     /// The finished layout, waiting for its validation step.
@@ -254,6 +295,44 @@ pub struct Planner {
     scratch: Scratch,
     totals: Totals,
     time: u32,
+    /// The record (ADR-027): `None` until its load finished, and no room is planned before.
+    record: Option<Record>,
+    /// How the record's load ended, for the console.
+    loaded: Option<Loaded>,
+    /// The record changed since it was last written.
+    dirty: bool,
+    /// The record may be written: false for a global whose load never got the segment's text
+    /// (`LoadError::Unavailable`), which leaves the segment as it is for the next global.
+    readonly: bool,
+}
+
+/// How the record's load ended (ADR-027).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Loaded {
+    /// A record of `rooms` entries, written on tick `written`.
+    Record { rooms: usize, written: u32 },
+    /// The segment was empty (never written, or cleared).
+    Empty,
+    /// No segment is configured for it.
+    Off,
+    /// The load failed, or the record was refused: plans come from what stands.
+    Refused(Refusal),
+}
+
+/// Why the record was not used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    Load(LoadError),
+    Record(RecordError),
+}
+
+impl core::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Load(e) => write!(f, "{e}"),
+            Self::Record(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 impl Planner {
@@ -262,10 +341,15 @@ impl Planner {
     /// made starts again (a lost anchor keeps the plan); rooms no longer owned are dropped.
     pub fn begin(&mut self, snap: &Snapshot, movement: &Movement) {
         self.time = snap.tick.time;
+        self.forget_unowned(snap);
+        let Some(record) = self.record.as_mut() else {
+            // Nothing is planned before the record's load finished.
+            return;
+        };
+        let rooms = &snap.rooms;
         for r in &mut self.rooms {
             r.seen = false;
         }
-        let rooms = &snap.rooms;
         for row in rooms.owned() {
             let Some(&name) = rooms.names().get(row) else {
                 continue;
@@ -286,6 +370,7 @@ impl Planner {
                         && new_spawn_off_plan(snap, name, plan)
                         && let Ok(facts) = Facts::read(snap, movement, name)
                     {
+                        let facts = facts.with_record(record.get(name));
                         r.state = State::Run(Box::new(Running::new(facts)));
                         self.totals.started = self.totals.started.saturating_add(1);
                     }
@@ -297,6 +382,7 @@ impl Planner {
                     let state = match Facts::read(snap, movement, name) {
                         Ok(facts) => {
                             self.totals.started = self.totals.started.saturating_add(1);
+                            let facts = facts.with_record(record.get(name));
                             State::Run(Box::new(Running::new(facts)))
                         }
                         Err(Missing::Unplannable(why)) => {
@@ -317,6 +403,24 @@ impl Planner {
             }
         }
         self.rooms.retain(|r| r.seen);
+    }
+
+    /// Drops the record's entries of rooms not owned this tick (marking it dirty), so a room lost
+    /// and claimed again starts from what stands. [`Planner::begin`] does it; the glue calls it
+    /// alone while the planner is switched off, so the record never outlives a claim.
+    pub fn forget_unowned(&mut self, snap: &Snapshot) {
+        let rooms = &snap.rooms;
+        let owned = |name: RoomName| {
+            rooms.owned().any(|row| {
+                rooms.names().get(row) == Some(&name)
+                    && matches!(rooms.controllers().get(row), Some(Controller::Mine { .. }))
+            })
+        };
+        if let Some(record) = self.record.as_mut()
+            && record.retain(owned)
+        {
+            self.dirty = true;
+        }
     }
 
     /// Whether some room is planning (the job has a step to run).
@@ -340,6 +444,8 @@ impl Planner {
             rooms,
             scratch,
             totals,
+            record,
+            dirty,
             ..
         } = self;
         let Some(room) = rooms.iter_mut().find(|r| matches!(r.state, State::Run(_))) else {
@@ -360,13 +466,19 @@ impl Planner {
                     std::mem::replace(&mut room.state, State::Failed("taken"))
                 {
                     let Running { facts, steps, .. } = *running;
-                    room.state = State::Ready(Box::new(Plan {
+                    let plan = Plan {
                         layout,
                         facts,
                         anchor,
                         ready_at: time,
                         steps,
-                    }));
+                    };
+                    if let Some(rec) = record.as_mut()
+                        && rec.set(plan.entry(room.name))
+                    {
+                        *dirty = true;
+                    }
+                    room.state = State::Ready(Box::new(plan));
                     totals.ready = totals.ready.saturating_add(1);
                 }
             }
@@ -397,6 +509,102 @@ impl Planner {
 
     pub fn totals(&self) -> &Totals {
         &self.totals
+    }
+
+    /// The record's load finished: its frame, or why there is none (ADR-027). Returns whether
+    /// the segment held a usable record or none at all (an empty segment), for the segment
+    /// manager's counters. Ignored once a record is in use. A segment that held a record this
+    /// build refuses is written again at once (with what this global plans); one whose text never
+    /// arrived is left as it is for the next global, and nothing is written in this one.
+    pub fn loaded(&mut self, frame: Result<Frame<'_>, LoadError>) -> bool {
+        if self.record.is_some() {
+            return true;
+        }
+        let frame = frame.and_then(|f| {
+            f.header
+                .expect(kind::PLANNER, record::SCHEMA)
+                .map_err(LoadError::Decode)
+                .map(|()| f)
+        });
+        let (rec, loaded, ok) = match frame {
+            Ok(f) => match Record::decode(f.payload) {
+                Ok(r) => {
+                    let rooms = r.entries().len();
+                    let written = f.header.written;
+                    (r, Loaded::Record { rooms, written }, true)
+                }
+                Err(e) => (
+                    Record::default(),
+                    Loaded::Refused(Refusal::Record(e)),
+                    false,
+                ),
+            },
+            Err(LoadError::Decode(DecodeError::Empty)) => (Record::default(), Loaded::Empty, true),
+            Err(e) => (Record::default(), Loaded::Refused(Refusal::Load(e)), false),
+        };
+        match loaded {
+            Loaded::Refused(Refusal::Load(LoadError::Unavailable { .. })) => self.readonly = true,
+            Loaded::Refused(_) => self.dirty = true,
+            _ => {}
+        }
+        self.record = Some(rec);
+        self.loaded = Some(loaded);
+        ok
+    }
+
+    /// No segment keeps the record: plan from what stands at once.
+    pub fn no_record(&mut self) {
+        if self.record.is_none() {
+            self.record = Some(Record::default());
+            self.loaded = Some(Loaded::Off);
+        }
+    }
+
+    /// How the record's load ended (`None` while it is still loading).
+    pub fn load_state(&self) -> Option<Loaded> {
+        self.loaded
+    }
+
+    /// The record in use (`None` while it is still loading).
+    pub fn record(&self) -> Option<&Record> {
+        self.record.as_ref()
+    }
+
+    /// Whether the record changed since the last call (the glue marks its segment dirty then);
+    /// never in a global whose load did not get the segment's text.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty) && !self.readonly
+    }
+
+    /// Whether this global writes the record (module docs).
+    pub fn writes_record(&self) -> bool {
+        !self.readonly
+    }
+
+    /// The record's payload ([`record`]) into `out`.
+    pub fn payload(&self, out: &mut Vec<u8>) {
+        if let Some(r) = &self.record {
+            r.encode(out);
+        }
+    }
+}
+
+impl Plan {
+    /// The record entry of room `name`'s plan: its anchor and the containers and links of its
+    /// facts' standing ones (built, sited or from the record) that it holds on their tiles.
+    pub fn entry(&self, name: RoomName) -> Entry {
+        let adopted = self
+            .facts
+            .standing
+            .iter()
+            .copied()
+            .filter(|&(k, t)| self.layout.items.iter().any(|i| i.kind == k && i.tile == t))
+            .collect();
+        Entry {
+            room: name,
+            anchor: self.anchor,
+            adopted,
+        }
     }
 }
 
@@ -474,8 +682,21 @@ fn why(e: PlanError) -> &'static str {
 
 impl Running {
     fn new(facts: Facts) -> Self {
+        let prior = facts.prior.filter(|t| facts.anchors.contains(t));
+        let order = prior
+            .into_iter()
+            .chain(
+                facts
+                    .anchors
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|&t| Some(t) != prior),
+            )
+            .collect();
         Self {
             facts,
+            order,
             spawn: 0,
             run: None,
             done: None,
@@ -495,13 +716,7 @@ impl Running {
     /// The next piece of work: a phase of the run for the anchor being tried, or the validation
     /// of its finished layout (and its fit, module docs); then the next anchor, or the outcome.
     fn advance(&mut self, params: Params, s: &mut Scratch) -> Advance {
-        let anchor = self
-            .facts
-            .anchors
-            .len()
-            .checked_sub(self.spawn.saturating_add(1))
-            .and_then(|i| self.facts.anchors.get(i))
-            .copied();
+        let anchor = self.order.get(self.spawn).copied();
         let Some(anchor) = anchor else {
             return match self.best.take() {
                 Some((layout, at, _)) => Advance::Ready(layout, at),
@@ -516,8 +731,11 @@ impl Running {
                     sp == anchor || layout.of(StructureType::Spawn).any(|i| i.tile == sp)
                 });
                 let fit = (holds_all, holds(&layout, &self.facts.own));
-                // Nothing tried later can fit better, and a tie goes to the anchor tried first.
-                if fit == (true, self.facts.own.len()) {
+                // Nothing tried later can fit better, and a tie goes to the anchor tried first;
+                // the record's anchor is kept once its plan holds every standing spawn (ADR-027).
+                if fit == (true, self.facts.own.len())
+                    || (holds_all && Some(anchor) == self.facts.prior)
+                {
                     return Advance::Ready(layout, anchor);
                 }
                 if self.best.as_ref().is_none_or(|&(_, _, b)| fit > b) {
@@ -553,7 +771,7 @@ impl Running {
         self.run = None;
         self.done = None;
         self.spawn += 1;
-        if self.spawn < self.facts.anchors.len() {
+        if self.spawn < self.order.len() {
             Advance::More
         } else {
             match self.best.take() {
@@ -567,7 +785,8 @@ impl Running {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{MOVEMENT_MMO, PLANNER_MMO};
+    use crate::config::{MOVEMENT_MMO, PERSIST_MMO, PLANNER_MMO};
+    use crate::persist::frame;
     use crate::planner::layout::{MAX_LEVEL, kind_rank};
     use crate::planner::rules::{allowed, earliest_level};
     use crate::snapshot::{
@@ -653,6 +872,7 @@ mod tests {
             own: spawns.iter().map(|&t| (StructureType::Spawn, t)).collect(),
             spawns,
             standing: Vec::new(),
+            prior: None,
         }
     }
 
@@ -673,15 +893,22 @@ mod tests {
     }
 
     /// The plan the module's anchor rules pick for `facts`, worked out from `flood` and
-    /// `validate` alone: the anchors from the highest tile down; of the valid plans the one whose
-    /// spawn tiles hold every standing spawn, then the one holding the most of `facts.own` on tiles
-    /// of their type, the first tried on a tie; a plan holding everything ends the search.
+    /// `validate` alone: the record's anchor first, then the anchors from the highest tile down; of
+    /// the valid plans the one whose spawn tiles hold every standing spawn, then the one holding
+    /// the most of `facts.own` on tiles of their type, the first tried on a tie; a plan holding
+    /// everything ends the search, and so does the record anchor's plan holding every spawn.
     /// Uses: PLANNER_MMO.
     fn anchor_rule(facts: &Facts) -> Option<(Layout, Tile)> {
         let mut best: Option<(Layout, Tile, (bool, usize))> = None;
         let mut anchors = facts.anchors.clone();
         anchors.sort_unstable();
-        for &sp in anchors.iter().rev() {
+        // The record's anchor first (ADR-027), then the rest from the highest tile down.
+        let prior = facts.prior.filter(|t| anchors.contains(t));
+        let order: Vec<Tile> = prior
+            .into_iter()
+            .chain(anchors.iter().rev().copied().filter(|&t| Some(t) != prior))
+            .collect();
+        for &sp in &order {
             let Ok(layout) = flood_plan(facts, sp) else {
                 continue;
             };
@@ -697,7 +924,7 @@ mod tests {
                 .iter()
                 .filter(|&&(k, t)| layout.items.iter().any(|i| i.kind == k && i.tile == t))
                 .count();
-            if (all, held) == (true, facts.own.len()) {
+            if (all, held) == (true, facts.own.len()) || (all && Some(sp) == prior) {
                 return Some((layout, sp));
             }
             if best.as_ref().is_none_or(|b| (all, held) > b.2) {
@@ -768,11 +995,14 @@ mod tests {
     type Ready = (Layout, Tile, u32, u32);
 
     impl World {
+        /// A global whose planner record segment was empty (no record: plans from what stands).
         fn new() -> Self {
+            let mut planner = Planner::default();
+            assert!(planner.loaded(Err(LoadError::Decode(DecodeError::Empty))));
             Self {
                 snap: Snapshot::default(),
                 movement: Movement::default(),
-                planner: Planner::default(),
+                planner,
                 time: 0,
                 raw: open_raw(),
             }
@@ -783,6 +1013,12 @@ mod tests {
         /// Uses: CPU_TICK_LIMIT_MAX, CPU_BUCKET_MAX (a full bucket), SOURCE_ENERGY_CAPACITY,
         /// CONTAINER_HITS, CONSTRUCTION_COST (the object rows), MOVEMENT_MMO.
         fn tick(&mut self, scenes: &[Scene]) {
+            self.tick_without_begin(scenes);
+            self.planner.begin(&self.snap, &self.movement);
+        }
+
+        /// As [`World::tick`], without the planner's begin (the planner switched off).
+        fn tick_without_begin(&mut self, scenes: &[Scene]) {
             self.time += 1;
             let snap = &mut self.snap;
             snap.begin(TickContext::from_raw(
@@ -877,7 +1113,6 @@ mod tests {
                 self.movement
                     .set_statics(s.name, s.sources.iter().copied().chain(s.mineral));
             }
-            self.planner.begin(&self.snap, &self.movement);
         }
 
         /// Steps the planner until `Step::Done`, as the Optional tier slices it; the phase of
@@ -1842,5 +2077,649 @@ mod tests {
             moved != layout,
             "the scenario: a new run would move the plan"
         );
+    }
+
+    /// The frame of `payload` as the planner's segment holds it: owner `kind`, `schema`, written
+    /// on tick `written` (`persist::frame`).
+    fn framed(kind: u16, schema: u16, written: u32, payload: &[u8]) -> String {
+        let mut text = String::new();
+        frame::encode(kind, schema, written, payload, &mut text).expect("a payload that fits");
+        text
+    }
+
+    /// `rec`'s payload (`record`'s layout).
+    fn payload_of(rec: &Record) -> Vec<u8> {
+        let mut out = Vec::new();
+        rec.encode(&mut out);
+        out
+    }
+
+    /// The tick the tests' records were written on: any tick, echoed by `Loaded::Record`.
+    const WRITTEN: u32 = 4_321;
+
+    impl World {
+        /// A global whose planner record has not loaded yet (`Planner::default`).
+        fn unloaded() -> Self {
+            Self {
+                snap: Snapshot::default(),
+                movement: Movement::default(),
+                planner: Planner::default(),
+                time: 0,
+                raw: open_raw(),
+            }
+        }
+
+        /// A global whose planner segment held `rec`, written on [`WRITTEN`]: the frame encoded,
+        /// decoded and handed to `Planner::loaded`, as the glue does after a reset.
+        /// Uses: `persist::kind::PLANNER`, `record::SCHEMA`.
+        fn with_record(rec: &Record) -> Self {
+            let mut w = Self::unloaded();
+            let text = framed(kind::PLANNER, record::SCHEMA, WRITTEN, &payload_of(rec));
+            let mut buf = Vec::new();
+            let f = frame::decode(&text, &mut buf).expect("a frame");
+            assert!(w.planner.loaded(Ok(f)), "a usable record");
+            let rooms = rec.entries().len();
+            assert_eq!(
+                w.planner.load_state(),
+                Some(Loaded::Record {
+                    rooms,
+                    written: WRITTEN
+                })
+            );
+            w
+        }
+    }
+
+    /// A record of two rooms' entries (an anchor each, one with a container and a link adopted).
+    fn two_rooms() -> Record {
+        let mut r = Record::default();
+        r.set(Entry {
+            room: room("W1N1"),
+            anchor: spawn_tile(),
+            adopted: vec![
+                (StructureType::Container, tile(11, 10)),
+                (StructureType::Link, tile(26, 39)),
+            ],
+        });
+        r.set(Entry {
+            room: room("W2N3"),
+            anchor: tile(30, 20),
+            adopted: Vec::new(),
+        });
+        r
+    }
+
+    /// What the record's load means for writing it (ADR-027): a segment holding a record this
+    /// build refuses (another owner, another schema, a payload it cannot read, not text) is
+    /// written again at once with the empty record; one whose text never arrived
+    /// (`LoadError::Unavailable`, after `PersistConfig::load_retries` + 1 tries) is left as it is:
+    /// the global writes nothing, not even once a plan is ready; a good or empty one is written
+    /// only when an entry changes. Uses: PERSIST_MMO (load_retries), PLANNER_MMO, MOVEMENT_MMO,
+    /// CONTROLLER_STRUCTURES (the room's level).
+    #[test]
+    fn a_refused_record_is_written_again_and_an_unread_one_is_left() {
+        let bytes = payload_of(&two_rooms());
+        let refused = framed(kind::PLANNER, record::SCHEMA + 1, WRITTEN, &bytes);
+        let mut buf = Vec::new();
+        let mut p = Planner::default();
+        p.loaded(frame::decode(&refused, &mut buf).map_err(LoadError::Decode));
+        assert!(p.writes_record());
+        assert!(p.take_dirty(), "the refused segment is replaced at once");
+        assert!(!p.take_dirty());
+        let mut p = Planner::default();
+        p.loaded(Err(LoadError::NotText));
+        assert!(p.take_dirty());
+        // Never read: nothing is written in this global.
+        let mut w = World::unloaded();
+        let given_up = LoadError::Unavailable {
+            tries: PERSIST_MMO.load_retries + 1,
+        };
+        assert!(!w.planner.loaded(Err(given_up)));
+        assert!(!w.planner.writes_record());
+        w.tick(&[Scene::open("W1N1", &[spawn_tile()])]);
+        w.plan();
+        let _ = w.ready(room("W1N1"));
+        assert!(
+            w.planner
+                .record()
+                .is_some_and(|r| r.get(room("W1N1")).is_some()),
+            "the plan's entry is kept in the heap"
+        );
+        assert!(!w.planner.take_dirty(), "but the segment is not written");
+        // A good record: clean until an entry changes.
+        let w = World::with_record(&two_rooms());
+        let mut planner = w.planner;
+        assert!(planner.writes_record());
+        assert!(!planner.take_dirty());
+    }
+
+    /// The record drops a room no longer owned even while the planner is switched off (the glue
+    /// calls `forget_unowned` alone then), so a room lost and claimed again later does not plan
+    /// from its earlier claim's entry. Uses: PLANNER_MMO, MOVEMENT_MMO, CONTROLLER_STRUCTURES.
+    #[test]
+    fn a_lost_rooms_entry_is_dropped_while_the_planner_is_off() {
+        let mut w = World::with_record(&two_rooms());
+        assert!(w.planner.record().is_some_and(|r| r.entries().len() == 2));
+        // A tick with only W1N1 owned, as the snapshot sees it, without the planner's begin.
+        let scene = Scene::open("W1N1", &[spawn_tile()]);
+        w.tick(std::slice::from_ref(&scene));
+        let _ = w.planner.take_dirty();
+        let mut gone = scene.clone();
+        gone.owned = false;
+        w.tick_without_begin(std::slice::from_ref(&gone));
+        w.planner.forget_unowned(&w.snap);
+        assert!(w.planner.record().is_some_and(|r| r.entries().is_empty()));
+        assert!(w.planner.take_dirty(), "the dropped entries are written");
+    }
+
+    /// `Planner::loaded` (ADR-027): every way the record's load fails leaves an empty record in
+    /// use, so rooms are planned from what stands, and `load_state` says why: another owner's
+    /// frame or another schema (the header check), a payload `record::decode` refuses, a segment
+    /// that never loaded or held no string; each returns false (nothing usable). An empty segment
+    /// returns true with an empty record too, and a good frame gives its record, with its room
+    /// count and written tick. Once a record is in use a later load is ignored, whatever it holds;
+    /// `no_record` (no segment configured) gives `Loaded::Off`, and a later load is ignored then.
+    /// Uses: `persist::kind::{PLANNER, CONFIG}`, `record::SCHEMA`, PERSIST_MMO (`load_retries`:
+    /// a load given up), `persist::frame` (the segment's text).
+    #[test]
+    fn the_records_load_leaves_a_record_in_use_whatever_the_segment_held() {
+        let good = two_rooms();
+        let bytes = payload_of(&good);
+        let mut long = bytes.clone();
+        long.push(0);
+        let given_up = LoadError::Unavailable {
+            tries: PERSIST_MMO.load_retries + 1,
+        };
+        let load = |seg: Result<&str, LoadError>| -> (bool, Planner) {
+            let mut p = Planner::default();
+            let mut buf = Vec::new();
+            let f = seg.and_then(|t| frame::decode(t, &mut buf).map_err(LoadError::Decode));
+            let ok = p.loaded(f);
+            (ok, p)
+        };
+        let other_kind = framed(kind::CONFIG, record::SCHEMA, WRITTEN, &bytes);
+        let other_schema = framed(kind::PLANNER, record::SCHEMA + 1, WRITTEN, &bytes);
+        let refused = framed(kind::PLANNER, record::SCHEMA, WRITTEN, &long);
+        let failures = [
+            (
+                Ok(other_kind.as_str()),
+                Refusal::Load(LoadError::Decode(DecodeError::Kind {
+                    expected: kind::PLANNER,
+                    found: kind::CONFIG,
+                })),
+            ),
+            (
+                Ok(other_schema.as_str()),
+                Refusal::Load(LoadError::Decode(DecodeError::Schema {
+                    expected: record::SCHEMA,
+                    found: record::SCHEMA + 1,
+                })),
+            ),
+            (Ok(refused.as_str()), Refusal::Record(RecordError::Long)),
+            (Err(given_up), Refusal::Load(given_up)),
+            (Err(LoadError::NotText), Refusal::Load(LoadError::NotText)),
+        ];
+        for (seg, why) in failures {
+            let (ok, p) = load(seg);
+            assert!(!ok, "{why}");
+            assert_eq!(p.load_state(), Some(Loaded::Refused(why)));
+            assert_eq!(p.record(), Some(&Record::default()), "{why}");
+        }
+        // An empty segment: never written, or cleared.
+        let (ok, p) = load(Ok(""));
+        assert!(ok);
+        assert_eq!(p.load_state(), Some(Loaded::Empty));
+        assert_eq!(p.record(), Some(&Record::default()));
+        // A good record.
+        let text = framed(kind::PLANNER, record::SCHEMA, WRITTEN, &bytes);
+        let (ok, mut p) = load(Ok(text.as_str()));
+        assert!(ok);
+        let in_use = Some(Loaded::Record {
+            rooms: good.entries().len(),
+            written: WRITTEN,
+        });
+        assert_eq!(p.load_state(), in_use);
+        assert_eq!(p.record(), Some(&good));
+        // Later loads are ignored once a record is in use: a failure, an empty segment, another
+        // record, or no segment at all.
+        let mut buf = Vec::new();
+        let other = framed(
+            kind::PLANNER,
+            record::SCHEMA,
+            WRITTEN + 1,
+            &payload_of(&Record::default()),
+        );
+        p.loaded(Err(given_up));
+        p.loaded(Err(LoadError::Decode(DecodeError::Empty)));
+        p.loaded(frame::decode(&other, &mut buf).map_err(LoadError::Decode));
+        p.no_record();
+        assert_eq!(p.load_state(), in_use);
+        assert_eq!(p.record(), Some(&good));
+        // A refused record stays the empty one in use: a good record later is ignored.
+        let (_, mut p) = load(Ok(refused.as_str()));
+        p.loaded(frame::decode(&text, &mut buf).map_err(LoadError::Decode));
+        assert_eq!(
+            p.load_state(),
+            Some(Loaded::Refused(Refusal::Record(RecordError::Long)))
+        );
+        assert_eq!(p.record(), Some(&Record::default()));
+        // No segment configured: an empty record at once, and a load after it is ignored.
+        let mut p = Planner::default();
+        assert_eq!((p.load_state(), p.record()), (None, None));
+        p.no_record();
+        assert_eq!(p.load_state(), Some(Loaded::Off));
+        assert_eq!(p.record(), Some(&Record::default()));
+        p.loaded(frame::decode(&text, &mut buf).map_err(LoadError::Decode));
+        assert_eq!(p.load_state(), Some(Loaded::Off));
+        assert_eq!(p.record(), Some(&Record::default()));
+    }
+
+    /// No room is planned before the record's load finished (ADR-027): a fresh planner with an
+    /// owned room, its spawn and its terrain starts nothing, tick after tick (no status, no run,
+    /// no step, nothing counted, nothing to write); the `begin` after `loaded` starts the run at
+    /// its first phase, and so does the `begin` after `no_record`.
+    /// Uses: PLANNER_MMO, MOVEMENT_MMO, CONTROLLER_STRUCTURES (the room's level).
+    #[test]
+    fn no_room_is_planned_before_the_record_loads() {
+        let scene = Scene::open("W1N1", &[spawn_tile()]);
+        let name = scene.name;
+        type Unlock = fn(&mut Planner);
+        let unlocks: [(&str, Unlock); 2] = [
+            ("loaded", |p| {
+                assert!(p.loaded(Err(LoadError::Decode(DecodeError::Empty))));
+            }),
+            ("no_record", Planner::no_record),
+        ];
+        for (how, unlock) in unlocks {
+            let mut w = World::unloaded();
+            for _ in 0..3 {
+                w.tick(std::slice::from_ref(&scene));
+                assert_eq!(w.planner.status(name), Status::None, "{how}");
+                assert!(!w.planner.busy());
+                assert_eq!(w.planner.next_phase(), None);
+                assert_eq!(w.planner.rooms().count(), 0);
+                assert_eq!(w.planner.step(params()), Step::Done);
+                assert_eq!(*w.planner.totals(), Totals::default());
+                assert_eq!(w.planner.load_state(), None);
+                assert!(!w.planner.take_dirty());
+                let mut out = Vec::new();
+                w.planner.payload(&mut out);
+                assert!(out.is_empty(), "no record to write before it loads");
+            }
+            unlock(&mut w.planner);
+            w.tick(std::slice::from_ref(&scene));
+            assert_eq!(w.planner.status(name), Status::Planning("core"), "{how}");
+            assert!(w.planner.busy());
+            assert_eq!(w.planner.totals().started, 1);
+        }
+    }
+
+    /// The record's anchor (ADR-027): after a global reset at the level of a second spawn (C5),
+    /// with the anchor spawn A lost and not sited again and the plan's first later spawn B
+    /// standing, a planner whose record holds the room's entry plans it on A again: the layout
+    /// the room was built from, the facts' prior anchor A, one anchor's run (the steps of the
+    /// first plan, in the plan and the totals). A stray extension neither A's nor B's plan holds
+    /// stands too, so A's fit is not full and only the record's keep rule ends the search before
+    /// B is tried. The same entry is set again, so nothing is to be written. With an empty record
+    /// the same scene has only B to anchor on, and the plan moves.
+    /// Uses: CONTROLLER_STRUCTURES (via `rules::earliest_level` for the second spawn's level),
+    /// PLANNER_MMO, MOVEMENT_MMO, `persist::kind::PLANNER`, `record::SCHEMA`.
+    #[test]
+    fn the_records_anchor_plans_the_room_it_was_built_from_in_one_run() {
+        use StructureType::{Extension, Spawn};
+        let a = spawn_tile();
+        let name = room("W1N1");
+        let level = earliest_level(Spawn, 1).expect("a level allows a second spawn");
+        let mut built_from = Scene::open("W1N1", &[a]);
+        built_from.level = level;
+        let mut w = World::new();
+        w.tick(&[built_from]);
+        w.plan();
+        let (layout, anchor, _, one_run) = w.ready(name);
+        assert_eq!(anchor, a);
+        let Status::Ready(plan) = w.planner.status(name) else {
+            panic!("ready");
+        };
+        let entry = plan.entry(name);
+        assert_eq!((entry.room, entry.anchor), (name, a));
+        assert_eq!(w.planner.record().and_then(|r| r.get(name)), Some(&entry));
+        let b = layout
+            .of(Spawn)
+            .filter(|i| i.tile != a && i.level <= level)
+            .map(|i| i.tile)
+            .min()
+            .expect("a later spawn due at the level");
+        let on_b = flood_plan(&open_facts(vec![b]), b).expect("a plan on B");
+        let stray = (0..ROOM_AREA)
+            .filter_map(Tile::from_index)
+            .filter(|x| !x.is_edge())
+            .find(|&x| !gives(&layout, Extension, x) && !gives(&on_b, Extension, x))
+            .expect("a tile neither plan gives an extension");
+        let mut reset = Scene::open("W1N1", &[b]);
+        reset.level = level;
+        reset.built = vec![(Extension, stray)];
+        let mut rec = Record::default();
+        assert!(rec.set(entry.clone()));
+        let mut w = World::with_record(&rec);
+        w.tick(std::slice::from_ref(&reset));
+        assert_eq!(w.planner.status(name), Status::Planning("core"));
+        w.plan();
+        let (again, at, _, steps) = w.ready(name);
+        assert_eq!(at, a, "anchored on the record's anchor");
+        assert!(again == layout, "the plan the room was built from");
+        assert_eq!(steps, one_run, "one anchor's run");
+        let t = *w.planner.totals();
+        assert_eq!((t.started, t.ready, t.failed, t.steps), (1, 1, 0, one_run));
+        let Status::Ready(plan) = w.planner.status(name) else {
+            panic!("ready");
+        };
+        let mut anchors = vec![a, b];
+        anchors.sort_unstable();
+        assert_eq!(plan.facts.prior, Some(a));
+        assert_eq!(plan.facts.anchors, anchors);
+        assert_eq!(plan.facts.spawns, [b]);
+        // The scenario: A's plan holds B but not the stray, so its fit is short of full, and the
+        // job and the anchor rules agree on the plan.
+        assert!(holds_spawn(&layout, b) && !gives(&layout, Extension, stray));
+        assert_eq!(plan.facts.own.len(), 2);
+        let (rule, rule_at) = anchor_rule(&plan.facts).expect("a valid plan");
+        assert_eq!((&rule, rule_at), (&layout, a));
+        assert_eq!(plan.entry(name), entry);
+        assert!(!w.planner.take_dirty(), "the same entry: nothing to write");
+        // Without the record, the room has one candidate, the standing spawn.
+        let mut w = World::new();
+        w.tick(&[reset]);
+        w.plan();
+        let (moved, on, ..) = w.ready(name);
+        assert_eq!(on, b);
+        assert!(moved == on_b, "the plan on B");
+        assert!(
+            moved != layout,
+            "the scenario: the record is what keeps the plan"
+        );
+    }
+
+    /// The keep rule (ADR-027): a record anchor A whose valid plan does not hold a standing spawn
+    /// (a new spawn standing off A's spawn tiles, with A lost or standing) is not kept at once:
+    /// the run goes on to the other anchors (more steps than one anchor's run) and readies what
+    /// the anchor rules worked out from `flood` and `validate` give for the facts with the prior
+    /// anchor. With A lost, the new spawn's plan holds everything standing and wins.
+    /// Uses: PLANNER_MMO, MOVEMENT_MMO, CONTROLLER_STRUCTURES (the room's level),
+    /// `persist::kind::PLANNER`, `record::SCHEMA`.
+    #[test]
+    fn a_record_anchor_whose_plan_misses_a_standing_spawn_is_not_kept() {
+        let a = spawn_tile();
+        let name = room("W1N1");
+        let mut w = World::new();
+        w.tick(&[Scene::open("W1N1", &[a])]);
+        w.plan();
+        let (layout, anchor, _, one_run) = w.ready(name);
+        assert_eq!(anchor, a);
+        let mut rec = Record::default();
+        let Status::Ready(plan) = w.planner.status(name) else {
+            panic!("ready");
+        };
+        rec.set(plan.entry(name));
+        let off = [tile(40, 40), tile(8, 30), tile(30, 8)]
+            .into_iter()
+            .find(|&t| !holds_spawn(&layout, t))
+            .expect("a tile off the plan's spawns");
+        let mut both = vec![a, off];
+        both.sort_unstable();
+        for spawns in [vec![off], both] {
+            let mut w = World::with_record(&rec);
+            w.tick(&[Scene::open("W1N1", &spawns)]);
+            w.plan();
+            let Status::Ready(plan) = w.planner.status(name) else {
+                panic!("ready with spawns {spawns:?}");
+            };
+            assert_eq!(plan.facts.prior, Some(a));
+            assert_eq!(plan.facts.spawns, spawns);
+            let (rule, at) = anchor_rule(&plan.facts).expect("a valid plan");
+            assert_eq!((&plan.layout, plan.anchor), (&rule, at), "{spawns:?}");
+            assert!(
+                plan.steps > one_run,
+                "the run went on past the record's anchor: {spawns:?}"
+            );
+            assert_eq!(plan.ready_at, w.time);
+            if spawns == [off] {
+                assert_eq!(plan.anchor, off, "the new spawn's plan holds what stands");
+                assert!(plan.layout != layout);
+            }
+        }
+    }
+
+    /// The record's upkeep (ADR-027): a loaded entry of a room this global does not own is
+    /// dropped at the first `begin` and marks the record for writing (`take_dirty` true once);
+    /// no entry is set while the room plans, and the plan becoming ready sets its entry
+    /// (`Plan::entry`) and marks it once. Ticks with the same facts leave it clean; the payload
+    /// round-trips through `Record::decode` to the record in use, and a reset planned from it sets
+    /// the same entry again (nothing to write). The room no longer owned drops its entry and
+    /// marks the record, whose payload is then the empty record's.
+    /// Uses: PLANNER_MMO, MOVEMENT_MMO, CONTROLLER_STRUCTURES (the room's level),
+    /// `persist::kind::PLANNER`, `record::SCHEMA`.
+    #[test]
+    fn the_record_follows_the_ready_plans_and_the_owned_rooms() {
+        let a = spawn_tile();
+        let scene = Scene::open("W1N1", &[a]);
+        let name = scene.name;
+        let stale = room("W9N9");
+        let mut rec = Record::default();
+        rec.set(Entry {
+            room: stale,
+            anchor: a,
+            adopted: Vec::new(),
+        });
+        let mut w = World::with_record(&rec);
+        assert!(!w.planner.take_dirty(), "a load is no change");
+        w.tick(std::slice::from_ref(&scene));
+        assert_eq!(w.planner.record().map(Record::entries), Some(&[][..]));
+        assert!(w.planner.take_dirty(), "the stale room's entry dropped");
+        assert!(!w.planner.take_dirty());
+        while w.planner.busy() {
+            assert_eq!(w.planner.record().and_then(|r| r.get(name)), None);
+            assert!(!w.planner.take_dirty(), "nothing set while the room plans");
+            w.planner.step(params());
+        }
+        let Status::Ready(plan) = w.planner.status(name) else {
+            panic!("ready");
+        };
+        let entry = plan.entry(name);
+        assert_eq!(entry.anchor, a);
+        let record = w.planner.record().expect("in use");
+        assert_eq!(record.entries(), std::slice::from_ref(&entry));
+        assert!(w.planner.take_dirty(), "the new entry");
+        assert!(!w.planner.take_dirty());
+        let (layout, ..) = w.ready(name);
+        for _ in 0..3 {
+            w.tick(std::slice::from_ref(&scene));
+            assert!(!w.planner.take_dirty(), "the same facts: no change");
+        }
+        let mut out = Vec::new();
+        w.planner.payload(&mut out);
+        let decoded = Record::decode(&out).expect("the payload decodes");
+        assert_eq!(Some(&decoded), w.planner.record());
+        // A reset planned from that record sets the same entry again: nothing to write.
+        let mut again = World::with_record(&decoded);
+        again.tick(std::slice::from_ref(&scene));
+        assert!(!again.planner.take_dirty());
+        again.plan();
+        assert!(again.ready(name).0 == layout);
+        assert_eq!(again.planner.record(), Some(&decoded));
+        assert!(
+            !again.planner.take_dirty(),
+            "the same entry: nothing to write"
+        );
+        // The room no longer owned: its entry is dropped, and the record is written.
+        let mut lost = scene.clone();
+        lost.owned = false;
+        w.tick(&[lost]);
+        assert_eq!(w.planner.status(name), Status::None);
+        assert_eq!(w.planner.record().and_then(|r| r.get(name)), None);
+        assert!(w.planner.take_dirty(), "the entry dropped");
+        assert!(!w.planner.take_dirty());
+        out.clear();
+        w.planner.payload(&mut out);
+        assert_eq!(out, payload_of(&Record::default()));
+        assert_eq!(Record::decode(&out), Ok(Record::default()));
+    }
+
+    /// `Plan::entry` (ADR-027) keeps the plan's anchor and only the facts' standing containers and
+    /// links the layout gives their type on their tiles: a container on the plan's mining tile and
+    /// a link on its controller link tile are kept; a container and a link on a tile the plan gives
+    /// neither, and a link on the plan's other mining tile (its container's, not a link's), are not.
+    /// Uses: PLANNER_MMO, `kind_rank` (layout::KINDS: the facts' order).
+    #[test]
+    fn a_plans_entry_keeps_only_the_standing_it_holds() {
+        use StructureType::{Container, Link};
+        let a = spawn_tile();
+        let name = room("W1N1");
+        let layout = flood_plan(&open_facts(vec![a]), a).expect("a plan on the anchor");
+        let (m0, m1) = match layout.roles.mining[..] {
+            [m0, m1] => (m0, m1),
+            _ => panic!("a mining tile per source"),
+        };
+        let link = layout.roles.controller_link.expect("a controller link");
+        let stray = (0..ROOM_AREA)
+            .filter_map(Tile::from_index)
+            .filter(|x| !x.is_edge())
+            .find(|&x| !gives(&layout, Container, x) && !gives(&layout, Link, x))
+            .expect("a tile the plan gives no container or link");
+        assert!(gives(&layout, Container, m1) && !gives(&layout, Link, m1));
+        let mut facts = open_facts(vec![a]);
+        facts.standing = by_kind(vec![
+            (Container, m0),
+            (Container, stray),
+            (Link, link),
+            (Link, stray),
+            (Link, m1),
+        ]);
+        let plan = Plan {
+            layout,
+            facts,
+            anchor: a,
+            ready_at: 0,
+            steps: 0,
+        };
+        assert_eq!(
+            plan.entry(name),
+            Entry {
+                room: name,
+                anchor: a,
+                adopted: by_kind(vec![(Container, m0), (Link, link)]),
+            }
+        );
+    }
+
+    /// The job's entry is the ready plan's: with a container built on the plan's mining tile, a
+    /// container site on its other one and a container standing off the plan, the record's entry
+    /// holds the two on the plan and not the stray (the plan gives no container there).
+    /// Uses: PLANNER_MMO, MOVEMENT_MMO, CONTROLLER_STRUCTURES (the room's level), CONTAINER_HITS
+    /// and CONSTRUCTION_COST (the container and site rows).
+    #[test]
+    fn the_records_entry_leaves_out_a_container_off_the_plan() {
+        use StructureType::Container;
+        let a = spawn_tile();
+        let name = room("W1N1");
+        let layout = flood_plan(&open_facts(vec![a]), a).expect("a plan on the anchor");
+        let (m0, m1) = match layout.roles.mining[..] {
+            [m0, m1] => (m0, m1),
+            _ => panic!("a mining tile per source"),
+        };
+        let stray = (0..ROOM_AREA)
+            .filter_map(Tile::from_index)
+            .filter(|x| !x.is_edge())
+            .find(|&x| !gives(&layout, Container, x))
+            .expect("a tile the plan gives no container");
+        let mut scene = Scene::open("W1N1", &[a]);
+        scene.containers = vec![m0, stray];
+        scene.sites = vec![(Container, m1)];
+        let mut w = World::new();
+        w.tick(&[scene]);
+        w.plan();
+        let Status::Ready(plan) = w.planner.status(name) else {
+            panic!("ready");
+        };
+        let mut standing = vec![(Container, m0), (Container, m1), (Container, stray)];
+        standing.sort_unstable_by_key(|&(_, t)| t);
+        assert_eq!(plan.facts.standing, standing);
+        assert!(!gives(&plan.layout, Container, stray), "the scenario");
+        let mut on_plan = vec![(Container, m0), (Container, m1)];
+        on_plan.sort_unstable_by_key(|&(_, t)| t);
+        let entry = plan.entry(name);
+        assert_eq!(entry.adopted, on_plan);
+        assert_eq!(w.planner.record().and_then(|r| r.get(name)), Some(&entry));
+    }
+
+    /// The record's adopted tiles (ADR-027): a container standing within `RECEIVER_RANGE` of the
+    /// controller off the tile a fresh plan gives its container is adopted (ADR-026) and goes in
+    /// the entry; after a reset with that container lost and not sited again, the record keeps it
+    /// standing for the run, so the plan is the one the room was built from and the entry is
+    /// unchanged (nothing to write). With an empty record the plan puts the controller container
+    /// back where a fresh plan does.
+    /// Uses: RECEIVER_RANGE, CONTROLLER_LINK_RANGE (the controller container's tiles), PLANNER_MMO,
+    /// MOVEMENT_MMO, CONTROLLER_STRUCTURES (the room's level), CONTAINER_HITS (the container row),
+    /// `persist::kind::PLANNER`, `record::SCHEMA`.
+    #[test]
+    fn the_records_adopted_container_keeps_the_plan_while_it_is_lost() {
+        use crate::economy::{CONTROLLER_LINK_RANGE, RECEIVER_RANGE};
+        use StructureType::Container;
+        let a = spawn_tile();
+        let name = room("W1N1");
+        let fresh = flood_plan(&open_facts(vec![a]), a).expect("a plan on the anchor");
+        let given = fresh
+            .roles
+            .controller_container
+            .expect("a controller container");
+        // A fresh plan tries the link range first, so a tile at the receiver range is a choice
+        // only a standing container makes.
+        const { assert!(CONTROLLER_LINK_RANGE < RECEIVER_RANGE) };
+        let fixed: Vec<Tile> = source_tiles()
+            .into_iter()
+            .chain([controller_tile(), mineral_tile()])
+            .collect();
+        let off = (0..ROOM_AREA)
+            .filter_map(Tile::from_index)
+            .filter(|&t| t.range(controller_tile()) == RECEIVER_RANGE)
+            .filter(|&t| t != given && !t.is_edge())
+            .filter(|&t| fixed.iter().all(|&f| f.range(t) > 1))
+            .find(|&t| fresh.items.iter().all(|i| i.tile != t))
+            .expect("a free tile at the receiver range");
+        let mut built_from = Scene::open("W1N1", &[a]);
+        built_from.containers = vec![off];
+        let mut w = World::new();
+        w.tick(&[built_from]);
+        w.plan();
+        let (layout, ..) = w.ready(name);
+        assert_eq!(layout.roles.controller_container, Some(off), "adopted");
+        assert!(
+            layout != fresh,
+            "the scenario: the container moves the plan"
+        );
+        let Status::Ready(plan) = w.planner.status(name) else {
+            panic!("ready");
+        };
+        let entry = plan.entry(name);
+        assert_eq!(entry.adopted, [(Container, off)]);
+        let mut rec = Record::default();
+        rec.set(entry.clone());
+        let lost = Scene::open("W1N1", &[a]);
+        let mut w = World::with_record(&rec);
+        w.tick(std::slice::from_ref(&lost));
+        w.plan();
+        let Status::Ready(plan) = w.planner.status(name) else {
+            panic!("ready");
+        };
+        assert_eq!(plan.facts.standing, [(Container, off)]);
+        assert!(plan.layout == layout, "the plan the room was built from");
+        assert_eq!(plan.entry(name), entry);
+        assert!(!w.planner.take_dirty(), "the same entry: nothing to write");
+        // Without the record the container is gone from the facts, and so is its tile.
+        let mut w = World::new();
+        w.tick(&[lost]);
+        w.plan();
+        let (again, ..) = w.ready(name);
+        assert!(again == fresh);
+        assert_eq!(again.roles.controller_container, Some(given));
     }
 }

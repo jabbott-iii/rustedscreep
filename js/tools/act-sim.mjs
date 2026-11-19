@@ -103,14 +103,16 @@ function expectedCalls(offset) {
 // a move by it. Odd ticks: 10 calls, 3 skipped, 6 OK (heal, drop, move, say, rangedHeal, b's move), 5 billed
 // (say is free, V34), full 1, not enough 1, unknown 1 (upgradeController), threw 1 (pull). Even ticks: b's
 // rangedHeal fails (not in range), so b's repair is called and OK: 11 calls, 2 skipped, 6 OK, 5 billed,
-// 3 failed. The all-throw tick: 13 calls, all thrown, none skipped. Since boot the counts also hold the opening's one
-// createConstructionSite call (ADR-020: W1N1 at RCL2 has one extension, the far one, of the 5 it allows), on the loop
-// after the constants self-check (offset 2): issued, ok and billed each one more than before ADR-020 from offset 3 on
-// (V203; the fake room places nothing, so the next pick waits 10 loops, past this run).
+// 3 failed. The all-throw tick: 13 calls, all thrown, none skipped. The counts also hold the opening's one
+// createConstructionSite call (ADR-020: W1N1 at RCL2 has one extension, the far one, of the 5 it allows), at offset 3:
+// the room has no source, so its plan fails at once and the interim placement places, but only from the loop after
+// the planner's record loaded (offset 2, after the planner's begin; ADR-027: the call was at offset 2 before), so
+// offset 3's own counts are one more (issued 11, ok 7, billed 6) and since boot each is one more than before ADR-020
+// from offset 3 on (V203; the fake room places nothing, so the next pick waits 10 loops, past this run).
 const ACT_EXPECTED = {
   3: [
     'rustedscreep act at tick 50000003: queued 14 (replaced 1), refused 6, not mine 1, spawning 1, ' +
-      'spawning target 1, wrong target 1, not in range 1, zero amount 1 | blocked 3 | issued 10: ok 6 (billed 5), ' +
+      'spawning target 1, wrong target 1, not in range 1, zero amount 1 | blocked 3 | issued 11: ok 7 (billed 6), ' +
       'failed 2, not enough 1, full 1, unknown 1, threw 1, missing 0 | since boot: ticks 3, queued 42, refused 13, ' +
       'blocked 8, issued 32, ok 19, billed 16, failed 7, unknown 3, threw 3, missing 0 | last failure at tick ' +
       '50000003: pull threw',

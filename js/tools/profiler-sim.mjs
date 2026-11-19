@@ -30,7 +30,7 @@ import { join } from 'node:path';
 const SCAN_INTERVAL = 50;
 import { build } from './build.mjs';
 import { ROOT, fail, isMain } from './lib/common.mjs';
-import { CONFIG_SEGMENT, checkResults, commandResults, driverRawMemory, simulate } from './smoke.mjs';
+import { CONFIG_SEGMENT, PLANNER_SEGMENT, checkResults, commandResults, driverRawMemory, simulate } from './smoke.mjs';
 import { sceneAt } from './lib/world.mjs';
 
 /** PROFILER_MMO (config.rs): window length, kept windows and segment id. */
@@ -226,9 +226,11 @@ export function profilerSim() {
   if (JSON.stringify(siteCalls) !== JSON.stringify(wantSites)) problems.push(`createConstructionSite at ${JSON.stringify(siteCalls.slice(0, 8))}, expected ${LOST_MAX} from offset ${constsLast} or ${constsLast + 1}, ${APPEAR_TICKS} apart`);
   world.loopCalls.forEach((c, offset) => {
     if (offset < 2) return; // the loader also reads the clock on the boot ticks and the first loop
-    // The second loop reads the config record (P1.10) the first activated: one more RawMemory.segments
-    // read and the load job's two clock samples.
+    // The second loop reads the config record (P1.10) and the planner's record (ADR-027) the first activated:
+    // one more RawMemory.segments read and the load job's three clock samples (two steps in one run; two
+    // before ADR-027).
     const config = offset === 2 ? 1 : 0;
+    const LOAD_SAMPLES = 3;
     // Movement (P2.1): the owned W1N1 (the Harvester's room) was first read on the first loop, so its
     // periodic rescan comes every SCAN_INTERVAL loops after it: one unit, a sample before and after.
     const rescan = offset > 1 && (offset - 1) % SCAN_INTERVAL === 0 ? 1 : 0;
@@ -238,7 +240,7 @@ export function profilerSim() {
     // hauler to store), and its Optional placement job (ADR-020) one unit from the second loop (2 more).
     const opening = 4 + 2 + 2 + (offset >= 2 ? 2 : 0);
     const reads = (closing.has(offset) && offset !== closeAt(noRawMemory.window) ? 1 : 0) + config;
-    const want = { getUsed: (closing.has(offset) ? 7 : 6) + 2 * config + 2 * rescan + opening, segments: reads };
+    const want = { getUsed: (closing.has(offset) ? 7 : 6) + LOAD_SAMPLES * config + 2 * rescan + opening, segments: reads };
     const checking = offset <= constsLast;
     const usedOk = checking ? c.getUsed >= want.getUsed && c.getUsed <= want.getUsed + 64 : c.getUsed === want.getUsed;
     if (!usedOk || c.segments !== want.segments) {
@@ -249,9 +251,11 @@ export function profilerSim() {
   const cold = world.logs.filter((l) => l.startsWith('rustedscreep profiler: first loop'));
   if (cold.length !== 1) problems.push(`cold lines: ${cold.length}`);
   const saves = JSON.stringify(world.segmentSaves);
-  // The driver re-saves the loaded config segment on the second loop (V119); then the two window writes.
+  // The driver re-saves the loaded config and planner record segments on the second loop (V119; the planner's
+  // since ADR-027); then the two window writes.
   const wantSaves = JSON.stringify([
-    { offset: 2, keys: [String(CONFIG_SEGMENT)] }, ...[closeAt(1), closeAt(2)].map((offset) => ({ offset, keys: [SEGMENT] })),
+    { offset: 2, keys: [String(PLANNER_SEGMENT), String(CONFIG_SEGMENT)] },
+    ...[closeAt(1), closeAt(2)].map((offset) => ({ offset, keys: [SEGMENT] })),
   ]);
   if (saves !== wantSaves) problems.push(`segment saves ${saves}, expected ${wantSaves}`);
   if (world.segmentErrors.length) problems.push(`segment errors: ${world.segmentErrors.join(' / ')}`);

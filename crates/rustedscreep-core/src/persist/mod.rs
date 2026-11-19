@@ -30,4 +30,6 @@ pub mod kind {
     pub const SELF_TEST: u16 = 1;
     /// The runtime config overrides (`crate::config::overrides`).
     pub const CONFIG: u16 = 2;
+    /// The planner's anchors and adopted tiles (`crate::planner::record`, ADR-027).
+    pub const PLANNER: u16 = 3;
 }

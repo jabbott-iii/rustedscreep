@@ -190,6 +190,10 @@ pub struct PersistConfig {
     /// The segment that keeps the runtime config overrides across global resets ([`overrides`];
     /// 0 to 99). Unit: segment id.
     pub config_segment: u8,
+    /// The segment that keeps the planner's record across global resets: each owned room's plan
+    /// anchor and adopted containers and links (`planner::record`, ADR-027; 0 to 99). Unit:
+    /// segment id.
+    pub planner_segment: u8,
 }
 
 /// Segment manager values for the official MMO.
@@ -199,6 +203,7 @@ pub const PERSIST_MMO: PersistConfig = PersistConfig {
     max_writes_per_tick: 2,
     self_test_segment: 98,
     config_segment: 97,
+    planner_segment: 96,
 };
 
 /// How much the bot logs, least verbose first. rustedscreep-wasm maps it to `log::LevelFilter`
@@ -864,7 +869,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 93;
+pub const FIELD_COUNT: usize = 94;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -992,6 +997,7 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(persist, "PersistConfig", max_writes_per_tick, 1, 10, true),
     number!(persist, "PersistConfig", self_test_segment, 0, 99, false),
     number!(persist, "PersistConfig", config_segment, 0, 99, false),
+    number!(persist, "PersistConfig", planner_segment, 0, 99, false),
     Field {
         key: "log.level",
         tuning: "LogConfig::level",
@@ -1166,7 +1172,7 @@ pub struct Rule {
 /// `CPU_TICK_LIMIT_MAX`: Standard switches on from the bucket at the start of the tick, and one tick
 /// is billed about tickLimit at most (the scheduler stops every tier at the ceiling and the reserve
 /// covers the rest), so a Standard tick leaves the bucket at or above the boot gate (TUNING.md).
-pub static RULES: [Rule; 9] = [
+pub static RULES: [Rule; 12] = [
     Rule {
         keys: ["loader.backoff_base_ticks", "loader.backoff_max_ticks"],
         text: "loader.backoff_base_ticks must be at most loader.backoff_max_ticks",
@@ -1212,6 +1218,21 @@ pub static RULES: [Rule; 9] = [
         keys: ["persist.self_test_segment", "persist.config_segment"],
         text: "persist.self_test_segment and persist.config_segment must differ",
         holds: |c| c.persist.self_test_segment != c.persist.config_segment,
+    },
+    Rule {
+        keys: ["persist.planner_segment", "profiler.stats_segment"],
+        text: "persist.planner_segment and profiler.stats_segment must differ",
+        holds: |c| c.persist.planner_segment != c.profiler.stats_segment,
+    },
+    Rule {
+        keys: ["persist.planner_segment", "persist.self_test_segment"],
+        text: "persist.planner_segment and persist.self_test_segment must differ",
+        holds: |c| c.persist.planner_segment != c.persist.self_test_segment,
+    },
+    Rule {
+        keys: ["persist.planner_segment", "persist.config_segment"],
+        text: "persist.planner_segment and persist.config_segment must differ",
+        holds: |c| c.persist.planner_segment != c.persist.config_segment,
     },
     Rule {
         keys: ["repair.walk_pct", "repair.start_pct"],
@@ -1296,6 +1317,7 @@ mod tests {
             max_writes_per_tick: _,
             self_test_segment: _,
             config_segment: _,
+            planner_segment: _,
         } = PERSIST_MMO;
         let LogConfig {
             level: _,
@@ -1442,6 +1464,7 @@ mod tests {
                     "max_writes_per_tick",
                     "self_test_segment",
                     "config_segment",
+                    "planner_segment",
                 ],
             ),
             ("log", &["level", "skip_window_ticks", "consts_findings"]),
@@ -1631,6 +1654,7 @@ mod tests {
             "profiler.stats_segment",
             "persist.self_test_segment",
             "persist.config_segment",
+            "persist.planner_segment",
         ] {
             assert_eq!(
                 range(key),

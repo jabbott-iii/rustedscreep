@@ -324,7 +324,9 @@ Base planner in the tick path (P4.3, ADR-026). `planner::job::Planner` reads eac
 the controller, sources and spawns from the snapshot, the mineral from movement's statics, the standing containers and links and their
 own sites, which `flood::Run::adopt` hands the run) and plans it once a global, one phase a step, then validates it; with several
 spawns or a spawn site each is tried as the anchor (from the highest tile down, so the room's first spawn usually goes first), and the
-valid plan that holds every standing spawn and the most of what stands is kept. The plan lives in the heap only (it is deterministic in those facts); a plan is planned again only when a spawn it did not know
+valid plan that holds every standing spawn and the most of what stands is kept. The plan lives in the heap; a small record (ADR-027,
+`planner::record`, segment `persist.planner_segment`) keeps each room's anchor and adopted container and link tiles across global resets,
+and no room is planned until it has loaded: the record's anchor is tried first and its plan kept once it holds every standing spawn; a plan is planned again only when a spawn it did not know
 stands off its spawn tiles. Each planned road records what it serves (`layout::RoadNeed`), so `planner::build` places it only from the
 earliest level a structure it serves is placed under the config's switches. rustedscreep-wasm's
 `planner.rs` runs it as the Optional `planner` job (each step heavy, timed with two `getUsed` calls for `rustedscreep.planner()`).
@@ -451,17 +453,20 @@ Current state (P1.6, `rustedscreep_core::scheduler`; values from `SCHEDULER_MMO`
 ## 5. Persistence
 _P1._ Segment map, format versions, dirty policy, rebuild path.
 
-Current state (P1.10; the manager and the frame are P1.9, ADR-004):
+Current state (P1.10 and ADR-027; the manager and the frame are P1.9, ADR-004):
 
 | Segment | Owner | Format | Written | Read |
 |---|---|---|---|---|
+| 96 (`PersistConfig::planner_segment`) | the planner's record (`planner::record`, ADR-027) | frame kind 3, schema 1; payload `count:u16`, then per owned room `room:u16 anchor:u16 n:u8 (kind:u8 tile:u16)*n` (the packed room name, V255; the plan's anchor and adopted container and link tiles) | when a room's entry changes (a plan ready with another anchor or adopted tiles, a room no longer owned), or at once after a refused record, on the next tick that runs the Standard tier; never in a global whose load did not get the segment's text | once per global, as 97; no room is planned until it has loaded |
 | 97 (`PersistConfig::config_segment`) | runtime config overrides (`config::overrides`) | frame kind 2, schema 1; payload ASCII `key=value\n` lines in field order | after a console change, on the next tick that runs the Standard tier | once per global: requested at the start, looked up on the first loop, read on the next after the activation |
 | 98 (`PersistConfig::self_test_segment`) | the self-test (`rustedscreep.persistTest`) | frame kind 1, a test pattern | on the tick after the command | on the tick after the write |
 | 99 (`ProfilerConfig::stats_segment`) | the profiler (`profiler` builds) | JSON, format v1 (`profiler/text.rs`) | once per 1000-loop window, without activation | never by the bot (read in the console, TEST_PLAN §8); the manager reserves it |
 
 - Frame (ADR-004): `rs1b` + base64 of a 16-byte header (kind, schema, write tick, length, CRC-32) and the payload. Every decode
   failure is an error the owner answers by rebuilding: for the config record, the profile's values apply (an empty segment means no
-  overrides; anything else that is not a valid record is logged once and its overrides are not used). The record's lines are
+  overrides; anything else that is not a valid record is logged once and its overrides are not used); for the planner's record, rooms
+  are planned from what stands (an empty segment means no record; a refused one is logged once and written again with what this
+  global plans; a segment never read is logged once and left as it is). The record's lines are
   checked again on load like a console change: unknown keys, fields only a profile sets and bad values are dropped with a note,
   numbers are clamped, and overrides that break a rule together are dropped.
 - Console changes wait until the record has loaded, so they cannot overwrite a record not yet read. Clearing segment 97 from the
