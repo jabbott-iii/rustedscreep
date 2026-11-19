@@ -8,13 +8,13 @@
 // (assumed, V95). npm run build runs the plain smoke test; npm run check also runs a trap-test build
 // through 10 forced traps. npm run build runs the smoke test twice, with the wasm as a binary module and as the base64
 // text module the GitHub link delivers (ADR-015). Standalone: node js/tools/smoke.mjs [dir] [binary|base64].
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import vm from 'node:vm';
 import { FIXTURE_DIR, parseFixture } from './consts-fixture.mjs';
 import { ROOT, WASM_MODULE, fail, isMain } from './lib/common.mjs';
-import { wasmModuleText } from './lib/wasm-text.mjs';
+import { partIndex, partModuleName, wasmModuleTexts } from './lib/wasm-text.mjs';
 import { sceneAt } from './lib/world.mjs';
 
 // atob, btoa and Buffer were never probed on the MMO (V95), so the sandbox has none and the loader needs none.
@@ -106,6 +106,16 @@ export function driverRawMemory(offset, world) {
   };
 }
 
+/** The wasm text modules in `dir`, { module name: source }: every `rustedscreep_wasm[_<k>].js` file (ADR-028). */
+export function partFiles(dir) {
+  const out = {};
+  for (const f of readdirSync(dir).sort()) {
+    const k = partIndex(f);
+    if (k >= 0) out[partModuleName(k)] = readFileSync(join(dir, f), 'utf8');
+  }
+  return out;
+}
+
 /**
  * Runs the bundle in `dir` for up to `ticks` ticks. `command(world)` may return console command source
  * to evaluate after that tick's loop, as the game does. Stops early once `until(world)` is true.
@@ -120,19 +130,21 @@ export function driverRawMemory(offset, world) {
  * `setup(context, world)` runs once per new global, before the bundle is evaluated (to instrument the realm).
  * `bucket` is Game.cpu.bucket: a number, or `bucket(offset)` for one per tick.
  * `wasmForm` is how require('rustedscreep_wasm') answers: 'binary', the module's bytes (an API upload, V31), or
- * 'base64', the text module the GitHub link delivers (ADR-015), read from `${dir}/rustedscreep_wasm.js` (or made from
- * `wasmBytes`) and evaluated in the driver's module wrapper once per global (V138); without the file it throws
- * "Unknown module", as the live link did with only the .wasm (V136).
+ * 'base64', the text modules the GitHub link delivers (ADR-015, ADR-028): `rustedscreep_wasm` and any
+ * `rustedscreep_wasm_<k>`, read from their files in `dir` (or made from `wasmBytes`, or given as `textModules`,
+ * { name: source }) and each evaluated in the driver's module wrapper once per global (V138); a missing one throws
+ * "Unknown module", as the live link did with only the .wasm (V136), and one that throws is not cached.
  */
 export function simulate(dir, {
   ticks = 6, bucket = 10000, command = null, until = null, memoryJson = '{}', withHalt = true, wasmBytes = null,
   scene = sceneAt, rawMemory = driverRawMemory, constants = ENGINE_CONSTANTS, setup = null, wasmForm = 'binary',
+  textModules = null,
 } = {}) {
   if (wasmForm !== 'binary' && wasmForm !== 'base64') throw new Error(`unknown wasm form ${wasmForm}`);
   const code = readFileSync(join(dir, 'main.js'), 'utf8');
-  const textPath = join(dir, `${WASM_MODULE}.js`);
   const bytes = wasmForm === 'binary' ? (wasmBytes ?? readFileSync(join(dir, `${WASM_MODULE}.wasm`))) : null;
-  const wasmText = wasmForm === 'base64' ? (wasmBytes ? wasmModuleText(wasmBytes) : existsSync(textPath) ? readFileSync(textPath, 'utf8') : null) : null;
+  const texts = wasmForm !== 'base64' ? null
+    : textModules ?? (wasmBytes ? Object.fromEntries(wasmModuleTexts(wasmBytes).map((t, k) => [partModuleName(k), t])) : partFiles(dir));
   const world = {
     time: 50000000, memoryJson, logs: [], notifies: [], halts: 0, globals: 0, ticksRun: 0,
     segments: {}, segmentSaves: [], segmentErrors: [], loopCalls: [],
@@ -152,11 +164,14 @@ export function simulate(dir, {
       if (cache.has(name)) return cache.get(name);
       let value;
       if (name === WASM_MODULE && wasmForm === 'binary') value = new Uint8(bytes);
-      else if (name === WASM_MODULE && wasmText !== null) {
+      else if (texts !== null && Object.hasOwn(texts, name)) {
         const __module = vm.runInContext('({ exports: {} })', context);
         context.__module = __module;
-        vm.runInContext(`(function __module(module,exports){ ${wasmText}\n})(__module, __module.exports)`, context, { filename: `${WASM_MODULE}.js` });
-        delete context.__module;
+        try {
+          vm.runInContext(`(function __module(module,exports){ ${texts[name]}\n})(__module, __module.exports)`, context, { filename: `${name}.js` });
+        } finally {
+          delete context.__module;
+        }
         value = __module.exports;
       } else throw new Error(`Unknown module '${name}'`);
       cache.set(name, value);
@@ -501,9 +516,12 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [], wasmForm = 'bin
   const boot = world.logs.find((l) => l.startsWith('rustedscreep boot:'));
   if (!boot) throw new Error(`no boot log; logs: ${world.logs.join(' / ')}`);
   if (!boot.includes(': match)')) throw new Error(`the boot log does not report a matching CRC-32: ${boot}`);
-  // The boot line names the delivery that ran: the text module's base64 (ADR-015) or a binary module's bytes.
-  const form = wasmForm === 'base64' ? / \| wasm String\(base64, \d+ chars\) \d+ B crc32 / : / \| wasm Uint8Array \d+ B crc32 /;
-  if (!form.test(boot)) throw new Error(`the boot log does not show the ${wasmForm} wasm module: ${boot}`);
+  // The boot line names the delivery that ran: the text modules' base64 (ADR-015), with their count when the wasm is
+  // split (ADR-028), or a binary module's bytes.
+  const parts = Object.keys(partFiles(dir)).length;
+  const form = wasmForm === 'binary' ? / \| wasm Uint8Array \d+ B crc32 /
+    : parts > 1 ? new RegExp(` \\| wasm String\\(base64, \\d+ chars in ${parts} parts\\) \\d+ B crc32 `) : / \| wasm String\(base64, \d+ chars\) \d+ B crc32 /;
+  if (!form.test(boot)) throw new Error(`the boot log does not show the ${wasmForm} wasm module${wasmForm === 'base64' ? ` in ${parts} part(s)` : ''}: ${boot}`);
   if (!boot.includes(', atob undefined, Buffer undefined')) throw new Error(`the boot log does not report atob and Buffer: ${boot}`);
   const booted = world.logs.findIndex((l) => l.startsWith('rustedscreep booted in'));
   if (booted < 0) throw new Error(`the bundle never finished booting; logs: ${world.logs.join(' / ')}`);

@@ -494,6 +494,28 @@ function persistTest(bytes) {
 }
 
 /**
+ * Exported to JS as `plannerSummary`, for the `rustedscreep.planner()` console command: one line
+ * with each owned room's plan and its placement's last look, the totals since boot and the CPU
+ * per planner phase (P4.3).
+ * @returns {string}
+ */
+function plannerSummary() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        let ret;
+        __wbg_call_guard();
+        ret = wasm.plannerSummary();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        __wbg_call_guard();
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * Exported to JS as `profilerSummary`, for the `rustedscreep.profiler()` console command: one line
  * with the open window's CPU statistics, the act cost per call, the last loop, the last closed
  * window, the stats-segment writes and the cold loop. A build without the `profiler` feature says so.
@@ -711,6 +733,10 @@ function __wbg_get_imports() {
         },
         __wbg_deleteProperty_3ad7a085da623822: function() { return handleError(function (arg0, arg1) {
             const ret = Reflect.deleteProperty(arg0, arg1);
+            return ret;
+        }, arguments); },
+        __wbg_destroy_c79477a7058f2e5c: function() { return handleError(function (arg0) {
+            const ret = arg0.destroy();
             return ret;
         }, arguments); },
         __wbg_drop_2117aa4480fb3f7d: function() { return handleError(function (arg0, arg1, arg2) {
@@ -1111,7 +1137,7 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("string")], shim_idx: 16, ret: Externref, inner_ret: Some(Externref) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("string")], shim_idx: 17, ret: Externref, inner_ret: Some(Externref) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_66fc74bf8055cade___convert__closures_____invoke___wasm_bindgen_66fc74bf8055cade___JsValue__wasm_bindgen_66fc74bf8055cade___JsValue__true_);
             return ret;
         },
@@ -1355,7 +1381,8 @@ function initSync(module) {
 }
 
 // Base64 (RFC 4648 section 4, the standard alphabet, padded) to bytes, for the wasm text module the GitHub link
-// delivers (ADR-015: the link uploads files as text, so the wasm travels as base64 in a .js module, V137). Plain JS:
+// delivers (ADR-015: the link uploads files as text, so the wasm travels as base64 in a .js module, V137; ADR-028
+// splits it across several, which decodeBase64Into writes into one buffer). Plain JS:
 // TextDecoder is undefined on the MMO (V72), and atob and Buffer were never probed there (V95). Strict: a length
 // that is not a multiple of 4, any character outside the alphabet, or a misplaced '=' throws. Non-canonical
 // trailing bits are not refused; they do not change the bytes, and the loader's CRC-32 covers the content.
@@ -1373,16 +1400,38 @@ function lookup() {
     table$1 = t;
     return t;
 }
-/** The bytes that padded standard base64 `text` encodes; throws a TypeError for anything else. */
-function decodeBase64(text) {
+/** The '=' that end `text` (0, 1 or 2); throws a TypeError when its length is not a multiple of 4. */
+function padding(text) {
     const n = text.length;
     if (n % 4 !== 0)
         throw new TypeError(`base64 text of ${n} characters is not a multiple of 4`);
-    const pad = n === 0 || text.charCodeAt(n - 1) !== PAD ? 0 : text.charCodeAt(n - 2) === PAD ? 2 : 1;
-    const out = new Uint8Array((n / 4) * 3 - pad);
+    return n === 0 || text.charCodeAt(n - 1) !== PAD ? 0 : text.charCodeAt(n - 2) === PAD ? 2 : 1;
+}
+/** How many bytes padded standard base64 `text` decodes to; throws a TypeError when its length is not a multiple of 4. */
+function decodedLength(text) {
+    return (text.length / 4) * 3 - padding(text);
+}
+/** The bytes that padded standard base64 `text` encodes; throws a TypeError for anything else. */
+function decodeBase64(text) {
+    const out = new Uint8Array(decodedLength(text));
+    decodeBase64Into(text, out, 0);
+    return out;
+}
+/**
+ * Decodes padded standard base64 `text` into `out` from `offset`, for a wasm split across text modules (ADR-028),
+ * and returns the number of bytes written (`decodedLength(text)`). Throws a TypeError for text that is not base64
+ * and a RangeError when `out` has no room for it.
+ */
+function decodeBase64Into(text, out, offset) {
+    const n = text.length;
+    const pad = padding(text);
+    const length = (n / 4) * 3 - pad;
+    if (offset < 0 || offset + length > out.length) {
+        throw new RangeError(`no room for ${length} bytes at offset ${offset} of ${out.length}`);
+    }
     const t = lookup();
     const full = pad ? n - 4 : n;
-    let o = 0;
+    let o = offset;
     for (let i = 0; i < full; i += 4) {
         const c0 = text.charCodeAt(i);
         const c1 = text.charCodeAt(i + 1);
@@ -1418,7 +1467,7 @@ function decodeBase64(text) {
         if (pad === 1)
             out[o] = ((b & 15) << 4) | (c >> 2);
     }
-    return out;
+    return length;
 }
 
 // CRC-32 (ISO-HDLC, the zlib/PNG CRC): the same algorithm as js/tools/lib/crc32.mjs, so the boot log
@@ -1513,6 +1562,79 @@ function toBytes(value) {
     if (Object.prototype.toString.call(value) === '[object ArrayBuffer]')
         return new Uint8Array(value);
     throw new TypeError(`require('${WASM_MODULE}') returned ${typeTag(value)}, not bytes`);
+}
+/** The module that holds part `k` of the wasm's base64 text (ADR-028): `rustedscreep_wasm`, then `rustedscreep_wasm_1`, … */
+function partModuleName(k) {
+    return k === 0 ? WASM_MODULE : `${WASM_MODULE}_${k}`;
+}
+/**
+ * The wasm's bytes, and the form that ran for the boot line. A binary module under `rustedscreep_wasm` (an API
+ * upload, the private server, the sandbox) is used alone, as `toBytes` reads it. A string there is part 0 of the
+ * text form the GitHub link delivers (ADR-015, ADR-028): every part `wasmParts` lists must be a string of exactly
+ * its recorded length, only the last may end in '=', and the parts are decoded into one buffer, so a missing,
+ * empty, cut or misplaced part throws a TypeError that names it before anything is decoded or compiled (an empty
+ * part 0 with toBytes's text, `returned Object, not bytes`, since a non-string part 0 is read as a binary module).
+ * A part of the recorded length with other content decodes, and the CRC-32 check reports it (ADR-015).
+ */
+function loadWasm(requireModule, wasmParts) {
+    // A part that is missing, or cut short (a SyntaxError that does not name its module), is named, part 0 too.
+    let first;
+    try {
+        first = requireModule(WASM_MODULE);
+    }
+    catch (e) {
+        throw new TypeError(`require('${WASM_MODULE}') threw ${message(e)}`);
+    }
+    // A non-string part 0 is read as a binary module; an empty text module ({}) fails here, as on 5217308 (V257).
+    if (typeof first !== 'string')
+        return { bytes: toBytes(first), tag: typeTag(first) };
+    const count = Array.isArray(wasmParts) ? wasmParts.length : 0;
+    if (count === 0)
+        throw new TypeError(`require('${WASM_MODULE}') returned a String, but this build records no text parts`);
+    const texts = [];
+    let chars = 0;
+    for (let k = 0; k < count; k++) {
+        const name = partModuleName(k);
+        const want = wasmParts[k];
+        let value = first;
+        if (k > 0) {
+            try {
+                value = requireModule(name);
+            }
+            catch (e) {
+                throw new TypeError(`require('${name}') threw ${message(e)}`);
+            }
+        }
+        if (typeof value !== 'string')
+            throw new TypeError(`require('${name}') returned ${typeTag(value)}, not a ${want}-character string`);
+        if (value.length !== want)
+            throw new TypeError(`require('${name}') returned ${value.length} characters, not ${want}`);
+        if (k < count - 1 && value.charCodeAt(want - 1) === 61)
+            throw new TypeError(`require('${name}') ends in '=' but is not the last part`);
+        texts.push(value);
+        chars += want;
+    }
+    const notBase64 = (k, e) => new TypeError(`require('${partModuleName(k)}') returned a String that is not base64 (${message(e)})`);
+    let total = 0;
+    for (let k = 0; k < count; k++) {
+        try {
+            total += decodedLength(texts[k]);
+        }
+        catch (e) {
+            throw notBase64(k, e);
+        }
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (let k = 0; k < count; k++) {
+        try {
+            offset += decodeBase64Into(texts[k], bytes, offset);
+        }
+        catch (e) {
+            throw notBase64(k, e);
+        }
+    }
+    return { bytes, tag: `String(base64, ${chars} chars${count > 1 ? ` in ${count} parts` : ''})` };
 }
 function message(e) {
     return e instanceof Error ? `${e.name}: ${e.message}` : String(e);
@@ -1611,10 +1733,8 @@ class Loader {
         let bytes;
         let tag;
         try {
-            const raw = this.env.requireModule(WASM_MODULE);
-            // The boot line shows which delivery ran: a binary module's type, or the text module's base64 (ADR-015).
-            tag = typeof raw === 'string' ? `String(base64, ${raw.length} chars)` : typeTag(raw);
-            bytes = toBytes(raw);
+            // The boot line shows which delivery ran: a binary module's type, or the text modules' base64 (ADR-015, ADR-028).
+            ({ bytes, tag } = loadWasm((name) => this.env.requireModule(name), this.build.wasmParts));
         }
         catch (e) {
             this.incident('load', message(e));
@@ -1946,6 +2066,10 @@ class Loader {
     opening() {
         return this.summary('openingSummary', 'opening summary');
     }
+    /** Console command `rustedscreep.planner()`: the wasm's planner summary (plans, placement, CPU per phase). */
+    planner() {
+        return this.summary('plannerSummary', 'planner summary');
+    }
     /**
      * Console command `rustedscreep.spawn(room, role)`: a spawn of `room` spawns one creep of `role` (worker when
      * omitted) sized to the room's capacity, once the room holds its cost; `rustedscreep.spawn()` cancels. Only
@@ -2001,7 +2125,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"f3e7dbd63bfe-cee9042d","wasmCrc32":"cee9042d","features":[]});
+const BUILD = ({"id":"b5d2f8bf4d00-dirty-421df93f","wasmCrc32":"421df93f","features":[],"wasmParts":[653044,653044]});
 const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;
@@ -2088,6 +2212,7 @@ const glue = {
     spawnerSummary: spawnerSummary,
     spawn: spawn,
     openingSummary: openingSummary,
+    plannerSummary: plannerSummary,
 };
 const loader = new Loader(env, glue, CONFIG, BUILD);
 const routedError = (...args) => {
@@ -2119,7 +2244,7 @@ function routeConsole() {
 // `rustedscreep.configReset()`, `rustedscreep.consts()`, `rustedscreep.movement()`,
 // `rustedscreep.moveTo("W1N1", 25, 25, 1)` (from another room: `rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1")`;
 // `rustedscreep.moveTo()` cancels), `rustedscreep.spawner()` or `rustedscreep.spawn("W1N1", "worker")`
-// (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`.
+// (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`, `rustedscreep.planner()`.
 g.rustedscreep = {
     trapTest: (n = 1) => loader.scheduleTraps(Number(n)),
     status: () => loader.status(),
@@ -2140,6 +2265,7 @@ g.rustedscreep = {
     spawner: () => loader.spawner(),
     spawn: (room, role) => loader.spawn(room, role),
     opening: () => loader.opening(),
+    planner: () => loader.planner(),
 };
 function loop() {
     try {

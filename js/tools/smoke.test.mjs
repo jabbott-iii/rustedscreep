@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { WASM_MODULE } from './lib/common.mjs';
-import { wasmModuleText } from './lib/wasm-text.mjs';
+import { partFileName, wasmModuleText, wasmModuleTexts } from './lib/wasm-text.mjs';
 import { saveSegments, simulate } from './smoke.mjs';
 
 // The smallest valid wasm module: magic number and version 1 (WebAssembly core spec, binary format).
@@ -117,6 +117,34 @@ test('the base64 form without the text module reproduces the live Unknown module
     () => withBundle("exports.loop = function () { require('rustedscreep_wasm'); };", (dir) => simulate(dir, { ticks: 1, wasmForm: 'base64' })),
     /Unknown module 'rustedscreep_wasm'/,
   );
+});
+
+test('the base64 form serves every part file as its own module, and one that throws is evaluated again (ADR-028)', () => {
+  const world = withBundle(
+    "exports.loop = function () { const a = require('rustedscreep_wasm'), b = require('rustedscreep_wasm_1'); let c = 'none'; try { c = require('rustedscreep_wasm_2'); } catch (e) { c = String(e.message); } console.log(typeof a + ' ' + (a + b).length + ' ' + typeof c + ' ' + c); };",
+    (dir) => {
+      wasmModuleTexts(EMPTY_WASM, 8).forEach((t, k) => writeFileSync(join(dir, partFileName(k)), t));
+      return simulate(dir, { ticks: 1, wasmForm: 'base64' });
+    },
+  );
+  assert.deepEqual(world.logs, ["string 12 string Unknown module 'rustedscreep_wasm_2'"]);
+  let evals = 0;
+  const cut = withBundle(
+    "exports.loop = function () { for (let i = 0; i < 2; i++) { try { require('rustedscreep_wasm_1'); } catch (e) { console.log(e.name); } } };",
+    (dir) => simulate(dir, {
+      ticks: 1, wasmForm: 'base64',
+      textModules: { rustedscreep_wasm: wasmModuleText(EMPTY_WASM), rustedscreep_wasm_1: 'module.exports = "AAAA' },
+      setup: () => { evals += 1; },
+    }),
+  );
+  assert.deepEqual(cut.logs, ['SyntaxError', 'SyntaxError']);
+  assert.equal(evals, 1);
+  const empty = withBundle(
+    "exports.loop = function () { const v = require('rustedscreep_wasm_1'); console.log(Object.prototype.toString.call(v) + ' ' + Object.keys(v).length); };",
+    (dir) => simulate(dir, { ticks: 1, wasmForm: 'base64', textModules: { rustedscreep_wasm_1: '' } }),
+  );
+  // An empty module exports {}, as the live failure of 5217308 showed (V257).
+  assert.deepEqual(empty.logs, ['[object Object] 0']);
 });
 
 test('the sandbox has no atob, btoa or Buffer, as assumed for the MMO (V95)', () => {

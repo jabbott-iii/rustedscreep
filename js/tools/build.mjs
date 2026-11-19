@@ -2,7 +2,8 @@
 // exact Cargo.lock version (--target web), then the pinned wasm-opt -O4, then tsc and Rollup, then a
 // smoke run in a Screeps-like sandbox, with the wasm as a binary module and as the base64 text module the
 // GitHub link delivers (ADR-015). Output: dist/main.js, dist/rustedscreep_wasm.wasm, dist/rustedscreep_wasm.js (the
-// .wasm as base64) and dist/build-info.json. Usage: npm run build [-- --features trap-test,profiler].
+// .wasm as base64; with dist/rustedscreep_wasm_1.js, … when one module would pass the largest size the link has
+// delivered intact, ADR-028) and dist/build-info.json. Usage: npm run build [-- --features trap-test,profiler].
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -11,7 +12,7 @@ import {
 } from './lib/common.mjs';
 import { bundleProblems } from './lib/bundle-check.mjs';
 import { crc32Hex } from './lib/crc32.mjs';
-import { wasmModuleBytes, wasmModuleText } from './lib/wasm-text.mjs';
+import { PART_MAX_CHARS, partFileName, textModuleBase64, wasmModuleTexts, wasmPartsBytes } from './lib/wasm-text.mjs';
 import { smoke } from './smoke.mjs';
 
 export const DIST = join(ROOT, 'dist');
@@ -94,9 +95,11 @@ function cargoWasmPath() {
 
 /**
  * `loaderOverrides` replaces some loader values from config.rs. Only tests use it (js/tools/trap-sim.mjs runs
- * the reinstantiate mode); the build ID and build-info.json record it.
+ * the reinstantiate mode); the build ID and build-info.json record it. `partMaxChars` caps the base64 characters
+ * of one wasm text part (ADR-028), as a number or a function of the wasm's base64 length; only tests lower it
+ * (js/tools/split-sim.mjs), and build-info.json records the value used.
  */
-export function build({ features = [], dist = DIST, loaderOverrides = {} } = {}) {
+export function build({ features = [], dist = DIST, loaderOverrides = {}, partMaxChars = PART_MAX_CHARS } = {}) {
   // Remove every output first, so a build that fails part way cannot leave an older build to be checked or staged.
   for (const dir of [PKG, TS_OUT, dist]) rmSync(dir, { recursive: true, force: true });
 
@@ -133,13 +136,15 @@ export function build({ features = [], dist = DIST, loaderOverrides = {} } = {})
   mustRun('wasm-opt', tools.wasmOpt, [join(PKG, `${WASM_MODULE}_bg.wasm`), '-O4', '-o', distWasm]);
   const wasmBytes = readFileSync(distWasm);
   const wasmCrc = crc32Hex(wasmBytes);
-  // The text module the GitHub link can carry (ADR-015), checked to decode to the exact .wasm.
-  const wasmText = wasmModuleText(wasmBytes);
-  if (!wasmModuleBytes(wasmText).equals(wasmBytes)) fail('the wasm text module does not decode to the .wasm');
-  writeFileSync(join(dist, `${WASM_MODULE}.js`), wasmText);
+  // The text modules the GitHub link can carry (ADR-015, ADR-028), checked to decode to the exact .wasm.
+  const maxChars = typeof partMaxChars === 'function' ? partMaxChars(Math.ceil(wasmBytes.length / 3) * 4) : partMaxChars;
+  const wasmTexts = wasmModuleTexts(wasmBytes, maxChars);
+  if (!wasmPartsBytes(wasmTexts).equals(wasmBytes)) fail('the wasm text modules do not decode to the .wasm');
+  wasmTexts.forEach((text, k) => writeFileSync(join(dist, partFileName(k)), text));
+  const wasmParts = wasmTexts.map((text) => textModuleBase64(text).length);
   const overrideTag = Object.keys(loaderOverrides).length ? `+override(${Object.entries(loaderOverrides).map(([k, v]) => `${k}=${v}`).join(',')})` : '';
   const buildId = `${gitDescription()}-${wasmCrc}${features.map((f) => `+${f}`).join('')}${overrideTag}`;
-  const buildValue = { id: buildId, wasmCrc32: wasmCrc, features };
+  const buildValue = { id: buildId, wasmCrc32: wasmCrc, features, wasmParts };
 
   step('tsc (ES2022)');
   mustRun('tsc', join(BIN, 'tsc'), ['-p', join(ROOT, 'js')]);
@@ -171,6 +176,7 @@ export function build({ features = [], dist = DIST, loaderOverrides = {} } = {})
     features,
     loaderConfig: config,
     loaderOverrides,
+    partMaxChars: maxChars,
     tools: {
       wasmBindgen: tools.wasmBindgen,
       wasmOpt: tools.wasmOptVersion,
@@ -181,7 +187,9 @@ export function build({ features = [], dist = DIST, loaderOverrides = {} } = {})
       main: { file: 'main.js', bytes: mainBytes.length, sha256: sha256(mainBytes) },
       [WASM_MODULE]: {
         file: `${WASM_MODULE}.wasm`, bytes: wasmBytes.length, sha256: sha256(wasmBytes), crc32: wasmCrc,
-        text: { file: `${WASM_MODULE}.js`, bytes: Buffer.byteLength(wasmText), sha256: sha256(Buffer.from(wasmText)) },
+        text: wasmTexts.map((text, k) => ({
+          file: partFileName(k), chars: wasmParts[k], bytes: Buffer.byteLength(text), sha256: sha256(Buffer.from(text)),
+        })),
       },
     },
   };
@@ -191,7 +199,9 @@ export function build({ features = [], dist = DIST, loaderOverrides = {} } = {})
   console.log(`build ${buildId}`);
   console.log(`  main.js             ${mainBytes.length} bytes`);
   console.log(`  ${WASM_MODULE}.wasm  ${wasmBytes.length} bytes, crc32 ${wasmCrc}, sha256 ${info.modules[WASM_MODULE].sha256}`);
-  console.log(`  ${WASM_MODULE}.js    ${Buffer.byteLength(wasmText)} bytes (the .wasm as base64, ADR-015)`);
+  for (const part of info.modules[WASM_MODULE].text) {
+    console.log(`  ${part.file.padEnd(22)}  ${part.bytes} bytes (${part.chars} characters of the .wasm as base64, ADR-015, ADR-028)`);
+  }
   return info;
 }
 

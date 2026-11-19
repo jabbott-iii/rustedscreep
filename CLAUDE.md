@@ -94,7 +94,8 @@ The live server's constants are the ground truth for that server. At init, the b
 | Base planner in the sandbox (the plain build in E7N57 as it stands at RCL4: the plan in the Optional tier, road sites only while storage and towers are off, then with `planner.storage` and `planner.towers` on the destroy of the ADR-020 extension on each one's tile and its site, the CPU per planner step; then two more globals: the record of ADR-027 loaded and used, a corrupted one refused; P4.3, ADR-026) | `node js/tools/planner-sim.mjs` |
 | Regenerate the engine-constants fixture from an engine's `lib/constants.js` | `node js/tools/consts-fixture.mjs <path> <version>` |
 | Write the terrain corpus fixtures from saved room-terrain and room-objects responses (local files only; the fixtures' README lists the requests) | `node js/tools/rooms-fixture.mjs <dir> <shard> <YYYY-MM-DD>` |
-| Tool tests (Node) / sizes and upload budget | `npm run test` / `npm run size` |
+| Split wasm in the sandbox (the plain build in three text parts: the boot from them, a stale part never required, each part empty, one missing, two cut, one padded; ADR-028) | `node js/tools/split-sim.mjs` |
+| Tool tests (Node) / sizes, upload budget and the per-module cap (ADR-028) | `npm run test` / `npm run size` |
 | Full gate (same as `/check`) | `npm run check` |
 | Stage the MMO deploy folder for the GitHub link (ask first; the user pushes) | `npm run stage` (`-- --out <dir>` for a dry run, `-- --features trap-test` for the gate's recovery test, `-- --features profiler` for the live CPU measurements) |
 

@@ -1,5 +1,6 @@
 // Base64 (RFC 4648 section 4, the standard alphabet, padded) to bytes, for the wasm text module the GitHub link
-// delivers (ADR-015: the link uploads files as text, so the wasm travels as base64 in a .js module, V137). Plain JS:
+// delivers (ADR-015: the link uploads files as text, so the wasm travels as base64 in a .js module, V137; ADR-028
+// splits it across several, which decodeBase64Into writes into one buffer). Plain JS:
 // TextDecoder is undefined on the MMO (V72), and atob and Buffer were never probed there (V95). Strict: a length
 // that is not a multiple of 4, any character outside the alphabet, or a misplaced '=' throws. Non-canonical
 // trailing bits are not refused; they do not change the bytes, and the loader's CRC-32 covers the content.
@@ -19,15 +20,40 @@ function lookup(): Uint8Array {
   return t;
 }
 
-/** The bytes that padded standard base64 `text` encodes; throws a TypeError for anything else. */
-export function decodeBase64(text: string): Uint8Array {
+/** The '=' that end `text` (0, 1 or 2); throws a TypeError when its length is not a multiple of 4. */
+function padding(text: string): number {
   const n = text.length;
   if (n % 4 !== 0) throw new TypeError(`base64 text of ${n} characters is not a multiple of 4`);
-  const pad = n === 0 || text.charCodeAt(n - 1) !== PAD ? 0 : text.charCodeAt(n - 2) === PAD ? 2 : 1;
-  const out = new Uint8Array((n / 4) * 3 - pad);
+  return n === 0 || text.charCodeAt(n - 1) !== PAD ? 0 : text.charCodeAt(n - 2) === PAD ? 2 : 1;
+}
+
+/** How many bytes padded standard base64 `text` decodes to; throws a TypeError when its length is not a multiple of 4. */
+export function decodedLength(text: string): number {
+  return (text.length / 4) * 3 - padding(text);
+}
+
+/** The bytes that padded standard base64 `text` encodes; throws a TypeError for anything else. */
+export function decodeBase64(text: string): Uint8Array {
+  const out = new Uint8Array(decodedLength(text));
+  decodeBase64Into(text, out, 0);
+  return out;
+}
+
+/**
+ * Decodes padded standard base64 `text` into `out` from `offset`, for a wasm split across text modules (ADR-028),
+ * and returns the number of bytes written (`decodedLength(text)`). Throws a TypeError for text that is not base64
+ * and a RangeError when `out` has no room for it.
+ */
+export function decodeBase64Into(text: string, out: Uint8Array, offset: number): number {
+  const n = text.length;
+  const pad = padding(text);
+  const length = (n / 4) * 3 - pad;
+  if (offset < 0 || offset + length > out.length) {
+    throw new RangeError(`no room for ${length} bytes at offset ${offset} of ${out.length}`);
+  }
   const t = lookup();
   const full = pad ? n - 4 : n;
-  let o = 0;
+  let o = offset;
   for (let i = 0; i < full; i += 4) {
     const c0 = text.charCodeAt(i);
     const c1 = text.charCodeAt(i + 1);
@@ -58,5 +84,5 @@ export function decodeBase64(text: string): Uint8Array {
     out[o++] = (a << 2) | (b >> 4);
     if (pad === 1) out[o] = ((b & 15) << 4) | (c >> 2);
   }
-  return out;
+  return length;
 }

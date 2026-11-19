@@ -1,7 +1,7 @@
 // The loader's boot, run and recovery state machine (ADR-003). Every Screeps global it needs comes in
 // through `Env` and the wasm through `Glue`, so js/test/loader.test.mjs can drive it natively; main.ts
 // wires it to the real runtime. No game logic lives here.
-import { decodeBase64 } from './base64.js';
+import { decodeBase64, decodeBase64Into, decodedLength } from './base64.js';
 import { crc32Hex } from './crc32.js';
 
 /** Loader thresholds, injected at build time from rustedscreep-core's config.rs (LOADER_MMO). */
@@ -23,6 +23,12 @@ export interface BuildInfo {
   /** CRC-32 of the .wasm that npm run stage reports, to compare with the bytes require() returns (V77). */
   wasmCrc32: string;
   features: string[];
+  /**
+   * The characters of each part of the wasm's base64 text, part 0 first (ADR-028): the GitHub link delivers the
+   * wasm as `rustedscreep_wasm` and, when one module would pass the largest size seen intact (V257), also as
+   * `rustedscreep_wasm_1`, `rustedscreep_wasm_2`, … A text part of any other length is a load incident.
+   */
+  wasmParts: number[];
 }
 
 /** The wasm-bindgen glue, as the loader uses it. */
@@ -186,6 +192,73 @@ export function toBytes(value: unknown): Uint8Array {
   throw new TypeError(`require('${WASM_MODULE}') returned ${typeTag(value)}, not bytes`);
 }
 
+/** The module that holds part `k` of the wasm's base64 text (ADR-028): `rustedscreep_wasm`, then `rustedscreep_wasm_1`, … */
+export function partModuleName(k: number): string {
+  return k === 0 ? WASM_MODULE : `${WASM_MODULE}_${k}`;
+}
+
+/**
+ * The wasm's bytes, and the form that ran for the boot line. A binary module under `rustedscreep_wasm` (an API
+ * upload, the private server, the sandbox) is used alone, as `toBytes` reads it. A string there is part 0 of the
+ * text form the GitHub link delivers (ADR-015, ADR-028): every part `wasmParts` lists must be a string of exactly
+ * its recorded length, only the last may end in '=', and the parts are decoded into one buffer, so a missing,
+ * empty, cut or misplaced part throws a TypeError that names it before anything is decoded or compiled (an empty
+ * part 0 with toBytes's text, `returned Object, not bytes`, since a non-string part 0 is read as a binary module).
+ * A part of the recorded length with other content decodes, and the CRC-32 check reports it (ADR-015).
+ */
+export function loadWasm(requireModule: (name: string) => unknown, wasmParts: readonly number[]): { bytes: Uint8Array; tag: string } {
+  // A part that is missing, or cut short (a SyntaxError that does not name its module), is named, part 0 too.
+  let first: unknown;
+  try {
+    first = requireModule(WASM_MODULE);
+  } catch (e) {
+    throw new TypeError(`require('${WASM_MODULE}') threw ${message(e)}`);
+  }
+  // A non-string part 0 is read as a binary module; an empty text module ({}) fails here, as on 5217308 (V257).
+  if (typeof first !== 'string') return { bytes: toBytes(first), tag: typeTag(first) };
+  const count = Array.isArray(wasmParts) ? wasmParts.length : 0;
+  if (count === 0) throw new TypeError(`require('${WASM_MODULE}') returned a String, but this build records no text parts`);
+  const texts: string[] = [];
+  let chars = 0;
+  for (let k = 0; k < count; k++) {
+    const name = partModuleName(k);
+    const want = wasmParts[k] as number;
+    let value: unknown = first;
+    if (k > 0) {
+      try {
+        value = requireModule(name);
+      } catch (e) {
+        throw new TypeError(`require('${name}') threw ${message(e)}`);
+      }
+    }
+    if (typeof value !== 'string') throw new TypeError(`require('${name}') returned ${typeTag(value)}, not a ${want}-character string`);
+    if (value.length !== want) throw new TypeError(`require('${name}') returned ${value.length} characters, not ${want}`);
+    if (k < count - 1 && value.charCodeAt(want - 1) === 61) throw new TypeError(`require('${name}') ends in '=' but is not the last part`);
+    texts.push(value);
+    chars += want;
+  }
+  const notBase64 = (k: number, e: unknown) =>
+    new TypeError(`require('${partModuleName(k)}') returned a String that is not base64 (${message(e)})`);
+  let total = 0;
+  for (let k = 0; k < count; k++) {
+    try {
+      total += decodedLength(texts[k] as string);
+    } catch (e) {
+      throw notBase64(k, e);
+    }
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (let k = 0; k < count; k++) {
+    try {
+      offset += decodeBase64Into(texts[k] as string, bytes, offset);
+    } catch (e) {
+      throw notBase64(k, e);
+    }
+  }
+  return { bytes, tag: `String(base64, ${chars} chars${count > 1 ? ` in ${count} parts` : ''})` };
+}
+
 function message(e: unknown): string {
   return e instanceof Error ? `${e.name}: ${e.message}` : String(e);
 }
@@ -282,10 +355,8 @@ export class Loader {
     let bytes: Uint8Array;
     let tag: string;
     try {
-      const raw = this.env.requireModule(WASM_MODULE);
-      // The boot line shows which delivery ran: a binary module's type, or the text module's base64 (ADR-015).
-      tag = typeof raw === 'string' ? `String(base64, ${raw.length} chars)` : typeTag(raw);
-      bytes = toBytes(raw);
+      // The boot line shows which delivery ran: a binary module's type, or the text modules' base64 (ADR-015, ADR-028).
+      ({ bytes, tag } = loadWasm((name) => this.env.requireModule(name), this.build.wasmParts));
     } catch (e) {
       this.incident('load', message(e));
       return false;

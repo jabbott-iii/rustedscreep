@@ -351,7 +351,8 @@ differences. The native test runs it against engine common 2.16.0 (`tests/fixtur
 js/ (P1.3, P1.4): `js/src/main.ts` wires the loader (`js/src/loader.ts`) to the game's `loop` and the `rustedscreep.*` console
 commands. The loader boots once the bucket reaches `LoaderConfig::boot_bucket_min` (480, set at the P1 gate from the MMO cold start,
 VERIFICATION_LOG V150). On the first boot tick it requires the wasm, which arrives through the GitHub link as a base64 text module
-(`rustedscreep_wasm.js`, decoded in plain JS by `js/src/base64.ts`, ADR-015) or as a binary module through the API, checks its
+(`rustedscreep_wasm.js`, decoded in plain JS by `js/src/base64.ts`, ADR-015; split across `rustedscreep_wasm.js`, `rustedscreep_wasm_1.js`, … when one
+module would pass 905709 bytes, each part checked against the length the build records and decoded into one buffer, ADR-028) or as a binary module through the API, checks its
 CRC-32 against the build's, logs the boot line and compiles it; on the next tick (`boot_split_ticks`) it instantiates and runs the
 first loop. Recovery is in section 6. `js/tools/` holds the build
 (cargo → wasm-bindgen `--target web` → `wasm-opt -O4` → tsc → Rollup CJS into `dist/`), stage (into `deploy/` for the GitHub link),

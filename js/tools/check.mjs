@@ -57,7 +57,11 @@ function wasmClippy() {
 function size() {
   try {
     const m = measure();
-    return { ok: m.withinBudget, detail: `main.js ${m.mainBytes} B, wasm ${m.wasmBytes} B, upload ${m.uploadChars}/${m.budget}` };
+    const cap = m.withinModuleCap ? '' : `; ${m.largestModule.file} over the module cap (V257, ADR-028)`;
+    return {
+      ok: m.withinBudget && m.withinModuleCap,
+      detail: `main.js ${m.mainBytes} B, wasm ${m.wasmBytes} B in ${m.parts.length} part(s), largest module ${m.largestModule.bytes}/${m.moduleCap} B, upload ${m.uploadChars}/${m.budget}${cap}`,
+    };
   } catch (e) {
     return { ok: false, detail: `no build to measure (${e.message})` };
   }
@@ -86,6 +90,7 @@ const ROWS = [
   ['19 Opening (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'opening-sim.mjs')], true],
   ['20 Links (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'link-sim.mjs')], true],
   ['21 Planner (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'planner-sim.mjs')], true],
+  ['22 Split wasm (sandbox, plain build in 3 parts)', 'node', [join(ROOT, 'js', 'tools', 'split-sim.mjs')], true],
 ];
 
 function main() {

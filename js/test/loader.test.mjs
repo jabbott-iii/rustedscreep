@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { crc32Hex } from '../build-test/crc32.js';
-import { Loader, sanitizeLoaderMemory, toBytes } from '../build-test/loader.js';
+import { Loader, loadWasm, partModuleName, sanitizeLoaderMemory, toBytes } from '../build-test/loader.js';
 
 const CONFIG = {
   bootBucketMin: 1500,
@@ -21,11 +21,16 @@ const WASM = Uint8Array.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x
 /**
  * `wasm` is the build's bytes (its CRC goes into the build info); `moduleValue` is what require('rustedscreep_wasm')
  * returns, the bytes by default (a binary module) or, for the GitHub link's text module, a base64 string (ADR-015).
+ * `wasmParts` is the build's record of its text parts (one part of the build's base64 by default, ADR-028), and
+ * `modules` answers require for any other name: a value, or a function that throws.
  */
-function harness({ config = {}, glue = {}, bucket = 10000, wasm = WASM, moduleValue = wasm, compileThrows = false } = {}) {
+function harness({
+  config = {}, glue = {}, bucket = 10000, wasm = WASM, moduleValue = wasm, compileThrows = false,
+  wasmParts = [Buffer.from(wasm).toString('base64').length], modules = {},
+} = {}) {
   const h = {
     time: 1000, bucket, cpu: 0, halts: 0, notifies: [], logs: [], memoryReads: 0, mem: null,
-    initCount: 0, loops: 0, loopThrows: false, resets: 0, resetThrows: false, compiles: 0,
+    initCount: 0, loops: 0, loopThrows: false, resets: 0, resetThrows: false, compiles: 0, requires: [],
   };
   const env = {
     time: () => h.time,
@@ -39,7 +44,9 @@ function harness({ config = {}, glue = {}, bucket = 10000, wasm = WASM, moduleVa
     notify: (m) => h.notifies.push(m),
     log: (m) => h.logs.push(m),
     requireModule: (name) => {
-      if (name === 'rustedscreep_wasm') return moduleValue;
+      h.requires.push(name);
+      if (name === 'rustedscreep_wasm') return typeof moduleValue === 'function' ? moduleValue() : moduleValue;
+      if (Object.hasOwn(modules, name)) return typeof modules[name] === 'function' ? modules[name]() : modules[name];
       throw new Error(`Unknown module '${name}'`);
     },
     compile: (bytes) => {
@@ -63,7 +70,7 @@ function harness({ config = {}, glue = {}, bucket = 10000, wasm = WASM, moduleVa
     },
     ...glue,
   };
-  const build = { id: 'abc-dirty-00000000', wasmCrc32: crc32Hex(wasm), features: [] };
+  const build = { id: 'abc-dirty-00000000', wasmCrc32: crc32Hex(wasm), features: [], wasmParts };
   h.newGlobal = () => new Loader(env, g, { ...CONFIG, ...config }, build);
   h.loader = h.newGlobal();
   /** One tick; a halt replaces the loader, like a global reset. */
@@ -358,12 +365,23 @@ test('a base64 string module boots like the binary one, and the boot line names 
 });
 
 test('a string that is not base64 is a load incident and is never compiled', () => {
-  for (const bad of ['abc', 'AA=A', 'AAA-', 'AAAA\n', 'not bytes']) {
+  // WASM's base64 is 16 characters, so these have the build's length and fail the decode itself.
+  for (const bad of ['AAAAAAAAAAAAAA=A', 'AAAAAAAAAAAAAAA-', 'AAAAAAAAAAAAAAA\n', 'not bytes, sorry']) {
     const h = harness({ moduleValue: bad });
     h.tick(3);
     assert.equal(h.compiles, 0, JSON.stringify(bad));
-    assert.ok(h.logs.some((l) => /incident: load/.test(l) && /not base64|multiple of 4/.test(l)), `${JSON.stringify(bad)}: ${h.logs.join(' / ')}`);
+    assert.ok(h.logs.some((l) => /incident: load/.test(l) && /returned a String that is not base64/.test(l)), `${JSON.stringify(bad)}: ${h.logs.join(' / ')}`);
     assert.ok(h.mem.streak >= 1);
+  }
+});
+
+test('a string of another length than the build records is a load incident before any decode (ADR-028)', () => {
+  for (const bad of ['', 'abc', 'AAAA', 'AA=A', Buffer.from(WASM).toString('base64').slice(4), `${Buffer.from(WASM).toString('base64')}AAAA`]) {
+    const h = harness({ moduleValue: bad });
+    h.tick(3);
+    assert.equal(h.compiles, 0, JSON.stringify(bad));
+    assert.ok(h.logs.some((l) => /incident: load/.test(l) && new RegExp(`require\\('rustedscreep_wasm'\\) returned ${bad.length} characters, not 16`).test(l)),
+      `${JSON.stringify(bad)}: ${h.logs.join(' / ')}`);
   }
 });
 
@@ -376,6 +394,104 @@ test('a base64 string that decodes to other bytes is a CRC-32 MISMATCH and is no
   const boot = h.logs.find((l) => l.startsWith('rustedscreep boot:'));
   assert.match(boot, /: MISMATCH\)/);
   assert.equal(h.notifies.filter((n) => /does not match the build's/.test(n)).length, 1);
+});
+
+// A wasm of 40 bytes is 56 base64 characters: three parts of 20, 20 and 16 with 20-character parts (ADR-028).
+const BIG_WASM = Uint8Array.from([...WASM, ...Array.from({ length: 30 }, (_, i) => (i * 37) & 255)]);
+function split(bytes = BIG_WASM, sizes = [20, 20, 16]) {
+  const b64 = Buffer.from(bytes).toString('base64');
+  const parts = [];
+  let at = 0;
+  for (const n of sizes) parts.push(b64.slice(at, (at += n)));
+  assert.equal(parts.join(''), b64);
+  return parts;
+}
+function splitHarness(parts, overrides = {}, extra = {}) {
+  const modules = {};
+  parts.slice(1).forEach((p, i) => { modules[partModuleName(i + 1)] = p; });
+  return harness({ wasm: BIG_WASM, moduleValue: parts[0], wasmParts: parts.map((p) => p.length), modules: { ...modules, ...overrides }, ...extra });
+}
+
+test('a split text module boots from its parts in order, and the boot line counts them (ADR-028)', () => {
+  const parts = split();
+  const h = splitHarness(parts);
+  h.tick();
+  assert.equal(h.loader.phase, 'compiled');
+  assert.deepEqual(h.compiledBytes, Array.from(BIG_WASM));
+  assert.deepEqual(h.requires.slice(0, 3), ['rustedscreep_wasm', 'rustedscreep_wasm_1', 'rustedscreep_wasm_2']);
+  const boot = h.logs.find((l) => l.startsWith('rustedscreep boot:'));
+  assert.match(boot, /\| wasm String\(base64, 56 chars in 3 parts\) 40 B crc32 [0-9a-f]{8} \(stage [0-9a-f]{8}: match\) \|/);
+  h.tick();
+  assert.equal(h.loops, 1);
+  assert.equal(h.notifies.length, 0);
+});
+
+test('a part beyond the build\'s count is never required, and a binary module ignores the parts', () => {
+  const parts = split();
+  const h = splitHarness(parts, { rustedscreep_wasm_3: () => { throw new Error('must not be required'); } });
+  h.tick(2);
+  assert.equal(h.loops, 1);
+  assert.ok(!h.requires.includes('rustedscreep_wasm_3'));
+  const bin = harness({ wasm: BIG_WASM, wasmParts: parts.map((p) => p.length), modules: { rustedscreep_wasm_1: () => { throw new Error('no'); } } });
+  bin.tick(2);
+  assert.equal(bin.loops, 1);
+  assert.deepEqual([...new Set(bin.requires)], ['rustedscreep_wasm', 'sentinel']);
+});
+
+test('a missing, empty, cut, short or misplaced part is a load incident that names it, and is never compiled', () => {
+  const parts = split();
+  const cases = [
+    // The live failure of 5217308 (V257): the module arrived empty, and an empty module exports {}.
+    [{ rustedscreep_wasm_1: {} }, /require\('rustedscreep_wasm_1'\) returned Object, not a 20-character string/],
+    [{ rustedscreep_wasm_2: () => { throw new Error("Unknown module 'rustedscreep_wasm_2'"); } }, /require\('rustedscreep_wasm_2'\) threw Error: Unknown module 'rustedscreep_wasm_2'/],
+    [{ rustedscreep_wasm_1: () => { throw new SyntaxError('Invalid or unexpected token'); } }, /require\('rustedscreep_wasm_1'\) threw SyntaxError: Invalid or unexpected token/],
+    [{ rustedscreep_wasm_1: parts[1].slice(4) }, /require\('rustedscreep_wasm_1'\) returned 16 characters, not 20/],
+    [{ rustedscreep_wasm_2: `${parts[2]}AAAA` }, /require\('rustedscreep_wasm_2'\) returned 20 characters, not 16/],
+    [{ rustedscreep_wasm_1: 42 }, /require\('rustedscreep_wasm_1'\) returned Number, not a 20-character string/],
+    [{ rustedscreep_wasm_1: `${parts[1].slice(0, 16)}AA==` }, /require\('rustedscreep_wasm_1'\) ends in '=' but is not the last part/],
+    [{ rustedscreep_wasm_2: `${parts[2].slice(0, 12)}AA-A` }, /require\('rustedscreep_wasm_2'\) returned a String that is not base64/],
+    [{ rustedscreep_wasm_1: `${parts[1].slice(0, 16)}AA-A` }, /require\('rustedscreep_wasm_1'\) returned a String that is not base64/],
+  ];
+  for (const [overrides, want] of cases) {
+    const h = splitHarness(parts, overrides);
+    h.tick(3);
+    assert.equal(h.compiles, 0, String(want));
+    assert.ok(h.logs.some((l) => /incident: load/.test(l) && want.test(l)), `${want}: ${h.logs.join(' / ')}`);
+    assert.ok(h.mem.streak >= 1);
+  }
+  // Part 0 is named the same way: a wrong-length string, other content that is not base64, a cut file, a missing one.
+  const part0 = [
+    [parts[0].slice(4), /require\('rustedscreep_wasm'\) returned 16 characters, not 20/],
+    [`${parts[0].slice(0, 16)}A-AA`, /require\('rustedscreep_wasm'\) returned a String that is not base64/],
+    [() => { throw new SyntaxError('Invalid or unexpected token'); }, /require\('rustedscreep_wasm'\) threw SyntaxError: Invalid or unexpected token/],
+    [() => { throw new Error("Unknown module 'rustedscreep_wasm'"); }, /require\('rustedscreep_wasm'\) threw Error: Unknown module 'rustedscreep_wasm'/],
+    // The live failure of 5217308 (V257): part 0 empty, read as a binary module that is not bytes.
+    [{}, /TypeError: require\('rustedscreep_wasm'\) returned Object, not bytes/],
+  ];
+  for (const [moduleValue, want] of part0) {
+    const h = splitHarness(parts, {}, { moduleValue });
+    h.tick();
+    assert.equal(h.compiles, 0, String(want));
+    assert.ok(h.logs.some((l) => /incident: load/.test(l) && want.test(l)), `${want}: ${h.logs.join(' / ')}`);
+  }
+});
+
+test('parts of the recorded lengths with other content decode and boot with a CRC-32 MISMATCH (ADR-015, ADR-028)', () => {
+  // Swapping two parts of equal length gives a wasm no build produced; only the CRC-32 sees it, and it boots.
+  const parts = split();
+  const h = splitHarness(parts, { rustedscreep_wasm_1: parts[0] }, { moduleValue: parts[1] });
+  h.tick();
+  const boot = h.logs.find((l) => l.startsWith('rustedscreep boot:'));
+  assert.match(boot, /in 3 parts\) 40 B crc32 [0-9a-f]{8} \(stage [0-9a-f]{8}: MISMATCH\)/);
+  assert.equal(h.notifies.filter((n) => /does not match the build's/.test(n)).length, 1);
+});
+
+test('loadWasm refuses a text module when the build records no parts', () => {
+  assert.throws(() => loadWasm(() => 'AQID', []), /records no text parts/);
+  assert.throws(() => loadWasm(() => 'AQID', undefined), /records no text parts/);
+  assert.deepEqual(Array.from(loadWasm(() => 'AQID', [4]).bytes), [1, 2, 3]);
+  assert.equal(loadWasm(() => 'AQID', [4]).tag, 'String(base64, 4 chars)');
+  assert.equal(loadWasm(() => Uint8Array.from([1]), []).tag, 'Uint8Array');
 });
 
 test('the snapshot command calls the wasm only while it is ready, and reports a missing export', () => {
