@@ -494,6 +494,28 @@ function persistTest(bytes) {
 }
 
 /**
+ * Exported to JS as `plannerSummary`, for the `rustedscreep.planner()` console command: one line
+ * with each owned room's plan and its placement's last look, the totals since boot and the CPU
+ * per planner phase (P4.3).
+ * @returns {string}
+ */
+function plannerSummary() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        let ret;
+        __wbg_call_guard();
+        ret = wasm.plannerSummary();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        __wbg_call_guard();
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * Exported to JS as `profilerSummary`, for the `rustedscreep.profiler()` console command: one line
  * with the open window's CPU statistics, the act cost per call, the last loop, the last closed
  * window, the stats-segment writes and the cold loop. A build without the `profiler` feature says so.
@@ -711,6 +733,10 @@ function __wbg_get_imports() {
         },
         __wbg_deleteProperty_3ad7a085da623822: function() { return handleError(function (arg0, arg1) {
             const ret = Reflect.deleteProperty(arg0, arg1);
+            return ret;
+        }, arguments); },
+        __wbg_destroy_c79477a7058f2e5c: function() { return handleError(function (arg0) {
+            const ret = arg0.destroy();
             return ret;
         }, arguments); },
         __wbg_drop_2117aa4480fb3f7d: function() { return handleError(function (arg0, arg1, arg2) {
@@ -1111,7 +1137,7 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("string")], shim_idx: 16, ret: Externref, inner_ret: Some(Externref) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("string")], shim_idx: 17, ret: Externref, inner_ret: Some(Externref) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_66fc74bf8055cade___convert__closures_____invoke___wasm_bindgen_66fc74bf8055cade___JsValue__wasm_bindgen_66fc74bf8055cade___JsValue__true_);
             return ret;
         },
@@ -1946,6 +1972,10 @@ class Loader {
     opening() {
         return this.summary('openingSummary', 'opening summary');
     }
+    /** Console command `rustedscreep.planner()`: the wasm's planner summary (plans, placement, CPU per phase). */
+    planner() {
+        return this.summary('plannerSummary', 'planner summary');
+    }
     /**
      * Console command `rustedscreep.spawn(room, role)`: a spawn of `room` spawns one creep of `role` (worker when
      * omitted) sized to the room's capacity, once the room holds its cost; `rustedscreep.spawn()` cancels. Only
@@ -2001,7 +2031,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"f3e7dbd63bfe-cee9042d","wasmCrc32":"cee9042d","features":[]});
+const BUILD = ({"id":"614db580737b-421df93f","wasmCrc32":"421df93f","features":[]});
 const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;
@@ -2088,6 +2118,7 @@ const glue = {
     spawnerSummary: spawnerSummary,
     spawn: spawn,
     openingSummary: openingSummary,
+    plannerSummary: plannerSummary,
 };
 const loader = new Loader(env, glue, CONFIG, BUILD);
 const routedError = (...args) => {
@@ -2119,7 +2150,7 @@ function routeConsole() {
 // `rustedscreep.configReset()`, `rustedscreep.consts()`, `rustedscreep.movement()`,
 // `rustedscreep.moveTo("W1N1", 25, 25, 1)` (from another room: `rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1")`;
 // `rustedscreep.moveTo()` cancels), `rustedscreep.spawner()` or `rustedscreep.spawn("W1N1", "worker")`
-// (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`.
+// (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`, `rustedscreep.planner()`.
 g.rustedscreep = {
     trapTest: (n = 1) => loader.scheduleTraps(Number(n)),
     status: () => loader.status(),
@@ -2140,6 +2171,7 @@ g.rustedscreep = {
     spawner: () => loader.spawner(),
     spawn: (room, role) => loader.spawn(room, role),
     opening: () => loader.opening(),
+    planner: () => loader.planner(),
 };
 function loop() {
     try {
