@@ -35,8 +35,10 @@
 //   most one work call and one move a creep a tick, never a move while fatigued; every call returns OK in the model,
 //   and every move resolves;
 // - `Memory.creeps` holds no worker's entry after any loop, though the harness wrote one on every OK (ADR-018);
-// - the controller reaches level 2, before the first worker could die of old age (the model has no aging, so the
-//   run is bounded by CREEP_LIFE_TIME after the first worker leaves its spawn);
+// - the controller reaches level 2, before the first worker could die of old age (the model sets each creep's
+//   `ageTime` but no creep dies, so the run is bounded by CREEP_LIFE_TIME after the first worker leaves its spawn);
+// - P5.2: each creep's `ticksToLive` (V198: undefined until the creep tick after it left the spawn sets `ageTime`,
+//   V170) is read from its first loop out until it gives a number and never again, and never while it spawns;
 // - the base planner (P4.3) plans the room in the Optional tier and logs it once (`rustedscreep planner: W1N1 planned
 //   in N steps: M items, anchor (25, 20), valid`); its placement calls createConstructionSite once a loop from the
 //   loop after the level-up: first CONTROLLER_STRUCTURES.extension[2] extensions (the plan's order puts them before
@@ -138,6 +140,8 @@ function makeWorld() {
     levelAt: null,
     builtAt: null,
     leftSpawn: [],
+    /** P5.2: each creep's `ticksToLive` reads, by name: the offset and what the getter returned. */
+    ttlReads: new Map(),
     placed: null,
     context: null,
   };
@@ -178,6 +182,13 @@ function creepObject(state, c, offset, objects) {
   const busy = (method, target, args) => (c.spawning ? record(method, target, args, C.ERR_BUSY) : null);
   const self = {
     id: c.id, name: c.name, my: true, spawning: c.spawning, fatigue: c.fatigue, owner: { username: 'bot' }, pos: pos(c.x, c.y),
+    // V198: `ageTime - Game.time`, undefined until the creep tick after it left the spawn sets `ageTime` (V170).
+    get ticksToLive() {
+      const ttl = c.ageTime === undefined ? undefined : c.ageTime - (T0 + offset);
+      if (!state.ttlReads.has(c.name)) state.ttlReads.set(c.name, []);
+      state.ttlReads.get(c.name).push([offset, ttl]);
+      return ttl;
+    },
     body: c.body.map((type) => ({ type, hits: 100 })),
     store: makeStore({ energy: c.energy }, { capacity }),
     move(direction) {
@@ -492,8 +503,12 @@ function advance(state, offset) {
     state.sites.push({ id: id(state.nextId++), x: o.x, y: o.y, type: o.type, progress: 0, total: C.CONSTRUCTION_COST[o.type] });
   }
   applyMoves(state, offset, byName);
-  // Creep ticks (V55): every creep, spawning ones too, sheds 2 fatigue per MOVE part.
-  for (const c of state.creeps) c.fatigue = Math.max(0, c.fatigue - 2 * count(c.body, 'move'));
+  // Creep ticks (V55): every creep, spawning ones too, sheds 2 fatigue per MOVE part; a creep out of its spawn gets
+  // its `ageTime` on its first creep tick outside (V170, V198; inferred to come after the tick that placed it).
+  for (const c of state.creeps) {
+    c.fatigue = Math.max(0, c.fatigue - 2 * count(c.body, 'move'));
+    if (!c.spawning && c.ageTime === undefined) c.ageTime = time + C.CREEP_LIFE_TIME;
+  }
   // Spawn tick (V174): place the creep once gameTime >= spawnTime - 1, on the first free of directions 1..8; regenerate.
   if (sp.spawning && time >= sp.spawning.spawnTime - 1) {
     const c = state.creeps.find((x) => x.name === sp.spawning.name);
@@ -593,7 +608,8 @@ export function openingSim(dir = join(ROOT, 'dist')) {
   const summaries = {};
   let recoveredAt = null;
   const memoryWorkers = [];
-  // The model has no aging: stop before the first worker could die (CREEP_LIFE_TIME after it leaves its spawn, V170).
+  // No creep dies in the model (it sets `ageTime` only): stop before the first worker could (CREEP_LIFE_TIME after it
+  // leaves its spawn, V170).
   const bound = 1 + C.CREEP_SPAWN_TIME * PATTERN.length + C.CREEP_LIFE_TIME;
   const done = () => state.builtAt !== null && state.offset >= state.builtAt + SETTLE;
   const world = simulate(dir, {
@@ -673,6 +689,25 @@ export function openingSim(dir = join(ROOT, 'dist')) {
   if (JSON.stringify(state.entries.map(([o]) => o)) !== JSON.stringify(oks)) problems.push(`Memory entries written at ${JSON.stringify(state.entries)}, expected one per OK at ${JSON.stringify(oks)}`);
   if (memoryWorkers.length) problems.push(`Memory.creeps kept worker entries after the loop: ${JSON.stringify(memoryWorkers.slice(0, 4))}`);
   if (/"w[WE]\d+[NS]\d+-/.test(world.memoryJson)) problems.push(`the stored Memory holds a worker entry: ${world.memoryJson.slice(0, 200)}`);
+
+  // P5.2: the snapshot reads each creep's `ticksToLive` from its first loop out of the spawn until the getter gives a
+  // number (undefined on that first loop, V198), and never again: its death tick is kept with its handle.
+  // The first read is on its first loop out (`out`) and none comes earlier. The run's last loop is world.ticksRun - 1
+  // (the harness counts a loop after its command), so a creep out on that loop has had exactly that one undefined
+  // read, and one placed by that loop's processing none.
+  for (const [out, name] of state.leftSpawn) {
+    const reads = state.ttlReads.get(name) ?? [];
+    const firstNumber = reads.findIndex(([, ttl]) => typeof ttl === 'number');
+    const late = (out === world.ticksRun - 1 && reads.length === 1 && reads[0][1] === undefined)
+      || (out >= world.ticksRun && reads.length === 0);
+    const early = reads.some(([o]) => o < out) || (reads.length > 0 && reads[0][0] !== out);
+    if (early || (!late && (firstNumber < 0 || firstNumber !== reads.length - 1 || reads.some(([, ttl], k) => k < firstNumber && ttl !== undefined)))) {
+      problems.push(`ticksToLive reads of ${name} (out from offset ${out}): ${JSON.stringify(reads)}, expected undefined on that loop, then one number and none after`);
+    }
+  }
+  for (const [name, reads] of state.ttlReads) {
+    if (!state.leftSpawn.some(([, n]) => n === name)) problems.push(`ticksToLive read on ${name} while it spawned: ${JSON.stringify(reads)}`);
+  }
 
   // Level 2 and the first extension, within the bound.
   if (state.levelAt === null || state.builtAt === null) {

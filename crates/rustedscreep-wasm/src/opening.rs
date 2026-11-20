@@ -49,7 +49,7 @@ use std::fmt::Write as _;
 
 use rustedscreep_core::config::{
     HaulingConfig, LinkConfig, MiningConfig, MovementConfig, OpeningConfig, PlannerConfig,
-    RepairConfig, SchedulerConfig, UpgradingConfig,
+    RepairConfig, SchedulerConfig, SpawnConfig, UpgradingConfig,
 };
 use rustedscreep_core::economy::placement::{DestroyTarget, Placement};
 use rustedscreep_core::economy::{
@@ -257,6 +257,7 @@ impl OpeningGlue {
         hauling_cfg: &HaulingConfig,
         upgrading_cfg: &UpgradingConfig,
         mcfg: &MovementConfig,
+        spawn_cfg: &SpawnConfig,
     ) {
         let Self {
             core,
@@ -287,6 +288,7 @@ impl OpeningGlue {
                     mining_cfg,
                     link_cfg,
                     mcfg,
+                    spawn_cfg,
                     cap,
                     refused,
                     controller_container,
@@ -309,6 +311,7 @@ impl OpeningGlue {
                     buffer,
                     hauling_cfg,
                     mcfg,
+                    spawn_cfg,
                     plan,
                     mined,
                     cap,
@@ -336,6 +339,7 @@ impl OpeningGlue {
                     spawner,
                     upgrading_cfg,
                     mcfg,
+                    spawn_cfg,
                     room.and_then(|room| mining.plan(room)),
                     room.map_or(&[][..], |room| mining.receivers(room)),
                     room.and_then(|room| hauling.plan(room)),
@@ -819,8 +823,8 @@ impl OpeningGlue {
         for (room, plan, stats) in self.hauling.room_states() {
             let _ = write!(
                 text,
-                " {room}: haulers {} of {} (working {}, requested {}, hauled sources {})",
-                stats.haulers, stats.want, stats.working, stats.requested, stats.hauled
+                " {room}: haulers {} of {} (working {}, due {}, requested {}, hauled sources {})",
+                stats.haulers, stats.want, stats.working, stats.due, stats.requested, stats.hauled
             );
             let mut first = true;
             for (&n, kind) in stats.tasks.iter().zip(HaulTask::KINDS) {
@@ -880,10 +884,11 @@ impl OpeningGlue {
         for (room, plan, stats) in self.upgrading.room_states() {
             let _ = write!(
                 text,
-                " {room}: upgraders {} of {} (working {}, requested {}, upgrades {}{})",
+                " {room}: upgraders {} of {} (working {}, due {}, requested {}, upgrades {}{})",
                 stats.upgraders,
                 stats.want,
                 stats.working,
+                stats.due,
                 stats.requested,
                 stats.upgrades,
                 if stats.takes { ", taking" } else { "" }
@@ -935,12 +940,14 @@ impl OpeningGlue {
         for (room, plan, stats) in self.mining.room_states() {
             let _ = write!(
                 text,
-                " {room}: miners {} (mined {}, harvests {}, requested {}, idle {}), links {} \
-                 (linked {}, transfers {}, sends {})",
+                " {room}: miners {} (mined {}, harvests {}, requested {}, due {}, next {}, idle {}), \
+                 links {} (linked {}, transfers {}, sends {})",
                 stats.miners,
                 stats.mined,
                 stats.harvests,
                 stats.requested,
+                stats.due,
+                stats.next,
                 stats.idle,
                 stats.links,
                 stats.linked,
@@ -1004,7 +1011,8 @@ impl OpeningGlue {
 
 /// One source's harvest cycles for the summary (the P3 gate, `economy::SourceHarvest`): the cycles
 /// counted since the global started; the last [`LIFE_CYCLES`] (one miner life), what they harvested
-/// of what they held and the worst of them; all of them; and the refills kept out.
+/// of what they held and the worst of them; all of them; the refills kept out; and the handovers
+/// between its miners with their gaps (P5.2; `last -1` before the first).
 fn harvest_summary(text: &mut String, h: &SourceHarvest) {
     let pct = |permille: u64| (permille / 10, permille % 10);
     let _ = write!(text, ", harvest cycles {}", h.cycles);
@@ -1022,6 +1030,15 @@ fn harvest_summary(text: &mut String, h: &SourceHarvest) {
         let _ = write!(text, ", all {a}.{ad}%");
     }
     let _ = write!(text, ", unmined {}, missed {}", h.unmined, h.missed);
+    // P5.2: the handovers between its miners and the ticks they left it with none.
+    let _ = write!(
+        text,
+        ", handovers {} (gap ticks {}, last {}, most {})",
+        h.handovers,
+        h.gap_ticks,
+        h.last_gap.map_or(-1, i64::from),
+        h.max_gap
+    );
 }
 
 #[cold]

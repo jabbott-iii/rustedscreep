@@ -148,6 +148,7 @@ pub fn game_loop() {
                     &cfg.hauling,
                     &cfg.upgrading,
                     &cfg.movement,
+                    &cfg.spawn,
                 );
                 spawn.plan(&mut tick, snapshot);
                 // Standard: the persistence loads, then the opening's repairing, building and

@@ -605,8 +605,10 @@ function snapshotSummary() {
 
 /**
  * Exported to JS as `spawn`, for `rustedscreep.spawn(room, role)`: from the next tick, a spawn of
- * `room` spawns one creep of `role` (worker when omitted) sized to the room's capacity, once the
- * room holds its cost (P2.3). With no room it cancels the request.
+ * `room` spawns one creep of `role` (worker when omitted) of the room's planned body, once the
+ * room holds its cost (P2.3); for an owned room without a spawn, a spawn room within
+ * `spawn.help_range` whose capacity fits the body, on a tick that room starts full while the
+ * Standard tier runs (P5.1). With no room it cancels the request.
  * @param {string | null} [room]
  * @param {string | null} [role]
  * @returns {string}
@@ -1106,6 +1108,10 @@ function __wbg_get_imports() {
         },
         __wbg_ticks_to_downgrade_b676132f27fbfc30: function(arg0) {
             const ret = arg0.ticksToDowngrade;
+            return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
+        __wbg_ticks_to_live_internal_819d2d1b62b60d7d: function(arg0) {
+            const ret = arg0.ticksToLive;
             return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
         },
         __wbg_time_a0ddfc3f3fde445c: function() {
@@ -2125,7 +2131,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"e67a8397e368-dirty-f1a04fc6","wasmCrc32":"f1a04fc6","features":[],"wasmParts":[653104,653104]});
+const BUILD = ({"id":"fed995490f52-dirty-53658e17","wasmCrc32":"53658e17","features":[],"wasmParts":[662636,662636]});
 const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;

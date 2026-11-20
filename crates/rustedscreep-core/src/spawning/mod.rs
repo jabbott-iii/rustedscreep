@@ -14,13 +14,20 @@
 //!    once per room in [`Spawner::rooms`]: serving rooms with a request and a ready spawn (none
 //!    when nothing is asked or every spawn of each serving room is busy or held).
 //! 4. The act step issues [`Spawner::orders`] and reports each outcome to [`Spawner::record`].
+//!
+//! Pre-spawn replacement (P5.2, [`lead`], [`is_due`]): the jobs whose creeps hold a post (miners,
+//! haulers, upgraders) count a creep whose `ticksToLive` is within its successor's spawn time,
+//! walk and `spawn.replace_margin_ticks` as due, so they ask for the successor while the creep
+//! still works and the successor reaches the post by the tick the creep is gone.
 
 mod body;
 mod name;
+mod replace;
 mod spawner;
 
 pub use body::{Body, known_part};
 pub use name::{CreepName, Identity, NAME_MAX, ORDERS_PER_TICK, Role, serial};
+pub use replace::{is_due, lead, lead_ticks};
 pub use spawner::{
     BodySpec, EnergyBudget, SpawnEvent, SpawnOrder, SpawnRequest, SpawnSide, SpawnStats,
     SpawnTotals, Spawner, room_distance,

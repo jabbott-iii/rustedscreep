@@ -17,7 +17,9 @@
 //! - own creep: 7 (`get`, `id`, the id string copy, `pos`, `__packedPos`, `spawning`, and
 //!   `fatigue` unless it is spawning; the last since P2.1, V160), plus on the tick its handle is
 //!   new `name` and the name copy (P2.3; its identity, `spawning::CreepName`); unless it is
-//!   spawning, `store`, `getUsedCapacity` and `getCapacity` for energy (P2.4, V196, V197);
+//!   spawning, `store`, `getUsedCapacity` and `getCapacity` for energy (P2.4, V196, V197), and
+//!   `ticksToLive` on each tick until it reads a number, normally once or twice in its life and
+//!   once after a global reset (P5.2, V198; its death tick is kept with its handle);
 //! - room: 8 with a controller (`get`, `name`, the name copy, `controller`, `my`, `level`, `find`,
 //!   `length`), 6 without, plus `energyAvailable` and `energyCapacityAvailable` when the bot owns
 //!   it (P2.3, V175), and for an owned room its controller's 3 progress and timer getters and its
@@ -402,6 +404,21 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
                         capacity: store.get_capacity(Some(energy)),
                     },
                 );
+                // P5.2: `ticksToLive` until it reads a number (undefined before `ageTime` is set,
+                // V198); its death tick is then kept with the handle, since `ageTime` never
+                // changes and the bot renews no creep (V170).
+                if snapshot
+                    .creeps
+                    .deaths()
+                    .get(row)
+                    .copied()
+                    .flatten()
+                    .is_none()
+                    && let Some(ttl) = creep.ticks_to_live()
+                {
+                    let death = snapshot.tick.time.saturating_add(ttl);
+                    snapshot.creeps.set_death(row, death);
+                }
             }
             Ok(handle)
         } else {

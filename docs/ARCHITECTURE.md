@@ -13,7 +13,10 @@ Current state (P3.3; P1 plus movement, in room and between rooms, the minimal sp
    then per creep 7 (`Array.get`, `id`, the id string copy, `pos`, `__packedPos`, `spawning`, and `fatigue` unless it is spawning,
    P2.1, V160), plus `name` and its copy on the tick the creep's handle is new: its identity (role, home, serial) parsed in core
    (`spawning::CreepName`, P2.3), kept as the handle's static data. An own creep that is not spawning adds 3 (P2.4): `store`,
-   `getUsedCapacity("energy")` and `getCapacity("energy")` (`CreepStore`; null reads 0, a creep with no active CARRY part, V196, V197).
+   `getUsedCapacity("energy")` and `getCapacity("energy")` (`CreepStore`; null reads 0, a creep with no active CARRY part, V196, V197),
+   and `ticksToLive` on each tick until it reads a number (P5.2, V198, V261): `Game.time` plus that number is kept with the handle as
+   the creep's death tick (`Creeps::set_death`, a side table by handle slot), so it is read once or twice in a life and once after a
+   global reset.
 3. `Game.rooms`: 3 calls, then per room 8 with a controller (`get`, `name`, the name copy, `controller`, `my`, `level`, `find`,
    `length`) or 6 without, plus `energyAvailable` and `energyCapacityAvailable` for an owned room (P2.3, V175); per hostile 5 (`get`,
    `id`, the id copy, `pos`, `__packedPos`; hostile results never include spawning creeps, V101). An owned room adds (P2.4) its
@@ -176,6 +179,19 @@ structure row, busy) and the creep identity column; `ActLog::record_structure` c
 `spawn.rs` binds `spawnCreep`, runs the job, issues the orders (§1 step 7a) and answers `rustedscreep.spawner()` and
 `rustedscreep.spawn(room, role)` (a request repeated each tick until a spawn's call for it returns OK, and again if its creep does
 not appear on the next tick).
+
+Pre-spawn replacement (P5.2): `spawning::replace` gives a replacement's lead (`lead_ticks`: the successor body's spawn time, its walk
+to the post and `spawn.replace_margin_ticks`, at most half the body's life, so a slot never holds more than two creeps) and `is_due`
+(a creep whose `ticksToLive`, from the snapshot's death tick, is at most the lead). Each job whose creeps hold a post leaves a due
+creep out of its count, so it asks for the successor while the creep still works: mining per source (a second slot: the successor walks next to
+the source, off the mining tile, and takes the source on the tick the miner is gone; `SourceHarvest` counts the handovers and their
+gaps), hauling per source (`loads` counts the haulers not due, for the request and for a new hauler's source), upgrading (a successor
+with every post held waits near the best reachable post). The opening's workers are not replaced early (a pool: measured, TUNING).
+The miners', haulers' and upgraders' walks are upper bounds on their plans' ways (`sizing::walk_ticks_max`: the way's cost times the
+ticks a rate unit takes, whatever its tile count; an empty hauler's is up to twice its tiles on plain), an upgrader's plus an estimated
+two plain tiles round the store to its post, so the lead falls short only by where the spawn puts the creep, a swamp tile by the post
+and an order's wait, which the margin covers. Nothing is persisted: a reset reads each death tick again and
+gives each due miner its successor back in the same pass.
 
 RCL1–3 opening (P2.4; the P3 economy replaces it): `rustedscreep_core::economy` is pure. `sizing` gives a worker's round between a
 source and the controller (harvest a load at `HARVEST_POWER` per WORK, walk it loaded and back with the fatigue rules, V54, V55, upgrade it

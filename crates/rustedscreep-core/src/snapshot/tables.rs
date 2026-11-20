@@ -221,6 +221,13 @@ pub struct Creeps {
     fatigue: Vec<u32>,
     identity: Vec<Option<Identity>>,
     store: Vec<CreepStore>,
+    /// The tick each own creep is gone by (P5.2, [`Self::set_death`]), per row.
+    death: Vec<Option<u32>>,
+    /// The death ticks known so far, by handle slot with the handle that owns the entry (a slot is
+    /// reused by later creeps, which the handle's generation tells apart). Kept between ticks: a
+    /// creep's `ageTime` never changes once set (V170) and the bot never renews a creep, so its
+    /// death tick is read once in its life and once after a global reset.
+    lives: Vec<Option<(CreepHandle, u32)>>,
 }
 
 impl Creeps {
@@ -233,6 +240,7 @@ impl Creeps {
         self.fatigue.clear();
         self.identity.clear();
         self.store.clear();
+        self.death.clear();
     }
 
     pub(super) fn finish(&mut self) -> u32 {
@@ -262,7 +270,32 @@ impl Creeps {
         self.fatigue.push(row.fatigue);
         self.identity.push(id);
         self.store.push(CreepStore::default());
+        let death = usize::try_from(handle.slot())
+            .ok()
+            .and_then(|slot| self.lives.get(slot).copied().flatten())
+            .filter(|&(h, _)| h == handle)
+            .map(|(_, d)| d);
+        self.death.push(death);
         Ok(handle)
+    }
+
+    /// Records that the creep at `row` is gone by tick `death` (P5.2): `Game.time` plus the
+    /// `ticksToLive` it shows now (V198). It is kept for the creep's handle, so later ticks know it
+    /// without a read; nothing for a row that does not exist.
+    pub fn set_death(&mut self, row: usize, death: u32) {
+        let (Some(&handle), Some(cell)) = (self.handle.get(row), self.death.get_mut(row)) else {
+            return;
+        };
+        *cell = Some(death);
+        let Ok(slot) = usize::try_from(handle.slot()) else {
+            return;
+        };
+        if self.lives.len() <= slot {
+            self.lives.resize(slot.saturating_add(1), None);
+        }
+        if let Some(entry) = self.lives.get_mut(slot) {
+            *entry = Some((handle, death));
+        }
     }
 
     /// Sets the store of the creep at `row` (P2.4); nothing for a row that does not exist.
@@ -324,6 +357,22 @@ impl Creeps {
     /// not parse (`spawning::CreepName`).
     pub fn identities(&self) -> &[Option<Identity>] {
         &self.identity
+    }
+
+    /// The tick each creep is gone by (P5.2): `None` for hostile creeps, spawning ones, and own
+    /// creeps whose `ticksToLive` has not been read as a number yet.
+    pub fn deaths(&self) -> &[Option<u32>] {
+        &self.death
+    }
+
+    /// The `ticksToLive` of the creep at `row` at tick `now` (its death tick less `now`; 1 on its
+    /// last tick, V198), or `None` when its death tick is not known.
+    pub fn ticks_to_live(&self, row: usize, now: u32) -> Option<u32> {
+        self.death
+            .get(row)
+            .copied()
+            .flatten()
+            .map(|d| d.saturating_sub(now))
     }
 
     /// Creeps first seen this tick.
@@ -730,7 +779,7 @@ impl RoomObjects {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustedscreep_consts::RoomCoordinate;
+    use rustedscreep_consts::{CREEP_LIFE_TIME, RoomCoordinate};
 
     fn room(name: &str) -> RoomName {
         name.parse().expect("valid room name")
@@ -1042,6 +1091,67 @@ mod tests {
         creeps.finish();
         assert_eq!(reads, 2, "read again for a new handle");
         assert_eq!(creeps.identities(), [None]);
+    }
+
+    /// Uses: CREEP_LIFE_TIME. A death tick set once (P5.2) stays with its creep's handle on later
+    /// ticks, whatever its row, and `ticks_to_live` counts down by one a tick to 1 on its last tick
+    /// (V198); a creep that reuses the slot after the handle is released starts unknown, as does a
+    /// hostile creep, and a row that does not exist is left alone.
+    #[test]
+    fn creep_deaths_are_kept_per_handle() {
+        let row = CreepRow {
+            pos: pos(10, 10, "W1N1"),
+            my: true,
+            spawning: false,
+            fatigue: 0,
+        };
+        let mut creeps = Creeps::default();
+        let start = 1000;
+        let death = start + CREEP_LIFE_TIME;
+        creeps.begin();
+        creeps.push_named(ObjectKey(1), row, || None).expect("own");
+        creeps
+            .push(ObjectKey(2), CreepRow { my: false, ..row })
+            .expect("hostile");
+        assert_eq!(creeps.deaths(), [None, None]);
+        creeps.set_death(0, death);
+        creeps.set_death(5, death);
+        creeps.finish();
+        assert_eq!(creeps.ticks_to_live(0, start), Some(CREEP_LIFE_TIME));
+        let own = creeps.handle_of(ObjectKey(1)).expect("own handle");
+        // The rows change order on the next tick (the hostile first): the death tick follows the
+        // handle, not the row.
+        for (now, hostile_first) in [(start + 1, true), (death - 1, false)] {
+            creeps.begin();
+            if hostile_first {
+                creeps
+                    .push(ObjectKey(2), CreepRow { my: false, ..row })
+                    .expect("hostile");
+            }
+            creeps.push_named(ObjectKey(1), row, || None).expect("own");
+            if !hostile_first {
+                creeps
+                    .push(ObjectKey(2), CreepRow { my: false, ..row })
+                    .expect("hostile");
+            }
+            creeps.finish();
+            let (mine, theirs) = if hostile_first { (1, 0) } else { (0, 1) };
+            assert_eq!(creeps.deaths()[mine], Some(death));
+            assert_eq!(creeps.deaths()[theirs], None);
+            assert_eq!(creeps.ticks_to_live(mine, now), Some(death - now));
+            assert_eq!(creeps.ticks_to_live(theirs, now), None);
+        }
+        assert_eq!(creeps.ticks_to_live(0, death - 1), Some(1), "its last tick");
+        // Gone for a tick: the handle is released, and the next creep in its slot is unknown.
+        creeps.begin();
+        creeps.finish();
+        creeps.begin();
+        creeps.push_named(ObjectKey(3), row, || None).expect("new");
+        creeps.finish();
+        let new = creeps.handle_of(ObjectKey(3)).expect("new handle");
+        assert_eq!(new.slot(), own.slot(), "the slot is reused");
+        assert_ne!(new, own);
+        assert_eq!(creeps.deaths(), [None]);
     }
 
     #[test]

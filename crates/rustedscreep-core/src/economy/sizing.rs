@@ -40,6 +40,30 @@ pub fn walk_ticks(trip: Trip, weight: u32, moves: u32) -> Option<u32> {
     Some(trip.tiles.max(fatigue.div_ceil(per_tick)))
 }
 
+/// Ticks to walk `trip` with `weight` parts that make fatigue and `moves` MOVE parts, at most, or
+/// `None` with no MOVE part (P5.2: a replacement's lead must not fall short of the walk). A creep
+/// moves only while its fatigue is 0 (V50); a move onto a tile of rate `r` adds `r × weight` (V54)
+/// and each tick takes `R = MOVE_POWER × moves` away, down to 0 (V55), so each tile takes
+/// `max(1, ceil(r × weight / R))` ticks and none carries over to the next. A rate is a whole number
+/// of at least 1, so that is at most `r × max(1, ceil(weight / R))`, and the walk at most
+/// `trip.cost × max(1, ceil(weight / R))`, with `trip.cost` the sum of the rates on the way. That
+/// holds however many tiles the way has (`trip.tiles` is only a lower bound on them, a range). It
+/// is exact on road, and on plain and swamp when the weight is a whole multiple of `R`; otherwise
+/// it counts up to `r - 1` ticks a tile too many, the most with no weight, where a creep walks a
+/// tile a tick and this gives the way's cost (twice its tiles on plain). Never below
+/// [`walk_ticks`]. The rates are movement's default cost profile (`MOVE_COST_*`, as for
+/// [`walk_ticks`]); a runtime profile below them makes this fall short. The way starts at the
+/// trip's start, not wherever the spawn puts the creep.
+///
+/// Uses: `MOVE_POWER`, [`walk_ticks`].
+pub fn walk_ticks_max(trip: Trip, weight: u32, moves: u32) -> Option<u32> {
+    let low = walk_ticks(trip, weight, moves)?;
+    let per_tile = weight
+        .div_ceil(MOVE_POWER.saturating_mul(moves).max(1))
+        .max(1);
+    Some(trip.cost.saturating_mul(per_tile).max(low))
+}
+
 /// One worker's round: harvest a full load at a source, carry it to the controller, upgrade it all
 /// and walk back. Upgrading is the opening's slowest way to spend a load, so the round is the
 /// longest one a worker makes (filling a spawn is one tick, building takes `BUILD_POWER` times less
@@ -744,8 +768,11 @@ pub fn miner_work(capacity: u32) -> u32 {
 /// room that holds at most `energy` (P3.1): [`miner_work`] WORK parts, then the MOVE parts that
 /// waste the least energy over its life. Each MOVE costs `BODYPART_COST[MOVE]`; each tick of the
 /// walk out is a tick its source is not harvested, a loss of the source's yield `capacity /
-/// ENERGY_REGEN_TIME` (the miner's WORK parts take at least that). The walk is [`walk_ticks`] with
-/// the WORK parts as the weight (no CARRY). Ties go to fewer MOVE parts; MOVE parts past the one
+/// ENERGY_REGEN_TIME` (the miner's WORK parts take at least that). That loss is the one without
+/// pre-spawn replacement: with `spawn.replace` on (P5.2) the walk overlaps the old miner's harvest
+/// and costs only the new miner's life, so this body can carry more MOVE parts than it needs (not
+/// re-solved yet). The walk is [`walk_ticks`] with the WORK parts as the weight (no CARRY). Ties go
+/// to fewer MOVE parts; MOVE parts past the one
 /// that brings the walk down to `trip.tiles` save nothing. `None` when the WORK parts and one MOVE
 /// cost more than `energy` or pass `MAX_CREEP_SIZE`, or for an empty capacity.
 ///
@@ -933,8 +960,9 @@ pub fn hauler_plan(
 /// What a source of `capacity` yields over one creep life: `capacity` every `ENERGY_REGEN_TIME`
 /// ticks (V184), for `CREEP_LIFE_TIME` ticks (V170). The upgraders' budget is counted per creep
 /// life, so every creep's body cost (paid once a life) adds up with it in whole energy. An upper
-/// bound on what a mined source gives: each miner life loses the replacement's spawning and walk
-/// out (no pre-spawn before P5). Unit: energy.
+/// bound on what a mined source gives: with `spawn.replace` off (P5.2), or a replacement whose
+/// order waits until the miner is gone, each miner life loses the replacement's spawning and walk
+/// out. Unit: energy.
 ///
 /// Uses: `CREEP_LIFE_TIME`, `ENERGY_REGEN_TIME`.
 pub fn yield_per_life(capacity: u32) -> u64 {
@@ -957,9 +985,10 @@ pub fn upgrader_carry(work: u32) -> u32 {
 
 /// What one upgrader of `work` WORK, `carry` CARRY and `moves` MOVE parts upgrades over a life
 /// when its post is `trip` from the spawn (P3.4): `work × UPGRADE_CONTROLLER_POWER` a tick for the
-/// life left after its spawning (`CREEP_SPAWN_TIME` a part, V170: its replacement is ordered once
-/// it is gone, so the room waits that long) and its walk out (empty, so only the WORK parts weigh,
-/// V54). A lower bound: spawning lengthens its cycle rather than shortening its life. `None`
+/// life left after its spawning (`CREEP_SPAWN_TIME` a part, V170: with `spawn.replace` off its
+/// replacement is ordered once it is gone, so the room waits that long; P5.2's pre-spawn hides it)
+/// and its walk out (empty, so only the WORK parts weigh, V54). A lower bound: spawning lengthens
+/// its cycle rather than shortening its life. `None`
 /// without a MOVE part. Unit: energy.
 ///
 /// Uses: `CREEP_LIFE_TIME`, `CREEP_SPAWN_TIME`, `UPGRADE_CONTROLLER_POWER`, [`walk_ticks`].

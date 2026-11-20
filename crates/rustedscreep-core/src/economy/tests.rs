@@ -13,7 +13,8 @@
 //! energy a tick while it and the room hold less than `SPAWN_ENERGY_CAPACITY` (V174); spawning
 //! drains spawns first, then extensions (V173) and takes `CREEP_SPAWN_TIME` per part (V170); a creep
 //! dies `CREEP_LIFE_TIME` ticks after it is born and leaves a tombstone with its store (V194, the
-//! body reclaim left out: about 0 at old age); piles lose `ceil(amount / ENERGY_DECAY)` a tick and
+//! body reclaim left out: about 0 at old age), and the snapshot shows its `ticksToLive` from its
+//! second tick out of the spawn (V198, P5.2); piles lose `ceil(amount / ENERGY_DECAY)` a tick and
 //! merge on a tile (V193). Moves follow V51, V52 and the fatigue rules (V54, V55) on plain and swamp
 //! terrain (no roads).
 //! The game side accepts the bot's plan and the processor then runs each creep's intents in its own
@@ -35,6 +36,8 @@
 //! down at the end of every tick (V217). Sends run after the creep intents, so a withdraw sees the
 //! link's energy at the tick's start, as the game side computes it.
 
+use super::hauling::hauler_lead;
+use super::mining::miner_lead;
 use super::placement::{
     CONTROLLER_CLEAR, EDGE_MARGIN, Placement, PlanView, SPAWN_CLEAR, extensions_in, next_extension,
 };
@@ -42,13 +45,15 @@ use super::sizing::{
     Round, Trip, WorkerScratch, WorkerSource, WorkerTargets, build_round, carry_round,
     container_upkeep, haul_round, hauler_plan, haulers_for, miner_body, miner_work,
     smallest_worker, source_wants, upgraded, upgrader_carry, upgrader_plan, upgrader_upgrade,
-    walk_ticks, worker_plan, worker_round, worker_value, workers_for_source, yield_per_life,
+    walk_ticks, walk_ticks_max, worker_plan, worker_round, worker_value, workers_for_source,
+    yield_per_life,
 };
+use super::upgrading::{POST_STEP, upgrader_lead};
 use super::*;
 use crate::config::{
     CACHE_MMO, HAULING_MMO, HaulingConfig, LINK_MMO, LinkConfig, MINING_MMO, MMO, MOVEMENT_MMO,
     MiningConfig, OPENING_MMO, OpeningConfig, PLANNER_MMO, REPAIR_MMO, RepairConfig, SPAWN_MMO,
-    UPGRADING_MMO, UpgradingConfig,
+    SpawnConfig, UPGRADING_MMO, UpgradingConfig,
 };
 use crate::intents::{ActLog, CreepIntent, IntentBuffer, Outcome, Target, TargetRow};
 use crate::movement::{
@@ -80,6 +85,62 @@ use rustedscreep_consts::{
 fn repeats(n: u32) -> Body {
     let unit = smallest_worker().expect("smallest worker");
     Body::scaled(unit.parts(), unit.cost() * n, u8::MAX).expect("body")
+}
+
+/// Uses: MOVE_POWER, MOVE_COST_ROAD, MOVE_COST_PLAIN, MOVE_COST_SWAMP (P5.2). Against the exact
+/// walk, tile by tile (V50, V54, V55: a move at fatigue 0 adds the tile's rate times the weight,
+/// and each tick takes `MOVE_POWER` a MOVE part away, so a tile takes `max(1, ceil(rate × weight
+/// / (MOVE_POWER × moves)))` ticks), over every mix of up to 5 road, 5 plain and 5 swamp tiles,
+/// weights 0 to 12 and 1 to 10 MOVE parts, with the trip's `tiles` anywhere from 0 to the tiles
+/// walked (a trip counts its tiles as a range, which a detour exceeds): `walk_ticks` never exceeds
+/// the walk and `walk_ticks_max` never falls below it. Pinned: a 5 WORK, 4 MOVE miner over 15
+/// plain tiles takes 2 ticks a tile, 30, which `walk_ticks` puts at 19 and `walk_ticks_max` at
+/// 30; around a wall, 25 plain tiles counted as 15 take 50, which `walk_ticks_max` gives too.
+#[test]
+fn walk_ticks_max_bounds_the_exact_walk() {
+    for road in 0..=5u32 {
+        for plain in 0..=5u32 {
+            for swamp in 0..=5u32 {
+                let tiles = road + plain + swamp;
+                let cost =
+                    road * MOVE_COST_ROAD + plain * MOVE_COST_PLAIN + swamp * MOVE_COST_SWAMP;
+                for weight in 0..=12u32 {
+                    for moves in 1..=10u32 {
+                        let per_tick = MOVE_POWER * moves;
+                        let tile = |rate: u32| (rate * weight).div_ceil(per_tick).max(1);
+                        let exact = road * tile(MOVE_COST_ROAD)
+                            + plain * tile(MOVE_COST_PLAIN)
+                            + swamp * tile(MOVE_COST_SWAMP);
+                        for counted in 0..=tiles {
+                            let trip = Trip {
+                                tiles: counted,
+                                cost,
+                            };
+                            let low = walk_ticks(trip, weight, moves).expect("a MOVE");
+                            let high = walk_ticks_max(trip, weight, moves).expect("a MOVE");
+                            assert!(
+                                low <= exact && exact <= high,
+                                "{trip:?} of {tiles} tiles, {weight} {moves}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(walk_ticks_max(Trip { tiles: 3, cost: 6 }, 1, 0), None);
+    let plain = Trip {
+        tiles: 15,
+        cost: 15 * MOVE_COST_PLAIN,
+    };
+    assert_eq!(15 * (5 * MOVE_COST_PLAIN).div_ceil(4 * MOVE_POWER), 30);
+    assert_eq!(walk_ticks(plain, 5, 4), Some(19));
+    assert_eq!(walk_ticks_max(plain, 5, 4), Some(30));
+    let around = Trip {
+        tiles: 15,
+        cost: 25 * MOVE_COST_PLAIN,
+    };
+    assert_eq!(walk_ticks_max(around, 5, 4), Some(50));
 }
 
 /// Uses: MOVE_POWER, MOVE_COST_PLAIN, MOVE_COST_SWAMP. The walk takes at least the tiles and at
@@ -1345,6 +1406,8 @@ struct World {
     repair_cfg: RepairConfig,
     hauling_cfg: HaulingConfig,
     upgrading_cfg: UpgradingConfig,
+    /// The spawn queue's values (P5.2: `replace` and its margin).
+    spawn_cfg: SpawnConfig,
     /// Haulers (P3.3): transfers into a container and the energy they moved; takes that found
     /// nothing left (an earlier take this tick emptied the target: billed for nothing).
     stored: u32,
@@ -1408,6 +1471,10 @@ struct World {
     events: Vec<(u32, Event)>,
     failed: u32,
     spawned: Vec<(u32, Body)>,
+    /// P5.2: each accepted order (the tick, the role, the body's spawn time) and each creep gone of
+    /// old age (the first tick it is gone, its role).
+    orders: Vec<(u32, Role, u32)>,
+    aged: Vec<(u32, Role)>,
     /// Each worker spawned (P3.6): the tick, its body, the budget the opening requested it with
     /// that tick, and the plan's body then.
     worker_spawns: Vec<(u32, Body, Option<EnergyBudget>, Option<Body>)>,
@@ -1487,6 +1554,7 @@ impl World {
             repair_cfg: REPAIR_MMO,
             hauling_cfg: HAULING_MMO,
             upgrading_cfg: UPGRADING_MMO,
+            spawn_cfg: SPAWN_MMO,
             stored: 0,
             stored_energy: 0,
             empty_takes: 0,
@@ -1525,6 +1593,8 @@ impl World {
             events: Vec::new(),
             failed: 0,
             spawned: Vec::new(),
+            orders: Vec::new(),
+            aged: Vec::new(),
             worker_spawns: Vec::new(),
             levels: Vec::new(),
             leveled: 0,
@@ -1653,6 +1723,21 @@ impl World {
                         capacity: c.capacity(),
                     },
                 );
+                // Its ticksToLive (P5.2), read only until known, as the snapshot does: shown from
+                // its second tick out of the spawn (V198, inferred), and the model's creep acts
+                // last on `born + CREEP_LIFE_TIME` (`end_of_tick` removes it then).
+                if self
+                    .snap
+                    .creeps
+                    .deaths()
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_none()
+                    && time > c.born + 1
+                {
+                    self.snap.creeps.set_death(i, c.born + CREEP_LIFE_TIME + 1);
+                }
             }
         }
         let energy = self.room_energy();
@@ -1783,7 +1868,8 @@ impl World {
             self.movement.set_objects(room, self.footprints());
         }
         self.buffer.begin(&self.snap);
-        self.spawner.begin(&self.snap, &SPAWN_MMO);
+        let spawn_cfg = self.spawn_cfg;
+        self.spawner.begin(&self.snap, &spawn_cfg);
         self.opening.begin(&self.snap);
         self.mining.begin(&self.snap);
         self.hauling.begin(&self.snap);
@@ -1813,6 +1899,7 @@ impl World {
                     &mining_cfg,
                     &link_cfg,
                     &mcfg,
+                    &spawn_cfg,
                     cap,
                     &refused,
                     controller_container,
@@ -1833,6 +1920,7 @@ impl World {
                     &mut self.buffer,
                     &hauling_cfg,
                     &mcfg,
+                    &spawn_cfg,
                     self.mining.plan(room),
                     &mined,
                     cap,
@@ -1860,6 +1948,7 @@ impl World {
                     &mut self.spawner,
                     &upgrading_cfg,
                     &mcfg,
+                    &spawn_cfg,
                     self.mining.plan(room),
                     &receivers,
                     self.hauling.plan(room),
@@ -1988,7 +2077,7 @@ impl World {
         for i in 0..self.spawner.orders().len() {
             let order = self.spawner.orders()[i];
             let outcome = self.spawn(order.body, order.identity);
-            self.spawner.record(i, outcome, &SPAWN_MMO);
+            self.spawner.record(i, outcome, &self.spawn_cfg);
         }
         for i in 0..self.placement.orders().len() {
             let order = self.placement.orders()[i];
@@ -2180,6 +2269,8 @@ impl World {
             born: 0,
         });
         self.spawned.push((self.time, body));
+        self.orders
+            .push((self.time, identity.role, body.spawn_time()));
         if identity.role == Role::Worker {
             let (budget, plan_body) = self
                 .opening
@@ -2698,6 +2789,9 @@ impl World {
             alive
         });
         for c in dead {
+            if c.spawning == 0 && now >= c.born + CREEP_LIFE_TIME {
+                self.aged.push((now + 1, c.identity.role));
+            }
             let key = self.key();
             let parts = u32::try_from(c.body.len()).expect("small");
             self.loose.push(Loose::Tomb {
@@ -3573,13 +3667,12 @@ fn miners_on(w: &World) -> Vec<Option<usize>> {
         .iter()
         .map(|s| {
             w.creeps.iter().position(|c| {
+                // The source's miner, not its successor (P5.2).
+                let h = w.snap.creeps.handle_of(ObjectKey(c.key));
                 c.identity.role == Role::Miner
                     && c.spawning == 0
-                    && w.snap
-                        .creeps
-                        .handle_of(ObjectKey(c.key))
-                        .and_then(|h| w.mining.source_of(h))
-                        == Some(s.source)
+                    && h.and_then(|h| w.mining.source_of(h)) == Some(s.source)
+                    && !h.is_some_and(|h| w.mining.is_successor(h))
             })
         })
         .collect()
@@ -3718,6 +3811,391 @@ fn a_reset_keeps_one_miner_per_source() {
     };
     assert_eq!(at(&a), at(&b));
     assert_eq!(a.progress, b.progress);
+}
+
+/// Each source's miners this tick, spawning ones included (P5.2: its miner and its successor).
+fn miners_per_source(w: &World) -> Vec<usize> {
+    let Some((_, Some(plan), _)) = w.mining.room_states().next() else {
+        return Vec::new();
+    };
+    plan.sources
+        .iter()
+        .map(|s| {
+            w.creeps
+                .iter()
+                .filter(|c| {
+                    c.identity.role == Role::Miner
+                        && w.snap
+                            .creeps
+                            .handle_of(ObjectKey(c.key))
+                            .and_then(|h| w.mining.source_of(h))
+                            == Some(s.source)
+                })
+                .count()
+        })
+        .collect()
+}
+
+/// Uses: CREEP_LIFE_TIME, CREEP_SPAWN_TIME, MOVE_POWER (P5.2, TEST_PLAN §7). At
+/// RCL3 over four creep lives with `spawn.replace` on, each source's miner is replaced before it is
+/// gone: the room's handovers are as many as its miners gone of old age, each source's successor is
+/// next to the source on the tick after the old miner's last there (no gap), and no source ever has
+/// more than two miners (the old one and its successor). The successors are out of the spawn no
+/// longer than their lead's walk and margin before each handover (plus one successor still out at
+/// the end). With `spawn.replace` off the gaps add up to at least the miner's spawn time a
+/// handover, and the last is at least it. (With `spawn.replace_margin_ticks` at 0 one run, on
+/// 2026-11-20, left gaps of up to 5 ticks at one source, the spawn's exit and the tile it stopped
+/// on, and up to 22 at the other, an order that waited for the spawn: what the margin is for.)
+#[test]
+fn miners_are_replaced_before_they_die() {
+    let run = |replace: bool, margin: u32| {
+        let mut w = World::new(3, SPAWN_ENERGY_CAPACITY);
+        w.spawn_cfg.replace = replace;
+        w.spawn_cfg.replace_margin_ticks = margin;
+        let mut waiting = 0u32;
+        for _ in 0..4 * CREEP_LIFE_TIME {
+            w.step();
+            let per = miners_per_source(&w);
+            assert!(per.iter().all(|&n| n <= 2), "{per:?} at {}", w.time);
+            waiting += w.mining.stats(w.room).map_or(0, |s| s.next);
+        }
+        (w, waiting)
+    };
+    let default = SPAWN_MMO.replace_margin_ticks;
+    for (replace, margin) in [(true, default), (false, default)] {
+        let (w, waiting) = run(replace, margin);
+        let plan = mine_plan(&w);
+        let aged = w.aged.iter().filter(|a| a.1 == Role::Miner).count();
+        let mut handovers = 0;
+        let mut most_walk = 0;
+        for s in &plan.sources {
+            let rec = w
+                .mining
+                .harvest(w.room)
+                .iter()
+                .find(|r| r.source == s.source)
+                .expect("a record");
+            let body = s.body.expect("a body");
+            let spawn = body.spawn_time();
+            let work = count(&body, Part::Work);
+            let moves = count(&body, Part::Move);
+            let walk = walk_ticks_max(s.trip.expect("a trip"), work, moves).expect("a MOVE");
+            most_walk = most_walk.max(walk);
+            assert!(rec.handovers >= 2, "{replace}: {rec:?}");
+            handovers += rec.handovers;
+            if replace {
+                assert_eq!((rec.gap_ticks, rec.max_gap), (0, 0), "{rec:?}");
+            } else {
+                assert!(
+                    rec.gap_ticks >= u64::from(rec.handovers) * u64::from(spawn),
+                    "{rec:?}"
+                );
+                assert!(rec.last_gap.is_some_and(|g| g >= spawn), "{rec:?}");
+            }
+        }
+        assert_eq!(
+            handovers as usize, aged,
+            "{replace} {margin}: one handover per miner gone"
+        );
+        if replace {
+            assert!(
+                waiting <= (handovers + 1) * (most_walk + margin + 1),
+                "{margin}: successors out {waiting} ticks for {handovers} handovers"
+            );
+        } else {
+            assert_eq!(waiting, 0);
+        }
+    }
+}
+
+/// Uses: CREEP_SPAWN_TIME (`Body::spawn_time`), MOVE_POWER (`walk_ticks_max`) (P5.2).
+/// Each job's replacement lead, on a world's plans at RCL4: a miner's is its body's spawn time, its
+/// longest walk out on the plan's trip with its WORK parts as the weight, and the margin; a
+/// hauler's its body's spawn time, the mining plan's way from the spawn to its tile walked empty
+/// (no part makes fatigue: a tick a tile, at most the way's cost), and the margin; an upgrader's
+/// its body's spawn time, its longest walk on the plan's trip and `POST_STEP` plain tiles to its
+/// post with its WORK parts as the weight, and the margin. Each is 0 with `spawn.replace` off and
+/// without a body.
+#[test]
+fn job_leads_come_from_their_plans() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    w.run(4000);
+    let on = SPAWN_MMO;
+    let off = SpawnConfig {
+        replace: false,
+        ..SPAWN_MMO
+    };
+    let margin = on.replace_margin_ticks;
+    let n = |b: &Body, p: Part| u32::try_from(b.count(p)).expect("small");
+    let mine = mine_plan(&w);
+    assert!(!mine.sources.is_empty());
+    for s in &mine.sources {
+        let body = s.body.expect("a miner body");
+        let trip = s.trip.expect("a trip");
+        let walk =
+            walk_ticks_max(trip, n(&body, Part::Work), n(&body, Part::Move)).expect("a MOVE");
+        assert_eq!(miner_lead(s, &on), body.spawn_time() + walk + margin);
+        assert_eq!(miner_lead(s, &off), 0);
+        assert_eq!(miner_lead(&MineSource { body: None, ..*s }, &on), 0);
+    }
+    let haul = w.hauling.plan(w.room).expect("a hauling plan");
+    assert!(!haul.sources.is_empty());
+    for s in &haul.sources {
+        let body = s.body.expect("a hauler body");
+        let trip = mine
+            .sources
+            .iter()
+            .find(|m| m.source == s.source)
+            .and_then(|m| m.trip)
+            .expect("the mining plan's trip");
+        assert_eq!(
+            hauler_lead(s, haul, &on),
+            body.spawn_time() + trip.cost + margin
+        );
+        assert_eq!(hauler_lead(s, haul, &off), 0);
+        assert_eq!(hauler_lead(&HaulSource { body: None, ..*s }, haul, &on), 0);
+    }
+    let (_, up, _) = w.upgrading.room_states().next().expect("a room");
+    let up = up.expect("an upgrading plan");
+    let body = up.body.expect("an upgrader body");
+    let trip = up.trip.expect("a trip");
+    // The trip, then `POST_STEP` plain tiles round the store to the post.
+    let to_post = Trip {
+        tiles: trip.tiles + POST_STEP,
+        cost: trip.cost + POST_STEP * MOVE_COST_PLAIN,
+    };
+    let walk = walk_ticks_max(to_post, n(&body, Part::Work), n(&body, Part::Move)).expect("a MOVE");
+    assert_eq!(upgrader_lead(up, &on), body.spawn_time() + walk + margin);
+    assert_eq!(upgrader_lead(up, &off), 0);
+    let none = UpgradePlan {
+        body: None,
+        ..up.clone()
+    };
+    assert_eq!(upgrader_lead(&none, &on), 0);
+}
+
+/// P5.2, after a global reset (mining's heap state lost) on a tick a successor stands next to its
+/// source, waiting: on the next tick the old miner takes its tile's source back and the successor its slot
+/// beside it (the old miner is seen as due within the same pass), so no miner is asked for that
+/// tick and none later for that source (at most one for each other source, whose miner may come
+/// due meanwhile), no source ever has more than two, and once the old miners are gone each source
+/// has its miner.
+#[test]
+fn a_reset_keeps_the_successor() {
+    let mut w = World::new(3, SPAWN_ENERGY_CAPACITY);
+    let mut before = None;
+    // Until a successor stands next to its source, waiting.
+    let waiting = |w: &World| {
+        w.creeps.iter().any(|c| {
+            let h = w.snap.creeps.handle_of(ObjectKey(c.key));
+            c.spawning == 0
+                && h.is_some_and(|h| w.mining.is_successor(h))
+                && h.and_then(|h| w.mining.source_of(h))
+                    .is_some_and(|s| c.at.range(tile_of(s)) <= 1)
+        })
+    };
+    for _ in 0..3 * CREEP_LIFE_TIME {
+        w.step();
+        if waiting(&w) {
+            before = w.mining.stats(w.room).copied();
+            break;
+        }
+    }
+    let before = before.expect("a successor waits within three lives");
+    // Each successor's source before the reset, by creep id.
+    let successors = |w: &World| {
+        let mut v: Vec<(u128, Position)> = w
+            .creeps
+            .iter()
+            .filter_map(|c| {
+                let h = w.snap.creeps.handle_of(ObjectKey(c.key))?;
+                w.mining.is_successor(h).then_some(())?;
+                Some((c.key, w.mining.source_of(h)?))
+            })
+            .collect();
+        v.sort_by_key(|e| e.0);
+        v
+    };
+    let held = successors(&w);
+    assert!(!held.is_empty());
+    w.mining = Mining::default();
+    w.step();
+    assert_eq!(successors(&w), held, "each successor keeps its source");
+    let after = *w.mining.stats(w.room).expect("stats");
+    assert_eq!(
+        (after.due, after.next),
+        (before.due, before.next),
+        "{before:?} {after:?}"
+    );
+    assert_eq!(after.requested, 0, "{after:?}");
+    assert_eq!(after.idle, 0, "{after:?}");
+    let miners = w.orders.iter().filter(|o| o.1 == Role::Miner).count();
+    let sources = mine_plan(&w).sources.len();
+    let mut handed = false;
+    for _ in 0..CREEP_LIFE_TIME / 4 {
+        w.step();
+        let per = miners_per_source(&w);
+        assert!(per.iter().all(|&n| n <= 2), "{per:?} at {}", w.time);
+        // No unassigned third miner either: every miner beyond one a source is a due one's.
+        let stats = *w.mining.stats(w.room).expect("stats");
+        assert!(
+            w.miners() <= sources + stats.due as usize,
+            "{} miners at {}: {stats:?}",
+            w.miners(),
+            w.time
+        );
+        if w.mining
+            .stats(w.room)
+            .is_some_and(|s| s.next == 0 && s.due == 0)
+        {
+            handed = true;
+            break;
+        }
+    }
+    assert!(
+        handed,
+        "the old miners are gone and their successors hold the sources"
+    );
+    // At most one order for each source that had no successor at the reset (its own miner may
+    // come due meanwhile); none for the one whose successor waited.
+    let after_reset = w.orders.iter().filter(|o| o.1 == Role::Miner).count() - miners;
+    assert!(
+        after_reset <= sources - before.next as usize,
+        "{after_reset} miners ordered after the reset"
+    );
+    assert!(miners_on(&w).iter().all(Option::is_some));
+}
+
+/// P5.2, a reset while one source's successor waits next to it and another source's successor is
+/// still spawning, with the waiting one's id the higher (ids are in no age order in the game): the
+/// waiting one keeps its source's successor slot, so the spawning one, nearer by range to that
+/// source (the two are equally far from the spawn and it comes first by id), takes the other
+/// source's.
+#[test]
+fn a_reset_keeps_a_waiting_successor_on_its_source() {
+    let mut w = World::new(3, SPAWN_ENERGY_CAPACITY);
+    let next_to = |w: &World, c: &SimCreep| {
+        let h = w.snap.creeps.handle_of(ObjectKey(c.key))?;
+        w.mining.is_successor(h).then_some(())?;
+        let s = w.mining.source_of(h)?;
+        (c.spawning == 0 && c.at.range(tile_of(s)) <= 1).then_some(s)
+    };
+    let mut found = None;
+    for _ in 0..3 * CREEP_LIFE_TIME {
+        w.step();
+        let waiting = w.creeps.iter().position(|c| next_to(&w, c).is_some());
+        let spawning = w.creeps.iter().any(|c| {
+            c.identity.role == Role::Miner
+                && c.spawning > 0
+                && w.snap
+                    .creeps
+                    .handle_of(ObjectKey(c.key))
+                    .is_some_and(|h| w.mining.is_successor(h))
+        });
+        if let Some(i) = waiting
+            && spawning
+        {
+            found = Some((i, next_to(&w, &w.creeps[i]).expect("a source")));
+            break;
+        }
+    }
+    let (i, source) = found.expect("a successor waits while another spawns, within three lives");
+    // The reset, with the waiting successor's id above every other.
+    let key = u128::MAX / 2;
+    w.creeps[i].key = key;
+    w.mining = Mining::default();
+    w.step();
+    let h = w
+        .snap
+        .creeps
+        .handle_of(ObjectKey(key))
+        .expect("the waiting one");
+    assert!(w.mining.is_successor(h));
+    assert_eq!(w.mining.source_of(h), Some(source), "it keeps its source");
+    let per = miners_per_source(&w);
+    assert!(per.iter().all(|&n| n <= 2), "{per:?}");
+}
+
+/// P5.2: each creep of `role` gone of old age in `w`, by the first tick it was gone, with the order
+/// matched to it: deaths and orders of the role are matched one to one in time order, each death
+/// taking the earliest order not yet taken that was made at most half a life before it (no lead
+/// reaches that far, `spawning::lead_ticks`). `None` when no order matches. Each order is (the
+/// tick, the body's spawn time).
+fn matched_orders(w: &World, role: Role) -> Vec<(u32, Option<(u32, u32)>)> {
+    let mut taken = vec![false; w.orders.len()];
+    w.aged
+        .iter()
+        .filter(|a| a.1 == role)
+        .map(|&(gone, _)| {
+            let pick = w.orders.iter().enumerate().find(|&(i, &(at, r, _))| {
+                !taken[i] && r == role && at + CREEP_LIFE_TIME / 2 >= gone
+            });
+            let order = pick.map(|(i, &(at, _, spawn))| {
+                taken[i] = true;
+                (at, spawn)
+            });
+            (gone, order)
+        })
+        .collect()
+}
+
+/// Uses: CREEP_LIFE_TIME, CREEP_SPAWN_TIME (P5.2, TEST_PLAN §7). At RCL4 over four creep lives
+/// with `spawn.replace` on, every miner, hauler and upgrader gone of old age had a successor
+/// ordered no earlier than the role's lead before it was gone ([`miner_lead`], [`hauler_lead`],
+/// [`upgrader_lead`] on the final plans: the request opens when the creep is due) and out of the
+/// spawn by then (its order at least the body's spawn time earlier, V173, V174), each role at least
+/// twice. With it off none was out in time: each successor is ordered once its predecessor is gone.
+/// Whether a successor reached its post in time is measured for the miners
+/// (`miners_are_replaced_before_they_die`). An upgrader's order can wait past the margin for the
+/// room to hold its body's cost (the lowest priority, an exact body at the room's capacity): here
+/// 64 to 145 ticks past its lead, a gap its walk then adds to (the energy wait, P5.3). The
+/// opening's workers are not replaced early (`SpawnConfig::replace` gives the measurement).
+#[test]
+fn crews_are_replaced_before_they_die() {
+    for replace in [true, false] {
+        let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+        w.spawn_cfg.replace = replace;
+        w.run(4 * CREEP_LIFE_TIME);
+        let cfg = w.spawn_cfg;
+        let mine = mine_plan(&w);
+        let haul = w.hauling.plan(w.room).expect("a hauling plan");
+        let (_, up, _) = w.upgrading.room_states().next().expect("a room");
+        let up = up.expect("an upgrading plan");
+        let leads = [
+            (
+                Role::Miner,
+                mine.sources.iter().map(|s| miner_lead(s, &cfg)).max(),
+            ),
+            (
+                Role::Hauler,
+                haul.sources
+                    .iter()
+                    .map(|s| hauler_lead(s, haul, &cfg))
+                    .max(),
+            ),
+            (Role::Upgrader, Some(upgrader_lead(up, &cfg))),
+        ];
+        for (role, lead) in leads {
+            let lead = lead.expect("a lead");
+            let deaths = matched_orders(&w, role);
+            assert!(deaths.len() >= 2, "{role:?}: {deaths:?}");
+            for &(gone, order) in &deaths {
+                let (at, spawn) = order.expect("a matched order");
+                assert_eq!(
+                    at + spawn <= gone,
+                    replace,
+                    "{replace} {role:?}: {deaths:?}"
+                );
+                if replace {
+                    assert!(
+                        gone - at <= lead,
+                        "{role:?} ordered early: {deaths:?}, lead {lead}"
+                    );
+                }
+            }
+        }
+        assert_eq!(w.failed, 0);
+    }
 }
 
 /// With `mining.enabled` and `mining.place_containers` off the room runs the opening alone: no
@@ -4681,8 +5159,9 @@ fn a_container_off_the_mining_tiles_is_never_repaired() {
 /// Uses: CONTAINER_HITS, CONTAINER_DECAY, CONTAINER_DECAY_TIME_OWNED, CREEP_LIFE_TIME. At RCL5 with
 /// the link network (one source link, `links.source_links`), the linked source's container, whose
 /// gatherers wait at the controller link instead (P3.2), set between `repair.walk_pct` and
-/// `repair.start_pct`: under repair, but over a creep life (three decay steps, still above the walk
-/// share) no worker is sent to it from outside repair range. Set below `repair.walk_pct`, it is
+/// `repair.start_pct` once its miner sends through the link: under repair, but over a creep life
+/// (three decay steps, still above the walk share) no worker is sent to it from outside repair
+/// range. Set below `repair.walk_pct`, it is
 /// repaired back above that share within a creep life. Upgraders off (P3.4): with them the workers
 /// take from the nearest container, this one too, and repair it from there.
 #[test]
@@ -4697,11 +5176,19 @@ fn a_linked_container_waits_for_the_walk_share() {
         linked = mine
             .and_then(|m| m.sources.iter().find(|s| s.linked))
             .and_then(|s| s.tile);
-        if linked.is_some_and(|t| hits_at(&w, tile_of(t)).is_some()) {
+        // Its container stands and its miner sends through the link (one spawned before the link
+        // stood has no CARRY part and fills the container, where the workers then gather).
+        let sends = |t: Position| {
+            w.mining
+                .mined(w.room)
+                .iter()
+                .any(|m| m.tile == t && m.link.is_some())
+        };
+        if linked.is_some_and(|t| hits_at(&w, tile_of(t)).is_some() && sends(t)) {
             break;
         }
     }
-    let at = tile_of(linked.expect("a linked source within 12000 ticks"));
+    let at = tile_of(linked.expect("a linked source sending within 12000 ticks"));
     let walk = share(REPAIR_MMO.walk_pct);
     // Three steps in a creep life, each `CONTAINER_DECAY`: still above the walk share.
     set_container(&mut w, at, walk + 4 * CONTAINER_DECAY);
@@ -4710,7 +5197,12 @@ fn a_linked_container_waits_for_the_walk_share() {
         assert_eq!(walking_repairers(&w, Some(at)), 0, "walked at {}", w.time);
     }
     let hits = hits_at(&w, at).expect("there");
-    assert!(below_share(hits, REPAIR_MMO.start_pct) && !below_share(hits, REPAIR_MMO.walk_pct));
+    assert!(
+        below_share(hits, REPAIR_MMO.start_pct) && !below_share(hits, REPAIR_MMO.walk_pct),
+        "hits {hits} at {} (walk share {walk}, start share {})",
+        w.time,
+        share(REPAIR_MMO.start_pct)
+    );
     let (_, _, _, stats) = w.opening.room_states().next().expect("room");
     assert!(stats.repairing >= 1, "under repair all the same");
     // Below the walk share: repaired back above it.
@@ -4945,7 +5437,8 @@ fn haulers_raise_the_upgrade_rate() {
 /// Uses: CONTAINER_CAPACITY, CARRY_CAPACITY, `CONTROLLER_LINK_RANGE`. A room that
 /// starts at RCL4 places the controller container on a free tile 2 from the controller (off the
 /// controller link's tile, not next to a source), builds it, and gets the plan's haulers: CARRY and
-/// MOVE parts only, at most `max_per_source` a source. They fill the spawns and extensions and
+/// MOVE parts only, at most `max_per_source` a source besides those due for replacement (P5.2).
+/// They fill the spawns and extensions and
 /// carry the rest into the container; the workers (from P3.4 the upgraders) take it there, the
 /// workers are sized with no walk, and fill nothing while a hauler hauls a mined source.
 #[test]
@@ -4986,7 +5479,14 @@ fn haulers_carry_a_sources_energy_to_the_controller_container() {
         w.step();
         let (_, _, _, os) = w.opening.room_states().next().expect("room");
         let (_, _, hs) = w.hauling.room_states().next().expect("room");
-        assert!(hs.haulers <= want, "no more haulers than the plan wants");
+        // A due hauler's successor joins it before it is gone (P5.2): the plan's count holds for
+        // the haulers not due (the successors among them).
+        assert!(
+            hs.haulers.saturating_sub(hs.due) <= want && hs.due <= want,
+            "no more haulers than the plan wants, besides the due ones: {} with {} due, want {want}",
+            hs.haulers,
+            hs.due
+        );
         if hs.hauled > 0 {
             assert_eq!(os.tasks[2], 0, "no worker fills while a hauler hauls");
         }
@@ -5196,7 +5696,8 @@ fn a_hauled_rooms_containers_are_kept() {
 }
 
 /// A global reset forgets every hauler's source and mode; the next ticks give them back from their
-/// stores and the plan's wants, so no hauler is ordered beyond the plan and they keep storing.
+/// stores and the plan's wants, so no hauler is ordered beyond the plan (besides due haulers'
+/// successors, P5.2) and they keep storing.
 #[test]
 fn a_reset_keeps_the_haulers_hauling() {
     let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
@@ -5206,9 +5707,10 @@ fn a_reset_keeps_the_haulers_hauling() {
     w.hauling = Hauling::default();
     let stored = w.stored;
     w.run(1000);
-    let (_, plan, _) = w.hauling.room_states().next().expect("room");
+    let (_, plan, stats) = w.hauling.room_states().next().expect("room");
     let want: u32 = plan.expect("plan").sources.iter().map(|s| s.want).sum();
-    assert!(w.haulers() as u32 <= want);
+    // Beyond the plan only by due haulers' successors (P5.2).
+    assert!(w.haulers() as u32 <= want + stats.due, "{stats:?}");
     assert!(w.stored > stored, "storing again after the reset");
     assert_eq!(w.failed, 0);
 }
@@ -5700,7 +6202,13 @@ fn upgraders_take_the_controllers_energy_from_their_posts() {
         .iter()
         .filter(|c| c.identity.role == Role::Upgrader)
         .collect();
-    assert_eq!(upgraders.len() as u32, plan.want);
+    // The plan's count, with a due upgrader's successor besides it (P5.2).
+    let (_, _, ustats) = w.upgrading.room_states().next().expect("room");
+    assert!(
+        upgraders.len() as u32 >= plan.want && upgraders.len() as u32 - ustats.due <= plan.want,
+        "{} upgraders, {ustats:?}",
+        upgraders.len()
+    );
     let mut seen = Vec::new();
     for c in &upgraders {
         let work = count(&c.body, Part::Work);
@@ -5912,7 +6420,13 @@ fn critical_upgrading_goes_on_with_the_standard_tier_off() {
     );
     let (_, plan, stats) = w.upgrading.room_states().next().expect("room");
     assert!(stats.takes);
-    assert_eq!(stats.upgraders, plan.expect("a plan").want);
+    // The plan's count holds for the upgraders not due (P5.2), and with the due ones it is met,
+    // whether or not a due upgrader's successor is ordered yet.
+    let want = plan.expect("a plan").want;
+    assert!(
+        stats.upgraders.saturating_sub(stats.due) <= want && want <= stats.upgraders,
+        "{stats:?}"
+    );
     assert_eq!(w.progress, progress, "no upgrade");
     assert!(
         w.takes_log.iter().all(|t| t.1 != Role::Upgrader),
@@ -6252,9 +6766,10 @@ fn an_upgrader_keeps_its_own_work_parts() {
 
 /// Uses: EXTENSION_ENERGY_CAPACITY. No worker transfers into a spawn or extension a hauler's
 /// transfer goes into on the same tick: with the miners gone (and none ordered, so the workers fill
-/// too and nothing drains the room), every spawn and extension full but one, every hauler holding a
-/// fifth of its room, one of them and a full worker next to it, the worker leaves it to the hauler
-/// (its no-amount transfer would fill all the room and leave the hauler's billed for nothing).
+/// too and nothing drains the room) and nothing left at their tiles to take, every spawn and
+/// extension full but one, every hauler holding a fifth of its room, one of them and a full worker
+/// next to it, the worker leaves it to the hauler (its no-amount transfer would fill all the room
+/// and leave the hauler's billed for nothing).
 #[test]
 fn a_worker_never_fills_where_a_hauler_transfers() {
     let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
@@ -6264,6 +6779,23 @@ fn a_worker_never_fills_where_a_hauler_transfers() {
         ..MINING_MMO
     };
     w.creeps.retain(|c| c.identity.role != Role::Miner);
+    // Nothing left to take at the mining tiles, so every hauler delivers what it holds (one still
+    // gathering would take a container's leftover energy instead).
+    let tiles: Vec<Tile> = w
+        .mining
+        .mine_tiles(w.room)
+        .iter()
+        .map(|&p| tile_of(p))
+        .collect();
+    w.loose
+        .retain(|l| !matches!(*l, Loose::Pile { at, .. } if tiles.contains(&at)));
+    for l in &mut w.loose {
+        if let Loose::Container { at, energy, .. } = l
+            && tiles.contains(at)
+        {
+            *energy = 0;
+        }
+    }
     let target = w
         .stores
         .iter()

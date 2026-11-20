@@ -59,22 +59,22 @@
 //! stands on, else the first free one in id order. Nothing is read from or written to `Memory`.
 
 use rustedscreep_consts::{
-    CONTROLLER_MAX_UPGRADE_PER_TICK, Part, Position, ResourceType, RoomCoordinate, RoomName,
-    StructureType, UPGRADE_CONTROLLER_POWER,
+    CONTROLLER_MAX_UPGRADE_PER_TICK, MOVE_COST_PLAIN, Part, Position, ResourceType, RoomCoordinate,
+    RoomName, StructureType, UPGRADE_CONTROLLER_POWER,
 };
 
 use super::hauling::HaulPlan;
 use super::mining::{MinePlan, MineSource, Receiver, link_loss};
 use super::opening::Plan as WorkerPlan;
-use super::sizing::{Trip, upgrader_plan, yield_per_life};
-use crate::config::{MovementConfig, UpgradingConfig};
+use super::sizing::{Trip, upgrader_plan, walk_ticks_max, yield_per_life};
+use crate::config::{MovementConfig, SpawnConfig, UpgradingConfig};
 use crate::intents::{CreepIntent, IntentBuffer, Target};
 use crate::movement::{Dial, FlowField, Goal, MoveError, MoveTo, Movement, Tile, UNREACHED};
 use crate::scheduler::{Commit, Fault, Tier};
 use crate::snapshot::{
     Controller, CreepHandle, ObjectHandle, ObjectKind, Snapshot, StructureHandle,
 };
-use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner};
+use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner, is_due, lead};
 
 /// The spawn priority of an upgrader request: below a hauler's (`PRIORITY_HAULER`, which brings
 /// its energy) and a room short of workers (`PRIORITY_LOW`), above the opening's normal worker
@@ -89,6 +89,10 @@ const WORK_RANGE: u8 = 3;
 /// How hard an upgrader's moves push past other creeps (`MoveTo::priority`): as the opening's
 /// workers that take energy (2), below a hauler that fills or stores (3).
 const MOVE_PRIORITY: u8 = 2;
+
+/// How near the best post an upgrader with no post waits (P5.2). It moves below the post holders'
+/// priority, so a holder walking to its post shoves it off that tile.
+const WAIT_RANGE: u8 = 2;
 
 /// Posts movement found no way to that a room remembers at once.
 const UNREACHABLE_MAX: usize = 16;
@@ -197,6 +201,8 @@ pub struct UpgradeStats {
     pub want: u32,
     /// Upgrader requests made this tick.
     pub requested: u32,
+    /// Upgraders due for replacement (P5.2): they work on, but the plan counts them no more.
+    pub due: u32,
     /// Upgraders per task in the last `upgrading work` run, in [`UpgradeTask::KINDS`] order.
     pub tasks: [u32; UpgradeTask::KINDS.len()],
     /// Upgrade calls pushed in that run.
@@ -510,6 +516,7 @@ impl Upgrading {
         spawner: &mut Spawner,
         cfg: &UpgradingConfig,
         mcfg: &MovementConfig,
+        scfg: &SpawnConfig,
         mine: Option<&MinePlan>,
         receivers: &[Receiver],
         haul: Option<&HaulPlan>,
@@ -562,10 +569,18 @@ impl Upgrading {
             ..UpgradeStats::default()
         };
         let mut working = false;
+        let lead = self
+            .rooms
+            .get(ri)
+            .and_then(|r| r.plan.as_ref())
+            .map_or(0, |p| upgrader_lead(p, scfg));
         for i in members.0..members.1 {
             let Some(m) = self.members.get(i).copied() else {
                 continue;
             };
+            if is_due(snap.creeps.ticks_to_live(m.row, now), lead) {
+                stats.due = stats.due.saturating_add(1);
+            }
             if snap.creeps.spawning().get(m.row).copied().unwrap_or(true) {
                 continue;
             }
@@ -596,7 +611,8 @@ impl Upgrading {
                 && cap.is_none_or(|c| body.cost() <= c)
             {
                 wants = true;
-                if stats.upgraders < plan.want {
+                // A due upgrader no longer fills its place (P5.2).
+                if stats.upgraders.saturating_sub(stats.due) < plan.want {
                     let asked = spawner.request(SpawnRequest {
                         home: name,
                         role: Role::Upgrader,
@@ -643,7 +659,7 @@ impl Upgrading {
             .and_then(|u| self.work_rooms.get(u).copied())
             .ok_or(Fault::new("unit out of range", unit))?;
         let now = self.time;
-        let (members, controller, plan_work) = {
+        let (members, controller, plan_work, first_post) = {
             let r = self
                 .rooms
                 .get_mut(ri)
@@ -656,7 +672,19 @@ impl Upgrading {
                 s.2 = s.2.saturating_sub(took);
             }
             r.unreachable.retain(|&(_, until)| now < until);
-            (r.members, r.controller, body_work(r.plan.as_ref()))
+            // The best post movement has not found unreachable (as `assign_posts` filters them).
+            let first_post = r.plan.as_ref().and_then(|p| {
+                p.posts
+                    .iter()
+                    .copied()
+                    .find(|q| !r.unreachable.iter().any(|u| u.0 == *q))
+            });
+            (
+                r.members,
+                r.controller,
+                body_work(r.plan.as_ref()),
+                first_post,
+            )
         };
         let mut tasks = [0u32; UpgradeTask::KINDS.len()];
         let mut upgrades = 0u32;
@@ -673,7 +701,22 @@ impl Upgrading {
             let store = snap.creeps.stores().get(m.row).copied().unwrap_or_default();
             let post = self.upgrader(m.handle).and_then(|u| u.post);
             let Some(post) = post else {
-                movement.give_way(snap, m.handle, None);
+                // With every post held (a successor ordered before its predecessor is gone, P5.2),
+                // it waits near the best reachable post, so it takes the first one to free within a
+                // step or two; below the post holders' priority, it makes way for them. With no such
+                // post, or no way there, it makes way anywhere.
+                let waited = first_post.is_some_and(|near| {
+                    let to = MoveTo {
+                        target: near,
+                        range: WAIT_RANGE,
+                        priority: MOVE_PRIORITY.saturating_sub(1),
+                        tier: Tier::Standard,
+                    };
+                    movement.request(snap, m.handle, to, mcfg, commit) != Err(MoveError::NoPath)
+                });
+                if !waited {
+                    movement.give_way(snap, m.handle, None);
+                }
                 self.set_task(m.handle, UpgradeTask::Idle);
                 if let Some(t) = tasks.get_mut(UpgradeTask::Idle.kind_index()) {
                     *t += 1;
@@ -1150,6 +1193,37 @@ impl Upgrading {
         self.taken_posts = taken;
         self.open_posts = posts;
     }
+}
+
+/// How many tiles past the plan's trip an upgrader's post may lie (P5.2): the trip ends on the
+/// first store's neighbour nearest the spawn, and every post is another neighbour of a store, at
+/// most this far round the store's ring from it. Unit: tiles.
+pub(super) const POST_STEP: u32 = 2;
+
+/// The lead of a replacement for one of `plan`'s upgraders (P5.2, [`lead`]): its body's spawn
+/// time, its walk out at most on the plan's trip and then [`POST_STEP`] plain tiles round the
+/// store to its post (empty, so only the WORK parts weigh, V54, as
+/// [`upgrader_upgrade`](super::sizing::upgrader_upgrade) counts it; [`walk_ticks_max`]), and the
+/// margin; 0 without a body (no upgrader is requested), and no walk without a trip. The post step
+/// is an estimate: a swamp tile on the ring walks longer, a road shorter.
+///
+/// Uses: `MOVE_COST_PLAIN`, [`POST_STEP`], [`lead`], [`walk_ticks_max`].
+pub(super) fn upgrader_lead(plan: &UpgradePlan, scfg: &SpawnConfig) -> u32 {
+    let Some(body) = plan.body else {
+        return 0;
+    };
+    let parts = |p: Part| u32::try_from(body.count(p)).unwrap_or(u32::MAX);
+    let walk = plan
+        .trip
+        .map(|t| Trip {
+            tiles: t.tiles.saturating_add(POST_STEP),
+            cost: t
+                .cost
+                .saturating_add(POST_STEP.saturating_mul(MOVE_COST_PLAIN)),
+        })
+        .and_then(|t| walk_ticks_max(t, parts(Part::Work), parts(Part::Move)))
+        .unwrap_or(0);
+    lead(scfg, &body, walk)
 }
 
 /// The store an upgrader at `at` with `free` room withdraws from (module docs): of those next to

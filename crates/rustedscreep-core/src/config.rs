@@ -390,12 +390,29 @@ pub struct SpawnConfig {
     /// (P5.1). Default 3: a helped creep's best walk, `ROOM_SIZE` ticks a room, stays within a
     /// tenth of `CREEP_LIFE_TIME`; safe range 0 to 10. Unit: rooms.
     pub help_range: u32,
+    /// Replace creeps that hold a post before they die (P5.2, `spawning::lead`): the miners, the
+    /// haulers and the upgraders count a creep whose `ticksToLive` is within its successor's spawn
+    /// time, walk and `replace_margin_ticks` as due and ask for the successor while it still works
+    /// (the opening's workers, a pool, are not replaced early: measured, TUNING). Off, a job asks
+    /// only once the creep is gone, and each handover leaves the post empty for the successor's
+    /// spawn time and walk. Unit: flag.
+    pub replace: bool,
+    /// What a replacement's lead adds to the successor's spawn time and walk (P5.2): the ticks its
+    /// order may wait for energy or a spawn, where the spawn puts the creep, and a miner's
+    /// successor's step around the held mining tile (the walk itself is an upper bound on the
+    /// plan's way, `economy::sizing::walk_ticks_max`). The successor's
+    /// early ticks cost this much of its life (20 of `CREEP_LIFE_TIME`, 1.3% of a body); an order
+    /// that waits longer leaves the post empty for the rest. The lead stays at most half a life
+    /// whatever this is. Default 20; safe range 0 to 300. Unit: ticks.
+    pub replace_margin_ticks: u32,
 }
 
 /// Spawn queue values for the official MMO.
 pub const SPAWN_MMO: SpawnConfig = SpawnConfig {
     hold_ticks: 20,
     help_range: 3,
+    replace: true,
+    replace_margin_ticks: 20,
 };
 
 /// RCL1–3 opening thresholds (ROADMAP P2.4): worker counts, recovery, scavenging, the downgrade
@@ -557,9 +574,10 @@ pub struct HaulingConfig {
     /// room's energy goes to its level's extensions and the mining tiles' containers first.
     /// Unit: level.
     pub container_level: u32,
-    /// The most haulers one source gets: past it the source's container fills and its overflow
-    /// piles, so the cap bounds the spawn time a long trip at a low capacity can take. Unit:
-    /// creeps.
+    /// The most haulers one source gets, besides those due for replacement (P5.2: a due hauler no
+    /// longer counts, so its successor is ordered while it still hauls): past it the source's
+    /// container fills and its overflow piles, so the cap bounds the spawn time a long trip at a
+    /// low capacity can take. Unit: creeps.
     pub max_per_source: u32,
     /// Spare carrying the sizing adds on top of the source's yield over a hauler's round, which is
     /// a lower bound (a walk can take a tick more per tile with rounding, and traffic). Unit:
@@ -597,10 +615,10 @@ pub struct UpgradingConfig {
     /// WORK part. Unit: WORK parts.
     pub worker_repeats: u32,
     /// A room's miner, or hauler, counts toward the upgraders' budget for this long after the room
-    /// last had one (spawning ones count): a replacement is ordered only once the creep is gone,
-    /// and shows from the tick after its order, so without it each death would hand the
-    /// controller's energy back to the workers for a tick or more and rebuild both plans. Unit:
-    /// ticks.
+    /// last had one (spawning ones count): with `spawn.replace` off (P5.2), or a replacement whose
+    /// order waits until the creep is gone, the replacement shows only from the tick after its
+    /// order, so without it each death would hand the controller's energy back to the workers for
+    /// a tick or more and rebuild both plans. Unit: ticks.
     pub crew_grace_ticks: u32,
 }
 
@@ -881,7 +899,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 95;
+pub const FIELD_COUNT: usize = 97;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1093,6 +1111,8 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(movement, "MovementConfig", route_cache_size, 4, 1024, true),
     number!(spawn, "SpawnConfig", hold_ticks, 1, 1500, true),
     number!(spawn, "SpawnConfig", help_range, 0, 10, true),
+    flag!(spawn, "SpawnConfig", replace, true),
+    number!(spawn, "SpawnConfig", replace_margin_ticks, 0, 300, true),
     number!(opening, "OpeningConfig", max_workers, 1, 50, true),
     number!(opening, "OpeningConfig", min_workers, 1, 10, true),
     number!(opening, "OpeningConfig", wait_ticks, 50, 3000, true),
@@ -1384,6 +1404,8 @@ mod tests {
         let SpawnConfig {
             hold_ticks: _,
             help_range: _,
+            replace: _,
+            replace_margin_ticks: _,
         } = SPAWN_MMO;
         let OpeningConfig {
             max_workers: _,
@@ -1517,7 +1539,15 @@ mod tests {
                     "route_cache_size",
                 ],
             ),
-            ("spawn", &["hold_ticks", "help_range"]),
+            (
+                "spawn",
+                &[
+                    "hold_ticks",
+                    "help_range",
+                    "replace",
+                    "replace_margin_ticks",
+                ],
+            ),
             (
                 "opening",
                 &[

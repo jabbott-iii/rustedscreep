@@ -1,6 +1,7 @@
 //! Static miners (ROADMAP P3.1) and the link network (P3.2): one creep per source that stands on the
-//! source's mining tile and harvests every tick the source holds energy, and from the level that
-//! allows links a source link beside each mining tile that sends to the controller link.
+//! source's mining tile and harvests every tick the source holds energy (and, near its end, its
+//! successor beside it, P5.2), and from the level that allows links a source link beside each
+//! mining tile that sends to the controller link.
 //!
 //! A miner's body is [`miner_work`] WORK parts and the MOVE parts [`miner_body`] picks. With no
 //! CARRY, harvesting has no store check (V182), and what does not fit the store goes into a
@@ -39,7 +40,8 @@
 //!    the spawn job: the room's plan (built again when movement's grid version, the room's
 //!    capacity, its first spawn, its controller, its sources, the containers next to them, its links
 //!    and link sites, the network's switch, the level or the placement's refused tiles change), each
-//!    miner's source, one spawn request per source with no miner, the mined sources, the tiles that
+//!    miner's source, one spawn request per source with no miner or whose miner is due and has no
+//!    successor (P5.2), the mined sources, the tiles that
 //!    need a container or a link site (never a refused one), each miner's transfer, harvest and move,
 //!    and whether a source link may send.
 //! 3. The Standard `links` job runs [`Mining::send_room`] per room with a link that may send: each
@@ -56,19 +58,29 @@
 //! link tile is free, off any road, at x and y of [`LINK_MARGIN`] to `ROOM_SIZE - 1 -
 //! LINK_MARGIN`, not a mining tile, and its free neighbours stay connected without it.
 //!
+//! Pre-spawn replacement (P5.2, `spawning::replace`): a source whose miner shows a `ticksToLive` at
+//! most its successor's lead ([`miner_lead`]: the plan body's spawn time, its walk out and
+//! `spawn.replace_margin_ticks`) asks for a successor. The successor takes the source's second slot:
+//! it walks to a tile next to the source (not the mining tile, which the miner holds), does not
+//! harvest, and on the tick the miner is gone takes the source and harvests from where it stands
+//! on its way onto the tile. Each source's [`SourceHarvest`] counts the handovers and the ticks
+//! between the old miner's last tick next to it and the new one's first.
+//!
 //! Miners keep their source between ticks in the heap. After a global reset a miner on a mining
-//! tile takes that tile's source, and the others take the nearest source with no miner, so a reset
-//! never orders a second miner for a mined source. Link roles are read from the links' places every
-//! tick. Nothing is read from or written to `Memory`.
+//! tile takes that tile's source, and the others take the nearest source with no miner, else
+//! become the successor of the nearest source whose miner is due and has none (the miner is seen
+//! as due in the same pass), so a reset never orders a second miner for a mined source. Link roles
+//! are read from the links' places every tick. Nothing is read from or written to `Memory`.
 
 use rustedscreep_consts::{
     CREEP_LIFE_TIME, ENERGY_REGEN_TIME, HARVEST_POWER, INTENT_CPU_COST, LINK_CAPACITY,
-    LINK_LOSS_RATIO, Position, ROOM_SIZE, ResourceType, RoomCoordinate, RoomName, StructureType,
+    LINK_LOSS_RATIO, Part, Position, ROOM_SIZE, ResourceType, RoomCoordinate, RoomName,
+    StructureType,
 };
 
 use super::placement::keeps_neighbours_connected;
-use super::sizing::{Trip, miner_body, miner_body_with, miner_work};
-use crate::config::{LinkConfig, MiningConfig, MovementConfig};
+use super::sizing::{Trip, miner_body, miner_body_with, miner_work, walk_ticks_max};
+use crate::config::{LinkConfig, MiningConfig, MovementConfig, SpawnConfig};
 use crate::intents::{CreepIntent, IntentBuffer, Outcome, Target};
 use crate::movement::{
     CostGrid, Dial, FlowField, Goal, MoveError, MoveTo, Movement, Tile, UNREACHED,
@@ -77,7 +89,7 @@ use crate::scheduler::{Commit, Fault, Tier};
 use crate::snapshot::{
     Controller, CreepHandle, ObjectHandle, ObjectKind, Snapshot, StructureHandle,
 };
-use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner};
+use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner, is_due, lead};
 
 /// The spawn priority of a miner request: above the opening's normal worker requests
 /// (`PRIORITY_NORMAL`), below a room short of workers (`PRIORITY_LOW`) or recovering
@@ -245,6 +257,10 @@ pub struct MineStats {
     pub harvests: u32,
     /// Miner requests made this tick.
     pub requested: u32,
+    /// Sources whose miner is due for replacement (P5.2), and successors out of the spawn (walking
+    /// to their source or waiting next to it).
+    pub due: u32,
+    pub next: u32,
     /// Miners with no source to mine (more miners than sources with a tile).
     pub idle: u32,
     /// Built links in the room. Unit: structures.
@@ -287,7 +303,8 @@ pub const LIFE_CYCLES: usize = (CREEP_LIFE_TIME / ENERGY_REGEN_TIME) as usize;
 /// `HARVEST_POWER` once its harvest is pushed (the snapshot holds no body): a cycle reads higher
 /// than it was by at most that when the miner's WORK parts are damaged or its harvest refused on
 /// that tick (10 of a 3000 source's cycle), and lower when someone else harvests the source then
-/// (a worker, its miner gone). In the heap: a global reset starts it again.
+/// (a worker, its miner gone). It also counts the handovers between its miners (P5.2,
+/// [`Self::hold`]). In the heap: a global reset starts it again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceHarvest {
     pub source: Position,
@@ -307,6 +324,16 @@ pub struct SourceHarvest {
     /// Refills kept out: of a cycle no miner harvested in, and after a skipped tick.
     pub unmined: u32,
     pub missed: u32,
+    /// The miner last next to it (its claimant, P5.2) and the tick it was.
+    holder: Option<(CreepHandle, u32)>,
+    /// Handovers (P5.2): ticks on which a miner was next to it after another one had been. Each
+    /// one's gap is the ticks between the last tick the old miner was next to it and the first
+    /// the new one was, 0 when the new one came on the next tick; their sum, the last and the
+    /// longest. A tick the bot skipped counts as a gap tick. Unit: handovers, ticks.
+    pub handovers: u32,
+    pub gap_ticks: u64,
+    pub last_gap: Option<u32>,
+    pub max_gap: u32,
 }
 
 impl SourceHarvest {
@@ -322,7 +349,27 @@ impl SourceHarvest {
             capacity: 0,
             unmined: 0,
             missed: 0,
+            holder: None,
+            handovers: 0,
+            gap_ticks: 0,
+            last_gap: None,
+            max_gap: 0,
         }
+    }
+
+    /// Its miner, `miner`, stands next to it on tick `now` (P5.2): a miner other than the last one
+    /// there is a handover (struct docs).
+    pub fn hold(&mut self, now: u32, miner: CreepHandle) {
+        if let Some((last, at)) = self.holder
+            && last != miner
+        {
+            let gap = now.saturating_sub(at.saturating_add(1));
+            self.handovers = self.handovers.saturating_add(1);
+            self.gap_ticks = self.gap_ticks.saturating_add(u64::from(gap));
+            self.last_gap = Some(gap);
+            self.max_gap = self.max_gap.max(gap);
+        }
+        self.holder = Some((miner, now));
     }
 
     /// This tick's snapshot of the source, before any harvest: a rise over the last one ends a
@@ -452,6 +499,9 @@ struct Miner {
     handle: CreepHandle,
     /// The source it mines (by position: sources never move).
     source: Option<Position>,
+    /// It is `source`'s successor (P5.2): it waits next to the source until the source's miner is
+    /// gone, then takes the source.
+    next: bool,
 }
 
 /// One built link of the room being run.
@@ -507,6 +557,13 @@ pub struct Mining {
     statics: Vec<Tile>,
     targets: Vec<(Position, Option<Position>)>,
     claims: Vec<Option<usize>>,
+    /// Per plan source (P5.2): its successor's member index, its replacement lead, and whether
+    /// its miner is due ([`crate::spawning::is_due`]); and the `ticksToLive` of the room's
+    /// members, by member index less the room's first.
+    nexts: Vec<Option<usize>>,
+    leads: Vec<u32>,
+    dues: Vec<bool>,
+    ttls: Vec<Option<u32>>,
 }
 
 impl Mining {
@@ -792,9 +849,17 @@ impl Mining {
             .map(|r| (r.name, r.plan.as_ref(), &r.stats))
     }
 
-    /// The source miner `handle` mines, if it is one of the room miners this module drives.
+    /// The source miner `handle` mines, or as its successor waits to mine (P5.2,
+    /// [`Self::is_successor`]), if it is one of the room miners this module drives.
     pub fn source_of(&self, handle: CreepHandle) -> Option<Position> {
         self.miner(handle).and_then(|m| m.source)
+    }
+
+    /// Whether miner `handle` is its source's successor this tick (P5.2): it waits for the source's
+    /// miner to go.
+    pub fn is_successor(&self, handle: CreepHandle) -> bool {
+        self.miner(handle)
+            .is_some_and(|m| m.source.is_some() && m.next)
     }
 
     fn room(&self, room: RoomName) -> Option<&MineRoom> {
@@ -825,6 +890,7 @@ impl Mining {
         cfg: &MiningConfig,
         lcfg: &LinkConfig,
         mcfg: &MovementConfig,
+        scfg: &SpawnConfig,
         cap: Option<u32>,
         refused: &[Tile],
         controller_container: Option<u32>,
@@ -844,7 +910,7 @@ impl Mining {
         // Before the plan: a miner's CARRY part is only for a link that can pass the energy on.
         self.rank_links(found.controller, allowed);
         self.ensure_plan(ri, snap, row, found, movement, lcfg, mcfg, refused, commit);
-        self.assign(ri, snap, members);
+        self.assign(ri, snap, members, scfg);
         let now = self.time;
         if let Some(r) = self.rooms.get_mut(ri) {
             r.unreachable.retain(|&(_, until)| now < until);
@@ -858,6 +924,8 @@ impl Mining {
             link_spots,
             links,
             claims,
+            nexts,
+            dues,
             send_rooms,
             held,
             ..
@@ -955,9 +1023,15 @@ impl Mining {
         }
         for (j, s) in plan_sources.iter().enumerate() {
             let claim = claims.get(j).copied().flatten();
-            // The spawn request: a source with no miner, once the room pays for one (and it has
-            // a tile, without which no miner could claim it).
-            if claim.is_none()
+            let next = nexts.get(j).copied().flatten();
+            let due = dues.get(j).copied().unwrap_or(false);
+            if due {
+                stats.due = stats.due.saturating_add(1);
+            }
+            // The spawn request: a source with no miner, or whose miner is due and has no
+            // successor (P5.2), once the room pays for one (and it has a tile, without which no
+            // miner could claim it).
+            if (claim.is_none() || (due && next.is_none()))
                 && cfg.enabled
                 && s.tile.is_some()
                 && let Some(body) = s.body
@@ -994,6 +1068,23 @@ impl Mining {
                     .min_by_key(|(_, l)| (Some(l.pos) != s.link, tile_key(l.pos)))
                     .map(|(i, _)| i)
             });
+            // Its successor waits next to the source (P5.2), off the mining tile, which the miner
+            // holds until it is gone (an arrived creep is shoved only within its range). It does
+            // not harvest there (that would land on a pile off the container); on the tick the
+            // miner is gone it takes the source and harvests from where it stands on its way onto
+            // the tile.
+            if let Some(n) = next.and_then(|i| all.get(i)).copied()
+                && !snap.creeps.spawning().get(n.row).copied().unwrap_or(true)
+            {
+                stats.next = stats.next.saturating_add(1);
+                let to = MoveTo {
+                    target: s.source,
+                    range: NEAR,
+                    priority: MOVE_PRIORITY,
+                    tier: Tier::Critical,
+                };
+                let _ = movement.request(snap, n.handle, to, mcfg, commit);
+            }
             let Some(m) = claim.and_then(|i| all.get(i)).copied() else {
                 continue;
             };
@@ -1022,6 +1113,9 @@ impl Mining {
             });
             let has_link = linked.is_some();
             if near {
+                if let Some(rec) = r.harvest.iter_mut().find(|x| x.source == s.source) {
+                    rec.hold(now, m.handle);
+                }
                 // Where its harvest lands this tick: its tile, or wherever it stands next to the
                 // source on the way there; or the controller link.
                 r.mined.push(Mined {
@@ -1128,7 +1222,7 @@ impl Mining {
         }
         // Miners with no source make way.
         for i in members.0..members.1 {
-            if claims.contains(&Some(i)) {
+            if claims.contains(&Some(i)) || nexts.contains(&Some(i)) {
                 continue;
             }
             let Some(m) = all.get(i) else {
@@ -1163,6 +1257,7 @@ impl Mining {
             *cell = Some(Miner {
                 handle: m.handle,
                 source: None,
+                next: false,
             });
         }
         cell.as_mut()
@@ -1574,41 +1669,86 @@ impl Mining {
         }
     }
 
-    /// Each miner's source for this tick (module docs): one kept from the last tick first, then a
-    /// miner standing on a mining tile takes it, then the rest, by id, take the nearest source with
-    /// no miner. `self.claims` holds the result per plan source.
-    fn assign(&mut self, ri: usize, snap: &Snapshot, members: (usize, usize)) {
+    /// Each miner's source for this tick (module docs): one kept from the last tick first (miners
+    /// before successors; a successor whose source has no miner any more takes it), then a miner
+    /// standing on a mining tile takes it and one standing next to a due source with no successor
+    /// becomes its successor, then the rest, by id, take the nearest source with no miner, else
+    /// become the successor of the nearest source whose miner is due and that has none (P5.2). `self.claims` holds the result per plan source, `self.nexts` the successors,
+    /// `self.leads` the replacement leads ([`miner_lead`]) and `self.dues` whether each source's
+    /// miner is due.
+    fn assign(&mut self, ri: usize, snap: &Snapshot, members: (usize, usize), scfg: &SpawnConfig) {
         let mut claims = std::mem::take(&mut self.claims);
+        let mut nexts = std::mem::take(&mut self.nexts);
+        let mut leads = std::mem::take(&mut self.leads);
+        let mut dues = std::mem::take(&mut self.dues);
+        let mut ttls = std::mem::take(&mut self.ttls);
         let mut plan = std::mem::take(&mut self.targets);
         claims.clear();
+        nexts.clear();
+        leads.clear();
+        dues.clear();
+        ttls.clear();
         plan.clear();
+        let now = self.time;
+        ttls.extend(
+            self.members
+                .get(members.0..members.1)
+                .unwrap_or(&[])
+                .iter()
+                .map(|m| snap.creeps.ticks_to_live(m.row, now)),
+        );
         if let Some(p) = self.rooms.get(ri).and_then(|r| r.plan.as_ref()) {
             plan.extend(p.sources.iter().map(|s| (s.source, s.tile)));
+            leads.extend(p.sources.iter().map(|s| miner_lead(s, scfg)));
         }
         claims.resize(plan.len(), None);
-        // Kept sources.
-        for i in members.0..members.1 {
-            let Some(w) = self.miner_mut(i) else {
-                continue;
-            };
-            let kept = w.source.and_then(|src| {
-                plan.iter()
-                    .position(|p| p.0 == src && p.1.is_some())
-                    .filter(|&j| claims.get(j).copied().flatten().is_none())
-            });
-            match kept {
-                Some(j) => {
-                    if let Some(c) = claims.get_mut(j) {
-                        *c = Some(i);
+        nexts.resize(plan.len(), None);
+        // Kept sources: miners first, then successors.
+        for successors in [false, true] {
+            for i in members.0..members.1 {
+                let Some(w) = self.miner_mut(i) else {
+                    continue;
+                };
+                if w.next != successors {
+                    continue;
+                }
+                let kept = w
+                    .source
+                    .and_then(|src| plan.iter().position(|p| p.0 == src && p.1.is_some()));
+                let free = |c: &[Option<usize>], j: usize| c.get(j).copied().flatten().is_none();
+                match kept {
+                    Some(j) if free(&claims, j) => {
+                        if let Some(c) = claims.get_mut(j) {
+                            *c = Some(i);
+                        }
+                        w.next = false;
+                    }
+                    Some(j) if successors && free(&nexts, j) => {
+                        if let Some(n) = nexts.get_mut(j) {
+                            *n = Some(i);
+                        }
+                    }
+                    _ => {
+                        w.source = None;
+                        w.next = false;
                     }
                 }
-                None => w.source = None,
             }
         }
-        // Then a miner on a mining tile, then the nearest source with no miner.
+        // Whether source `j`'s miner (member `claims[j]`) is due under its lead.
+        let due_at = |claims: &[Option<usize>], j: usize| {
+            claims
+                .get(j)
+                .copied()
+                .flatten()
+                .and_then(|i| ttls.get(i.checked_sub(members.0)?).copied())
+                .is_some_and(|ttl| is_due(ttl, leads.get(j).copied().unwrap_or(0)))
+        };
+        // Then a miner on a mining tile, then the nearest source with no miner, then the nearest
+        // whose miner is due and that has no successor.
         for pass in 0..2 {
             for i in members.0..members.1 {
-                if claims.contains(&Some(i)) {
+                if claims.contains(&Some(i)) || nexts.contains(&Some(i)) {
                     continue;
                 }
                 let Some(m) = self.members.get(i).copied() else {
@@ -1618,33 +1758,76 @@ impl Mining {
                     continue;
                 };
                 let free = |j: usize| claims.get(j).copied().flatten().is_none();
-                let pick = if pass == 0 {
+                let open = |j: usize| {
+                    !free(j) && due_at(&claims, j) && nexts.get(j).copied().flatten().is_none()
+                };
+                let nearest = |ok: &dyn Fn(usize) -> bool| {
                     plan.iter()
                         .enumerate()
-                        .find(|&(j, p)| free(j) && p.1 == Some(at))
-                        .map(|(j, _)| j)
-                } else {
-                    plan.iter()
-                        .enumerate()
-                        .filter(|&(j, p)| free(j) && p.1.is_some())
+                        .filter(|&(j, p)| ok(j) && p.1.is_some())
                         .min_by_key(|&(j, p)| (range(at, p.0), j))
                         .map(|(j, _)| j)
                 };
-                let Some(j) = pick else {
+                let pick = if pass == 0 {
+                    // On a mining tile: its source. Next to a due source with no successor (one
+                    // that waited there before a reset): that source's successor slot.
+                    plan.iter()
+                        .enumerate()
+                        .find(|&(j, p)| free(j) && p.1 == Some(at))
+                        .map(|(j, _)| (j, false))
+                        .or_else(|| {
+                            plan.iter()
+                                .enumerate()
+                                .find(|&(j, p)| open(j) && range(at, p.0) <= NEAR)
+                                .map(|(j, _)| (j, true))
+                        })
+                } else {
+                    nearest(&free)
+                        .map(|j| (j, false))
+                        .or_else(|| nearest(&open).map(|j| (j, true)))
+                };
+                let Some((j, next)) = pick else {
                     continue;
                 };
-                if let Some(c) = claims.get_mut(j) {
+                let slot = if next {
+                    nexts.get_mut(j)
+                } else {
+                    claims.get_mut(j)
+                };
+                if let Some(c) = slot {
                     *c = Some(i);
                 }
                 let source = plan.get(j).map(|p| p.0);
                 if let Some(w) = self.miner_mut(i) {
                     w.source = source;
+                    w.next = next;
                 }
             }
         }
+        dues.extend((0..plan.len()).map(|j| due_at(&claims, j)));
         self.claims = claims;
+        self.nexts = nexts;
+        self.leads = leads;
+        self.dues = dues;
+        self.ttls = ttls;
         self.targets = plan;
     }
+}
+
+/// The lead of a replacement for the miner of `s` (P5.2, [`lead`]): its plan body's spawn time,
+/// its walk out at most ([`walk_ticks_max`] on the plan's trip with the WORK parts as the weight)
+/// and the margin; 0 without a body or a trip (no miner is requested). The trip ends on the mining
+/// tile, the source's neighbour nearest the spawn; the successor waits on another neighbour, as
+/// near or farther, and the margin covers that step too.
+///
+/// Uses: [`lead`], [`walk_ticks_max`].
+pub(super) fn miner_lead(s: &MineSource, scfg: &SpawnConfig) -> u32 {
+    let (Some(body), Some(trip)) = (s.body, s.trip) else {
+        return 0;
+    };
+    let parts = |p: Part| u32::try_from(body.count(p)).unwrap_or(u32::MAX);
+    let walk = walk_ticks_max(trip, parts(Part::Work), parts(Part::Move)).unwrap_or(0);
+    lead(scfg, &body, walk)
 }
 
 /// Whether `t` may take a link (module docs): inside [`LINK_MARGIN`], walkable, and not a road

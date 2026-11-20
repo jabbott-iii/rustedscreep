@@ -52,7 +52,7 @@
 // - the creeps call nothing else, every call returns OK, the only sites placed are extensions, every spawnCreep
 //   names a worker with two arguments, and `Memory.creeps` keeps no entry after a loop (ADR-018);
 // - `rustedscreep.opening()` after every loop: the mining part `W1N1: miners 1 (mined 1, harvests 1, requested 0,
-//   idle 0), links 2 (linked 1, transfers T, sends S)` with that loop's transfer and send calls, `, controller link
+//   due 0, next 0, idle 0), links 2 (linked 1, transfers T, sends S)` with that loop's transfer and send calls, `, controller link
 //   (x,y)`, the source's tile, trip (range to the spawn - 1 tiles, PLAIN_COST each) and ` link (x,y)`, and a body of
 //   miner_work WORK, `1 CARRY` and MOVE parts at a cost the room's capacity pays; the opening's plan shows the source
 //   mined and linked; the room part `, containers 1 (under repair 1, lowest hits H)` with that loop's `hits` (P3.5:
@@ -729,7 +729,7 @@ export function linkSim(dir = join(ROOT, 'dist')) {
   const tiles = range(MINE, SPAWN) - 1;
   // The source's harvest record (the P3 gate's recorder) follows its body: no refill comes within the run (a 3000
   // source mined at 10 a tick lasts 300 ticks), so no cycle is counted or kept out.
-  const bodyRe = new RegExp(` link ${at(SOURCE_LINK).replace(/[()]/g, '\\$&')} body ${MINER_WORK} WORK 1 CARRY (\\d+) MOVE \\((\\d+) energy\\), harvest cycles 0, unmined 0, missed 0;`);
+  const bodyRe = new RegExp(` link ${at(SOURCE_LINK).replace(/[()]/g, '\\$&')} body ${MINER_WORK} WORK 1 CARRY (\\d+) MOVE \\((\\d+) energy\\), harvest cycles 0, unmined 0, missed 0, handovers 0 \\(gap ticks 0, last -1, most 0\\);`);
   loops.forEach((o, k) => {
     const r = results[k] ?? '';
     const sent = state.calls.filter((c) => c.method === 'transferEnergy' && c.offset <= o);
@@ -740,7 +740,7 @@ export function linkSim(dir = join(ROOT, 'dist')) {
       ` source ${at(SOURCE)} open 1 want `,
       ' mined linked, ',
       `, containers 1 (under repair 1, lowest hits ${CONTAINER_WORN_HITS - o});`,
-      ` | mining: ${ROOM}: miners 1 (mined 1, harvests 1, requested 0, idle 0), links 2 (linked 1, transfers ` +
+      ` | mining: ${ROOM}: miners 1 (mined 1, harvests 1, requested 0, due 0, next 0, idle 0), links 2 (linked 1, transfers ` +
         `${callsAt(o, MINER, 'transfer').length}, sends ${callsAt(o, sl.name, 'transferEnergy').length}), controller link ${at(CONTROLLER_LINK)}, ` +
         `source ${at(SOURCE)} tile ${at(MINE)} trip ${tiles} tiles cost ${tiles * PLAIN_COST} link ${at(SOURCE_LINK)} body `,
       ` | sites: picked ${sites} (0 containers, 0 links), placed ${sites}, refused 0, never seen `,

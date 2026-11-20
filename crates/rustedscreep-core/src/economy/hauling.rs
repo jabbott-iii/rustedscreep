@@ -39,20 +39,20 @@
 //! is read from or written to `Memory`.
 
 use rustedscreep_consts::{
-    CARRY_CAPACITY, CONTAINER_CAPACITY, Position, ResourceType, RoomName, StructureType,
+    CARRY_CAPACITY, CONTAINER_CAPACITY, Part, Position, ResourceType, RoomName, StructureType,
     extension_energy_capacity,
 };
 
 use super::mining::{MinePlan, MineSource, Mined};
-use super::sizing::{Trip, hauler_plan};
-use crate::config::{HaulingConfig, MovementConfig};
+use super::sizing::{Trip, hauler_plan, walk_ticks_max};
+use crate::config::{HaulingConfig, MovementConfig, SpawnConfig};
 use crate::intents::{CreepIntent, IntentBuffer, Target};
 use crate::movement::{Dial, FlowField, Goal, MoveError, MoveTo, Movement, Tile, UNREACHED};
 use crate::scheduler::{Commit, Fault, Tier};
 use crate::snapshot::{
     Controller, CreepHandle, ObjectHandle, ObjectKind, Snapshot, StructureHandle,
 };
-use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner};
+use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner, is_due, lead};
 
 /// The spawn priority of a hauler request: below a miner's (`PRIORITY_MINER`, whose source a hauler
 /// would wait at), above the opening's normal worker requests (`PRIORITY_NORMAL`), below a room
@@ -198,6 +198,8 @@ pub struct HaulStats {
     pub want: u32,
     /// Hauler requests made this tick.
     pub requested: u32,
+    /// Haulers due for replacement (P5.2): they work on, but their source counts them no more.
+    pub due: u32,
     /// Haulers per task, in [`HaulTask::KINDS`] order.
     pub tasks: [u32; HaulTask::KINDS.len()],
     /// Sources whose haulers work this tick ([`HaulView::hauled`]).
@@ -297,9 +299,11 @@ pub struct Hauling {
     container: Option<(ObjectHandle, Position, u32)>,
     loads: Vec<u32>,
     delivering: Vec<(usize, u8, HaulTask)>,
-    /// The plan's sources of the room being run (source, want, mining tile), its unreachable
-    /// targets, and the hauled sources being gathered (swapped into the room's view).
+    /// The plan's sources of the room being run (source, want, mining tile), their replacement
+    /// leads ([`hauler_lead`], P5.2), its unreachable targets, and the hauled sources being
+    /// gathered (swapped into the room's view).
     wants: Vec<(Position, u32, Position)>,
+    leads: Vec<u32>,
     blocked: Vec<Position>,
     hauled: Vec<Position>,
     /// The rooms (by index) with a Standard task this tick: the `hauling work` job's units.
@@ -471,6 +475,7 @@ impl Hauling {
         buffer: &mut IntentBuffer,
         cfg: &HaulingConfig,
         mcfg: &MovementConfig,
+        scfg: &SpawnConfig,
         mine: Option<&MinePlan>,
         mined: &[Mined],
         cap: Option<u32>,
@@ -501,6 +506,7 @@ impl Hauling {
         self.gather(snap, name, mine);
         self.ensure_plan(ri, snap, row, movement, cfg, mcfg, mine, commit);
         self.wants.clear();
+        self.leads.clear();
         self.blocked.clear();
         if let Some(r) = self.rooms.get_mut(ri) {
             r.unreachable.retain(|&(_, until)| now < until);
@@ -508,15 +514,19 @@ impl Hauling {
             if let Some(p) = &r.plan {
                 self.wants
                     .extend(p.sources.iter().map(|s| (s.source, s.want, s.tile)));
+                self.leads
+                    .extend(p.sources.iter().map(|s| hauler_lead(s, p, scfg)));
             }
         }
-        self.assign_sources(snap, members);
+        let due = self.assign_sources(snap, members);
 
         // Who is there, and the requests: one per source short of haulers while its miner is next
-        // to it (its haulers would only wait otherwise).
+        // to it (its haulers would only wait otherwise); a due hauler leaves its source short
+        // (P5.2).
         let mut stats = HaulStats {
             time: now,
             haulers: u32::try_from(members.1.saturating_sub(members.0)).unwrap_or(u32::MAX),
+            due,
             container: self.container.is_some(),
             ..HaulStats::default()
         };
@@ -833,21 +843,34 @@ impl Hauling {
 
     /// Each hauler's source for this tick: one kept from the last tick while its source is in the
     /// plan with haulers wanted, else the most wanted source relative to its haulers (`self.wants`).
-    /// `self.loads` holds each plan source's haulers (spawning ones included).
-    fn assign_sources(&mut self, snap: &Snapshot, members: (usize, usize)) {
+    /// `self.loads` holds each plan source's haulers (spawning ones included) that are not due
+    /// for replacement (P5.2): a due hauler keeps its source and works, but its source asks for and
+    /// draws its successor. Returns how many are due.
+    fn assign_sources(&mut self, snap: &Snapshot, members: (usize, usize)) -> u32 {
         self.loads.clear();
         self.loads.resize(self.wants.len(), 0);
+        let now = self.time;
         let kept_at = |h: Option<&Hauler>, wants: &[(Position, u32, Position)]| {
             h.and_then(|h| h.source)
                 .and_then(|p| wants.iter().position(|w| w.0 == p && w.1 > 0))
         };
+        let due_at = |leads: &[u32], j: usize, row: usize| {
+            is_due(
+                snap.creeps.ticks_to_live(row, now),
+                leads.get(j).copied().unwrap_or(0),
+            )
+        };
+        let mut due = 0u32;
         for i in members.0..members.1 {
             let Some(m) = self.members.get(i).copied() else {
                 continue;
             };
-            if let Some(j) = kept_at(self.hauler(m.handle), &self.wants)
-                && let Some(l) = self.loads.get_mut(j)
-            {
+            let Some(j) = kept_at(self.hauler(m.handle), &self.wants) else {
+                continue;
+            };
+            if due_at(&self.leads, j, m.row) {
+                due = due.saturating_add(1);
+            } else if let Some(l) = self.loads.get_mut(j) {
                 *l += 1;
             }
         }
@@ -870,15 +893,18 @@ impl Hauling {
                     (u64::from(load) * 1000 / u64::from(w.1.max(1)), j)
                 })
                 .map(|(j, w)| (j, w.0));
-            if let Some((j, _)) = pick
-                && let Some(l) = self.loads.get_mut(j)
-            {
-                *l += 1;
+            if let Some((j, _)) = pick {
+                if due_at(&self.leads, j, m.row) {
+                    due = due.saturating_add(1);
+                } else if let Some(l) = self.loads.get_mut(j) {
+                    *l += 1;
+                }
             }
             if let Some(h) = self.hauler_mut(i, snap) {
                 h.source = pick.map(|p| p.1);
             }
         }
+        due
     }
 
     /// Every hauler's mode and task for this tick (module docs).
@@ -1169,4 +1195,26 @@ fn range(a: Position, b: Position) -> u8 {
         .u8()
         .abs_diff(b.x().u8())
         .max(a.y().u8().abs_diff(b.y().u8()))
+}
+
+/// The lead of a replacement for a hauler of `s` (P5.2, [`lead`]): its body's spawn time, its
+/// walk out to the mining tile (the mining plan's way from the spawn, [`HaulInput::trip`], else
+/// the plan's trip; it walks out empty, and an empty CARRY part makes no fatigue, V54, so it walks
+/// a tile a tick and [`walk_ticks_max`] bounds that by the way's cost, up to twice its tiles on
+/// plain) and the margin; 0 without a body (no hauler is requested).
+///
+/// Uses: [`lead`], [`walk_ticks_max`].
+pub(super) fn hauler_lead(s: &HaulSource, plan: &HaulPlan, scfg: &SpawnConfig) -> u32 {
+    let Some(body) = s.body else {
+        return 0;
+    };
+    let trip = plan
+        .inputs
+        .iter()
+        .find(|i| i.source == s.source)
+        .and_then(|i| i.trip)
+        .unwrap_or(s.trip);
+    let moves = u32::try_from(body.count(Part::Move)).unwrap_or(u32::MAX);
+    let walk = walk_ticks_max(trip, 0, moves).unwrap_or(trip.tiles);
+    lead(scfg, &body, walk)
 }

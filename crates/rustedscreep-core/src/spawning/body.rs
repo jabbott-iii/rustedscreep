@@ -5,7 +5,9 @@
 
 use std::fmt;
 
-use rustedscreep_consts::{CREEP_SPAWN_TIME, MAX_CREEP_SIZE, Part};
+use rustedscreep_consts::{
+    CREEP_CLAIM_LIFE_TIME, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, MAX_CREEP_SIZE, Part,
+};
 
 /// Most parts a body holds (`MAX_CREEP_SIZE`, V170).
 const MAX: usize = MAX_CREEP_SIZE as usize;
@@ -119,6 +121,18 @@ impl Body {
     pub fn spawn_time(&self) -> u32 {
         u32::from(self.len).saturating_mul(CREEP_SPAWN_TIME)
     }
+
+    /// Ticks a creep of this body lives once out of its spawn: `CREEP_CLAIM_LIFE_TIME` with any
+    /// CLAIM part, else `CREEP_LIFE_TIME` (creeps/tick.js L87-91, V170). Unit: ticks.
+    ///
+    /// Uses: `CREEP_LIFE_TIME`, `CREEP_CLAIM_LIFE_TIME`.
+    pub fn life(&self) -> u32 {
+        if self.parts().contains(&Part::Claim) {
+            CREEP_CLAIM_LIFE_TIME
+        } else {
+            CREEP_LIFE_TIME
+        }
+    }
 }
 
 impl fmt::Debug for Body {
@@ -169,6 +183,9 @@ mod tests {
         assert_eq!(body.spawn_time(), 5 * CREEP_SPAWN_TIME);
         assert_eq!(body.count(Work), 2);
         assert_eq!(body.count(Attack), 0);
+        assert_eq!(body.life(), CREEP_LIFE_TIME);
+        let claimer = Body::new(&[Move, Claim]).expect("claimer");
+        assert_eq!(claimer.life(), CREEP_CLAIM_LIFE_TIME);
     }
 
     #[test]
