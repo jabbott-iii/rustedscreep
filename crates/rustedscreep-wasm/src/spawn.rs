@@ -1,8 +1,10 @@
-//! The minimal spawn path's glue (ROADMAP P2; rustedscreep-core `spawning`). After the snapshot,
-//! [`SpawnGlue::begin`] opens the tick's requests (the console's included); the Critical `spawn`
-//! job plans each room with a request and a ready spawn; in the act step, before the creep
-//! intents, each order becomes one `spawnCreep(body, name)` call on this tick's JS spawn
-//! (`JsWorld`, by structure row).
+//! The spawn queue's glue (ROADMAP P2's minimal spawn path, P5's global queue; rustedscreep-core
+//! `spawning`). After the snapshot, [`SpawnGlue::begin`] opens the tick's requests (the console's
+//! included); the Critical `spawn` job plans each serving room with a request and a ready spawn (a
+//! room's own spawns serve it; an owned room without one is served by a spawn room within
+//! `spawn.help_range` whose capacity fits the body, on a tick that room starts full and the
+//! Standard tier runs, P5.1); in the act step, before the creep intents, each order becomes one
+//! `spawnCreep(body, name)` call on this tick's JS spawn (`JsWorld`, by structure row).
 //!
 //! The method is bound here, not through screeps-game-api's `spawn_creep`, which converts each part
 //! with its own JS call and unwraps the return code, so an unlisted code would panic and trap
@@ -125,11 +127,17 @@ pub struct SpawnGlue {
 }
 
 impl SpawnGlue {
-    /// Opens the tick's requests for `snapshot`, and queues the console's request: a worker of the
-    /// body `worker` gives for its room (the opening's planned body, solved from the room's targets
-    /// at its capacity, P3.6), else the smallest worker. A console request accepted on the last tick
-    /// whose creep is not in this snapshot stands again (the processor dropped the order, V173).
-    pub fn begin(&mut self, snapshot: &Snapshot, worker: impl Fn(RoomName) -> Option<Body>) {
+    /// Opens the tick's requests for `snapshot` with `cfg`'s help range, and queues the console's
+    /// request: a worker of the body `worker` gives for its room (the opening's planned body, solved
+    /// from the room's targets at its capacity, P3.6), else the smallest worker. A console request
+    /// accepted on the last tick whose creep is not in this snapshot stands again (the processor
+    /// dropped the order, V173).
+    pub fn begin(
+        &mut self,
+        snapshot: &Snapshot,
+        cfg: &SpawnConfig,
+        worker: impl Fn(RoomName) -> Option<Body>,
+    ) {
         if let Some((request, id, name)) = self.accepted.take() {
             let creeps = &snapshot.creeps;
             let born = creeps
@@ -146,7 +154,7 @@ impl SpawnGlue {
                 );
             }
         }
-        self.spawner.begin(snapshot);
+        self.spawner.begin(snapshot, cfg);
         self.console_index = self.console.and_then(|c| {
             let body = match c.role {
                 Role::Worker => worker(c.home).or_else(smallest_worker)?,
@@ -168,12 +176,14 @@ impl SpawnGlue {
         &mut self.spawner
     }
 
-    /// The Critical `spawn` job: one unit per room with a request and a ready spawn, so a tick with
-    /// nothing asked, or with every spawn of each asking room busy or held, runs no job and reads no
-    /// clock. Requests come from the jobs that ran before it (Critical jobs earlier in the tick; the
-    /// console's at `begin`).
+    /// The Critical `spawn` job: one unit per serving room with a request it plans this tick and a
+    /// ready spawn, so a tick with nothing asked, or with every spawn of each serving room busy or
+    /// held, runs no job and reads no clock. A room serves others' requests only on a tick it
+    /// starts full and the Standard tier runs (P5.1). Requests come from the jobs that ran before
+    /// it (Critical jobs earlier in the tick; the console's at `begin`).
     pub fn plan<C: Clock>(&mut self, tick: &mut TickCpu<'_, C>, snapshot: &Snapshot) {
-        let count = self.spawner.close(snapshot);
+        // Serving another room is not Critical work: only while the Standard tier runs (P5.1).
+        let count = self.spawner.close(snapshot, tick.allows(Tier::Standard));
         if count == 0 {
             return;
         }
@@ -271,7 +281,10 @@ impl SpawnGlue {
 
     /// For `rustedscreep.spawn(room, role)`: from the next tick, a spawn of `room` spawns one creep
     /// of `role` (worker when omitted) of the room's planned worker body ([`Self::begin`]), once the
-    /// room holds its cost. With no room it cancels the request.
+    /// room holds its cost; for an owned room without a spawn, a spawn room within
+    /// `spawn.help_range` whose capacity fits the body spawns it, on a tick that room starts full
+    /// while the Standard tier runs (P5.1). With no room it cancels the request. The reply reads
+    /// the last tick's spawns, owned rooms and help range.
     pub fn set_console(&mut self, room: Option<&str>, role: Option<&str>) -> String {
         let Some(room) = room else {
             return match self.console.take() {
@@ -308,16 +321,28 @@ impl SpawnGlue {
         };
         self.console = Some(ConsoleRequest { home, role });
         self.accepted = None;
-        let note = if self.spawner.spawn_rooms().contains(&home) {
-            ""
-        } else {
-            " (no own spawn there on the last tick: nothing spawns until one exists)"
-        };
-        format!(
-            "rustedscreep spawn: from the next tick, a spawn of {home} spawns one {} of the room's \
-             planned body, once the room holds its cost; rustedscreep.spawn() cancels{note}",
-            role.as_str()
-        )
+        let role = role.as_str();
+        match self.spawner.server_of(home) {
+            Some(server) if server != home => format!(
+                "rustedscreep spawn: from the next tick, a spawn room within spawn.help_range \
+                 whose capacity fits the body spawns one {role} of {home}'s planned body for it, \
+                 on a tick that room starts full while the Standard tier runs; \
+                 rustedscreep.spawn() cancels (no own spawn in {home} on the last tick; the \
+                 nearest spawn room was {server})"
+            ),
+            server => {
+                let note = if server.is_some() {
+                    ""
+                } else {
+                    " (no own spawn there on the last tick: nothing spawns until one exists)"
+                };
+                format!(
+                    "rustedscreep spawn: from the next tick, a spawn of {home} spawns one {role} \
+                     of the room's planned body, once the room holds its cost; \
+                     rustedscreep.spawn() cancels{note}"
+                )
+            }
+        }
     }
 
     /// One line for `rustedscreep.spawner()`: each spawn room's energy and spawns, the last tick's
@@ -372,8 +397,8 @@ impl SpawnGlue {
         }
         let _ = write!(
             text,
-            " | requests {}, orders {} (ok {}, failed {}), waiting {}, unfit {}, no spawn {}, held {} | \
-             since boot: ticks {}, orders {}, ok {}, failed {}",
+            " | requests {}, orders {} (ok {}, failed {}), waiting {}, unfit {}, no spawn {}, helped {}, \
+             held {} | since boot: ticks {}, orders {}, ok {}, failed {}",
             s.requests,
             s.orders,
             s.ok,
@@ -381,6 +406,7 @@ impl SpawnGlue {
             s.waiting,
             s.unfit,
             s.no_spawn,
+            s.helped,
             s.held,
             t.ticks,
             t.orders,

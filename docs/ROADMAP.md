@@ -144,7 +144,7 @@ Modules:
 
 ## P5 Global spawn queue (SPEC §3.4)
 Modules:
-- [ ] A priority queue across spawns and rooms, with energy-aware bodies.
+- [x] A priority queue across spawns and rooms, with energy-aware bodies.
 - [ ] Pre-spawn replacement timed to spawn time plus travel time.
 - [ ] No wasted energy (no body or energy left idle while the queue is non-empty).
 

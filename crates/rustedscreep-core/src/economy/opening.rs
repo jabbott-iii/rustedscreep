@@ -538,7 +538,15 @@ impl Opening {
         };
         let row = row.ok_or(Fault::new("room not in this tick", unit))?;
         self.gather_facts(snap, name, mined, mine_tiles, receivers, haul);
-        self.ensure_plan(ri, snap, row, movement, cfg, mcfg, upgrade, commit);
+        // The capacity the room's workers are sized at: its own; for an owned room without a spawn
+        // (one that lost it), at most that of the nearest spawn room that would serve it (P5.1), so
+        // its worker fits there and its plan stays put while the nearest room does.
+        let own = snap.rooms.energy().get(row).copied().unwrap_or_default();
+        let helper = spawner.spawn_side(name).filter(|side| side.room != name);
+        let capacity = helper.map_or(own.capacity, |side| own.capacity.min(side.energy.capacity));
+        self.ensure_plan(
+            ri, snap, row, capacity, movement, cfg, mcfg, upgrade, commit,
+        );
         let want = self
             .rooms
             .get(ri)
@@ -634,20 +642,23 @@ impl Opening {
         if let Some((budget, priority)) = request
             && let Some(body) = {
                 // A spawn of the room is free this tick: only then can a body solved below the
-                // plan's capacity be ordered, so only then is one solved.
-                let ready =
-                    snap.spawns
-                        .rows()
-                        .iter()
-                        .zip(snap.spawns.busy())
-                        .any(|(&row, &busy)| {
-                            !busy
-                                && usize::try_from(row)
-                                    .ok()
-                                    .and_then(|i| snap.structures.positions().get(i))
-                                    .is_some_and(|p| p.room_name() == name)
-                        });
-                self.request_body(ri, budget, energy, ready, cfg, commit)
+                // plan's capacity be ordered, so only then is one solved. A room without a spawn
+                // that another serves asks for its plan's body, solved at the capacity above: a
+                // room serves another only on a tick it starts full (P5.1), so that body is what
+                // it can pay, and no stand-in solved for a busy spawn is ordered there (with no
+                // plan yet, a recovery asks for the smallest worker, as in any room).
+                let (at, ready) = match (helper, spawner.spawn_side(name)) {
+                    (Some(_), _) => (
+                        RoomEnergy {
+                            available: capacity,
+                            capacity,
+                        },
+                        true,
+                    ),
+                    (None, Some(side)) => (energy, side.idle),
+                    (None, None) => (energy, false),
+                };
+                self.request_body(ri, budget, at, ready, cfg, commit)
             }
         {
             let _ = spawner.request(SpawnRequest {
@@ -930,8 +941,9 @@ impl Opening {
         f.sources.sort_unstable_by_key(|s| tile_key(s.1));
     }
 
-    /// Builds room `ri`'s plan when it has none, or movement's grid version or the room's capacity
-    /// changed. Without a grid yet (the room's terrain or first scan is still to come), the room
+    /// Builds room `ri`'s plan when it has none, or movement's grid version or `capacity` changed
+    /// (the capacity its workers are sized at: the room's own, or for a room without a spawn at
+    /// most that of the spawn room nearest it, P5.1). Without a grid yet (the room's terrain or first scan is still to come), the room
     /// keeps its last plan, or plans `min_workers` until then.
     #[allow(clippy::too_many_arguments)]
     fn ensure_plan(
@@ -939,6 +951,7 @@ impl Opening {
         ri: usize,
         snap: &Snapshot,
         row: usize,
+        capacity: u32,
         movement: &mut Movement,
         cfg: &OpeningConfig,
         mcfg: &MovementConfig,
@@ -950,7 +963,6 @@ impl Opening {
             return;
         };
         let name = r.name;
-        let capacity = snap.rooms.energy().get(row).map_or(0, |e| e.capacity);
         let Some((grid, version)) = movement.room_grid(name, mcfg, commit) else {
             return;
         };

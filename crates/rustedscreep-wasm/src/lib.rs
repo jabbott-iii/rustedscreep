@@ -50,7 +50,7 @@ struct State {
     act: act::Act,
     /// Movement (P2.1): grids, fields, detours, traffic, the console's move order.
     movement: movement::MovementGlue,
-    /// The minimal spawn path (P2.3): requests, the plan, the orders and the console's request.
+    /// The spawn queue (P2.3, P5.1): requests, the plan, the orders and the console's request.
     spawn: spawn::SpawnGlue,
     /// The RCL1–3 opening (P2.4): workers, their spawn requests, recovery and the watchdogs.
     opening: opening::OpeningGlue,
@@ -122,7 +122,7 @@ pub fn game_loop() {
                 snapshot::log_skips(skip_log, snapshot, cfg.log.skip_window_ticks);
                 probe.snapshot();
                 act.begin(snapshot);
-                spawn.begin(snapshot, |room| opening.worker_body(room));
+                spawn.begin(snapshot, &cfg.spawn, |room| opening.worker_body(room));
                 opening.begin(snapshot, &mut movement.core);
                 // With no segment for the planner's record (ADR-027), plan from what stands at once.
                 if !persist.has_planner_segment() {
@@ -336,8 +336,10 @@ pub fn spawner_summary() -> String {
 }
 
 /// Exported to JS as `spawn`, for `rustedscreep.spawn(room, role)`: from the next tick, a spawn of
-/// `room` spawns one creep of `role` (worker when omitted) sized to the room's capacity, once the
-/// room holds its cost (P2.3). With no room it cancels the request.
+/// `room` spawns one creep of `role` (worker when omitted) of the room's planned body, once the
+/// room holds its cost (P2.3); for an owned room without a spawn, a spawn room within
+/// `spawn.help_range` whose capacity fits the body, on a tick that room starts full while the
+/// Standard tier runs (P5.1). With no room it cancels the request.
 #[wasm_bindgen(js_name = "spawn")]
 pub fn spawn_request(room: Option<String>, role: Option<String>) -> String {
     STATE

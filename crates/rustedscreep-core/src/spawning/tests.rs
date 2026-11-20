@@ -1,11 +1,13 @@
-//! The planner over scripted snapshots: priority, the room's energy shared by its spawns, waiting,
-//! unfit requests, holds and probation after a refused call, names, the per-tick order cap, and
-//! determinism. Expectations derive from `BODYPART_COST`, `SPAWN_ENERGY_CAPACITY`,
-//! `CONTROLLER_STRUCTURES`, `EXTENSION_ENERGY_CAPACITY`, `INTENT_CPU_COST` and the config.
+//! The queue over scripted snapshots: priority, the room's energy shared by its spawns, waiting,
+//! unfit requests, holds and probation after a refused call, names, the per-tick order cap,
+//! determinism, and the global queue of P5.1 (`room_distance`, the serving room of a home without a
+//! spawn, help only from a full room while allowed, own requests first, `spawn_side`). Expectations
+//! derive from `BODYPART_COST`, `SPAWN_ENERGY_CAPACITY`, `CONTROLLER_STRUCTURES`,
+//! `EXTENSION_ENERGY_CAPACITY`, `INTENT_CPU_COST`, `ROOM_SIZE`, `CREEP_LIFE_TIME` and the config.
 
 use rustedscreep_consts::{
-    ErrorCode, INTENT_CPU_COST, Part, Position, RoomCoordinate, RoomName, SPAWN_ENERGY_CAPACITY,
-    StructureType, extension_energy_capacity,
+    CREEP_LIFE_TIME, ErrorCode, INTENT_CPU_COST, Part, Position, ROOM_SIZE, RoomCoordinate,
+    RoomName, SPAWN_ENERGY_CAPACITY, StructureType, extension_energy_capacity,
 };
 
 use super::*;
@@ -14,7 +16,7 @@ use super::*;
 /// MOVE. No job spawns a fixed pattern since P3.6 (`economy::sizing`); the spawner still scales
 /// one when asked.
 const WORKER_PATTERN: [Part; 3] = [Part::Work, Part::Carry, Part::Move];
-use crate::config::SPAWN_MMO;
+use crate::config::{SPAWN_MMO, SpawnConfig};
 use crate::intents::Outcome;
 use crate::scheduler::Commit;
 use crate::snapshot::{
@@ -61,9 +63,23 @@ const fn spawn(key: u128, room: &'static str, x: u8) -> SpawnAt {
 /// spawns (pushed in the given order, which is the engine's object order), plus an extension that
 /// is not a spawn. Reusing one snapshot across ticks keeps the handles, as in the game loop.
 fn fill(s: &mut Snapshot, time: u32, rooms: &[(&str, RoomEnergy)], spawns: &[SpawnAt]) {
+    let rooms: Vec<(&str, RoomEnergy, Controller)> = rooms
+        .iter()
+        .map(|&(name, e)| (name, e, Controller::Mine { level: 3 }))
+        .collect();
+    fill_rooms(s, time, &rooms, spawns);
+}
+
+/// [`fill`] with each room's controller given (a visible room the bot does not own).
+fn fill_rooms(
+    s: &mut Snapshot,
+    time: u32,
+    rooms: &[(&str, RoomEnergy, Controller)],
+    spawns: &[SpawnAt],
+) {
     s.begin(TickContext::from_raw(time, 20, 500.0, 10_000));
-    for &(name, energy) in rooms {
-        let row = s.rooms.push(room(name), Controller::Mine { level: 3 });
+    for &(name, energy, controller) in rooms {
+        let row = s.rooms.push(room(name), controller);
         s.rooms.set_energy(row, energy);
     }
     let ext = StructureStatic {
@@ -145,12 +161,24 @@ fn worker(home: &str, budget: EnergyBudget, priority: u8) -> SpawnRequest {
 
 /// Runs a tick: begin, the requests, close, then every room planned in order.
 fn plan(sp: &mut Spawner, snap: &Snapshot, requests: &[SpawnRequest]) -> Commit {
-    sp.begin(snap);
+    plan_with(sp, snap, requests, &SPAWN_MMO, true)
+}
+
+/// [`plan`] with `cfg` in place of the profile's spawn values, and `help` for whether rooms may
+/// serve others (the Standard tier runs).
+fn plan_with(
+    sp: &mut Spawner,
+    snap: &Snapshot,
+    requests: &[SpawnRequest],
+    cfg: &SpawnConfig,
+    help: bool,
+) -> Commit {
+    sp.begin(snap, cfg);
     for &r in requests {
         sp.request(r).expect("open");
     }
     let mut commit = Commit::default();
-    for unit in 0..sp.close(snap) {
+    for unit in 0..sp.close(snap, help) {
         sp.plan_room(snap, unit, &mut commit).expect("plan");
     }
     commit
@@ -293,13 +321,21 @@ fn spawns_of_one_room_share_its_energy() {
 #[test]
 fn busy_spawns_and_other_rooms_are_left_alone() {
     let unit = unit_cost(&WORKER_PATTERN);
+    // W9N1 is owned, has no spawn and is beyond help range of both spawn rooms.
+    for r in ["W1N1", "W2N1"] {
+        assert!(room_distance(room("W9N1"), room(r)) > SPAWN_MMO.help_range);
+    }
     let busy = SpawnAt {
         busy: true,
         ..spawn(1, "W1N1", 20)
     };
     let snap = snap_at(
         T0,
-        &[("W1N1", energy(unit, unit)), ("W2N1", energy(unit, unit))],
+        &[
+            ("W1N1", energy(unit, unit)),
+            ("W2N1", energy(unit, unit)),
+            ("W9N1", CLAIMED),
+        ],
         &[busy, spawn(2, "W2N1", 20)],
     );
     let mut sp = Spawner::default();
@@ -308,13 +344,14 @@ fn busy_spawns_and_other_rooms_are_left_alone() {
         &snap,
         &[
             worker("W1N1", EnergyBudget::Available, 1),
-            worker("W3N1", EnergyBudget::Available, 1),
+            worker("W9N1", EnergyBudget::Available, 1),
         ],
     );
     assert!(
         sp.orders().is_empty(),
-        "W1N1's spawn is busy, W2N1 has no request"
+        "W1N1's spawn is busy, W2N1 serves no request"
     );
+    assert_eq!((sp.stats().no_spawn, sp.stats().helped), (1, 0));
     // By packed name: W2N1's room x (-3) is below W1N1's (-2).
     assert_eq!(sp.spawn_rooms(), [room("W2N1"), room("W1N1")]);
     assert!(
@@ -572,11 +609,17 @@ fn a_request_that_can_never_fit_is_skipped_whatever_its_budget() {
     }
 }
 
-/// Requests whose home has no own spawn are counted, and no unit is made for them.
+/// Requests whose (owned) home has no own spawn and no spawn room within help range are counted,
+/// and no unit is made for them.
 #[test]
 fn requests_for_a_room_without_a_spawn_are_counted() {
     let unit = unit_cost(&WORKER_PATTERN);
-    let snap = snap_at(T0, &[("W1N1", energy(unit, unit))], &[spawn(1, "W1N1", 20)]);
+    assert!(room_distance(room("W5N5"), room("W1N1")) > SPAWN_MMO.help_range);
+    let snap = snap_at(
+        T0,
+        &[("W1N1", energy(unit, unit)), ("W5N5", CLAIMED)],
+        &[spawn(1, "W1N1", 20)],
+    );
     let mut sp = Spawner::default();
     plan(
         &mut sp,
@@ -601,12 +644,12 @@ fn orders_past_the_per_tick_cap_fault() {
         .collect();
     let snap = snap_at(T0, &[("W1N1", energy(count * unit, count * unit))], &spawns);
     let mut sp = Spawner::default();
-    sp.begin(&snap);
+    sp.begin(&snap, &SPAWN_MMO);
     let req = capped(worker("W1N1", EnergyBudget::Available, 1), 1);
     for _ in 0..count {
         sp.request(req).expect("open");
     }
-    assert_eq!(sp.close(&snap), 1);
+    assert_eq!(sp.close(&snap, true), 1);
     let mut commit = Commit::default();
     assert!(sp.plan_room(&snap, 0, &mut commit).is_err());
     assert_eq!(sp.orders().len(), ORDERS_PER_TICK as usize);
@@ -654,14 +697,14 @@ fn requests_close_once_planning_starts() {
         sp.plan_room(&stale, 0, &mut commit).is_err(),
         "planned for another tick"
     );
-    sp.begin(&stale);
+    sp.begin(&stale, &SPAWN_MMO);
     sp.request(worker("W1N1", EnergyBudget::Available, 1))
         .expect("open");
     assert!(
         sp.plan_room(&stale, 0, &mut commit).is_err(),
         "planned before close"
     );
-    assert_eq!(sp.close(&stale), 1);
+    assert_eq!(sp.close(&stale, true), 1);
     assert!(sp.plan_room(&stale, 0, &mut commit).is_ok());
 }
 
@@ -675,17 +718,22 @@ fn planning_is_deterministic() {
         &[
             ("W2N1", energy(9 * unit, 9 * unit)),
             ("W1N1", energy(5 * unit, 9 * unit)),
+            ("W3N1", CLAIMED),
         ],
         &[
             spawn(5, "W2N1", 20),
             spawn(4, "W1N1", 20),
             spawn(6, "W1N1", 22),
+            spawn(7, "W2N1", 22),
         ],
     );
+    // W3N1 (owned) has no spawn: W2N1, 1 away and full, serves it after its own request, on its
+    // second spawn with what its own order leaves.
     let requests = [
         worker("W1N1", EnergyBudget::Available, 2),
-        worker("W2N1", EnergyBudget::Capacity, 2),
+        capped(worker("W2N1", EnergyBudget::Capacity, 2), 4),
         capped(worker("W1N1", EnergyBudget::Available, 2), 2),
+        worker("W3N1", EnergyBudget::Available, 9),
     ];
     let mut a = Spawner::default();
     let mut b = Spawner::default();
@@ -697,10 +745,20 @@ fn planning_is_deterministic() {
         .iter()
         .map(|o| CreepName::parse(o.name.as_bytes()).expect("name").home)
         .collect();
-    assert_eq!(rooms, [room("W2N1"), room("W1N1")], "rooms by packed name");
-    assert_eq!(a.orders()[1].request, 0, "the earlier of equal priorities");
     assert_eq!(
-        a.orders()[1].body.cost(),
+        rooms,
+        [room("W2N1"), room("W3N1"), room("W1N1")],
+        "rooms by packed name, each room's own first"
+    );
+    let helped = a.orders()[1];
+    assert_eq!(
+        (helped.request, helped.spawn, helped.body.cost()),
+        (3, handle(&snap, 7), 5 * unit),
+        "W2N1's second spawn, with the 9 - 4 repeats its own order left"
+    );
+    assert_eq!(a.orders()[2].request, 0, "the earlier of equal priorities");
+    assert_eq!(
+        a.orders()[2].body.cost(),
         5 * unit,
         "W1N1 spends what it holds"
     );
@@ -709,13 +767,17 @@ fn planning_is_deterministic() {
         1,
         "W1N1's second spawn finds nothing left"
     );
+    assert_eq!(a.stats().helped, 1);
 }
 
 /// At the safe range's minimum, a hold still keeps the spawn out for one tick.
 #[test]
 fn the_shortest_hold_lasts_one_tick() {
     let unit = unit_cost(&WORKER_PATTERN);
-    let cfg = crate::config::SpawnConfig { hold_ticks: 1 };
+    let cfg = SpawnConfig {
+        hold_ticks: 1,
+        ..SPAWN_MMO
+    };
     let spawns = [spawn(1, "W1N1", 20)];
     let req = worker("W1N1", EnergyBudget::Available, 1);
     let mut sp = Spawner::default();
@@ -752,4 +814,498 @@ fn a_released_spawn_takes_orders_at_once() {
     fill(&mut snap, T0 + 1, &[("W1N1", energy(unit, unit))], &spawns);
     plan(&mut sp, &snap, &[req]);
     assert_eq!(sp.orders()[0].spawn, h1, "first by id again");
+}
+
+/// `room_distance` over V169's coordinates: each of the eight neighbours is 1 away, the rooms either
+/// side of the W/E and N/S seams are neighbours, the larger difference counts, and it is symmetric.
+#[test]
+fn room_distance_is_the_larger_coordinate_difference() {
+    let c = room("E5N5");
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            let n = c.checked_add((dx, dy)).expect("a neighbour");
+            assert_eq!(room_distance(c, n), u32::from(dx != 0 || dy != 0));
+        }
+    }
+    assert_eq!(room_distance(room("W0N0"), room("E0N0")), 1);
+    assert_eq!(room_distance(room("W0N0"), room("W0S0")), 1);
+    assert_eq!(room_distance(room("W0N0"), room("E0S0")), 1);
+    let (a, b) = (room("W2N1"), room("E3N4"));
+    let want = a
+        .x_coord()
+        .abs_diff(b.x_coord())
+        .max(a.y_coord().abs_diff(b.y_coord()));
+    assert_eq!(
+        want, 6,
+        "W2 is x -3 and E3 is x 3; N1 is y -2 and N4 is y -5 (V169)"
+    );
+    assert_eq!((room_distance(a, b), room_distance(b, a)), (want, want));
+}
+
+/// An owned room with no spawn, as a claimed room before its spawn stands: no energy of its own.
+const CLAIMED: RoomEnergy = RoomEnergy {
+    available: 0,
+    capacity: 0,
+};
+
+/// A request whose (owned) home has no own spawn goes to the nearest spawn room within help range
+/// whose capacity fits its body (equal distances to the lower packed name), is sized to that
+/// room's capacity or to what it holds, and its creep keeps its home.
+#[test]
+fn a_room_without_a_spawn_is_served_by_the_nearest_spawn_room() {
+    let unit = unit_cost(&WORKER_PATTERN);
+    let (near, far) = (4 * unit, 9 * unit);
+    // W3N1 is 1 from W2N1 and 2 from W1N1 (room x: W3 -4, W2 -3, W1 -2; V169).
+    assert_eq!(room_distance(room("W3N1"), room("W2N1")), 1);
+    assert_eq!(room_distance(room("W3N1"), room("W1N1")), 2);
+    let rooms = [
+        ("W1N1", energy(far, far)),
+        ("W2N1", energy(near, near)),
+        ("W3N1", CLAIMED),
+    ];
+    let spawns = [spawn(1, "W1N1", 20), spawn(2, "W2N1", 20)];
+    let snap = snap_at(T0, &rooms, &spawns);
+    let mut sp = Spawner::default();
+    plan(&mut sp, &snap, &[worker("W3N1", EnergyBudget::Capacity, 1)]);
+    assert_eq!(sp.server_of(room("W3N1")), Some(room("W2N1")));
+    assert_eq!(
+        sp.server_of(room("W1N1")),
+        Some(room("W1N1")),
+        "a spawn room serves itself"
+    );
+    let [order] = sp.orders() else {
+        panic!("one order: {:?}", sp.orders())
+    };
+    assert_eq!(order.spawn, handle(&snap, 2), "the nearer room's spawn");
+    assert_eq!(
+        order.body.cost(),
+        near,
+        "sized to the serving room's capacity"
+    );
+    assert_eq!(
+        order.identity.home,
+        room("W3N1"),
+        "the creep keeps its home"
+    );
+    assert_eq!(
+        CreepName::parse(order.name.as_bytes()),
+        Some(order.identity)
+    );
+    assert_eq!((sp.stats().helped, sp.stats().no_spawn), (1, 0));
+    assert_eq!(sp.rooms(), [room("W2N1")]);
+
+    // An exact body above the nearer room's capacity goes on to the farther one, which fits it;
+    // an `Available` request spends what its room's own order leaves. A body no room in range fits
+    // has no serving room.
+    let spawns = [
+        spawn(1, "W1N1", 20),
+        spawn(2, "W2N1", 20),
+        spawn(3, "W2N1", 22),
+    ];
+    let snap = snap_at(T0 + 1, &rooms, &spawns);
+    let big = Body::scaled(&WORKER_PATTERN, near + unit, u8::MAX).expect("a body");
+    assert!(big.cost() > near && big.cost() <= far);
+    let huge = Body::scaled(&WORKER_PATTERN, far + unit, u8::MAX).expect("a body");
+    assert!(huge.cost() > far);
+    let exact = |body: Body| SpawnRequest {
+        body: BodySpec::Exact(body),
+        ..worker("W3N1", EnergyBudget::Capacity, 5)
+    };
+    let requests = [
+        exact(big),
+        capped(worker("W2N1", EnergyBudget::Available, 1), 1),
+        worker("W3N1", EnergyBudget::Available, 1),
+        exact(huge),
+    ];
+    plan(&mut sp, &snap, &requests);
+    let got: Vec<(StructureHandle, u32, u32)> = sp
+        .orders()
+        .iter()
+        .map(|o| (o.spawn, o.request, o.body.cost()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (handle(&snap, 2), 1, unit),
+            (handle(&snap, 3), 2, near - unit),
+            (handle(&snap, 1), 0, big.cost())
+        ],
+        "rooms planned by packed name: W2N1 (x -3) before W1N1 (x -2)"
+    );
+    let servers: Vec<Option<RoomName>> = (0..4).map(|i| sp.server_at(i)).collect();
+    assert_eq!(
+        servers,
+        [
+            Some(room("W1N1")),
+            Some(room("W2N1")),
+            Some(room("W2N1")),
+            None
+        ]
+    );
+    assert_eq!((sp.stats().helped, sp.stats().no_spawn), (2, 1));
+    assert_eq!(sp.stats().unfit, 0, "no room takes a body it cannot fit");
+
+    // Equal distances: W2N2 is 1 from W1N1 and from W3N1; W3N1 has the lower packed name.
+    let snap = snap_at(
+        T0 + 1,
+        &[
+            ("W1N1", energy(far, far)),
+            ("W3N1", energy(near, near)),
+            ("W2N2", CLAIMED),
+        ],
+        &[spawn(1, "W1N1", 20), spawn(3, "W3N1", 20)],
+    );
+    assert_eq!(room_distance(room("W2N2"), room("W1N1")), 1);
+    assert_eq!(room_distance(room("W2N2"), room("W3N1")), 1);
+    assert!(room("W3N1").packed_repr() < room("W1N1").packed_repr());
+    plan(&mut sp, &snap, &[worker("W2N2", EnergyBudget::Capacity, 1)]);
+    assert_eq!(sp.server_of(room("W2N2")), Some(room("W3N1")));
+    assert_eq!(sp.orders().first().map(|o| o.spawn), Some(handle(&snap, 3)));
+}
+
+/// Only an owned room is served by another's spawns: nothing drives a creep whose home the bot
+/// does not own (`economy` takes members of owned rooms), so such a request has no serving room,
+/// whether the room is visible (neutral, or another player's) or not.
+#[test]
+fn only_owned_rooms_are_served_by_others() {
+    let unit = unit_cost(&WORKER_PATTERN);
+    let mut snap = Snapshot::default();
+    fill_rooms(
+        &mut snap,
+        T0,
+        &[
+            (
+                "W1N1",
+                energy(2 * unit, 2 * unit),
+                Controller::Mine { level: 3 },
+            ),
+            ("W2N2", CLAIMED, Controller::Mine { level: 1 }),
+            ("W2N1", CLAIMED, Controller::Neutral),
+            ("W1N2", CLAIMED, Controller::Foreign { level: 2 }),
+        ],
+        &[spawn(1, "W1N1", 20), spawn(2, "W1N1", 22)],
+    );
+    for r in ["W2N2", "W2N1", "W1N2", "W2N0"] {
+        assert!(room_distance(room(r), room("W1N1")) <= SPAWN_MMO.help_range);
+    }
+    let ask = |home: &str| capped(worker(home, EnergyBudget::Available, 1), 1);
+    let mut sp = Spawner::default();
+    plan(
+        &mut sp,
+        &snap,
+        &[ask("W2N1"), ask("W1N2"), ask("W2N0"), ask("W2N2")],
+    );
+    for r in ["W2N1", "W1N2", "W2N0"] {
+        assert_eq!(sp.server_of(room(r)), None, "{r} is not owned");
+    }
+    let homes: Vec<RoomName> = sp.orders().iter().map(|o| o.identity.home).collect();
+    assert_eq!(homes, [room("W2N2")]);
+    assert_eq!((sp.stats().helped, sp.stats().no_spawn), (1, 3));
+}
+
+/// A helped request goes past the nearest room it fits when that room cannot help this tick (not
+/// full, or no ready spawn) to the nearest in range that can; with none, it stays with the nearest
+/// it fits by capacity (whatever that room holds now), and nothing spawns it.
+#[test]
+fn a_helped_request_goes_past_a_room_that_cannot_help() {
+    let unit = unit_cost(&WORKER_PATTERN);
+    let cap = 4 * unit;
+    // W3N1 (owned, no spawn) is 1 from W2N1 and 2 from W1N1.
+    let req = capped(worker("W3N1", EnergyBudget::Available, 1), 1);
+    let busy = |key: u128, room: &'static str| SpawnAt {
+        busy: true,
+        ..spawn(key, room, 20)
+    };
+    let mut sp = Spawner::default();
+    let world = |near: RoomEnergy, near_spawn: SpawnAt, far: RoomEnergy, far_spawn: SpawnAt| {
+        snap_at(
+            T0,
+            &[("W2N1", near), ("W1N1", far), ("W3N1", CLAIMED)],
+            &[near_spawn, far_spawn],
+        )
+    };
+
+    // The nearer room is not full: the farther, full one serves.
+    let snap = world(
+        energy(cap - 1, cap),
+        spawn(2, "W2N1", 20),
+        energy(cap, cap),
+        spawn(1, "W1N1", 20),
+    );
+    plan(&mut sp, &snap, &[req]);
+    assert_eq!(sp.server_at(0), Some(room("W1N1")));
+    assert_eq!(
+        sp.server_of(room("W3N1")),
+        Some(room("W2N1")),
+        "the nearest"
+    );
+    assert_eq!(sp.orders().first().map(|o| o.spawn), Some(handle(&snap, 1)));
+
+    // The nearer room is full but its spawn is busy: the farther one serves.
+    let snap = world(
+        energy(cap, cap),
+        busy(2, "W2N1"),
+        energy(cap, cap),
+        spawn(1, "W1N1", 20),
+    );
+    plan(&mut sp, &snap, &[req]);
+    assert_eq!(sp.server_at(0), Some(room("W1N1")));
+    assert_eq!(sp.orders().len(), 1);
+
+    // Neither can help: it stays with the nearer room, fitted by capacity though it holds less
+    // than the body costs, and no room is a unit.
+    let snap = world(
+        energy(0, cap),
+        spawn(2, "W2N1", 20),
+        energy(cap, cap),
+        busy(1, "W1N1"),
+    );
+    plan(&mut sp, &snap, &[req]);
+    assert_eq!(sp.server_at(0), Some(room("W2N1")));
+    assert!(sp.orders().is_empty() && sp.rooms().is_empty());
+    assert_eq!((sp.stats().helped, sp.stats().no_spawn), (1, 0));
+
+    // The nearer room's only spawn is held after a refused call: not ready, so it cannot help, and
+    // with the farther one busy the request stays with it; its held spawn is counted.
+    let snap = world(
+        energy(cap, cap),
+        spawn(2, "W2N1", 20),
+        energy(cap, cap),
+        busy(1, "W1N1"),
+    );
+    plan(&mut sp, &snap, &[req]);
+    let [order] = sp.orders() else {
+        panic!("one order: {:?}", sp.orders())
+    };
+    assert_eq!(order.spawn, handle(&snap, 2));
+    sp.record(0, Outcome::Threw, &SPAWN_MMO);
+    let mut snap = snap;
+    fill(
+        &mut snap,
+        T0 + 1,
+        &[
+            ("W2N1", energy(cap, cap)),
+            ("W1N1", energy(cap, cap)),
+            ("W3N1", CLAIMED),
+        ],
+        &[spawn(2, "W2N1", 20), busy(1, "W1N1")],
+    );
+    plan(&mut sp, &snap, &[req]);
+    assert_eq!(sp.server_at(0), Some(room("W2N1")));
+    assert!(sp.orders().is_empty() && sp.rooms().is_empty());
+    assert_eq!(sp.stats().held, 1, "a serving room's held spawn");
+}
+
+/// `spawn_side` names the room whose spawns would spawn a home's creep, with that room's energy and
+/// whether one of its spawns is idle: the home itself, the room that would serve an owned home
+/// without a spawn, or none.
+#[test]
+fn spawn_side_names_the_spawning_room() {
+    let unit = unit_cost(&WORKER_PATTERN);
+    let busy = SpawnAt {
+        busy: true,
+        ..spawn(1, "W1N1", 20)
+    };
+    let mut snap = Snapshot::default();
+    fill_rooms(
+        &mut snap,
+        T0,
+        &[
+            (
+                "W1N1",
+                energy(unit, 3 * unit),
+                Controller::Mine { level: 3 },
+            ),
+            (
+                "W2N1",
+                energy(2 * unit, 2 * unit),
+                Controller::Mine { level: 2 },
+            ),
+            (
+                "W3N1",
+                energy(5 * unit, 6 * unit),
+                Controller::Mine { level: 6 },
+            ),
+            ("W5N1", CLAIMED, Controller::Neutral),
+        ],
+        &[busy, spawn(2, "W2N1", 20)],
+    );
+    let mut sp = Spawner::default();
+    sp.begin(&snap, &SPAWN_MMO);
+    let side = |home: &str| sp.spawn_side(room(home));
+    assert_eq!(
+        side("W1N1"),
+        Some(SpawnSide {
+            room: room("W1N1"),
+            energy: energy(unit, 3 * unit),
+            idle: false
+        }),
+        "its own, busy"
+    );
+    // W3N1 lost its spawn but keeps extensions: it is sized at W2N1, 1 away.
+    assert_eq!(
+        side("W3N1"),
+        Some(SpawnSide {
+            room: room("W2N1"),
+            energy: energy(2 * unit, 2 * unit),
+            idle: true
+        })
+    );
+    assert_eq!(side("W5N1"), None, "not owned");
+}
+/// A room serves others only on a tick it starts full and help is allowed (the Standard tier
+/// runs); its own requests spawn either way. A room whose only requests are others' is no unit on
+/// a tick it does not help, so it reads no clock.
+#[test]
+fn a_room_helps_only_while_full_and_allowed() {
+    let unit = unit_cost(&WORKER_PATTERN);
+    let cap = 3 * unit;
+    let spawns = [spawn(1, "W1N1", 20), spawn(2, "W1N1", 22)];
+    let helped = capped(worker("W2N2", EnergyBudget::Available, 9), 1);
+    let own = capped(worker("W1N1", EnergyBudget::Available, 1), 1);
+    let at = |available: u32| {
+        snap_at(
+            T0,
+            &[("W1N1", energy(available, cap)), ("W2N2", CLAIMED)],
+            &spawns,
+        )
+    };
+    let homes =
+        |sp: &Spawner| -> Vec<RoomName> { sp.orders().iter().map(|o| o.identity.home).collect() };
+    let mut sp = Spawner::default();
+
+    // Not full: only its own request; with no own request, no unit.
+    let snap = at(cap - 1);
+    plan(&mut sp, &snap, &[helped, own]);
+    assert_eq!(homes(&sp), [room("W1N1")]);
+    plan(&mut sp, &snap, &[helped]);
+    assert!(sp.rooms().is_empty() && sp.orders().is_empty());
+    assert_eq!(
+        sp.stats().helped,
+        1,
+        "given to W1N1, which does not plan it"
+    );
+
+    // Full but help not allowed: the same.
+    let snap = at(cap);
+    plan_with(&mut sp, &snap, &[helped, own], &SPAWN_MMO, false);
+    assert_eq!(homes(&sp), [room("W1N1")]);
+    plan_with(&mut sp, &snap, &[helped], &SPAWN_MMO, false);
+    assert!(sp.rooms().is_empty() && sp.orders().is_empty());
+
+    // Full and allowed: both.
+    plan(&mut sp, &snap, &[helped, own]);
+    assert_eq!(homes(&sp), [room("W1N1"), room("W2N2")]);
+}
+
+/// Help reaches exactly `spawn.help_range` (straight or diagonal): a home that far is served, one a
+/// room farther is not, and at 0 no room serves another.
+#[test]
+fn help_reaches_exactly_help_range() {
+    let unit = unit_cost(&WORKER_PATTERN);
+    let range = SPAWN_MMO.help_range;
+    let step = i32::try_from(range).expect("range");
+    let server = room("E1N1");
+    let at = server.checked_add((step, 0)).expect("in the world");
+    let diagonal = server.checked_add((-step, step)).expect("in the world");
+    let beyond = server.checked_add((0, step + 1)).expect("in the world");
+    assert_eq!(room_distance(at, server), range);
+    assert_eq!(room_distance(diagonal, server), range);
+    assert_eq!(room_distance(beyond, server), range + 1);
+    let names: Vec<String> = [at, diagonal, beyond]
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    let mut rooms = vec![("E1N1", energy(3 * unit, 3 * unit))];
+    rooms.extend(names.iter().map(|n| (n.as_str(), CLAIMED)));
+    let spawns = [
+        spawn(1, "E1N1", 20),
+        spawn(2, "E1N1", 22),
+        spawn(3, "E1N1", 24),
+    ];
+    let snap = snap_at(T0, &rooms, &spawns);
+    let ask = |home: RoomName| SpawnRequest {
+        home,
+        ..capped(worker("E1N1", EnergyBudget::Available, 1), 1)
+    };
+    let requests = [ask(beyond), ask(at), ask(diagonal)];
+    let mut sp = Spawner::default();
+    plan(&mut sp, &snap, &requests);
+    let homes: Vec<RoomName> = sp.orders().iter().map(|o| o.identity.home).collect();
+    assert_eq!(
+        homes,
+        [at, diagonal],
+        "in request order; the farther home gets none"
+    );
+    assert_eq!((sp.stats().helped, sp.stats().no_spawn), (2, 1));
+    assert_eq!(sp.server_of(beyond), None);
+
+    let off = SpawnConfig {
+        help_range: 0,
+        ..SPAWN_MMO
+    };
+    plan_with(&mut sp, &snap, &requests, &off, true);
+    assert!(sp.orders().is_empty() && sp.rooms().is_empty());
+    assert_eq!((sp.stats().helped, sp.stats().no_spawn), (0, 3));
+    assert_eq!(sp.server_of(at), None);
+    assert_eq!(
+        sp.server_of(server),
+        Some(server),
+        "a spawn room still serves itself"
+    );
+}
+
+/// A serving room takes its own requests before those it serves for others, whatever their
+/// priority, on its first spawns by id; what its own orders leave is all the helped ones may spend.
+#[test]
+fn own_requests_come_before_helped_ones() {
+    let unit = unit_cost(&WORKER_PATTERN);
+    let cap = 2 * unit;
+    // W1N1 serves W2N1, 1 away, owned, with no spawn of its own.
+    assert!(room_distance(room("W2N1"), room("W1N1")) <= SPAWN_MMO.help_range);
+    let spawns = [spawn(1, "W1N1", 20), spawn(2, "W1N1", 22)];
+    let rooms = [("W1N1", energy(cap, cap)), ("W2N1", CLAIMED)];
+    let snap = snap_at(T0, &rooms, &spawns);
+    let helped = capped(worker("W2N1", EnergyBudget::Available, u8::MAX), 1);
+    let own = capped(worker("W1N1", EnergyBudget::Available, 1), 1);
+    let mut sp = Spawner::default();
+
+    plan(&mut sp, &snap, &[helped, own]);
+    let got: Vec<(RoomName, StructureHandle)> = sp
+        .orders()
+        .iter()
+        .map(|o| (o.identity.home, o.spawn))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (room("W1N1"), handle(&snap, 1)),
+            (room("W2N1"), handle(&snap, 2))
+        ],
+        "own first, on the first spawn by id; then the helped one"
+    );
+
+    // An own request at the room's capacity takes all it holds: the helped one waits.
+    plan(
+        &mut sp,
+        &snap,
+        &[helped, worker("W1N1", EnergyBudget::Capacity, 0)],
+    );
+    let [order] = sp.orders() else {
+        panic!("one order: {:?}", sp.orders())
+    };
+    assert_eq!(order.identity.home, room("W1N1"));
+    assert_eq!(order.body.cost(), cap);
+    assert_eq!(sp.stats().waiting, 1, "nothing left for the helped one");
+}
+
+/// `spawn.help_range`'s default (TUNING): a room is `ROOM_SIZE` tiles across and a creep walks at
+/// most one tile a tick, so a helped creep spends about `ROOM_SIZE` ticks a room of distance on
+/// the way at best (more with fatigue and detours); the default is the largest range whose best
+/// walk is within a tenth of `CREEP_LIFE_TIME`.
+#[test]
+fn the_default_help_ranges_best_walk_is_a_tenth_of_a_life() {
+    let walk = |range: u32| range * u32::from(ROOM_SIZE);
+    assert!(walk(SPAWN_MMO.help_range) * 10 <= CREEP_LIFE_TIME);
+    assert!(walk(SPAWN_MMO.help_range + 1) * 10 > CREEP_LIFE_TIME);
 }

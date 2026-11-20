@@ -1,18 +1,37 @@
-//! The minimal spawn path's planner (ROADMAP P2; the P5 global queue replaces it, the order and its
-//! issue stay). Each tick, jobs [`Spawner::request`] creeps for their rooms; [`Spawner::close`] ends
-//! the requests and keeps the rooms with a request and a ready spawn (not spawning, not held); the
-//! Critical `spawn` job plans each of them ([`Spawner::plan_room`]), so a tick with nothing asked,
-//! or with every spawn of each asking room busy or held, runs no job and reads no clock (a room
-//! that waits for energy with a ready spawn is planned every tick); the act layer issues the orders
-//! and reports each call's [`Outcome`] ([`Spawner::record`]).
+//! The global spawn queue (ROADMAP P5.1, from P2's minimal spawn path). Each tick, jobs
+//! [`Spawner::request`] creeps for their rooms. [`Spawner::close`] ends the requests and gives each
+//! to the room whose spawns serve it: its home when the home has an own spawn; for an owned home
+//! without one, a room with an own spawn within `spawn.help_range` ([`room_distance`]) whose
+//! capacity fits the request's body, the nearest that helps this tick with a ready spawn, else the
+//! nearest (equal distances to the lower packed name); else none (counted as `no_spawn`). It keeps
+//! the serving rooms with a request they may plan this tick and a ready spawn (not spawning, not
+//! held); the Critical `spawn` job plans each of them
+//! ([`Spawner::plan_room`]), so a tick with nothing asked, or with every spawn of each serving room
+//! busy or held, runs no job and reads no clock (a room that waits for energy with a ready spawn is
+//! planned every tick); the act layer issues the orders and reports each call's [`Outcome`]
+//! ([`Spawner::record`]).
 //!
-//! Per room: the ready spawns (not spawning at the start of the tick, V171, V175, and not held), in
-//! id order with the spawns on probation last, take the room's requests in priority order. A request sizes its body from the room's
-//! capacity or from what it holds now ([`EnergyBudget`]); when the next request cannot be paid for,
-//! the room waits and no request below it spawns, so energy is never spent around a waiting one. A
-//! request whose body cannot be built even at the room's capacity (one repeat of its pattern costs
-//! more, it allows no repeat, or its exact body costs more) is skipped, whatever its budget, so it
-//! never blocks the room.
+//! The queue is rebuilt every tick from the jobs' requests, so nothing about it outlives a global
+//! and a reset loses nothing; a request's serving room follows this tick's spawns.
+//!
+//! Per serving room: the ready spawns (not spawning at the start of the tick, V171, V175, and not
+//! held), in id order with the spawns on probation last, take the room's requests in order: its own
+//! requests first, then those it serves for other rooms, each by priority (equal priorities in
+//! request order). A room serves others only on a tick it starts full (`energyAvailable` at its
+//! `energyCapacityAvailable`, V175) and the Standard tier runs: helping is not Critical work, and
+//! only a full room's energy is spare. So within a tick a room's own requests always come first; a
+//! helped creep then keeps its spawn busy for its spawn time and spends the room's energy, which the
+//! room's later requests wait for (P5.2's replacement lead and P8's colony support weigh that). A
+//! spawn spends its own room's energy (V171, V173), so a [`BodySpec::Scaled`] body is sized from the
+//! serving room's capacity or from what that room holds now ([`EnergyBudget`]) and an exact body
+//! waits for its cost there. A job that solves an exact body for a home without a spawn reads the
+//! spawn room nearest it ([`Spawner::spawn_side`]): the opening, the only job that asks for one
+//! before P8's pioneers, plans such a home's workers at the smaller of the home's capacity and that
+//! room's, so the body fits there. The creep's name keeps the request's home. When the next request cannot be paid for, the room waits
+//! and no request below it spawns, so energy is never spent around a waiting one. A request whose
+//! body cannot be built even at its room's capacity (one repeat of its pattern costs more, it allows
+//! no repeat, or its exact body costs more) is skipped, whatever its budget, so it never blocks the
+//! room.
 //!
 //! The planner keeps the room's energy left over its orders: the runtime checks every spawn against
 //! the same tick-start `room.energyAvailable` (V172), and the processor silently drops a second
@@ -35,7 +54,7 @@ use super::name::{CreepName, Identity, Role, serial};
 use crate::config::SpawnConfig;
 use crate::intents::Outcome;
 use crate::scheduler::{Commit, Fault};
-use crate::snapshot::{ObjectKey, Snapshot, StructureHandle};
+use crate::snapshot::{ObjectKey, RoomEnergy, Snapshot, StructureHandle};
 
 /// What a request sizes its body from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,7 +92,9 @@ pub enum BodySpec {
 /// tick after the order, V101).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpawnRequest {
-    /// The room the creep works for; a spawn of that room spawns it (P5 lets others).
+    /// The room the creep works for, which its name records. A spawn of that room spawns it; with
+    /// none there and the room owned, a spawn of the nearest room with one within
+    /// `spawn.help_range` whose capacity fits the body (P5.1).
     pub home: RoomName,
     pub role: Role,
     pub body: BodySpec,
@@ -104,11 +125,16 @@ pub struct SpawnStats {
     pub orders: u32,
     /// Rooms whose next request waited for energy.
     pub waiting: u32,
-    /// Requests skipped because no body of theirs fits their room's capacity.
+    /// Requests skipped because no body of theirs fits their serving room's capacity.
     pub unfit: u32,
-    /// Requests whose home has no own spawn this tick (P5 lets other rooms spawn for it).
+    /// Requests whose home has no own spawn this tick and is not owned or has no room with one
+    /// within `spawn.help_range` whose capacity fits the body: nothing spawns them.
     pub no_spawn: u32,
-    /// Spawns of asking rooms, not spawning, that a refused call holds.
+    /// Requests whose home has no own spawn, given to another room's spawns (P5.1); whether they
+    /// spawn this tick is in `orders`, `waiting` and the serving room's state.
+    pub helped: u32,
+    /// Spawns of serving rooms (those given a request this tick), not spawning, that a refused
+    /// call holds.
     pub held: u32,
     /// Calls the game accepted (the order was recorded; the processor may still drop it, V173).
     pub ok: u32,
@@ -134,6 +160,33 @@ pub struct SpawnEvent {
     pub outcome: Outcome,
 }
 
+/// The room whose spawns would spawn a home's creep, for a job sizing its body
+/// ([`Spawner::spawn_side`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpawnSide {
+    /// The home itself when it has an own spawn, else the room that would serve it.
+    pub room: RoomName,
+    /// That room's energy at the start of the tick.
+    pub energy: RoomEnergy,
+    /// Whether a spawn of that room is not spawning at the start of the tick (it may still be held
+    /// after a refused call).
+    pub idle: bool,
+}
+
+/// A spawn room's state for the tick.
+#[derive(Clone, Copy, Debug, Default)]
+struct RoomSpawns {
+    energy: RoomEnergy,
+    /// It starts the tick full (`energyAvailable` at a non-zero `energyCapacityAvailable`).
+    full: bool,
+    /// A spawn of it is not spawning.
+    idle: bool,
+    /// A spawn of it is not spawning and not held ([`Spawner::close`]).
+    ready: bool,
+    /// Its spawns, not spawning, that a refused call holds ([`Spawner::close`]).
+    held: u32,
+}
+
 /// A spawn whose last call was refused: held until `until`, then on probation until a call of its
 /// own is accepted (module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,10 +203,20 @@ pub struct Spawner {
     open: Option<u32>,
     time: u32,
     requests: Vec<SpawnRequest>,
+    /// Each request's serving room, by request index, once [`Self::close`] ran.
+    servers: Vec<Option<RoomName>>,
+    /// `spawn.help_range` for this tick. Unit: rooms.
+    help_range: u32,
     orders: Vec<SpawnOrder>,
     /// Rooms with an own spawn this tick, by packed name.
     spawn_rooms: Vec<RoomName>,
-    /// Those with a request, once [`Self::close`] ran: the `spawn` job's units.
+    /// Each spawn room's energy and spawns this tick, by `spawn_rooms` index.
+    spawn_state: Vec<RoomSpawns>,
+    /// The owned rooms this tick (the homes another room may serve).
+    owned: Vec<RoomName>,
+    /// Whether rooms may serve others this tick ([`Self::close`]).
+    help: bool,
+    /// Those that serve a request this tick, once [`Self::close`] ran: the `spawn` job's units.
     rooms: Vec<RoomName>,
     holds: Vec<Hold>,
     // Scratch, reused per room: (on probation, id, handle, structure row) of the ready spawns.
@@ -167,12 +230,16 @@ pub struct Spawner {
 
 impl Spawner {
     /// Starts a tick for `snap`, which must already be taken: drops last tick's requests and
-    /// orders and the holds whose spawn is gone, and lists the rooms with own spawns.
-    pub fn begin(&mut self, snap: &Snapshot) {
+    /// orders and the holds whose spawn is gone, lists the rooms with own spawns (with their
+    /// capacity and whether they are full) and the owned rooms, and takes `cfg.help_range` for the
+    /// tick's serving rooms.
+    pub fn begin(&mut self, snap: &Snapshot, cfg: &SpawnConfig) {
         let time = snap.tick.time;
         self.open = Some(time);
         self.time = time;
+        self.help_range = cfg.help_range;
         self.requests.clear();
+        self.servers.clear();
         self.orders.clear();
         self.stats = SpawnStats::default();
         self.totals.ticks = self.totals.ticks.saturating_add(1);
@@ -194,6 +261,39 @@ impl Spawner {
                 }
             }
         }
+        let rooms = &snap.rooms;
+        let spawns = &snap.spawns;
+        self.spawn_state.clear();
+        self.spawn_state
+            .extend(self.spawn_rooms.iter().map(|&room| {
+                let energy = rooms
+                    .row_of(room)
+                    .and_then(|r| rooms.energy().get(r))
+                    .copied()
+                    .unwrap_or_default();
+                let idle = spawns
+                    .rows()
+                    .iter()
+                    .zip(spawns.busy())
+                    .any(|(&row, &busy)| {
+                        !busy
+                            && structures
+                                .positions()
+                                .get(row as usize)
+                                .is_some_and(|p| p.room_name() == room)
+                    });
+                RoomSpawns {
+                    energy,
+                    full: energy.capacity > 0 && energy.available >= energy.capacity,
+                    idle,
+                    ready: false,
+                    held: 0,
+                }
+            }));
+        self.owned.clear();
+        self.owned
+            .extend(rooms.owned().filter_map(|r| rooms.names().get(r).copied()));
+        self.help = false;
     }
 
     /// Queues `request` for this tick's plan and returns its index, or `None` once planning started
@@ -206,23 +306,109 @@ impl Spawner {
         Some(index)
     }
 
-    /// Ends this tick's requests and keeps the rooms with at least one request and at least one
-    /// ready spawn (not spawning, not held): the `spawn` job's units ([`Self::rooms`]). Returns how
-    /// many there are. Counts the held spawns of asking rooms and the requests with no spawn.
-    pub fn close(&mut self, snap: &Snapshot) -> u32 {
-        self.open = None;
-        self.rooms.clear();
-        for r in &self.requests {
-            if !self.spawn_rooms.contains(&r.home) {
-                self.stats.no_spawn = self.stats.no_spawn.saturating_add(1);
+    /// The nearest room that could serve `home` this tick, whatever the body and the room's state
+    /// (call after [`Self::begin`]): `home` when it has an own spawn; for an owned home without
+    /// one, the nearest room with one at most `spawn.help_range` away by [`room_distance`] (ties to
+    /// the lower packed name); else `None`. At [`Self::close`] a request may go on to a farther
+    /// room in range: one its body fits, or one that helps this tick with a ready spawn.
+    pub fn server_of(&self, home: RoomName) -> Option<RoomName> {
+        self.nearest(home, |_| true)
+    }
+
+    /// [`Self::server_of`]'s room with its energy and whether one of its spawns is idle, for a job
+    /// that sizes a body for `home` (call after [`Self::begin`]).
+    pub fn spawn_side(&self, home: RoomName) -> Option<SpawnSide> {
+        let room = self.server_of(home)?;
+        let at = self.spawn_rooms.iter().position(|&r| r == room)?;
+        let state = self.spawn_state.get(at)?;
+        Some(SpawnSide {
+            room,
+            energy: state.energy,
+            idle: state.idle,
+        })
+    }
+
+    /// The room that serves request `index` this tick, once [`Self::close`] ran.
+    pub fn server_at(&self, index: u32) -> Option<RoomName> {
+        self.servers.get(index as usize).copied().flatten()
+    }
+
+    /// Whether a body of `body` can be built at `capacity` ([`Self::plan_room`]'s fit).
+    ///
+    /// Uses: `BODYPART_COST` and `MAX_CREEP_SIZE` through [`Body::scaled`] and [`Body::cost`].
+    fn fits(body: BodySpec, capacity: u32) -> bool {
+        match body {
+            BodySpec::Scaled {
+                pattern,
+                max_repeats,
+            } => Body::scaled(pattern, capacity, max_repeats).is_some(),
+            BodySpec::Exact(b) => b.cost() <= capacity,
+        }
+    }
+
+    /// The room that serves `request` (module docs): its home when it has an own spawn; for an
+    /// owned home, the nearest in range whose capacity fits its body and that helps this tick with
+    /// a ready spawn, else the nearest in range its body fits. Call in [`Self::close`].
+    fn server_for(&self, request: &SpawnRequest) -> Option<RoomName> {
+        let fits = |i: usize| {
+            self.spawn_state
+                .get(i)
+                .is_some_and(|s| Self::fits(request.body, s.energy.capacity))
+        };
+        self.nearest(request.home, |i| fits(i) && self.helps_at(i))
+            .or_else(|| self.nearest(request.home, fits))
+    }
+
+    /// `home` when it has an own spawn, else the nearest spawn room in range for which `ok` holds
+    /// (by `spawn_rooms` index), for an owned `home` (ties to the lower packed name).
+    fn nearest(&self, home: RoomName, ok: impl Fn(usize) -> bool) -> Option<RoomName> {
+        if self.spawn_rooms.contains(&home) {
+            return Some(home);
+        }
+        if !self.owned.contains(&home) {
+            return None;
+        }
+        let mut best: Option<(u32, RoomName)> = None;
+        // By packed name, so the first of equal distances is the lower name.
+        for (i, &room) in self.spawn_rooms.iter().enumerate() {
+            let d = room_distance(home, room);
+            if d <= self.help_range && best.is_none_or(|(b, _)| d < b) && ok(i) {
+                best = Some((d, room));
             }
         }
+        best.map(|(_, room)| room)
+    }
+
+    /// Whether spawn room `i` plans the requests it serves for others this tick: [`Self::close`]
+    /// allowed help, it started the tick full and it has a ready spawn.
+    fn helps_at(&self, i: usize) -> bool {
+        self.help && self.spawn_state.get(i).is_some_and(|s| s.full && s.ready)
+    }
+
+    /// [`Self::helps_at`] by room name.
+    fn helps(&self, room: RoomName) -> bool {
+        self.spawn_rooms
+            .iter()
+            .position(|&r| r == room)
+            .is_some_and(|i| self.helps_at(i))
+    }
+
+    /// Ends this tick's requests, gives each its serving room (module docs) and keeps the serving
+    /// rooms with at least one request they plan this tick (their own, or those of others on a tick
+    /// they help) and at least one ready spawn (not spawning, not held): the `spawn` job's units
+    /// ([`Self::rooms`]). `help`: whether rooms may serve others this tick (rustedscreep-wasm passes
+    /// whether the Standard tier runs). Returns how many units there are. Counts the held spawns of
+    /// serving rooms, the requests given to another room and those with no serving room.
+    pub fn close(&mut self, snap: &Snapshot, help: bool) -> u32 {
+        self.open = None;
+        self.help = help;
+        self.rooms.clear();
+        // Each spawn room's ready and held spawns.
         let spawns = &snap.spawns;
-        for &room in &self.spawn_rooms {
-            if !self.requests.iter().any(|r| r.home == room) {
-                continue;
-            }
-            let mut ready = false;
+        let (holds, time) = (&self.holds, self.time);
+        for (&room, state) in self.spawn_rooms.iter().zip(self.spawn_state.iter_mut()) {
+            state.ready = false;
+            state.held = 0;
             for ((&handle, &row), &busy) in spawns
                 .handles()
                 .iter()
@@ -237,13 +423,42 @@ impl Spawner {
                 if !here || busy {
                     continue;
                 }
-                if self.is_held(handle) {
-                    self.stats.held = self.stats.held.saturating_add(1);
+                if holds.iter().any(|h| h.spawn == handle && h.until > time) {
+                    state.held = state.held.saturating_add(1);
                 } else {
-                    ready = true;
+                    state.ready = true;
                 }
             }
-            if ready {
+        }
+        // Each request's serving room (`servers` is moved out so the requests can be read).
+        let mut servers = std::mem::take(&mut self.servers);
+        servers.clear();
+        servers.extend(self.requests.iter().map(|r| self.server_for(r)));
+        self.servers = servers;
+        for (r, server) in self.requests.iter().zip(&self.servers) {
+            match server {
+                None => self.stats.no_spawn = self.stats.no_spawn.saturating_add(1),
+                Some(s) if *s != r.home => self.stats.helped = self.stats.helped.saturating_add(1),
+                Some(_) => {}
+            }
+        }
+        for (i, &room) in self.spawn_rooms.iter().enumerate() {
+            let helps = self.helps_at(i);
+            let Some(state) = self.spawn_state.get(i) else {
+                continue;
+            };
+            let mut serves = false;
+            let mut asked = false;
+            for (r, s) in self.requests.iter().zip(&self.servers) {
+                if *s == Some(room) {
+                    serves = true;
+                    asked |= r.home == room || helps;
+                }
+            }
+            if serves {
+                self.stats.held = self.stats.held.saturating_add(state.held);
+            }
+            if asked && state.ready {
                 self.rooms.push(room);
             }
         }
@@ -260,8 +475,9 @@ impl Spawner {
         &self.spawn_rooms
     }
 
-    /// Plans room `unit` of [`Self::rooms`]: its idle spawns take its requests (module docs). Each
-    /// order commits `INTENT_CPU_COST` (V34). Call after [`Self::close`].
+    /// Plans room `unit` of [`Self::rooms`]: its idle spawns take its own requests, then, on a tick
+    /// it helps, those it serves for others (module docs). Each order commits `INTENT_CPU_COST`
+    /// (V34). Call after [`Self::close`].
     ///
     /// Uses: `INTENT_CPU_COST`; `BODYPART_COST` and `MAX_CREEP_SIZE` through [`Body::scaled`] and
     /// [`Body::cost`].
@@ -320,21 +536,21 @@ impl Spawner {
             self.idle.insert(at, entry);
         }
 
-        // Highest priority first; equal priorities in request order (each goes after its equals).
+        // The room's own requests first, then those it serves for others; within each, highest
+        // priority first and equal priorities in request order (each goes after its equals).
         self.queue.clear();
+        let helps = self.helps(room);
         let requests = &self.requests;
-        for (index, r) in (0u32..).zip(requests) {
-            if r.home != room {
+        let rank = |r: &SpawnRequest| (r.home == room, r.priority);
+        for ((index, r), server) in (0u32..).zip(requests).zip(&self.servers) {
+            if *server != Some(room) || (r.home != room && !helps) {
                 continue;
             }
+            let key = rank(r);
             let at = self
                 .queue
                 .iter()
-                .position(|&i| {
-                    requests
-                        .get(i as usize)
-                        .is_some_and(|q| q.priority < r.priority)
-                })
+                .position(|&i| requests.get(i as usize).is_some_and(|q| rank(q) < key))
                 .unwrap_or(self.queue.len());
             self.queue.insert(at, index);
         }
@@ -382,7 +598,7 @@ impl Spawner {
                     .ok_or(Fault::new("too many spawn orders in one tick", unit))?;
                 let identity = Identity {
                     role: req.role,
-                    home: room,
+                    home: req.home,
                     serial,
                 };
                 self.orders.push(SpawnOrder {
@@ -490,4 +706,13 @@ impl Spawner {
     pub fn time(&self) -> u32 {
         self.time
     }
+}
+
+/// The distance between two rooms, in rooms: the larger of the differences of their world
+/// coordinates (`RoomName::x_coord` and `y_coord`, V169), so each of a room's eight neighbours is 1
+/// away and W0 and E0 are neighbours. The world does not wrap (V169).
+pub fn room_distance(a: RoomName, b: RoomName) -> u32 {
+    a.x_coord()
+        .abs_diff(b.x_coord())
+        .max(a.y_coord().abs_diff(b.y_coord()))
 }

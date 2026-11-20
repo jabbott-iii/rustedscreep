@@ -21,8 +21,9 @@
 // - after that OK, a tick with a ready spawn (on probation), a full room and no new command makes no call: the
 //   accepted request is gone; a third request goes to the spawn on probation (the only ready one), the harness drops
 //   that order, and on the next tick the request stands again (one warning) and is spawned;
-// - the console's refusals (not a room name, an unknown role, a number), a request for a room with no own spawn (a
-//   note, counted as `no spawn`), and cancels; `rustedscreep.spawner()` reports the room, the totals, the last
+// - the console's refusals (not a room name, an unknown role, a number), a request for a room with no own spawn that
+//   no other room serves (W5N5 is not owned: it is not in Game.rooms, so SpawnConfig::help_range never applies; a
+//   note, counted as `no spawn`, not `helped`), and cancels; `rustedscreep.spawner()` reports the room, the totals, the last
 //   accepted call and failure and the own creeps by home and role;
 // - ADR-018: the harness's spawnCreep writes `Memory.creeps[name]` on every OK, as the engine's runtime does (V181),
 //   and the stored Memory string never holds one of them (the bot deletes each entry in the same tick, V180), while
@@ -385,11 +386,11 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
   const wantParts = [
     [
       `rustedscreep spawner at tick ${T0 + THIRD}: ${ROOM} energy ${CAPACITY}/${CAPACITY}, spawns idle 1 busy 0 held 1`,
-      '| requests 1, orders 1 (ok 1, failed 0), waiting 0, unfit 0, no spawn 0, held 1 |',
+      '| requests 1, orders 1 (ok 1, failed 0), waiting 0, unfit 0, no spawn 0, helped 0, held 1 |',
     ],
     [
       `rustedscreep spawner at tick ${T0 + QUIET}: ${ROOM} energy ${CAPACITY}/${CAPACITY}, spawns idle 1 busy 1 held 0`,
-      '| requests 0, orders 0 (ok 0, failed 0), waiting 0, unfit 0, no spawn 0, held 0 |',
+      '| requests 0, orders 0 (ok 0, failed 0), waiting 0, unfit 0, no spawn 0, helped 0, held 0 |',
       `since boot: ticks ${QUIET}, orders 3, ok 2, failed 1`,
       `| last accepted ${event(THIRD, 'ok')}`,
       `| last failure ${event(FIRST, 'rcl not enough')}`,
@@ -398,7 +399,7 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
     ],
     [
       `rustedscreep spawner at tick ${T0 + LAST_SUMMARY_AT}: ${ROOM} energy ${CAPACITY - BODY_COST}/${CAPACITY}, spawns idle 0 busy 2 held 0`,
-      '| requests 1, orders 0 (ok 0, failed 0), waiting 0, unfit 0, no spawn 1, held 0 |',
+      '| requests 1, orders 0 (ok 0, failed 0), waiting 0, unfit 0, no spawn 1, helped 0, held 0 |',
       `since boot: ticks ${LAST_SUMMARY_AT}, orders 5, ok 4, failed 1`,
       `| last accepted ${event(REARMED, 'ok')}`,
       `| console request: ${OTHER} worker`,
@@ -417,7 +418,7 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
   ]);
   wantParts.push([
     `rustedscreep spawner at tick ${T0 + HELD_AGAIN_AT}: ${ROOM} energy ${CAPACITY}/${CAPACITY}, spawns idle 0 busy 1 held 1`,
-    '| requests 1, orders 0 (ok 0, failed 0), waiting 0, unfit 0, no spawn 0, held 1 |',
+    '| requests 1, orders 0 (ok 0, failed 0), waiting 0, unfit 0, no spawn 0, helped 0, held 1 |',
     `since boot: ticks ${HELD_AGAIN_AT}, orders 8, ok 5, failed 3`,
     `| last failure ${event(OTHER_THROW, 'threw')}`,
     `| console request: ${ROOM} worker | Memory resets 1 |`,

@@ -376,17 +376,27 @@ pub const MOVEMENT_MMO: MovementConfig = MovementConfig {
     route_cache_size: 64,
 };
 
-/// Spawn path thresholds (ROADMAP P2, the minimal spawn path); `docs/TUNING.md` gives the
-/// rationale and safe range.
+/// Spawn queue thresholds (ROADMAP P2's minimal spawn path, P5's global queue); `docs/TUNING.md`
+/// gives the rationale and safe range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpawnConfig {
     /// A spawn whose `spawnCreep` call the game refused (or that threw) takes no order for this
     /// long, so another spawn of its room can take the request. Unit: ticks.
     pub hold_ticks: u32,
+    /// A request whose home is an owned room with no own spawn is served by a room with one at most
+    /// this far away (`spawning::room_distance`, the larger of the two room-coordinate differences)
+    /// whose capacity fits its body: the nearest that starts the tick full with a ready spawn while
+    /// the Standard tier runs, else the nearest, where it waits. 0: no room spawns for another
+    /// (P5.1). Default 3: a helped creep's best walk, `ROOM_SIZE` ticks a room, stays within a
+    /// tenth of `CREEP_LIFE_TIME`; safe range 0 to 10. Unit: rooms.
+    pub help_range: u32,
 }
 
-/// Spawn path values for the official MMO.
-pub const SPAWN_MMO: SpawnConfig = SpawnConfig { hold_ticks: 20 };
+/// Spawn queue values for the official MMO.
+pub const SPAWN_MMO: SpawnConfig = SpawnConfig {
+    hold_ticks: 20,
+    help_range: 3,
+};
 
 /// RCL1–3 opening thresholds (ROADMAP P2.4): worker counts, recovery, scavenging, the downgrade
 /// guard and the stall watchdog; `docs/TUNING.md` gives the rationale and safe range.
@@ -871,7 +881,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 94;
+pub const FIELD_COUNT: usize = 95;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1082,6 +1092,7 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(movement, "MovementConfig", route_retry_ticks, 1, 5000, true),
     number!(movement, "MovementConfig", route_cache_size, 4, 1024, true),
     number!(spawn, "SpawnConfig", hold_ticks, 1, 1500, true),
+    number!(spawn, "SpawnConfig", help_range, 0, 10, true),
     number!(opening, "OpeningConfig", max_workers, 1, 50, true),
     number!(opening, "OpeningConfig", min_workers, 1, 10, true),
     number!(opening, "OpeningConfig", wait_ticks, 50, 3000, true),
@@ -1370,7 +1381,10 @@ mod tests {
             upgrading: _,
             planner: _,
         } = MMO.config;
-        let SpawnConfig { hold_ticks: _ } = SPAWN_MMO;
+        let SpawnConfig {
+            hold_ticks: _,
+            help_range: _,
+        } = SPAWN_MMO;
         let OpeningConfig {
             max_workers: _,
             min_workers: _,
@@ -1503,7 +1517,7 @@ mod tests {
                     "route_cache_size",
                 ],
             ),
-            ("spawn", &["hold_ticks"]),
+            ("spawn", &["hold_ticks", "help_range"]),
             (
                 "opening",
                 &[

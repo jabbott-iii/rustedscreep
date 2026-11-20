@@ -1783,7 +1783,7 @@ impl World {
             self.movement.set_objects(room, self.footprints());
         }
         self.buffer.begin(&self.snap);
-        self.spawner.begin(&self.snap);
+        self.spawner.begin(&self.snap, &SPAWN_MMO);
         self.opening.begin(&self.snap);
         self.mining.begin(&self.snap);
         self.hauling.begin(&self.snap);
@@ -1899,7 +1899,7 @@ impl World {
                 )
                 .expect("plan");
         }
-        for unit in 0..self.spawner.close(&self.snap) {
+        for unit in 0..self.spawner.close(&self.snap, self.standard) {
             self.spawner
                 .plan_room(&self.snap, unit, &mut commit)
                 .expect("spawn plan");
