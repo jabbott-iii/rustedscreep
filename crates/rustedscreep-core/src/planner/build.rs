@@ -23,8 +23,13 @@
 //!   from the plan's anchor (it cuts the item off; the first cut-off item in the order that some
 //!   destroy opens). Never while a hostile creep is in the room (`destroy` returns `ERR_BUSY`
 //!   then, V248, V249), never while the room is at `max_sites` (the replacement could not be
-//!   sited), and never while the caller holds the last destroy's replacement open. A road never
-//!   goes under an obstacle (V237 would accept it).
+//!   sited), and never while the caller holds the last destroy's replacement open. A road needs its
+//!   tile too (ADR-026's amendment, the user's choice, 2026-11-18): it is not placed under an
+//!   obstacle (V237 would accept it), and a road that stands under one counts as missing, so an
+//!   own off-plan extension there is destroyed for it by the same rules ([`road_clears`]). Any
+//!   other obstacle (a link, a storage, tower or late structure, one the snapshot does not hold)
+//!   or an own site of another type leaves the road blocked: a road's many tiles must not take a
+//!   structure whose store or service a destroy would lose.
 //!
 //! The ground is rebuilt from the snapshot and movement's last scan before each look, which the
 //! caller makes only when something it watches changed (`economy::placement`).
@@ -288,7 +293,7 @@ pub enum TileState {
     /// An own structure of `kind` stands in the way and may be destroyed for it.
     Clear(StructureType),
     /// Something else is in the way: another site, a spawn, a structure the snapshot does not
-    /// hold, an obstacle under a planned road, or a destroy that may not happen now.
+    /// hold, or a destroy that may not happen now.
     Blocked,
 }
 
@@ -296,10 +301,15 @@ pub enum TileState {
 /// (replacing is on, no hostile creep, no destroy's replacement still open).
 ///
 /// Rules (V237): any site refuses a site; a road or a rampart may go over any structure, but a road
-/// is not placed under an obstacle; every other type is refused by any costed structure that is not
-/// a road or a rampart.
+/// is not placed under an obstacle, which it may clear as other types do (ADR-026's amendment;
+/// [`next`] narrows a road's clear to an extension, [`road_clears`]), and a road standing under
+/// one is judged as missing; every other type is refused by any costed structure that is not a
+/// road or a rampart.
 pub fn tile_state(ground: &Ground, kind: StructureType, t: Tile, destroy: bool) -> TileState {
-    if ground.stands(kind, t) {
+    // A road that stands under an obstacle (one built over it by hand) is not the plan's road: its
+    // tile is judged as if the road were missing, so the obstacle may clear.
+    let covered = kind == StructureType::Road && ground.obstructed(t);
+    if ground.stands(kind, t) && !covered {
         return TileState::Built;
     }
     match ground.site_at(t) {
@@ -309,10 +319,15 @@ pub fn tile_state(ground: &Ground, kind: StructureType, t: Tile, destroy: bool) 
     }
     match kind {
         StructureType::Road => {
-            if ground.obstructed(t) {
-                TileState::Blocked
-            } else {
+            if !covered {
                 TileState::Free
+            } else {
+                // An own obstacle off the plan (no spawn) clears; a foreign one does not. An own
+                // site of another type was refused above.
+                match ground.replaceable(t) {
+                    Some(k) if destroy && blocks(k) => TileState::Clear(k),
+                    _ => TileState::Blocked,
+                }
             }
         }
         StructureType::Rampart => TileState::Free,
@@ -382,6 +397,16 @@ fn capped(ask: &Ask<'_>, ground: &Ground, kind: StructureType) -> bool {
         .and_then(|r| 1u32.checked_shl(r))
         .is_some_and(|bit| ask.full & bit != 0);
     held || ground.count(kind) >= allowed(kind, ask.level)
+}
+
+/// Whether a due road may have an own off-plan `blocker` destroyed for it (ADR-026's amendment):
+/// only an extension, which the bot places under every gate and builds again on a plan slot, and
+/// whose store is at most `EXTENSION_ENERGY_CAPACITY`. A spawn is never cleared ([`tile_state`]);
+/// one of the economy's links, and a storage, tower or late structure, whose store or service a
+/// destroy would lose (V195, V252), keep the road blocked until the user decides otherwise for
+/// their phases (P5, P7, P9).
+fn road_clears(blocker: StructureType) -> bool {
+    blocker == StructureType::Extension
 }
 
 /// The key a due item is offered by: its type's place in [`KINDS`], its level, its tile.
@@ -481,7 +506,12 @@ pub fn next(ask: &Ask<'_>, ground: &Ground, s: &mut Scratch) -> (Next, Census) {
         let state = if ask.skip.contains(&item.tile) {
             TileState::Blocked
         } else {
-            tile_state(ground, item.kind, item.tile, destroy)
+            match tile_state(ground, item.kind, item.tile, destroy) {
+                TileState::Clear(k) if item.kind == StructureType::Road && !road_clears(k) => {
+                    TileState::Blocked
+                }
+                s => s,
+            }
         };
         match state {
             TileState::Built => census.built += 1,
@@ -851,8 +881,10 @@ mod tests {
         assert_eq!(c.blocked, 2);
     }
 
+    /// ADR-026's amendment (2026-11-18): a due road clears an own off-plan extension under it, and
+    /// goes over a container; the free road goes first by tile, then the destroy.
     #[test]
-    fn a_road_never_goes_under_an_obstacle_but_may_go_over_a_container() {
+    fn a_road_replaces_an_off_plan_extension_and_goes_over_a_container() {
         let t = open();
         let l = layout(vec![
             item(StructureType::Road, 27, 25, 1),
@@ -861,7 +893,8 @@ mod tests {
         let mut g = spawned();
         g.structure(StructureType::Extension, tile(27, 25));
         g.structure(StructureType::Container, tile(23, 25));
-        let (n, c) = next(&ask(&l, &t, 1), &g, &mut Scratch::default());
+        let mut s = Scratch::default();
+        let (n, c) = next(&ask(&l, &t, 1), &g, &mut s);
         assert_eq!(
             n,
             Next::Site {
@@ -869,7 +902,141 @@ mod tests {
                 tile: tile(23, 25)
             }
         );
-        assert_eq!(c.blocked, 1);
+        assert_eq!(
+            (c.missing, c.blocked),
+            (2, 0),
+            "the extension's road is missing, not blocked"
+        );
+        g.site(StructureType::Road, tile(23, 25));
+        let (n, c) = next(&ask(&l, &t, 1), &g, &mut s);
+        assert_eq!(
+            n,
+            Next::Destroy {
+                kind: StructureType::Extension,
+                tile: tile(27, 25)
+            }
+        );
+        assert_eq!((c.sited, c.missing), (1, 1));
+    }
+
+    /// A road's destroy keeps ADR-026's rules: not with replacing off, not while a replacement is
+    /// held open, not at the site cap, not with a hostile creep in the room.
+    #[test]
+    fn a_road_destroy_waits_like_any_other() {
+        let t = open();
+        let l = layout(vec![item(StructureType::Road, 27, 25, 1)]);
+        let mut g = spawned();
+        g.structure(StructureType::Extension, tile(27, 25));
+        let mut s = Scratch::default();
+        let mut a = ask(&l, &t, 1);
+        a.replace = false;
+        let (n, c) = next(&a, &g, &mut s);
+        assert_eq!((n, c.blocked), (Next::Idle, 1));
+        a.replace = true;
+        a.holding = true;
+        assert_eq!(
+            next(&a, &g, &mut s),
+            (
+                Next::Idle,
+                Census {
+                    due: 1,
+                    blocked: 1,
+                    ..Census::default()
+                }
+            )
+        );
+        a.holding = false;
+        a.max_sites = 0;
+        let (n, c) = next(&a, &g, &mut s);
+        assert_eq!(
+            (n, c.missing),
+            (Next::Idle, 1),
+            "at the cap it waits, counted missing"
+        );
+        a.max_sites = 10;
+        g.hostile();
+        let (n, c) = next(&a, &g, &mut s);
+        assert_eq!((n, c.blocked), (Next::Idle, 1));
+    }
+
+    /// A road clears only an off-plan extension (ADR-026's amendment): a tower, a storage and a
+    /// lab stay with their gates on, as do a spawn, one of the economy's links, a structure the
+    /// snapshot does not hold and another type's own site.
+    #[test]
+    fn a_road_clears_only_an_off_plan_extension() {
+        let t = open();
+        let l = layout(vec![
+            item(StructureType::Road, 27, 25, 1),
+            item(StructureType::Road, 27, 27, 1),
+            item(StructureType::Road, 29, 25, 1),
+            item(StructureType::Road, 23, 25, 1),
+            item(StructureType::Road, 23, 27, 1),
+            item(StructureType::Road, 25, 22, 1),
+            item(StructureType::Road, 25, 28, 1),
+            item(StructureType::Road, 21, 25, 1),
+        ]);
+        let mut g = spawned();
+        g.structure(StructureType::Tower, tile(27, 25));
+        g.structure(StructureType::Storage, tile(27, 27));
+        g.structure(StructureType::Lab, tile(29, 25));
+        g.structure(StructureType::Link, tile(23, 25));
+        g.structure(StructureType::Spawn, tile(23, 27));
+        g.obstacle(tile(25, 22));
+        g.site(StructureType::Extension, tile(25, 28));
+        g.structure(StructureType::Extension, tile(21, 25));
+        let mut s = Scratch::default();
+        let mut a = ask(&l, &t, 1);
+        for gates in [
+            Gates::default(),
+            Gates {
+                storage: true,
+                towers: true,
+                ramparts: true,
+                late: true,
+            },
+        ] {
+            a.gates = gates;
+            let (n, c) = next(&a, &g, &mut s);
+            assert_eq!(
+                n,
+                Next::Destroy {
+                    kind: StructureType::Extension,
+                    tile: tile(21, 25)
+                },
+                "{gates:?}"
+            );
+            assert_eq!((c.due, c.blocked, c.missing), (8, 7, 1), "{gates:?}");
+        }
+    }
+
+    /// A road that stands under an own off-plan extension (one built over it by hand) is not
+    /// counted as built: the extension clears for it, and with replacing off the road is blocked.
+    #[test]
+    fn a_road_standing_under_an_extension_is_cleared_not_counted_built() {
+        let t = open();
+        let l = layout(vec![item(StructureType::Road, 27, 25, 1)]);
+        let mut g = spawned();
+        g.road(tile(27, 25));
+        g.structure(StructureType::Extension, tile(27, 25));
+        let mut s = Scratch::default();
+        let (n, c) = next(&ask(&l, &t, 1), &g, &mut s);
+        assert_eq!(
+            n,
+            Next::Destroy {
+                kind: StructureType::Extension,
+                tile: tile(27, 25)
+            }
+        );
+        assert_eq!((c.built, c.missing), (0, 1));
+        let mut a = ask(&l, &t, 1);
+        a.replace = false;
+        let (n, c) = next(&a, &g, &mut s);
+        assert_eq!((n, c.built, c.blocked), (Next::Idle, 0, 1));
+        // A plain standing road is built.
+        let mut plain = spawned();
+        plain.road(tile(27, 25));
+        let (_, c) = next(&ask(&l, &t, 1), &plain, &mut s);
+        assert_eq!((c.built, c.missing), (1, 0));
     }
 
     #[test]

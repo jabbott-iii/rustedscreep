@@ -2125,7 +2125,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"b5d2f8bf4d00-dirty-421df93f","wasmCrc32":"421df93f","features":[],"wasmParts":[653044,653044]});
+const BUILD = ({"id":"e67a8397e368-dirty-f1a04fc6","wasmCrc32":"f1a04fc6","features":[],"wasmParts":[653104,653104]});
 const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;

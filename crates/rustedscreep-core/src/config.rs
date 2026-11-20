@@ -616,7 +616,9 @@ pub struct PlannerConfig {
     /// Destroys an own structure that stands off the plan where a planned structure due at the
     /// room's level and placed by the bot needs its tile, or that cuts one off from the plan's
     /// first spawn (ADR-026): one at a time per room, never a spawn, never with a hostile creep in
-    /// the room. Off, such a planned structure waits.
+    /// the room. A due road counts too (ADR-026's amendment, 2026-11-18), but clears only an
+    /// off-plan extension (never a link, tower, storage or late structure, whose store or service a
+    /// destroy would lose). Off, such a planned structure waits.
     pub replace: bool,
     /// Places the storage and the hub link (nothing uses them before P5 and P6; the user's choice,
     /// 2026-11-18). Like every gate here, off it also leaves out the plan's roads that serve only

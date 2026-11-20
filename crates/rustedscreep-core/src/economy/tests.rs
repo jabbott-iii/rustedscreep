@@ -7167,6 +7167,80 @@ mod plan_path {
         assert_eq!((t.destroys, t.destroyed, t.refused), (2, 2, 1));
     }
 
+    /// ADR-026's amendment through the placement: two due roads each under an own off-plan
+    /// extension, in a room at its extension count with two plan slots waiting. One destroy at a
+    /// time: the first road's extension goes, the freed count takes a plan slot (an extension
+    /// comes before a road in `KINDS`), the road is sited, and only then does the second road's
+    /// extension go, followed by the second slot and road. No destroy while the room is at
+    /// `planner.max_sites`.
+    ///
+    /// Uses: `CONTROLLER_STRUCTURES` (through `earliest_level` and `allowed`).
+    #[test]
+    fn a_road_destroy_holds_until_the_freed_slot_and_the_road_are_sited() {
+        let level = level_of(Extension);
+        let n = allowed(Extension, level);
+        assert!(n >= 2, "two plan slots wait");
+        let slots: Vec<Tile> = (0..n)
+            .map(|i| tile(21 + 2 * u8::try_from(i).expect("small"), 30))
+            .collect();
+        let [r1, r2] = roads();
+        let mut items: Vec<Item> = slots.iter().map(|&t| item(Extension, t, level)).collect();
+        items.extend(road_items());
+        let mut b = Bench::new(level, items, Roles::default());
+        // The room is at its count: every slot but the first two built, and the two roads' tiles
+        // each under an off-plan extension.
+        for &t in slots.iter().skip(2) {
+            b.build(Extension, t);
+        }
+        b.build(Extension, r1);
+        b.build(Extension, r2);
+        let mut actions = Vec::new();
+        for _ in 0..40 {
+            let (orders, destroys) = b.tick();
+            actions.extend(destroys.iter().map(|d| (true, d.kind, d.tile)));
+            actions.extend(orders.iter().map(|o| (false, o.kind, o.tile)));
+            if actions.len() >= 6 {
+                break;
+            }
+        }
+        assert_eq!(
+            actions,
+            vec![
+                (true, Extension, r1),
+                (false, Extension, slots[0]),
+                (false, Road, r1),
+                (true, Extension, r2),
+                (false, Extension, slots[1]),
+                (false, Road, r2),
+            ]
+        );
+        let t = *b.placement.totals();
+        assert_eq!((t.destroys, t.destroyed), (2, 2));
+        let c = b.census().expect("a census");
+        assert_eq!((c.blocked, c.capped), (0, 0));
+
+        // At the site cap the road's extension stays.
+        let mut capped = Bench::new(
+            level,
+            slots
+                .iter()
+                .map(|&t| item(Extension, t, level))
+                .chain(road_items())
+                .collect(),
+            Roles::default(),
+        );
+        for &t in slots.iter().skip(2) {
+            capped.build(Extension, t);
+        }
+        capped.build(Extension, r1);
+        capped.build(Extension, r2);
+        capped.pcfg.max_sites = 0;
+        for _ in 0..5 {
+            let (orders, destroys) = capped.tick();
+            assert!(orders.is_empty() && destroys.is_empty());
+        }
+    }
+
     /// A destroy holds the next one open only for a replacement the bot places now: the storage
     /// gate turned off while the storage tile's blocker is being destroyed leaves nothing to hold
     /// for, so the tower tile's blocker is destroyed on the next look, not `verify_ticks` later;
