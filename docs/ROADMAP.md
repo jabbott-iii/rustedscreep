@@ -137,10 +137,10 @@ Modules:
 - [x] Candidates: a stamp/bunker planner, and distance transform with min-cut ramparts. Benchmark both, then decide ADR-007 (decided 2026-11-18: (b), the flood fill with min-cut ramparts).
 - [x] Placement of extensions, towers, labs, storage, terminal, links, roads, and ramparts. Incremental site placement per RCL, cached, with periodic verification. It keeps or replaces the interim extensions P2 placed (ADR-020) and takes over from `opening.place_extensions`.
 
-**Gate:**
-- [ ] The planner is deterministic and valid on the whole corpus: counts per RCL come from constants, and every structure is reachable.
-- [ ] Criterion bench numbers are recorded.
-- [ ] The planner runs time-sliced in the Optional tier.
+**Gate:** passed 2026-11-19.
+- [x] The planner is deterministic and valid on the whole corpus: counts per RCL come from constants, and every structure is reachable.
+- [x] Criterion bench numbers are recorded.
+- [x] The planner runs time-sliced in the Optional tier.
 
 ## P5 Global spawn queue (SPEC §3.4)
 Modules:
