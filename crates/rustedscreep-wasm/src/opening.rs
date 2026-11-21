@@ -408,10 +408,12 @@ impl OpeningGlue {
                 upgrade_work_job,
                 upgrades,
                 |unit, commit| {
-                    let taken = upgrading
-                        .work_room_name(unit)
-                        .map_or(&[][..], |room| core.taken(room));
-                    upgrading.work_room(unit, snapshot, movement, buffer, mcfg, taken, commit)
+                    let room = upgrading.work_room_name(unit);
+                    let taken = room.map_or(&[][..], |room| core.taken(room));
+                    let hauled = room.map_or(&[][..], |room| hauling.view(room).taken);
+                    upgrading.work_room(
+                        unit, snapshot, movement, buffer, mcfg, taken, hauled, commit,
+                    )
                 },
             );
         }

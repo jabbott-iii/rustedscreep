@@ -2022,6 +2022,7 @@ impl World {
         for unit in 0..self.upgrading.work_count() * u32::from(self.standard) {
             let room = self.upgrading.work_room_name(unit).expect("room");
             let taken = self.opening.taken(room).to_vec();
+            let hauled = self.hauling.view(room).taken.to_vec();
             self.upgrading
                 .work_room(
                     unit,
@@ -2030,6 +2031,7 @@ impl World {
                     &mut self.buffer,
                     &mcfg,
                     &taken,
+                    &hauled,
                     &mut commit,
                 )
                 .expect("upgrading work");
@@ -3974,6 +3976,231 @@ fn job_leads_come_from_their_plans() {
     assert_eq!(upgrader_lead(&none, &on), 0);
 }
 
+/// P5.3: ticks on which the room's spawn queue had waited for energy on the tick before (what
+/// the jobs read), the spawns and extensions had more room than the haulers held, and an empty
+/// hauler waited next to a mining tile though a store it may take from held a whole load for it: a
+/// container on a mining tile no hauler of its own takes from, or the controller container, after
+/// this tick's takes by the other haulers (each reserves its free room); all as the tick's snapshot
+/// shows them (what the job saw), over `ticks` ticks of `w`.
+fn haulers_waiting_by_stores(w: &mut World, ticks: u32) -> u32 {
+    let mut seen = 0;
+    // Whether the queue waited for energy on the last tick: `Spawner::waits_for_energy`'s input,
+    // read here whatever `spawn.refill_from_stores` (one room, so any wait is its).
+    let mut waited_last = false;
+    for _ in 0..ticks {
+        w.step();
+        let waited = std::mem::replace(&mut waited_last, w.spawner.stats().idle_energy > 0);
+        if !waited {
+            continue;
+        }
+        let snap = &w.snap;
+        let tiles = w.mining.mine_tiles(w.room);
+        let hauled: Vec<Position> = w
+            .hauling
+            .plan(w.room)
+            .map(|p| {
+                p.sources
+                    .iter()
+                    .filter(|s| s.want > 0)
+                    .map(|s| s.tile)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let st = &snap.structures;
+        let fill_room: u32 = (0..st.len())
+            .filter(|&k| {
+                matches!(
+                    st.kinds()[k],
+                    StructureType::Spawn | StructureType::Extension
+                )
+            })
+            .map(|k| st.free_energy()[k])
+            .sum();
+        let tasks: Vec<(Option<HaulTask>, CreepStore)> = (0..snap.creeps.len())
+            .map(|row| {
+                let h = snap.creeps.handles()[row];
+                (w.hauling.task(h), snap.creeps.stores()[row])
+            })
+            .collect();
+        let held: u32 = tasks
+            .iter()
+            .filter(|t| t.0.is_some())
+            .map(|t| t.1.energy)
+            .sum();
+        if fill_room <= held {
+            continue;
+        }
+        let containers: Vec<(Position, u32)> = (0..snap.objects.len())
+            .filter(|&k| {
+                let p = snap.objects.positions()[k];
+                snap.objects.kinds()[k] == ObjectKind::Container
+                    && tiles.contains(&p)
+                    && !hauled.contains(&p)
+            })
+            .map(|k| {
+                let h = snap.objects.handles()[k];
+                let taken: u32 = tasks
+                    .iter()
+                    .filter(|t| t.0 == Some(HaulTask::Take(h)))
+                    .map(|t| t.1.free())
+                    .sum();
+                (
+                    snap.objects.positions()[k],
+                    snap.objects.amounts()[k].saturating_sub(taken),
+                )
+            })
+            .collect();
+        let waited = tasks.iter().any(|&(task, store)| {
+            let Some(HaulTask::Wait(at)) = task else {
+                return false;
+            };
+            store.energy == 0
+                && store.free() > 0
+                && containers
+                    .iter()
+                    .any(|&(p, a)| p != at && a >= store.free())
+        });
+        if waited {
+            seen += 1;
+        }
+    }
+    seen
+}
+
+/// Uses: CREEP_LIFE_TIME (P5.3, TEST_PLAN §7). In a world of one room the spawns stand idle with
+/// a request only for energy (no hold, no help gate), at RCL3 to RCL5 over two lives; and while the
+/// queue waits for energy and the spawns have more room than the haulers hold, no empty hauler
+/// waits next to a mining tile while a mining tile no hauler takes from, or the controller
+/// container, holds a whole load for it.
+#[test]
+fn a_waiting_queue_idles_only_for_energy() {
+    for level in [3u8, 4, 5] {
+        let mut w = World::new(level, SPAWN_ENERGY_CAPACITY);
+        let seen = haulers_waiting_by_stores(&mut w, 2 * CREEP_LIFE_TIME);
+        assert_eq!(seen, 0, "RCL{level}: a hauler waited by a full store");
+        let t = *w.spawner.totals();
+        assert!(t.idle_energy > 0, "RCL{level}: {t:?}");
+        assert_eq!((t.idle_held, t.idle_help), (0, 0), "RCL{level}: {t:?}");
+        assert_eq!(w.failed, 0);
+    }
+}
+
+/// Uses: CONTAINER_CAPACITY (P5.3, TEST_PLAN §7). A scene at RCL4: a miner is gone, so the room
+/// asks for one, with every spawn and extension empty, so it waits for energy; every hauler is
+/// empty, and every mining tile's store too, but the controller container is full. On the next tick
+/// (the jobs read the last tick's wait) with `spawn.refill_from_stores` on, an empty hauler takes a
+/// load from the controller container and a worker with energy fills, and once the spawns are full
+/// that hauler never stores the load back; with it off, the haulers wait at their tiles and no
+/// worker fills.
+#[test]
+fn stored_energy_goes_to_a_waiting_spawn() {
+    let scene = |refill: bool| {
+        let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+        w.spawn_cfg.refill_from_stores = refill;
+        w.run(4000);
+        let first = w
+            .creeps
+            .iter()
+            .position(|c| c.identity.role == Role::Miner)
+            .expect("a miner");
+        w.creeps.remove(first);
+        let tiles: Vec<Tile> = w
+            .mining
+            .mine_tiles(w.room)
+            .iter()
+            .map(|&p| tile_of(p))
+            .collect();
+        let controller = tile_of(
+            mine_plan(&w)
+                .controller_container
+                .expect("a controller container"),
+        );
+        w.loose
+            .retain(|l| !matches!(*l, Loose::Pile { at, .. } if tiles.contains(&at)));
+        for &t in &tiles {
+            set_container_energy(
+                &mut w,
+                t,
+                if t == controller {
+                    CONTAINER_CAPACITY
+                } else {
+                    0
+                },
+            );
+        }
+        for c in w.creeps.iter_mut() {
+            match c.identity.role {
+                Role::Hauler => c.energy = 0,
+                Role::Worker => c.energy = c.capacity(),
+                _ => {}
+            }
+        }
+        // Two ticks: the first waits (and empties the stores' sides again), the second reads it.
+        for _ in 0..2 {
+            for s in w.stores.iter_mut().filter(|s| s.spawn_energy()) {
+                s.energy = 0;
+            }
+            w.step();
+        }
+        let cc = mine_plan(&w)
+            .controller_container
+            .expect("a controller container");
+        let to_cc = |w: &World, o: crate::snapshot::ObjectHandle| {
+            w.snap
+                .objects
+                .row_of(o)
+                .map(|r| w.snap.objects.positions()[r])
+                == Some(cc)
+        };
+        let taker = w.creeps.iter().find_map(|c| {
+            let h = w.snap.creeps.handle_of(ObjectKey(c.key))?;
+            matches!(w.hauling.task(h), Some(HaulTask::Take(o)) if to_cc(&w, o)).then_some(c.key)
+        });
+        let (_, _, _, os) = w.opening.room_states().next().expect("room");
+        let (filling, idle) = (os.tasks[2], w.spawner.stats().idle_energy);
+        // The queue keeps waiting until that hauler holds the load; then the spawns are full, and
+        // the load it took is never stored back in the container.
+        let mut stored_back = false;
+        if let Some(key) = taker {
+            for _ in 0..40 {
+                if w.creeps.iter().any(|c| c.key == key && c.energy > 0) {
+                    break;
+                }
+                for s in w.stores.iter_mut().filter(|s| s.spawn_energy()) {
+                    s.energy = 0;
+                }
+                w.step();
+            }
+            assert!(
+                w.creeps.iter().any(|c| c.key == key && c.energy > 0),
+                "the hauler took its load"
+            );
+            for _ in 0..30 {
+                for s in w.stores.iter_mut().filter(|s| s.spawn_energy()) {
+                    s.energy = s.capacity;
+                }
+                w.step();
+                let h = w.snap.creeps.handle_of(ObjectKey(key));
+                stored_back |= h.is_some_and(
+                    |h| matches!(w.hauling.task(h), Some(HaulTask::Store(o)) if to_cc(&w, o)),
+                );
+            }
+        }
+        (taker.is_some(), filling, idle, stored_back)
+    };
+    let (taking, filling, idle, stored_back) = scene(true);
+    assert!(idle > 0, "the queue still waits");
+    assert!(taking, "a hauler takes from the controller container");
+    assert!(filling > 0, "a worker fills");
+    assert!(!stored_back, "the load is not stored back");
+    let (taking, filling, _, _) = scene(false);
+    assert!(
+        !taking,
+        "off: no hauler takes from the controller container"
+    );
+    assert_eq!(filling, 0, "off: no worker fills while the haulers do");
+}
+
 /// P5.2, after a global reset (mining's heap state lost) on a tick a successor stands next to its
 /// source, waiting: on the next tick the old miner takes its tile's source back and the successor its slot
 /// beside it (the old miner is seen as due within the same pass), so no miner is asked for that
@@ -5440,7 +5667,8 @@ fn haulers_raise_the_upgrade_rate() {
 /// MOVE parts only, at most `max_per_source` a source besides those due for replacement (P5.2).
 /// They fill the spawns and extensions and
 /// carry the rest into the container; the workers (from P3.4 the upgraders) take it there, the
-/// workers are sized with no walk, and fill nothing while a hauler hauls a mined source.
+/// workers are sized with no walk, and fill nothing while a hauler hauls a mined source (unless
+/// the room's spawn queue waits for energy, P5.3).
 #[test]
 fn haulers_carry_a_sources_energy_to_the_controller_container() {
     let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
@@ -5487,7 +5715,8 @@ fn haulers_carry_a_sources_energy_to_the_controller_container() {
             hs.haulers,
             hs.due
         );
-        if hs.hauled > 0 {
+        // Unless the room's spawn queue waited for energy (P5.3), the input the jobs read.
+        if hs.hauled > 0 && !w.spawner.waits_for_energy(w.room) {
             assert_eq!(os.tasks[2], 0, "no worker fills while a hauler hauls");
         }
         takes_there += w

@@ -27,7 +27,9 @@
 //! one ([`HaulView::redirect`]): its gatherers take its energy at the controller container and its
 //! workers are sized with no walk; energy the haulers take this tick is not offered to gatherers,
 //! nor room they fill to fillers, nor at all a spawn or extension a hauler's transfer goes into this
-//! tick (P3.4); and while a hauler hauls a mined source no worker fills, except in a recovery.
+//! tick (P3.4); and while a hauler hauls a mined source no worker fills, except in a recovery or
+//! while the room's spawn queue waits for energy (P5.3, `Spawner::waits_for_energy`: the workers
+//! then fill too, from the room's piles and containers).
 //!
 //! Upgraders (P3.4, `economy::upgrading`): while the room's upgraders take the energy at the
 //! controller ([`UpgradeView::takes`]), a linked or hauled source gets no worker of its own (the
@@ -671,7 +673,9 @@ impl Opening {
         }
 
         // Modes and tasks, then the Critical tasks' intents and moves. Working haulers fill the
-        // room (P3.3), except in a recovery.
+        // room (P3.3), except in a recovery, or while its spawn queue waits for energy (P5.3: then
+        // the workers fill too, from the room's piles and containers).
+        let refill = spawner.waits_for_energy(name);
         self.assign(
             ri,
             snap,
@@ -680,7 +684,7 @@ impl Opening {
             rcfg,
             guard && !state.upgrade_blocked,
             state,
-            !haul.fills || recovering,
+            !haul.fills || recovering || refill,
             upgrade.takes,
             upgrade.sources,
         );

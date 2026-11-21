@@ -1309,3 +1309,105 @@ fn the_default_help_ranges_best_walk_is_a_tenth_of_a_life() {
     assert!(walk(SPAWN_MMO.help_range) * 10 <= CREEP_LIFE_TIME);
     assert!(walk(SPAWN_MMO.help_range + 1) * 10 > CREEP_LIFE_TIME);
 }
+
+/// Uses: BODYPART_COST (through the pattern's cost). P5.3: a spawn that is not spawning and takes
+/// no order while its room has a request it plans is counted idle, by cause. Waiting for energy:
+/// the spawn that could not pay and every ready spawn after it (one ready spawn of two orders, the
+/// other waits); the room is then the one `waits_for_energy` names on the next tick, and no longer
+/// once it orders, or with `spawn.refill_from_stores` off, or after a reset. Held after a refused
+/// call: each held spawn of a room given a request. Gated off helping: each ready spawn of a room
+/// given only another room's request on a tick it does not help. Totals add up across ticks.
+#[test]
+fn idle_spawns_with_a_queue_are_counted_by_cause() {
+    let unit = unit_cost(&WORKER_PATTERN);
+    let cfg = SPAWN_MMO;
+    let spawns = [spawn(1, "W1N1", 20), spawn(2, "W1N1", 30)];
+    let top = capped(worker("W1N1", EnergyBudget::Capacity, 9), 2);
+    let mut sp = Spawner::default();
+
+    // Both spawns ready, the top request two repeats, the room one short of them: both idle.
+    let mut snap = snap_at(T0, &[("W1N1", energy(2 * unit - 1, 3 * unit))], &spawns);
+    plan(&mut sp, &snap, &[top]);
+    assert!(sp.orders().is_empty());
+    assert_eq!((sp.stats().idle_energy, sp.stats().idle_help), (2, 0));
+    assert!(
+        !sp.waits_for_energy(room("W1N1")),
+        "this tick's wait shows from the next"
+    );
+
+    // Next tick it names the room; the room pays one order and the second request waits.
+    fill(
+        &mut snap,
+        T0 + 1,
+        &[("W1N1", energy(3 * unit, 3 * unit))],
+        &spawns,
+    );
+    sp.begin(&snap, &cfg);
+    assert!(sp.waits_for_energy(room("W1N1")));
+    assert!(!sp.waits_for_energy(room("W2N1")));
+    sp.request(top).expect("open");
+    sp.request(top).expect("open");
+    let mut commit = Commit::default();
+    for unit in 0..sp.close(&snap, true) {
+        sp.plan_room(&snap, unit, &mut commit).expect("plan");
+    }
+    assert_eq!(sp.orders().len(), 1);
+    assert_eq!(sp.stats().idle_energy, 1, "the second spawn waits");
+    assert_eq!(sp.totals().idle_energy, 3);
+
+    // A room that orders all it is asked is not named; off, no room is.
+    fill(
+        &mut snap,
+        T0 + 2,
+        &[("W1N1", energy(3 * unit, 3 * unit))],
+        &spawns,
+    );
+    plan(&mut sp, &snap, &[top]);
+    assert_eq!(sp.stats().idle_energy, 0);
+    let off = SpawnConfig {
+        refill_from_stores: false,
+        ..SPAWN_MMO
+    };
+    fill(&mut snap, T0 + 3, &[("W1N1", energy(0, 3 * unit))], &spawns);
+    plan_with(&mut sp, &snap, &[top], &off, true);
+    assert_eq!(sp.stats().idle_energy, 2);
+    fill(&mut snap, T0 + 4, &[("W1N1", energy(0, 3 * unit))], &spawns);
+    sp.begin(&snap, &off);
+    assert!(!sp.waits_for_energy(room("W1N1")), "refill off");
+    sp.begin(&snap, &cfg);
+    assert!(
+        !Spawner::default().waits_for_energy(room("W1N1")),
+        "a reset starts empty"
+    );
+
+    // Held: a refused call holds spawn 1; while the request waits, it counts as held.
+    let one = capped(worker("W1N1", EnergyBudget::Available, 1), 1);
+    fill(&mut snap, T0 + 5, &[("W1N1", energy(unit, unit))], &spawns);
+    plan(&mut sp, &snap, &[one]);
+    let first = sp.orders().iter().position(|o| o.spawn == handle(&snap, 1));
+    sp.record(
+        first.expect("spawn 1 ordered"),
+        Outcome::Failed(ErrorCode::RclNotEnough),
+        &cfg,
+    );
+    let held_before = sp.totals().idle_held;
+    fill(&mut snap, T0 + 6, &[("W1N1", energy(0, unit))], &spawns);
+    plan(&mut sp, &snap, &[one]);
+    assert_eq!((sp.stats().held, sp.stats().idle_energy), (1, 1));
+    assert_eq!(sp.totals().idle_held, held_before + 1);
+
+    // Gated off helping: a home with no spawn, served by W1N1, on a tick it does not help.
+    let mut sp = Spawner::default();
+    let mut snap = Snapshot::default();
+    fill(
+        &mut snap,
+        T0,
+        &[("W1N1", energy(3 * unit, 3 * unit)), ("W2N1", energy(0, 0))],
+        &spawns,
+    );
+    let helped = capped(worker("W2N1", EnergyBudget::Capacity, 9), 1);
+    plan_with(&mut sp, &snap, &[helped], &cfg, false);
+    assert!(sp.orders().is_empty());
+    assert_eq!((sp.stats().idle_help, sp.stats().idle_energy), (2, 0));
+    assert_eq!(sp.totals().idle_help, 2);
+}

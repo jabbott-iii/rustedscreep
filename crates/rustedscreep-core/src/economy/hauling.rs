@@ -25,7 +25,11 @@
 //! A hauler gathers until its store is full and delivers until it is empty. Gathering, it takes the
 //! pile on its source's mining tile first (piles decay, V193), else a whole load from the container
 //! there, else waits next to the tile; one whose source has no miner next to it delivers what it
-//! holds. Delivering, it fills the spawns and extensions with room (nearest first, reserved per
+//! holds. While the room's spawn queue waits for energy (P5.3, `Spawner::waits_for_energy`) it
+//! does not wait: what it holds goes to the spawns at once while they have room, and, while they
+//! have more room than the haulers hold, an empty one takes a whole load from a mining tile no
+//! hauler takes from (a pile before a container), the nearest, else from the controller container;
+//! a load from the controller container is never stored back there (it waits for the spawns' room). Delivering, it fills the spawns and extensions with room (nearest first, reserved per
 //! tick; last tick's fillers first), else the controller container while it has room. Its intent
 //! goes out on the tick it starts next to the target; its task is chosen again next tick.
 //!
@@ -276,6 +280,9 @@ struct Hauler {
     /// The source it hauls for (by position: sources never move).
     source: Option<Position>,
     task: HaulTask,
+    /// What it holds came from the controller container for a waiting spawn queue (P5.3): it is
+    /// never stored back there, so a take and a store never cancel out. Cleared once it is empty.
+    from_store: bool,
 }
 
 /// Hauling's state for one global.
@@ -559,7 +566,9 @@ impl Hauling {
             }
         }
 
-        self.assign_tasks(ri, snap, members, mined);
+        // P5.3: while the room's spawn queue waits for energy, haulers bring it from other stores.
+        let refill = spawner.waits_for_energy(name);
+        self.assign_tasks(ri, snap, members, mined, refill);
         let mut standard = false;
         for i in members.0..members.1 {
             let Some(task) = self.task_of(i, snap) else {
@@ -670,6 +679,7 @@ impl Hauling {
                 },
                 source: None,
                 task: HaulTask::Idle,
+                from_store: false,
             });
         }
         cell.as_mut()
@@ -914,10 +924,32 @@ impl Hauling {
         snap: &Snapshot,
         members: (usize, usize),
         mined: &[Mined],
+        refill: bool,
     ) {
         let blocked = std::mem::take(&mut self.blocked);
         let mut delivering = std::mem::take(&mut self.delivering);
         delivering.clear();
+        // P5.3: the room the spawns and extensions have left, and of it what the haulers' loads do
+        // not cover yet: a hauler is sent to another store only while some is left, each for its
+        // free room.
+        let fill_room = self
+            .fills
+            .iter()
+            .filter(|f| !blocked.contains(&f.1))
+            .fold(0u32, |a, f| a.saturating_add(f.2));
+        let held = self
+            .members
+            .get(members.0..members.1)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|m| !snap.creeps.spawning().get(m.row).copied().unwrap_or(true))
+            .filter_map(|m| snap.creeps.stores().get(m.row))
+            .fold(0u32, |a, s| a.saturating_add(s.energy));
+        let mut need = if refill {
+            fill_room.saturating_sub(held)
+        } else {
+            0
+        };
         for i in members.0..members.1 {
             let Some(m) = self.members.get(i).copied() else {
                 continue;
@@ -939,6 +971,9 @@ impl Hauling {
             }
             if store.energy == 0 {
                 mode = Mode::Gather;
+                if let Some(hm) = self.hauler_mut(i, snap) {
+                    hm.from_store = false;
+                }
             } else if store.free() == 0 {
                 mode = Mode::Deliver;
             }
@@ -980,6 +1015,47 @@ impl Hauling {
                             l.3 = l.3.saturating_sub(free);
                             Some(HaulTask::Take(l.0))
                         }
+                        // P5.3: the room's spawn queue waits for energy. What it holds goes to the
+                        // spawns now while they have room; an empty one, while the haulers' loads
+                        // leave some of that room, takes a whole load from a store no hauler of
+                        // its own takes from (a linked source's mining tile; a pile before a
+                        // container), the nearest, else from the controller container, rather
+                        // than wait.
+                        None if refill && store.energy > 0 && fill_room > 0 => None,
+                        None if need > 0 && store.energy == 0 => {
+                            let load = free.max(1);
+                            let wants = &self.wants;
+                            let hauled = |p: Position| wants.iter().any(|w| w.2 == p && w.1 > 0);
+                            let other = self
+                                .loose
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, l)| {
+                                    l.1 != tile
+                                        && !hauled(l.1)
+                                        && l.3 >= load
+                                        && !blocked.contains(&l.1)
+                                })
+                                .min_by_key(|(_, l)| {
+                                    let pile = l.2 == ObjectKind::Energy;
+                                    (range(at, l.1), !pile, l.1.x().u8(), l.1.y().u8())
+                                })
+                                .map(|(k, _)| k);
+                            if let Some(l) = other.and_then(|k| self.loose.get_mut(k)) {
+                                l.3 = l.3.saturating_sub(free);
+                                need = need.saturating_sub(free);
+                                Some(HaulTask::Take(l.0))
+                            } else if let Some((h, pos, room)) = self.container
+                                && CONTAINER_CAPACITY.saturating_sub(room) >= load
+                                && !blocked.contains(&pos)
+                            {
+                                self.container = Some((h, pos, room.saturating_add(free)));
+                                need = need.saturating_sub(free);
+                                Some(HaulTask::Take(h))
+                            } else {
+                                Some(HaulTask::Wait(tile))
+                            }
+                        }
                         None if store.energy > 0 && !mined_now => None,
                         None => Some(HaulTask::Wait(tile)),
                     }
@@ -988,6 +1064,12 @@ impl Hauling {
                     Some(t) => {
                         if let HaulTask::Take(o) = t {
                             self.claim(ri, o, free);
+                            // A load from the controller container is never stored back (P5.3).
+                            if self.container.is_some_and(|c| c.0 == o)
+                                && let Some(hm) = self.hauler_mut(i, snap)
+                            {
+                                hm.from_store = true;
+                            }
                         }
                         self.set_task(i, snap, Mode::Gather, t);
                         continue;
@@ -1038,6 +1120,7 @@ impl Hauling {
                     .min_by_key(|(j, f)| (range(at, f.1), *j))
                     .map(|(j, _)| j)
             });
+            let from_store = self.hauler(m.handle).is_some_and(|h| h.from_store);
             let task = match pick.and_then(|j| self.fills.get_mut(j)) {
                 Some(f) => {
                     let claim = energy.min(f.2);
@@ -1057,6 +1140,8 @@ impl Hauling {
                 }
                 // The container only with room for its load or a CARRY part's worth: no walk to move
                 // a few energy (a billed transfer).
+                // A load the controller container gave for the spawns waits for their room instead.
+                None if from_store => HaulTask::Idle,
                 None => match self.container.as_mut() {
                     Some(c)
                         if c.2 >= energy.clamp(1, CARRY_CAPACITY) && !blocked.contains(&c.1) =>

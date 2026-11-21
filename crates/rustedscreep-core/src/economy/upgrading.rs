@@ -642,7 +642,9 @@ impl Upgrading {
 
     /// The Standard half of the tick for unit `unit` of [`Upgrading::work_count`]: that room's
     /// withdraws, upgrades and moves. `taken` is what the opening's workers take this tick
-    /// (`Opening::taken`), per store: it is not offered again.
+    /// (`Opening::taken`) and `hauled` what the haulers take (`HaulView::taken`: since P5.3 a
+    /// hauler may take from the controller container while the room's spawn queue waits for
+    /// energy), per store: neither is offered again.
     #[allow(clippy::too_many_arguments)]
     pub fn work_room(
         &mut self,
@@ -652,6 +654,7 @@ impl Upgrading {
         buffer: &mut IntentBuffer,
         mcfg: &MovementConfig,
         taken: &[(Target, u32)],
+        hauled: &[(ObjectHandle, u32)],
         commit: &mut Commit,
     ) -> Result<(), Fault> {
         let ri = usize::try_from(unit)
@@ -665,11 +668,16 @@ impl Upgrading {
                 .get_mut(ri)
                 .ok_or(Fault::new("no room for the unit", unit))?;
             for s in &mut r.stores {
+                let target = s.0.target();
                 let took = taken
                     .iter()
-                    .filter(|t| t.0 == s.0.target())
+                    .filter(|t| t.0 == target)
                     .fold(0u32, |a, t| a.saturating_add(t.1));
-                s.2 = s.2.saturating_sub(took);
+                let hauls = hauled
+                    .iter()
+                    .filter(|t| Target::Object(t.0) == target)
+                    .fold(0u32, |a, t| a.saturating_add(t.1));
+                s.2 = s.2.saturating_sub(took).saturating_sub(hauls);
             }
             r.unreachable.retain(|&(_, until)| now < until);
             // The best post movement has not found unreachable (as `assign_posts` filters them).

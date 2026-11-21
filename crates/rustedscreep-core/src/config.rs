@@ -405,6 +405,14 @@ pub struct SpawnConfig {
     /// that waits longer leaves the post empty for the rest. The lead stays at most half a life
     /// whatever this is. Default 20; safe range 0 to 300. Unit: ticks.
     pub replace_margin_ticks: u32,
+    /// While a room's spawn queue waits for energy (P5.3, `Spawner::waits_for_energy`), bring it
+    /// the energy that lies in the room's stores: its workers fill the spawns and extensions even
+    /// while haulers fill, taking from piles and containers, and while the spawns have more room
+    /// than the haulers hold, an empty hauler with too little at its own mining tile for a load
+    /// takes one from a mining tile no hauler takes from or from the controller container (never
+    /// storing that load back). Off, the queue waits for what the haulers bring from their sources.
+    /// Unit: flag.
+    pub refill_from_stores: bool,
 }
 
 /// Spawn queue values for the official MMO.
@@ -413,6 +421,7 @@ pub const SPAWN_MMO: SpawnConfig = SpawnConfig {
     help_range: 3,
     replace: true,
     replace_margin_ticks: 20,
+    refill_from_stores: true,
 };
 
 /// RCL1–3 opening thresholds (ROADMAP P2.4): worker counts, recovery, scavenging, the downgrade
@@ -899,7 +908,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 97;
+pub const FIELD_COUNT: usize = 98;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1113,6 +1122,7 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(spawn, "SpawnConfig", help_range, 0, 10, true),
     flag!(spawn, "SpawnConfig", replace, true),
     number!(spawn, "SpawnConfig", replace_margin_ticks, 0, 300, true),
+    flag!(spawn, "SpawnConfig", refill_from_stores, true),
     number!(opening, "OpeningConfig", max_workers, 1, 50, true),
     number!(opening, "OpeningConfig", min_workers, 1, 10, true),
     number!(opening, "OpeningConfig", wait_ticks, 50, 3000, true),
@@ -1406,6 +1416,7 @@ mod tests {
             help_range: _,
             replace: _,
             replace_margin_ticks: _,
+            refill_from_stores: _,
         } = SPAWN_MMO;
         let OpeningConfig {
             max_workers: _,
@@ -1546,6 +1557,7 @@ mod tests {
                     "help_range",
                     "replace",
                     "replace_margin_ticks",
+                    "refill_from_stores",
                 ],
             ),
             (

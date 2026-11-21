@@ -33,7 +33,9 @@
 //   null Memory (V181), on the lower-id spawn with both ready; the bot logs the message, resets the raw string to
 //   `{}` (RawMemory.set, kept by the end-of-tick save, V180), notifies once and, the spawn released, spawns from it on
 //   the next tick; a later throw with a usable Memory (the other spawn's, while the first is busy) resets nothing and
-//   holds the spawn; the two throws' fault lines are the only faults; no trap or halt.
+//   holds the spawn; the two throws' fault lines are the only faults; no trap or halt;
+// - P5.3: every summary's since-boot idle spawn-ticks with a request (energy, held, help) never fall, help stays 0
+//   (one room), and a held spawn-tick is counted once a refusal holds a spawn while the room asks.
 // The P2.4 opening reads the room every loop (its finds, the controller's getters, the creeps' stores and, while the
 // room is not full, the spawns' free energy; engine-shaped here, V189, V196, V199) but stays inert: the room has no
 // source, so its plan wants no worker and requests none, and the console's workers (bot worker names) gather nothing
@@ -428,6 +430,20 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
     wantParts.forEach((parts, i) => {
       for (const p of parts) if (!summaries[i].includes(p)) problems.push(`spawner summary ${i + 1} lacks "${p}": ${summaries[i]}`);
     });
+    // P5.3: the since-boot idle spawn-ticks by cause, never falling; one room, so none gated off helping, and the
+    // held spawn counts from its refusal on.
+    let last = [0, 0, 0];
+    summaries.forEach((r, i) => {
+      const m = /, idle spawn-ticks with a request: energy (\d+), held (\d+), help (\d+) \|/.exec(r);
+      if (!m) {
+        problems.push(`spawner summary ${i + 1} has no idle spawn-ticks: ${r}`);
+        return;
+      }
+      const now = m.slice(1).map(Number);
+      if (now.some((v, k) => v < last[k]) || now[2] !== 0) problems.push(`spawner summary ${i + 1}: idle spawn-ticks ${now} after ${last}`);
+      last = now;
+    });
+    if (last[1] === 0) problems.push('no held spawn-tick counted, though a refusal held a spawn while its room asked');
   }
 
   // ADR-018: the harness wrote an entry on every OK with a usable Memory (the dropped order included: the runtime

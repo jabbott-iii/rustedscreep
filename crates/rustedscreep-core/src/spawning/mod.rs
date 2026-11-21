@@ -15,6 +15,11 @@
 //!    when nothing is asked or every spawn of each serving room is busy or held).
 //! 4. The act step issues [`Spawner::orders`] and reports each outcome to [`Spawner::record`].
 //!
+//! No wasted energy (P5.3): the spawner counts the spawn-ticks a spawn stood idle while its room
+//! had a request, by cause, and names the rooms that waited for energy on the last tick
+//! ([`Spawner::waits_for_energy`]), whose workers and haulers then bring the spawns the energy in
+//! the room's stores.
+//!
 //! Pre-spawn replacement (P5.2, [`lead`], [`is_due`]): the jobs whose creeps hold a post (miners,
 //! haulers, upgraders) count a creep whose `ticksToLive` is within its successor's spawn time,
 //! walk and `spawn.replace_margin_ticks` as due, so they ask for the successor while the creep

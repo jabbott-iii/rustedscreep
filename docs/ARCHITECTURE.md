@@ -193,6 +193,15 @@ two plain tiles round the store to its post, so the lead falls short only by whe
 and an order's wait, which the margin covers. Nothing is persisted: a reset reads each death tick again and
 gives each due miner its successor back in the same pass.
 
+No wasted energy (P5.3): `Spawner` counts, per tick and since the global started, the spawn-ticks a spawn not spawning took no order
+while its room had a request it plans, by cause (`idle_energy`: the room could not pay its next request; `idle_held`: held after a
+refused call; `idle_help`: only other rooms' requests on a tick it does not help), and keeps the rooms that waited for energy one tick
+(`waits_for_energy`, read by the jobs, which run before the plan). While a room waits and `spawn.refill_from_stores` is on, its
+workers fill the spawns and extensions even while haulers fill, and, while the spawns have more room than the haulers hold, an empty
+hauler with too little at its own mining tile takes a whole load from a mining tile no hauler takes from or the controller container
+instead of waiting (never storing a load from the controller container back; the upgraders see those takes). `rustedscreep.spawner()` prints the
+idle spawn-ticks by cause.
+
 RCL1–3 opening (P2.4; the P3 economy replaces it): `rustedscreep_core::economy` is pure. `sizing` gives a worker's round between a
 source and the controller (harvest a load at `HARVEST_POWER` per WORK, walk it loaded and back with the fatigue rules, V54, V55, upgrade it
 at `UPGRADE_CONTROLLER_POWER` per WORK) and the workers a source keeps busy: enough to carry away what it yields over a round

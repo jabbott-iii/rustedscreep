@@ -346,8 +346,9 @@ impl SpawnGlue {
     }
 
     /// One line for `rustedscreep.spawner()`: each spawn room's energy and spawns, the last tick's
-    /// requests and orders, totals since boot, the last spawn and failure, the console request and
-    /// the own creeps by home and role.
+    /// requests and orders, totals since boot (with the spawn-ticks a spawn stood idle while its room
+    /// had a request, by cause: energy, held, help; P5.3), the last spawn and failure, the console
+    /// request and the own creeps by home and role.
     pub fn summary(&self, snapshot: &Snapshot) -> String {
         let sp = &self.spawner;
         let s = sp.stats();
@@ -398,7 +399,8 @@ impl SpawnGlue {
         let _ = write!(
             text,
             " | requests {}, orders {} (ok {}, failed {}), waiting {}, unfit {}, no spawn {}, helped {}, \
-             held {} | since boot: ticks {}, orders {}, ok {}, failed {}",
+             held {} | since boot: ticks {}, orders {}, ok {}, failed {}, idle spawn-ticks with a \
+             request: energy {}, held {}, help {}",
             s.requests,
             s.orders,
             s.ok,
@@ -412,6 +414,9 @@ impl SpawnGlue {
             t.orders,
             t.ok,
             t.failed,
+            t.idle_energy,
+            t.idle_held,
+            t.idle_help,
         );
         if let Some(e) = sp.last_ok() {
             let _ = write!(text, " | last accepted ");

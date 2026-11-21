@@ -44,8 +44,16 @@
 //! room's other ready spawns, so a spawn that still refuses never takes the top request from one
 //! that works (which would let a lower request spawn first).
 //!
+//! Idle spawns (P5.3): a spawn not spawning that takes no order while its room has a request it
+//! plans is counted idle, by cause ([`SpawnStats`], [`SpawnTotals`]): waiting for energy (the spawn
+//! that could not pay and the room's later ready ones), held after a refused call, or, for a room
+//! given only other rooms' requests, gated off helping. The rooms that waited for energy are kept
+//! one tick ([`Spawner::waits_for_energy`]), so the jobs that move energy, which run before the
+//! plan, bring the waiting room the energy in its stores while `spawn.refill_from_stores` is on.
+//!
 //! No state outlives a global but the holds, which a reset drops (it fails open: one refused call
-//! per held spawn). A tick allocates nothing once the vectors have grown.
+//! per held spawn), and the last tick's waits, which a reset empties. A tick allocates nothing once
+//! the vectors have grown.
 
 use rustedscreep_consts::{INTENT_CPU_COST, Part, RoomName};
 
@@ -136,6 +144,11 @@ pub struct SpawnStats {
     /// Spawns of serving rooms (those given a request this tick), not spawning, that a refused
     /// call holds.
     pub held: u32,
+    /// Spawns not spawning and not held that took no order while their room had a request it
+    /// plans this tick (P5.3): the room waited for energy; or, of a room given only other rooms'
+    /// requests, on a tick it does not help (not full, or the Standard tier off).
+    pub idle_energy: u32,
+    pub idle_help: u32,
     /// Calls the game accepted (the order was recorded; the processor may still drop it, V173).
     pub ok: u32,
     /// Calls refused (a known error code), with an unknown result, or that threw.
@@ -149,6 +162,11 @@ pub struct SpawnTotals {
     pub orders: u64,
     pub ok: u64,
     pub failed: u64,
+    /// Spawn-ticks idle with a request (P5.3, [`SpawnStats`]): waiting for energy, held after a
+    /// refused call, and gated off helping. Unit: spawn-ticks.
+    pub idle_energy: u64,
+    pub idle_held: u64,
+    pub idle_help: u64,
 }
 
 /// The last accepted order, or the last call that was not accepted.
@@ -181,8 +199,9 @@ struct RoomSpawns {
     full: bool,
     /// A spawn of it is not spawning.
     idle: bool,
-    /// A spawn of it is not spawning and not held ([`Spawner::close`]).
+    /// A spawn of it is not spawning and not held ([`Spawner::close`]), and how many.
     ready: bool,
+    ready_n: u32,
     /// Its spawns, not spawning, that a refused call holds ([`Spawner::close`]).
     held: u32,
 }
@@ -207,6 +226,8 @@ pub struct Spawner {
     servers: Vec<Option<RoomName>>,
     /// `spawn.help_range` for this tick. Unit: rooms.
     help_range: u32,
+    /// `spawn.refill_from_stores` for this tick ([`Self::waits_for_energy`]).
+    refill: bool,
     orders: Vec<SpawnOrder>,
     /// Rooms with an own spawn this tick, by packed name.
     spawn_rooms: Vec<RoomName>,
@@ -219,6 +240,10 @@ pub struct Spawner {
     /// Those that serve a request this tick, once [`Self::close`] ran: the `spawn` job's units.
     rooms: Vec<RoomName>,
     holds: Vec<Hold>,
+    /// The rooms whose plan waited for energy this tick, and those of the last tick (P5.3,
+    /// [`Self::waits_for_energy`]), by plan order.
+    waited: Vec<RoomName>,
+    waited_last: Vec<RoomName>,
     // Scratch, reused per room: (on probation, id, handle, structure row) of the ready spawns.
     idle: Vec<(bool, ObjectKey, StructureHandle, u32)>,
     queue: Vec<u32>,
@@ -238,11 +263,14 @@ impl Spawner {
         self.open = Some(time);
         self.time = time;
         self.help_range = cfg.help_range;
+        self.refill = cfg.refill_from_stores;
         self.requests.clear();
         self.servers.clear();
         self.orders.clear();
         self.stats = SpawnStats::default();
         self.totals.ticks = self.totals.ticks.saturating_add(1);
+        std::mem::swap(&mut self.waited, &mut self.waited_last);
+        self.waited.clear();
         let structures = &snap.structures;
         self.holds.retain(|h| structures.row_of(h.spawn).is_some());
         self.spawn_rooms.clear();
@@ -287,6 +315,7 @@ impl Spawner {
                     full: energy.capacity > 0 && energy.available >= energy.capacity,
                     idle,
                     ready: false,
+                    ready_n: 0,
                     held: 0,
                 }
             }));
@@ -408,6 +437,7 @@ impl Spawner {
         let (holds, time) = (&self.holds, self.time);
         for (&room, state) in self.spawn_rooms.iter().zip(self.spawn_state.iter_mut()) {
             state.ready = false;
+            state.ready_n = 0;
             state.held = 0;
             for ((&handle, &row), &busy) in spawns
                 .handles()
@@ -427,6 +457,7 @@ impl Spawner {
                     state.held = state.held.saturating_add(1);
                 } else {
                     state.ready = true;
+                    state.ready_n = state.ready_n.saturating_add(1);
                 }
             }
         }
@@ -457,6 +488,15 @@ impl Spawner {
             }
             if serves {
                 self.stats.held = self.stats.held.saturating_add(state.held);
+                self.totals.idle_held = self.totals.idle_held.saturating_add(u64::from(state.held));
+                if !asked {
+                    // Only other rooms' requests, on a tick it does not help (P5.3).
+                    self.stats.idle_help = self.stats.idle_help.saturating_add(state.ready_n);
+                    self.totals.idle_help = self
+                        .totals
+                        .idle_help
+                        .saturating_add(u64::from(state.ready_n));
+                }
             }
             if asked && state.ready {
                 self.rooms.push(room);
@@ -557,7 +597,8 @@ impl Spawner {
 
         let mut left = energy.available;
         let mut next = 0usize;
-        for &(_, _, spawn, structure_row) in &self.idle {
+        let ready = self.idle.len();
+        for (k, &(_, _, spawn, structure_row)) in self.idle.iter().enumerate() {
             loop {
                 let Some(&index) = self.queue.get(next) else {
                     return Ok(());
@@ -591,6 +632,14 @@ impl Spawner {
                 };
                 let Some(body) = body.filter(|b| b.cost() <= left) else {
                     self.stats.waiting = self.stats.waiting.saturating_add(1);
+                    // This spawn and the room's later ready ones stand idle for the energy (P5.3).
+                    let idle = u32::try_from(ready.saturating_sub(k)).unwrap_or(u32::MAX);
+                    self.stats.idle_energy = self.stats.idle_energy.saturating_add(idle);
+                    self.totals.idle_energy =
+                        self.totals.idle_energy.saturating_add(u64::from(idle));
+                    if !self.waited.contains(&room) {
+                        self.waited.push(room);
+                    }
                     return Ok(());
                 };
                 let order_index = u32::try_from(self.orders.len()).unwrap_or(u32::MAX);
@@ -669,6 +718,14 @@ impl Spawner {
     /// The request at `index` in this tick's requests.
     pub fn request_at(&self, index: u32) -> Option<&SpawnRequest> {
         self.requests.get(index as usize)
+    }
+
+    /// Whether `room`'s plan waited for energy on the last tick (P5.3), its next request unpaid with
+    /// a spawn of it ready, while `spawn.refill_from_stores` is on: the jobs that move energy bring
+    /// it the energy in the room's stores. They read it while they run, before this tick's plan; a
+    /// global reset starts it empty.
+    pub fn waits_for_energy(&self, room: RoomName) -> bool {
+        self.refill && self.waited_last.contains(&room)
     }
 
     /// Whether the spawn is held after a refused call (it takes no order this tick).
