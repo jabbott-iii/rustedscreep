@@ -75,7 +75,7 @@ pub fn checksum(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    /// The catalogue's check value, and the empty input (0, since the final XOR undoes the initial value).
+    /// The catalog's check value, and the empty input (0, since the final XOR undoes the initial value).
     #[test]
     fn catalogue_check_value() {
         assert_eq!(checksum(b"123456789"), 0xCBF4_3926);

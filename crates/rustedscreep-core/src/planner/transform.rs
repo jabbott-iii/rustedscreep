@@ -2,9 +2,9 @@
 //! the room's border, so a planner finds where a square of open ground fits.
 //!
 //! `out[t] = 0` on a closed tile; on an open tile it is one more than the smallest value among its 8
-//! neighbours, with every tile past the border counted as closed. So `out[t] >= k` exactly when the
-//! square of side `2k - 1` centred on `t` is open and inside the room: 1 for the tile alone, 2 for a
-//! 3 × 3, 7 for a 13 × 13. Two raster passes (forward over the four neighbours already visited, then
+//! neighbors, with every tile past the border counted as closed. So `out[t] >= k` exactly when the
+//! square of side `2k - 1` centered on `t` is open and inside the room: 1 for the tile alone, 2 for a
+//! 3 × 3, 7 for a 13 × 13. Two raster passes (forward over the four neighbors already visited, then
 //! backward over the other four) give the exact chessboard distance in `2 * ROOM_AREA` steps with no
 //! allocation.
 

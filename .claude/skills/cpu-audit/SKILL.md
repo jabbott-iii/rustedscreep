@@ -7,8 +7,8 @@ agent: hot-path-reviewer
 background: false
 ---
 
-Audit `$ARGUMENTS` for CPU waste and tick-path robustness. If the argument is empty or `diff`, audit `git diff` plus untracked files
-under `crates/` and `js/`.
+Audit `$ARGUMENTS` for CPU waste and tick-path robustness (the tick path is the code that runs every game turn, or tick).
+If the argument is empty or `diff`, audit `git diff` plus untracked files under `crates/` and `js/`.
 
 Also read `docs/STATUS.md` for the latest profiler numbers. When those numbers exist, rank findings by measured subsystem cost.
 Return the findings table defined in your instructions.

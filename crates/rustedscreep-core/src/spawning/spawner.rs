@@ -766,8 +766,8 @@ impl Spawner {
 }
 
 /// The distance between two rooms, in rooms: the larger of the differences of their world
-/// coordinates (`RoomName::x_coord` and `y_coord`, V169), so each of a room's eight neighbours is 1
-/// away and W0 and E0 are neighbours. The world does not wrap (V169).
+/// coordinates (`RoomName::x_coord` and `y_coord`, V169), so each of a room's eight neighbors is 1
+/// away and W0 and E0 are neighbors. The world does not wrap (V169).
 pub fn room_distance(a: RoomName, b: RoomName) -> u32 {
     a.x_coord()
         .abs_diff(b.x_coord())

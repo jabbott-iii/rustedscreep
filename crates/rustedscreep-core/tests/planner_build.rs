@@ -102,9 +102,9 @@ fn adopting_its_own_containers_and_links_gives_the_same_plan() {
     });
 }
 
-/// A standing container on a neighbour two sources share (an interim ADR-023 container) is
+/// A standing container on a neighbor two sources share (an interim ADR-023 container) is
 /// adopted as the earlier source's mining tile, the source `economy::mining` reads it as (sources
-/// in tile order, each the neighbour with a container, V182's reach), so the miner already on it
+/// in tile order, each the neighbor with a container, V182's reach), so the miner already on it
 /// gets the plan's source link beside it. E1N55 (the P4.3 review's case: sources at (10, 37) and
 /// (11, 37)) with containers on (11, 38) and (12, 37): in every mode the plan's mining tiles are
 /// those two, each source's link is next to its mining tile, and the plan is valid.

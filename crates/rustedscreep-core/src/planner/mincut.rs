@@ -5,10 +5,10 @@
 //! such as an exit tile), a fixed tile (walkable, but no rampart can stand there), a cuttable tile
 //! with a cost, a sink (ground to keep inside) or a guarded tile (a structure, safe under a rampart
 //! of its own or when no attacker can stand within the solve's `reach` of it). Creeps move to any of
-//! the 8 neighbours, with no rule against passing between two diagonal walls (V244), so the graph
+//! the 8 neighbors, with no rule against passing between two diagonal walls (V244), so the graph
 //! is 8-connected. A vertex cut becomes an edge cut by splitting each tile into an entry node and an
 //! exit node joined by an edge of the tile's cost (unbounded for sources, fixed tiles and sinks);
-//! every move between neighbours, and the edges from the super source and to the super sink, are
+//! every move between neighbors, and the edges from the super source and to the super sink, are
 //! unbounded. A guarded tile's exit node leads to the sink, and the exit node of every tile within
 //! `reach` of it leads into its entry node: an attacker that stands within reach gets to the sink
 //! unless the guarded tile itself is cut (a rampart over the structure), so the cut weighs

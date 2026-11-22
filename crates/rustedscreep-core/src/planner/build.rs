@@ -19,7 +19,7 @@
 //!   ones), and blocked when its tile holds something else.
 //! - Replacing (ADR-026, the user's choice: replace blockers only): an own structure that is not
 //!   the plan's on its tile (no spawn) is destroyed when a planned item that is due, placed and not
-//!   capped needs the tile, or when, with it standing, such an item has no free neighbour reached
+//!   capped needs the tile, or when, with it standing, such an item has no free neighbor reached
 //!   from the plan's anchor (it cuts the item off; the first cut-off item in the order that some
 //!   destroy opens). Never while a hostile creep is in the room (`destroy` returns `ERR_BUSY`
 //!   then, V248, V249), never while the room is at `max_sites` (the replacement could not be
@@ -364,7 +364,7 @@ pub struct Census {
     pub capped: u32,
     /// Blocked and not to be cleared now.
     pub blocked: u32,
-    /// With no free neighbour reached from the plan's first spawn.
+    /// With no free neighbor reached from the plan's first spawn.
     pub cut_off: u32,
 }
 
@@ -582,7 +582,7 @@ fn fill_walk(ask: &Ask<'_>, ground: &Ground, s: &mut Scratch) {
     }
 }
 
-/// Fills `s.reached`: the tiles a creep reaches from the anchor's free neighbours.
+/// Fills `s.reached`: the tiles a creep reaches from the anchor's free neighbors.
 fn reach(ask: &Ask<'_>, ground: &Ground, s: &mut Scratch) {
     fill_walk(ask, ground, s);
     s.reached.fill(false);
@@ -603,7 +603,7 @@ fn reach(ask: &Ask<'_>, ground: &Ground, s: &mut Scratch) {
     }
 }
 
-/// The search [`opening`] reads: a 0-1 search from the anchor's neighbours through walkable tiles
+/// The search [`opening`] reads: a 0-1 search from the anchor's neighbors through walkable tiles
 /// (cost 0) and replaceable obstacles that are not the plan's on their tile (cost 1), over the
 /// whole room, into `s.cost` and `s.parent`.
 fn open_search(ask: &Ask<'_>, ground: &Ground, s: &mut Scratch) {
@@ -670,7 +670,7 @@ fn open_search(ask: &Ask<'_>, ground: &Ground, s: &mut Scratch) {
 }
 
 /// The replaceable own obstacle whose destroy opens the way to `target`, from [`open_search`]: of
-/// `target`'s neighbours the cheapest to reach (then the lowest tile), and of the obstacles on its
+/// `target`'s neighbors the cheapest to reach (then the lowest tile), and of the obstacles on its
 /// way, the one nearest the anchor. `None` when no destroy opens it (or nothing walls it off).
 fn opening(ground: &Ground, target: Tile, s: &Scratch) -> Option<(StructureType, Tile)> {
     let goal = target
@@ -716,7 +716,7 @@ pub enum Need {
 
 /// The plan's tile for the role of a site `economy::mining` asks for (ADR-023 to ADR-025 keep
 /// their timing; the plan says where), by the role the economy gives it, not by where the
-/// economy's own tile is (two sources may share a neighbour, and a source link may stand within
+/// economy's own tile is (two sources may share a neighbor, and a source link may stand within
 /// `RECEIVER_RANGE` of the controller). `sources` are in the plan's input order. `None` where the
 /// plan has no such role, or the source is not one of `sources`.
 pub fn role_tile(roles: &Roles, sources: &[Tile], need: Need) -> Option<Tile> {
@@ -1139,7 +1139,7 @@ mod tests {
     }
 
     /// Each role maps to the plan's tile for it, whatever the economy's own tile: two sources two
-    /// apart (sharing neighbours) each get their own mining container and link, the controller's
+    /// apart (sharing neighbors) each get their own mining container and link, the controller's
     /// roles go to the plan's controller tiles, and a source that is not the plan's gets nothing.
     #[test]
     fn roles_map_to_the_plans_tiles() {

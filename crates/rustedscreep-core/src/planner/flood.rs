@@ -18,7 +18,7 @@
 //!    takes the next structure of [`FILL_ORDER`] otherwise, so each structure has a road beside
 //!    it, the nearest ones go first, and the base grows as a compact Chebyshev ball. A tile that
 //!    may not take a structure (kept clear, the border rule, or one that would cut off an exit
-//!    tile or a spawn's free neighbour) joins the network as a bridge instead. Then only the
+//!    tile or a spawn's free neighbor) joins the network as a bridge instead. Then only the
 //!    roads some structure is served by are kept, each from the earliest level a structure it
 //!    serves stands.
 //! 7. Labs. The 10-lab stamp ([`LAB_SOURCES`], [`LAB_OUTPUTS`], [`LAB_ROADS`]) in the free
@@ -31,7 +31,7 @@
 //! container or the hub) joined to the hub through more such ground. No placement of the fill or
 //! the labs may cut off from the hub an exit side the bare room reaches (the standing spawn in
 //! place) or an exit tile reached when the fill began, the controller's upgrade range, a spawn's
-//! free neighbour that leads out (but a standing spawn given so, which the validator judges; one
+//! free neighbor that leads out (but a standing spawn given so, which the validator judges; one
 //! the run broke before the fill ends it with `NoRoom("spawn exit")`) or anything planned before
 //! it ([`Reach`]);
 //! the core and the shared steps keep the room one passage around each placement
@@ -126,7 +126,7 @@ fn at(t: Tile, (dx, dy): (i8, i8)) -> Option<Tile> {
 }
 
 /// Whether `t` is on the road lattice anchored at `hub`: the diagonal lines through the hub's
-/// diagonal neighbours, every [`LATTICE`] tiles. The tiles off it come in plus shapes of 5, each
+/// diagonal neighbors, every [`LATTICE`] tiles. The tiles off it come in plus shapes of 5, each
 /// next to the lattice (the hub's own plus is the core), so every structure in the fill has a road
 /// beside it, and the lines cross so the roads join up.
 fn lattice(hub: Tile, t: Tile) -> bool {
@@ -137,7 +137,7 @@ fn lattice(hub: Tile, t: Tile) -> bool {
 }
 
 /// The core's arm assignments, as indices into [`ARMS`]: storage, hub link, spawn, terminal, with
-/// the storage and the hub link on neighbouring arms (so they touch diagonally).
+/// the storage and the hub link on neighboring arms (so they touch diagonally).
 fn assignments() -> Vec<[usize; 4]> {
     let mut out = Vec::new();
     for storage in 0..ARMS.len() {
@@ -376,7 +376,7 @@ struct Grow {
 
 impl Grow {
     /// The network so far (every planned road, joined to the hub through roads), its distances,
-    /// and its neighbours offered.
+    /// and its neighbors offered.
     fn new(board: &Board, input: &PlanInput<'_>, hub: Tile, penalty: u16) -> Self {
         let mut g = Self {
             hub,
@@ -435,7 +435,7 @@ impl Grow {
         self.parent.get(t.index()).copied().flatten()
     }
 
-    /// Offers the undecided walkable neighbours of the network tile `u`, one step on (a slot in
+    /// Offers the undecided walkable neighbors of the network tile `u`, one step on (a slot in
     /// reach of the exits [`Params::exposed_penalty`] steps more).
     fn offer(&mut self, board: &Board, u: Tile) {
         let p = self.dist(u).saturating_add(1);
@@ -848,11 +848,11 @@ impl Run {
     /// Whether blocking `t` (and the `more` tiles; `t` a new spawn when `spawn`) keeps the room as
     /// the validator reads it from the hub: every side's exits, and every exit tile reached when
     /// the fill began (so no exit corridor is sealed off with cut ramparts in it that no creep
-    /// could build), the controller's upgrade range, a free neighbour of every obstacle planned
+    /// could build), the controller's upgrade range, a free neighbor of every obstacle planned
     /// and of the new ones, every road and container planned, and the spawn rule for every spawn
     /// but the exempt ([`Board::spawn_free`]). At once when `t` is no spawn, is next to no exit
-    /// and its free neighbours stay one group: nothing reached before is cut off, so only a spawn
-    /// beside it can lose its last free neighbour that is no post ([`Board::leaves_spawn_exit`]).
+    /// and its free neighbors stay one group: nothing reached before is cut off, so only a spawn
+    /// beside it can lose its last free neighbor that is no post ([`Board::leaves_spawn_exit`]).
     /// Else by a flood.
     ///
     /// Uses: `RECEIVER_RANGE` (upgrade range, V187).
@@ -1268,7 +1268,7 @@ mod tests {
     }
 
     /// The fill's structures each have a kept road (or the hub) beside them.
-    /// A spawn the run broke before the fill (here every free neighbour made a post) ends the run
+    /// A spawn the run broke before the fill (here every free neighbor made a post) ends the run
     /// at the fill's first step with `NoRoom("spawn exit")`, at once rather than after refusing
     /// every tile of the room; a standing spawn given so is exempt and planned around.
     #[test]

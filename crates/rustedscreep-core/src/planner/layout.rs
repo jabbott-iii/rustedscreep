@@ -175,7 +175,7 @@ pub enum PlanError {
 }
 
 /// The structure types a plan may hold, in the order a build would want them: what makes energy
-/// and spawns first, defence and late-game last. It fixes the order of [`Layout::items`] within a
+/// and spawns first, defense and late-game last. It fixes the order of [`Layout::items`] within a
 /// level, and the validator's walk over types.
 pub const KINDS: [StructureType; 16] = [
     StructureType::Spawn,

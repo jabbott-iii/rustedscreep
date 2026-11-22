@@ -8,13 +8,13 @@
 //! - tiles: the site rules for terrain and border (V237), nothing on the controller or a source,
 //!   only the extractor on the mineral, no road on a wall (a tunnel's cost, V242), at most one
 //!   costed structure and one road and one rampart per tile, no road under an obstacle;
-//! - reach: from the first spawn, every obstacle has a reached neighbour (filled or used from it),
+//! - reach: from the first spawn, every obstacle has a reached neighbor (filled or used from it),
 //!   every rampart and constructed wall has reached ground within `REPAIR_REACH` (built and
 //!   repaired from there, V185, V222), every road and container stands on reached ground, the
-//!   controller has reached ground in upgrade range, the mineral a reached neighbour once the extractor stands, and every side of
+//!   controller has reached ground in upgrade range, the mineral a reached neighbor once the extractor stands, and every side of
 //!   the room whose exits the bare room reaches still has one;
-//! - spawns (V174): every spawn has a free neighbour joined to the room's exits that is no creep's
-//!   post (the hub, a mining tile), and no free neighbour but the hub is a dead end a new creep
+//! - spawns (V174): every spawn has a free neighbor joined to the room's exits that is no creep's
+//!   post (the hub, a mining tile), and no free neighbor but the hub is a dead end a new creep
 //!   could be placed in and never leave;
 //! - labs (V240): two of the labs that stand are within `LAB_REACTION_RANGE` of every other one;
 //! - the hub, from the storage's level: reached, or next to a spawn that stands;
@@ -26,7 +26,7 @@
 //!   the controller link stands from the first link level and a source link or the hub link from
 //!   the second, so the links that stand send to it (with no more links than allowed, all are
 //!   active, V218);
-//! - defence (at every level from the first that allows ramparts): every protected structure that
+//! - defense (at every level from the first that allows ramparts): every protected structure that
 //!   stands is under a rampart that stands or out of ranged reach (V243) of every tile a hostile
 //!   creep can reach from an exit past the ramparts and constructed walls that stand.
 
@@ -77,7 +77,7 @@ pub enum Problem {
         tile: (u8, u8),
     },
     /// An item the first spawn's ground does not reach at `level`: an obstacle with no reached
-    /// neighbour, a road or container off reached ground, a rampart or wall with no reached ground
+    /// neighbor, a road or container off reached ground, a rampart or wall with no reached ground
     /// within `REPAIR_REACH`.
     Unreachable {
         kind: StructureType,
@@ -98,14 +98,14 @@ pub enum Problem {
         level: u8,
     },
     Role(&'static str),
-    /// A spawn with no free neighbour for a new creep (V174): none of its walkable neighbours
+    /// A spawn with no free neighbor for a new creep (V174): none of its walkable neighbors
     /// leads to the room's exits, or every one that does is a creep's post (the hub, a mining
     /// tile), where a creep stands for good.
     SpawnBlocked {
         tile: (u8, u8),
         level: u8,
     },
-    /// A walkable neighbour of a spawn (not the hub) with no way to the room's exits: a creep born
+    /// A walkable neighbor of a spawn (not the hub) with no way to the room's exits: a creep born
     /// there (the first free direction, V174) can never leave.
     SpawnPocket {
         tile: (u8, u8),
@@ -998,8 +998,8 @@ mod tests {
         );
     }
 
-    /// V174: a new creep needs a free neighbour of its spawn; the hub's filler stands on the hub for
-    /// good, so a spawn whose only free neighbour is the hub cannot spawn.
+    /// V174: a new creep needs a free neighbor of its spawn; the hub's filler stands on the hub for
+    /// good, so a spawn whose only free neighbor is the hub cannot spawn.
     #[test]
     fn a_spawn_whose_only_exit_is_the_hub_cannot_spawn() {
         let ring = [
@@ -1033,7 +1033,7 @@ mod tests {
         );
     }
 
-    /// V174: the spawn places a new creep on its first free neighbour; one walled in by
+    /// V174: the spawn places a new creep on its first free neighbor; one walled in by
     /// extensions is a dead end the creep never leaves.
     #[test]
     fn a_spawn_beside_a_dead_end_traps_its_creeps() {
@@ -1115,7 +1115,7 @@ mod tests {
         );
     }
 
-    /// Defence holds level by level: a rampart that closes the only way in from a later level
+    /// Defense holds level by level: a rampart that closes the only way in from a later level
     /// than the structure behind it leaves that structure exposed until then.
     #[test]
     fn a_line_that_closes_late_exposes_what_stands_behind_it() {
@@ -1190,7 +1190,7 @@ mod tests {
         assert!(p.contains(&Problem::Role(idle)), "{p:?}");
     }
 
-    /// `economy::mining` reads a source's mining tile as its neighbour with a container, sources in
+    /// `economy::mining` reads a source's mining tile as its neighbor with a container, sources in
     /// (x, y) order, nearest the spawn among several: a container next to a source must be its
     /// mining tile or an earlier source's.
     #[test]

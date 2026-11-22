@@ -188,7 +188,7 @@ struct Slot {
 }
 
 /// Routes kept whole, at most `capacity` of them (least recently used out first, but never one a
-/// creep used this tick or the one before: travellers keep theirs, and the book grows past the
+/// creep used this tick or the one before: travelers keep theirs, and the book grows past the
 /// capacity until they finish). A creep follows
 /// one route leg by leg, so exits found by different searches never mix (which could send creeps
 /// round between two rooms), and a room a path passes through twice is told apart by the leg.
@@ -393,8 +393,8 @@ mod tests {
         name.parse().expect("room")
     }
 
-    /// The room offsets of the four sides name the neighbouring rooms (x grows east, y south; the
-    /// crate's `checked_add`, V169), and the world's last rooms have no neighbour beyond.
+    /// The room offsets of the four sides name the neighboring rooms (x grows east, y south; the
+    /// crate's `checked_add`, V169), and the world's last rooms have no neighbor beyond.
     #[test]
     fn side_offsets_name_the_neighbouring_rooms() {
         use super::super::tile::Side;

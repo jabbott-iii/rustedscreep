@@ -522,7 +522,7 @@ pub struct LinkConfig {
     /// and the controller link's room both reach it. Unit: energy.
     pub send_min: u32,
     /// A source link whose `transferEnergy` call the game refused (or that threw) sends no more for
-    /// this long: every check the game makes is modelled (V216), so a refusal means something the
+    /// this long: every check the game makes is modeled (V216), so a refusal means something the
     /// bot cannot see, and the hold keeps it (and its log line) from repeating every tick.
     /// Unit: ticks.
     pub hold_ticks: u32,

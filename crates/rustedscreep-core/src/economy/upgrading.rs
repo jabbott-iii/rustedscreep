@@ -1204,7 +1204,7 @@ impl Upgrading {
 }
 
 /// How many tiles past the plan's trip an upgrader's post may lie (P5.2): the trip ends on the
-/// first store's neighbour nearest the spawn, and every post is another neighbour of a store, at
+/// first store's neighbor nearest the spawn, and every post is another neighbor of a store, at
 /// most this far round the store's ring from it. Unit: tiles.
 pub(super) const POST_STEP: u32 = 2;
 

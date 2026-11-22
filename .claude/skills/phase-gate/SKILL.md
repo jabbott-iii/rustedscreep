@@ -15,11 +15,13 @@ disable-model-invocation: true
    that area has changed since. Check `git status` and `git diff --stat`.
 3. Report a table: criterion | evidence (command and key output, or measured number) | pass / fail / not evaluated.
    Any fail or "not evaluated" means the gate is **not passed**.
-4. Measured numbers (CPU per tick per subsystem, bucket trend, wasm and bundle size, cold-start cost, throughput) go into
-   STATUS.md. Where a comparison against the naive baseline is part of the criteria, record both sides and the method.
+4. Measured numbers (CPU per tick, or game turn, per subsystem; bucket trend, the game's store of unused CPU over time; wasm
+   (WebAssembly) and bundle size; cold-start cost; throughput) go into STATUS.md. Where a comparison against the naive baseline (the
+   same bot with every cache and optimization toggled off) is part of the criteria, record both sides and the method.
 5. If the gate passes, tick the phase in STATUS.md, and in its track's roadmap tick the gate's criteria and add the pass date to its
    **Gate:** line. For a core phase (P#), set the next core phase as current and suggest starting a
-   fresh session (`/clear`) for it. For an optional-track phase (PS#, SE#), tick only its entry under "Optional tracks" (for PS3, the
-   scenario's own entry, and in the roadmap the scenario's box, since PS3's gate criteria have none) and leave the core's current phase and checklist unchanged. If the gate fails, list the blocking items as
+   fresh session (`/clear`) for it. For an optional-track phase (PS#, SE#), tick only its entry under "Optional tracks" (for PS3,
+   whose items are scripted scenarios, the scenario's own entry, and in the roadmap the scenario's box, since PS3's gate criteria have
+   none) and leave the core's current phase and checklist unchanged. If the gate fails, list the blocking items as
    STATUS checklist entries (core) or under the optional phase's entry (PS#, SE#).
 6. Offer a commit message (`/commit-msg`).

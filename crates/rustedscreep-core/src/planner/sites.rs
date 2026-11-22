@@ -4,8 +4,8 @@
 //! hub link (on the tile the candidate's core gives it), the extractor and the mineral container.
 //!
 //! The rules follow `economy::mining`, which reads these structures by position: a mining tile is a
-//! walkable neighbour of its source, off an earlier source's ground where it can be (the sources
-//! take their tiles in (x, y) order), then off a spawn's last free neighbour that is no post (a
+//! walkable neighbor of its source, off an earlier source's ground where it can be (the sources
+//! take their tiles in (x, y) order), then off a spawn's last free neighbor that is no post (a
 //! spawn must keep one, V174; counting as posts the tiles of sources with only one) and off a
 //! later source's ground (which may be all that source has);
 //! the controller container and link stand at `CONTROLLER_LINK_RANGE`, so every tile next to them
@@ -13,7 +13,7 @@
 //! `RECEIVER_RANGE`, or it would read as a controller link, and there is none where the controller
 //! link is next to the mining tile (that link takes the miner's energy); no link takes the hub or
 //! the hub link's tile; a link never closes a passage (`keeps_neighbours_connected`) or takes a
-//! spawn's last free neighbour that is no post (V174).
+//! spawn's last free neighbor that is no post (V174).
 //!
 //! Links are placed in a fixed order, so their levels (V234) give the build order ADR-024 uses:
 //! the controller link, the source farthest from the hub, the hub link, then the other sources.
@@ -55,7 +55,7 @@ pub fn reserve(board: &mut Board, input: &PlanInput<'_>) {
     }
 }
 
-/// The tiles some source of `sources` can be mined from alone (its only walkable neighbour that
+/// The tiles some source of `sources` can be mined from alone (its only walkable neighbor that
 /// takes a container, `except` left out as if an obstacle stood there): its mining tile, whatever
 /// the plan, so a post (V174) from the start.
 pub fn forced_tiles(board: &Board, sources: &[Tile], except: Option<Tile>) -> Vec<Tile> {
@@ -183,7 +183,7 @@ pub fn containers(
 }
 
 /// Whether a link on `t` keeps the ground around it one passage, leaves every spawn beside it a
-/// free neighbour that is no post (V174), and stays out of role tiles.
+/// free neighbor that is no post (V174), and stays out of role tiles.
 fn link_fits(board: &Board, t: Tile) -> bool {
     board.open(t)
         && board.can_place_role(StructureType::Link, t)
@@ -365,7 +365,7 @@ mod tests {
         TerrainGrid::from_row_major(&raw).expect("length")
     }
 
-    /// `economy::mining` gives each source, in (x, y) order, its neighbour with a container: a
+    /// `economy::mining` gives each source, in (x, y) order, its neighbor with a container: a
     /// later source's mining tile next to an earlier source could be read as the earlier one's.
     #[test]
     fn a_mining_tile_is_not_next_to_an_earlier_source() {
@@ -389,7 +389,7 @@ mod tests {
     }
 
     /// A source link is picked before the hub link (the module docs' order), so it must not take
-    /// the tile the core keeps for the hub link: here the lowest free neighbour of the mining tile.
+    /// the tile the core keeps for the hub link: here the lowest free neighbor of the mining tile.
     #[test]
     fn a_source_link_leaves_the_hub_link_tile() {
         let (controller, sources) = (tile(10, 10), [tile(30, 30)]);

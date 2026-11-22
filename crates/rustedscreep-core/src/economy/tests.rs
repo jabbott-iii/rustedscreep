@@ -3502,7 +3502,7 @@ fn extensions_follow_the_pattern() {
 }
 
 /// However many are placed, every free tile the spawn reached before still reaches it, and every
-/// extension has a free orthogonal neighbour to be filled from.
+/// extension has a free orthogonal neighbor to be filled from.
 #[test]
 fn extensions_never_cut_the_room() {
     // A wall with a one-tile gap at (30, 25) and an L-shaped wall near the spawn.
@@ -4480,7 +4480,7 @@ fn static_mining_reaches_rcl4_sooner() {
     assert!(with < without, "with miners {with}, without {without}");
 }
 
-/// Two sources whose nearest free neighbour to the spawn is the same tile get two mining tiles,
+/// Two sources whose nearest free neighbor to the spawn is the same tile get two mining tiles,
 /// each next to its own source, so both miners reach a tile and both sources are mined.
 #[test]
 fn neighbouring_sources_get_their_own_mining_tiles() {
@@ -4805,7 +4805,7 @@ fn mine_plan(w: &World) -> MinePlan {
 
 /// ADR-024's tiles in the scenario room at RCL5: the controller link 2 from the controller, each
 /// source link next to its mining tile, all inside the margin, off the mining tiles and each other,
-/// and none closes a way (its free neighbours stay connected); then the sites go in order, the
+/// and none closes a way (its free neighbors stay connected); then the sites go in order, the
 /// controller link first and the farthest source's next, as many as the level allows
 /// (`CONTROLLER_STRUCTURES`) and `links.source_links` leaves.
 #[test]

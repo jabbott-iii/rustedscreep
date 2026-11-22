@@ -1,7 +1,7 @@
 //! The terrain corpus is valid input for the base planner (ROADMAP P4.1). The rooms come from the
 //! official MMO, whose map code is closed, so each property the open-source generator gives (V227 to
 //! V229) is checked on the data here rather than assumed. The border test also pins the digit order:
-//! neighbouring rooms' edges match in row-major order (V224, V226) and not when read transposed.
+//! neighboring rooms' edges match in row-major order (V224, V226) and not when read transposed.
 
 mod common;
 
@@ -163,7 +163,7 @@ fn open_ground_is_one_area_that_reaches_every_object_and_an_exit() {
 }
 
 /// An edge tile and the tile a creep lands on in the next room (V151, `Tile::across`) are both walls
-/// or both open, for every pair of neighbouring rooms in the corpus. Read transposed (`x * 50 + y`)
+/// or both open, for every pair of neighboring rooms in the corpus. Read transposed (`x * 50 + y`)
 /// the same edges disagree, so this test fixes the digit order (V224, V226).
 ///
 /// Uses: ROOM_SIZE.

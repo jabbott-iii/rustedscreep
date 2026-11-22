@@ -8,7 +8,7 @@
 //! closed room blocks, a move from an edge tile goes straight across or back into its room (never
 //! along the edge), range is the world Chebyshev distance, and the path leaves out the origin. It is
 //! an A* with the range as its heuristic (every step costs at least 1), so its paths are cheapest
-//! ones; it does not count PathFinder's ops (jump-point expansions), so `max_ops` is not modelled
+//! ones; it does not count PathFinder's ops (jump-point expansions), so `max_ops` is not modeled
 //! and a search fails only when no path exists. The engine model follows V51 and V52 for moves (a move
 //! into a blocked tile or a tile whose creep stays fails, two moves into one tile fail the test)
 //! and V151 and V152 for transfers: a creep that ends a tick on an edge tile is on the tile across
@@ -631,7 +631,7 @@ fn no_route_is_remembered_for_retry_ticks() {
     );
 }
 
-/// Without a route search installed (the P2.1 behaviour), a target in another room is refused and
+/// Without a route search installed (the P2.1 behavior), a target in another room is refused and
 /// the creep's room is not read for it.
 #[test]
 fn without_a_router_another_room_is_refused() {
@@ -1187,7 +1187,7 @@ fn a_dip_in_a_room_known_only_by_terrain_is_searched_around_on_arrival() {
 
 /// Six creeps head for six targets two rooms on with room for four routes. Routes in use are never
 /// evicted (the book grows past its capacity while they travel), so each creep searches once (the
-/// final review: with eight travellers and four slots, five searches ran every tick).
+/// final review: with eight travelers and four slots, five searches ran every tick).
 #[test]
 fn more_travellers_than_kept_routes_do_not_search_every_tick() {
     let mut w = World::open(&["E0N0", "E1N0", "E2N0"]);
@@ -1253,11 +1253,11 @@ fn a_target_in_a_closed_room_costs_no_search() {
     );
 }
 
-/// Uses: ROOM_SIZE, MOVE_COST_SWAMP. On the route that dips through a neighbour (out north-east,
+/// Uses: ROOM_SIZE, MOVE_COST_SWAMP. On the route that dips through a neighbor (out north-east,
 /// back in further south, then out south), a second creep that starts near the south exit joins the
 /// route at the start room's later leg, the one with the shorter way to its exit, and leaves by the
 /// south exit at once (the final review: joining the first leg sent it round through the swamp and
-/// the neighbour, three crossings instead of one).
+/// the neighbor, three crossings instead of one).
 #[test]
 fn a_creep_joins_a_kept_route_at_its_nearest_leg() {
     let swamp = Terrain::Swamp as u8;

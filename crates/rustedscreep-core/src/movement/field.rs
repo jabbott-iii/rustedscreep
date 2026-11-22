@@ -3,7 +3,7 @@
 //!
 //! A field is a Dijkstra search from the goal outward over a [`CostGrid`], with Dial's bucket queue
 //! (step costs are small integers, so a ring of 256 buckets replaces the heap). Building one visits
-//! each walkable tile once and relaxes its 8 neighbours: about 20 000 relaxations for an open room,
+//! each walkable tile once and relaxes its 8 neighbors: about 20 000 relaxations for an open room,
 //! whatever the number of creeps that use it. The [`FieldCache`] keeps fields by room, goal and the
 //! grid's version, so a field is rebuilt only when the grid changed or it was evicted.
 
@@ -171,7 +171,7 @@ impl FlowField {
 
     /// Builds the field for `aim` on `grid` (a [`Goal`] is a `Near` aim). The goal tiles are
     /// [`Aim::tiles`]: for `Near` the walkable tiles within range, for `Exit` the open exits on its
-    /// side within range (unwalkable in the grid, so only their neighbours inside the room are
+    /// side within range (unwalkable in the grid, so only their neighbors inside the room are
     /// relaxed). Returns how many there are (0 means nothing can reach the aim).
     pub fn compute(&mut self, grid: &CostGrid, aim: impl Into<Aim>, queue: &mut Dial) -> u32 {
         let aim = aim.into();
@@ -230,10 +230,10 @@ impl FlowField {
     }
 
     /// The best next steps from `from` (which need not be walkable itself, so a creep on an edge or
-    /// a blocked tile still finds its way): the neighbours with a distance that minimize the step's
+    /// a blocked tile still finds its way): the neighbors with a distance that minimize the step's
     /// cost plus that distance, up to [`STEP_OPTIONS`] ties in direction order. Only walkable tiles
     /// and the goal exits of an `Exit` field have a distance; an exit's step costs
-    /// [`CostGrid::exit_cost`]. Empty when no neighbour reaches the goal.
+    /// [`CostGrid::exit_cost`]. Empty when no neighbor reaches the goal.
     pub fn steps(&self, grid: &CostGrid, from: Tile) -> Steps {
         let mut best = u32::MAX;
         let mut out = Steps::default();
@@ -269,7 +269,7 @@ impl FlowField {
         out
     }
 
-    /// Like [`Self::steps`], but the best [`STEP_OPTIONS`] neighbours with a distance whatever their
+    /// Like [`Self::steps`], but the best [`STEP_OPTIONS`] neighbors with a distance whatever their
     /// cost, best first (direction order on ties): for a creep on an edge tile, which leaves the room
     /// if it stays (V151), a costlier way in beats waiting on one taken tile.
     pub fn ranked_steps(&self, grid: &CostGrid, from: Tile) -> Steps {

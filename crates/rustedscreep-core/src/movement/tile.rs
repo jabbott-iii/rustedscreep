@@ -125,7 +125,7 @@ impl Tile {
         }
     }
 
-    /// The neighbour in direction `d`, or `None` past the room's edge.
+    /// The neighbor in direction `d`, or `None` past the room's edge.
     #[inline]
     pub fn step(self, d: Direction) -> Option<Self> {
         let (dx, dy) = offset(d);
@@ -134,7 +134,7 @@ impl Tile {
         Self::new(x, y)
     }
 
-    /// The neighbours inside the room, in [`DIRECTIONS`] order.
+    /// The neighbors inside the room, in [`DIRECTIONS`] order.
     #[inline]
     pub fn neighbors(self) -> impl Iterator<Item = (Direction, Self)> {
         DIRECTIONS

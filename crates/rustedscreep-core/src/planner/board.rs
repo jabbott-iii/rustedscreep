@@ -318,7 +318,7 @@ impl Board {
 
     /// Whether a spawn on `sp` keeps the validator's spawn rule (V174), on ground where `free`
     /// says which tiles stay walkable and `reached` which of them the hub's ground reaches: every
-    /// free neighbour but the hub joined to the room's exits (reached, since the hub's ground
+    /// free neighbor but the hub joined to the room's exits (reached, since the hub's ground
     /// reaches them, or else joined over `free` ground of its own, [`Board::joins_exit`]), so a new
     /// creep is never placed where it cannot leave, and one of them no creep's post (the hub, a
     /// mining tile), so a creep can be placed at all. `reached` stands for joined only while the
@@ -382,7 +382,7 @@ impl Board {
     }
 
     /// Whether the standing spawn on `t` keeps the spawn rule (V174) on the board as it is, with
-    /// no hub yet: every free neighbour joined to an exit and one of them no post (`posts`: the
+    /// no hub yet: every free neighbor joined to an exit and one of them no post (`posts`: the
     /// mining tiles the input forces, `sites::forced_tiles`). One flood from the exits. A spawn
     /// that does not was given so: the planners leave it to the validator.
     pub fn standing_spawn_free(&self, t: Tile, posts: &[Tile]) -> bool {
@@ -423,7 +423,7 @@ impl Board {
         exit
     }
 
-    /// Whether every spawn beside `t` keeps a free neighbour that is no creep's post once `t`
+    /// Whether every spawn beside `t` keeps a free neighbor that is no creep's post once `t`
     /// takes an obstacle or a post (V174): with `blocked` the tiles that are not free.
     pub fn leaves_spawn_exit(&self, t: Tile, blocked: impl Fn(Tile) -> bool) -> bool {
         t.neighbors().all(|(_, sp)| {

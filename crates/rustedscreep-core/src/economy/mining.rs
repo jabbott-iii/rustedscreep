@@ -14,7 +14,7 @@
 //! controller where the haulers unload and the workers take: a container or container site within
 //! [`RECEIVER_RANGE`] of the controller that no source's mining tile holds, else a free tile at
 //! [`CONTROLLER_LINK_RANGE`], nearest the spawn by path, under the link tiles' rules (but a
-//! container blocks no move, so its neighbours need not stay connected), off the link tiles and
+//! container blocks no move, so its neighbors need not stay connected), off the link tiles and
 //! not next to a source or a mineral. [`Mining::container_needs`] lists it after the mining tiles
 //! once a source with no link pays for its miner, from the level the caller asks for.
 //!
@@ -49,14 +49,14 @@
 //!    CLAUDE.md puts in Standard). With the tier off the source link fills, the miner stops
 //!    transferring and the container takes the harvest.
 //!
-//! The mining tile is the source's walkable neighbour, not on the room's edge and not another
+//! The mining tile is the source's walkable neighbor, not on the room's edge and not another
 //! source's mining tile, nearest the room's first spawn by path on movement's grid; a tile with a
 //! container or a container site wins, so a container placed earlier (by the bot or by hand) keeps
 //! its miner. The miner's walk out is measured on the same field. A source gets a miner only once
 //! the room's capacity pays for one that drains it; below that the opening's workers harvest it as
 //! before. Link tiles follow the extension pattern's rules for not closing the room (ADR-020): a
 //! link tile is free, off any road, at x and y of [`LINK_MARGIN`] to `ROOM_SIZE - 1 -
-//! LINK_MARGIN`, not a mining tile, and its free neighbours stay connected without it.
+//! LINK_MARGIN`, not a mining tile, and its free neighbors stay connected without it.
 //!
 //! Pre-spawn replacement (P5.2, `spawning::replace`): a source whose miner shows a `ticksToLive` at
 //! most its successor's lead ([`miner_lead`]: the plan body's spawn time, its walk out and
@@ -119,7 +119,7 @@ pub(crate) const NEAR: u8 = 1;
 
 /// A container site the room needs (ADR-023, ADR-025, [`Mining::container_needs`]): its tile, and
 /// the source whose mining tile it is on (`None`: the controller container), so a planned room maps
-/// it to the plan's container of the same role (P4.3; two sources may share a neighbour, so the
+/// it to the plan's container of the same role (P4.3; two sources may share a neighbor, so the
 /// tile alone does not say which).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContainerNeed {
@@ -1817,7 +1817,7 @@ impl Mining {
 /// The lead of a replacement for the miner of `s` (P5.2, [`lead`]): its plan body's spawn time,
 /// its walk out at most ([`walk_ticks_max`] on the plan's trip with the WORK parts as the weight)
 /// and the margin; 0 without a body or a trip (no miner is requested). The trip ends on the mining
-/// tile, the source's neighbour nearest the spawn; the successor waits on another neighbour, as
+/// tile, the source's neighbor nearest the spawn; the successor waits on another neighbor, as
 /// near or farther, and the margin covers that step too.
 ///
 /// Uses: [`lead`], [`walk_ticks_max`].

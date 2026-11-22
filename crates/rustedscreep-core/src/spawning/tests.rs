@@ -816,8 +816,8 @@ fn a_released_spawn_takes_orders_at_once() {
     assert_eq!(sp.orders()[0].spawn, h1, "first by id again");
 }
 
-/// `room_distance` over V169's coordinates: each of the eight neighbours is 1 away, the rooms either
-/// side of the W/E and N/S seams are neighbours, the larger difference counts, and it is symmetric.
+/// `room_distance` over V169's coordinates: each of the eight neighbors is 1 away, the rooms either
+/// side of the W/E and N/S seams are neighbors, the larger difference counts, and it is symmetric.
 #[test]
 fn room_distance_is_the_larger_coordinate_difference() {
     let c = room("E5N5");

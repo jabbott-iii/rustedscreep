@@ -38,7 +38,7 @@ pub fn earliest_level(kind: StructureType, n: u32) -> Option<u8> {
 }
 
 /// The types a full plan holds exactly as many of as each level allows: placing fewer leaves
-/// capacity, defence or production unused. Links, containers, roads, ramparts and walls are
+/// capacity, defense or production unused. Links, containers, roads, ramparts and walls are
 /// placed as the layout needs, up to the limit. The extractor counts only in a room with a
 /// mineral.
 pub const REQUIRED: [StructureType; 11] = [

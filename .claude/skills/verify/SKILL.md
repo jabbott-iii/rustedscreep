@@ -13,7 +13,8 @@ argument-hint: "[group or item, e.g. combat | boosts | creep.fatigue | tooling]"
 
 ## 2. Research (parallel, outside this context)
 - Spawn one `screeps-verifier` subagent per independent group, all in the same turn. Give each one the exact item list,
-  the pinned crate version (from `Cargo.lock`, or `Cargo.toml` before P1), and the target servers from `docs/PROJECT_CONTEXT.md`.
+  the pinned crate version (from `Cargo.lock`, or `Cargo.toml` before P1, the phase that set up the build), and the target
+  servers from `docs/PROJECT_CONTEXT.md`.
 - Ask for the verifier's standard output format (rows, discrepancies, suggested tests). Do not ask for raw page text.
 
 ## 3. Reconcile and record

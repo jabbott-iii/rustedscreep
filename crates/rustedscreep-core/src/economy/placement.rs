@@ -18,8 +18,8 @@
 //! The pattern is a checkerboard around the room's first spawn (by id): extensions take the tiles of
 //! the spawn's parity (`(x + y) % 2`) at range 2 or more, nearest by path first. Diagonal steps keep a
 //! tile's parity, so the tiles of the other parity, which the pattern never takes, stay connected to
-//! each other; a tile is taken only when its free neighbours stay connected without it (it is a
-//! simple tile), so narrow passages are never closed, and only when a free orthogonal neighbour can
+//! each other; a tile is taken only when its free neighbors stay connected without it (it is a
+//! simple tile), so narrow passages are never closed, and only when a free orthogonal neighbor can
 //! reach the spawn, so a worker can fill it. Tiles next to a source or a mineral (where harvesters
 //! stand), within the upgrade range of the controller, and within [`EDGE_MARGIN`] of the room's edge
 //! (clear of the engine's edge and exit rules, V205) are never taken.
@@ -63,7 +63,7 @@ use crate::snapshot::{Controller, ObjectKind, Snapshot};
 /// at x or y of 1 or 48 (V205); 3 keeps clear of both and of the exits' traffic.
 pub const EDGE_MARGIN: u8 = 3;
 
-/// The least range from the spawn: its ring of neighbours stays free, so new creeps can step out
+/// The least range from the spawn: its ring of neighbors stays free, so new creeps can step out
 /// and fillers can reach it.
 pub const SPAWN_CLEAR: u8 = 2;
 
@@ -1316,7 +1316,7 @@ pub fn next_extension(
     best.map(|(_, _, t)| t)
 }
 
-/// Whether the free neighbours of `t` stay one group (8-connected among themselves) once `t` is
+/// Whether the free neighbors of `t` stay one group (8-connected among themselves) once `t` is
 /// blocked: then any way through `t` can go around it, so blocking it never splits the room.
 pub(crate) fn keeps_neighbours_connected(t: Tile, blocked: impl Fn(Tile) -> bool) -> bool {
     let mut free = [None; 8];

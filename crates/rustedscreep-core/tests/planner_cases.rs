@@ -1,7 +1,7 @@
 //! Hand-made rooms for edge cases the P4.2 reviews found (2026-11-18), each planned by both
 //! candidates and judged by the validator: a standing spawn that is the one gap between two halves
 //! with exits of their own; one with a walled alcove behind it (a pocket as given, which only the
-//! validator may judge); and one whose two free neighbours both end up mining tiles unless the
+//! validator may judge); and one whose two free neighbors both end up mining tiles unless the
 //! earlier source leaves the later source's only tile to it. Last, the live room's standing
 //! extensions against each candidate's plan (a measure for ADR-007, `-- --nocapture`).
 
@@ -123,9 +123,9 @@ fn a_standing_spawn_with_a_pocket_as_given_is_left_to_the_validator() {
     }
 }
 
-/// A standing spawn whose only free neighbours are a1, one of source A's two tiles, and b1, the
+/// A standing spawn whose only free neighbors are a1, one of source A's two tiles, and b1, the
 /// only tile of source B: if A takes a1 on cost, B must take b1 and the spawn has no free
-/// neighbour left that is no post (SpawnBlocked, V174). A leaves b1's spawn its exit by taking
+/// neighbor left that is no post (SpawnBlocked, V174). A leaves b1's spawn its exit by taking
 /// its other tile, wherever the controller pulls the hub.
 #[test]
 fn an_earlier_source_leaves_a_spawn_its_last_exit() {
@@ -168,7 +168,7 @@ fn an_earlier_source_leaves_a_spawn_its_last_exit() {
 /// E7N57, the live room (STATUS 2026-11-15 to 2026-11-17): its spawn at (43, 21) and the 20
 /// extensions ADR-020's interim placement gives it up to RCL4, replayed with
 /// `economy::placement::next_extension` on one grid (the first five are checked against the live
-/// sites STATUS records; the other fifteen are modelled: the live job rescans the room and blocks
+/// sites STATUS records; the other fifteen are modeled: the live job rescans the room and blocks
 /// what stands, which moved one pick a tile in the review's model and no count). Prints how many
 /// each candidate's plan for the room with that spawn keeps as extensions (one may keep none); the
 /// rest stand on ground the plan wants for other things or for nothing, and must be destroyed and

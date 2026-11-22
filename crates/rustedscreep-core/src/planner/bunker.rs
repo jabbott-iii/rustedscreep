@@ -34,7 +34,7 @@
 //!
 //! Every stamp placement is checked before it is made by a flood from the hub over the plan as it
 //! would stand (the validator's reach rules at the top level): every obstacle keeps a reached
-//! neighbour, every road and container stands on reached ground, the controller keeps reached
+//! neighbor, every road and container stands on reached ground, the controller keeps reached
 //! ground in upgrade range, every side of the room with an exit and every exit tile the bare room
 //! reaches stay reached, and every spawn keeps the spawn rule (V174, [`Board::spawn_free`]; a
 //! standing spawn that broke it before the plan began is left to the validator). Removing items
@@ -588,8 +588,8 @@ struct Change<'c> {
 }
 
 /// Whether the plan with `change` keeps the validator's reach rules from the hub: every item
-/// reached (an obstacle or the extractor by a neighbour), each source and the mineral by a
-/// neighbour (their mining tiles and container come later), every new obstacle by a neighbour and
+/// reached (an obstacle or the extractor by a neighbor), each source and the mineral by a
+/// neighbor (their mining tiles and container come later), every new obstacle by a neighbor and
 /// every new road itself, the controller's upgrade range, every side and exit tile of `exits`,
 /// and the spawn rule ([`Board::spawn_free`]) for every spawn planned and new but the `exempt` (a
 /// standing spawn that broke it before the plan began).
@@ -672,9 +672,9 @@ fn reach_of<'r>(roads: &'r [Tile], s: &'r Scratch) -> impl Fn(Tile) -> u32 + 'r 
 }
 
 /// Whether an obstacle of `kind` may go on `t` alone and keep the plan's reach: the site rules,
-/// no open exit beside it, a reached walkable neighbour, its free neighbours one group (so the
+/// no open exit beside it, a reached walkable neighbor, its free neighbors one group (so the
 /// walkable ground stays one piece, `keeps_neighbours_connected`), and every obstacle beside it
-/// left with another reached walkable neighbour (for a spawn, one that is no creep's post); a new
+/// left with another reached walkable neighbor (for a spawn, one that is no creep's post); a new
 /// spawn keeps the spawn rule ([`Board::spawn_free`]).
 fn single_ok(board: &Board, kind: StructureType, t: Tile, reached: &[bool]) -> bool {
     let r = |n: Tile| reached.get(n.index()).copied().unwrap_or(false) && board.walkable(n);
@@ -924,9 +924,9 @@ impl<'a> Run<'a> {
     }
 
     /// What the standing spawn `t` does to the room before anything is planned: a source or the
-    /// mineral it leaves no walkable neighbour can never be mined (`NoRoom("mining tile")` or
+    /// mineral it leaves no walkable neighbor can never be mined (`NoRoom("mining tile")` or
     /// `NoRoom("mineral container")`, as the flood candidate's shared steps report it; one whose
-    /// neighbours it seals in a pocket fails later, at the core), and one whose free neighbours
+    /// neighbors it seals in a pocket fails later, at the core), and one whose free neighbors
     /// already break the spawn rule (V174, [`Board::standing_spawn_free`]) is exempt from the reach
     /// checks, so the validator judges it rather than every placement failing on it.
     fn check_standing(&mut self, t: Tile) -> Result<(), PlanError> {
@@ -1261,7 +1261,7 @@ impl<'a> Run<'a> {
 
     /// One step of the extensions: the best pod that fits (the largest the plan still has
     /// extensions for), unless single tiles are as cheap to fill as the pod's extensions on
-    /// average ([`POD_BIAS`] in the pod's favour); then those singles instead (all of them, or
+    /// average ([`POD_BIAS`] in the pod's favor); then those singles instead (all of them, or
     /// with no pod left every single the plan still lacks). False when neither fits.
     fn pods(&mut self, s: &mut Scratch) -> Result<bool, PlanError> {
         let missing = allowed(StructureType::Extension, MAX_LEVEL)

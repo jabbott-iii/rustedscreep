@@ -392,7 +392,7 @@ enum Retry {
     /// cannot be reached from where it stands).
     Search,
     /// Take a kept route through this room, or search one: the target cannot be reached inside
-    /// its own room from here, so the way may run through a neighbour.
+    /// its own room from here, so the way may run through a neighbor.
     Lookup,
     /// Search once more around the edge tiles the last search's path stepped onto and back from.
     Dips,
@@ -1508,7 +1508,7 @@ impl Movement {
     }
 
     /// The tiles of `room`'s sources and minerals, read with its terrain (none before that), for
-    /// planners that keep their neighbours free (P2.4's extension placement).
+    /// planners that keep their neighbors free (P2.4's extension placement).
     pub fn room_statics(&self, room: RoomName) -> impl Iterator<Item = Tile> + '_ {
         self.room_index(room)
             .and_then(|i| self.rooms.get(i))
@@ -1899,7 +1899,7 @@ fn find_room(rooms: &mut [RoomNav], name: RoomName) -> Option<&mut RoomNav> {
 const DETOUR_DROP_RANGE: u8 = 2;
 
 /// Whether `field` reaches a tile beside one of the room's open exits: a way into the room from a
-/// neighbour leads to the field's goal. Without one, no route out of the room and back in helps.
+/// neighbor leads to the field's goal. Without one, no route out of the room and back in helps.
 fn reaches_an_exit(field: &FlowField, grid: &CostGrid) -> bool {
     (0..ROOM_AREA)
         .filter_map(Tile::from_index)
