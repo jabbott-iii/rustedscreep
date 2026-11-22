@@ -86,6 +86,8 @@ export interface Glue {
   openingSummary?: () => string;
   /** One line about the base planner: per owned room its plan and its placement's last look, totals, CPU per phase (P4.3). */
   plannerSummary?: () => string;
+  /** One line about remote mining: per owned home its candidate rooms, the rooms it mines and their creeps (P6.2). */
+  remoteSummary?: () => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -688,6 +690,11 @@ export class Loader {
     return this.summary('plannerSummary', 'planner summary');
   }
 
+  /** Console command `rustedscreep.remote()`: the wasm's remote-mining summary (candidates, mined rooms, creeps). */
+  remote(): string {
+    return this.summary('remoteSummary', 'remote summary');
+  }
+
   /**
    * Console command `rustedscreep.spawn(room, role)`: a spawn of `room` spawns one creep of `role` (worker when
    * omitted) sized to the room's capacity, once the room holds its cost; `rustedscreep.spawn()` cancels. Only
@@ -707,7 +714,8 @@ export class Loader {
   private summary(
     name:
       | 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary' | 'persistSummary' | 'configSummary'
-      | 'constsSummary' | 'movementSummary' | 'spawnerSummary' | 'openingSummary' | 'plannerSummary',
+      | 'constsSummary' | 'movementSummary' | 'spawnerSummary' | 'openingSummary' | 'plannerSummary'
+      | 'remoteSummary',
     noun: string,
   ): string {
     const call = this.glue[name];

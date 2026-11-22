@@ -105,6 +105,9 @@ pub struct SpawnRequest {
     /// `spawn.help_range` whose capacity fits the body (P5.1).
     pub home: RoomName,
     pub role: Role,
+    /// The remote room a remote role works ([`Role::is_remote`], P6.2), which its name records too;
+    /// `None` for every other role.
+    pub remote: Option<RoomName>,
     pub body: BodySpec,
     /// What a [`BodySpec::Scaled`] body is sized to; an exact body only waits for its cost.
     pub budget: EnergyBudget,
@@ -647,6 +650,7 @@ impl Spawner {
                     .ok_or(Fault::new("too many spawn orders in one tick", unit))?;
                 let identity = Identity {
                     role: req.role,
+                    remote: req.remote,
                     home: req.home,
                     serial,
                 };

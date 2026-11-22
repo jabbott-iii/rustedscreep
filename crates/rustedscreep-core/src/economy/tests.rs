@@ -5477,6 +5477,7 @@ fn a_repairer_keeps_its_container() {
         key,
         identity: Identity {
             role: Role::Worker,
+            remote: None,
             home,
             serial: 1,
         },
@@ -5512,6 +5513,7 @@ fn a_repairer_keeps_its_container() {
         key,
         identity: Identity {
             role: Role::Worker,
+            remote: None,
             home,
             serial: 2,
         },

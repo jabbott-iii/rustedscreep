@@ -38,6 +38,12 @@
 //! hauler works in the room (its workers then fill nothing), and the energy the haulers took this
 //! tick (so no worker takes it too).
 //!
+//! Remote haulers (P6.2, ADR-029's "home sinks") join a room's haulers as guests while they are in
+//! their home room with energy ([`super::is_guest`]): they deliver as the room's own haulers do
+//! (the spawns and extensions, then the controller container), have no source, are not counted in
+//! the room's haulers or its requests, and leave when empty, when `economy::Remotes` sends them
+//! back.
+//!
 //! Haulers keep their source and mode between ticks in the heap; after a global reset they get a
 //! source again (the most wanted one relative to its haulers) and a mode from their store. Nothing
 //! is read from or written to `Memory`.
@@ -198,6 +204,8 @@ pub struct HaulStats {
     /// Haulers of the room, spawning ones included, and of them the ones out of the spawn.
     pub haulers: u32,
     pub working: u32,
+    /// Remote haulers delivering in the room this tick (P6.2, not in `haulers`).
+    pub guests: u32,
     /// Haulers the plan wants, over its sources.
     pub want: u32,
     /// Hauler requests made this tick.
@@ -270,6 +278,8 @@ struct Member {
     key: u128,
     row: usize,
     handle: CreepHandle,
+    /// A remote hauler delivering in its home room (P6.2): no source, always delivering.
+    guest: bool,
 }
 
 /// A hauler's state between ticks, in the slot of its handle.
@@ -369,10 +379,16 @@ impl Hauling {
         self.members.clear();
         let creeps = &snap.creeps;
         for (row, identity) in creeps.identities().iter().enumerate() {
-            let Some(id) = identity.filter(|id| id.role == Role::Hauler) else {
+            let Some(id) =
+                identity.filter(|id| matches!(id.role, Role::Hauler | Role::RemoteHauler))
+            else {
                 continue;
             };
             if !creeps.my().get(row).copied().unwrap_or(false) {
+                continue;
+            }
+            let guest = id.role == Role::RemoteHauler;
+            if guest && !super::is_guest(snap, row) {
                 continue;
             }
             let Ok(room) = self
@@ -396,6 +412,7 @@ impl Hauling {
                     key,
                     row,
                     handle,
+                    guest,
                 },
             );
         }
@@ -532,12 +549,16 @@ impl Hauling {
         // (P5.2).
         let mut stats = HaulStats {
             time: now,
-            haulers: u32::try_from(members.1.saturating_sub(members.0)).unwrap_or(u32::MAX),
             due,
             container: self.container.is_some(),
             ..HaulStats::default()
         };
         for m in self.members.get(members.0..members.1).unwrap_or(&[]) {
+            if m.guest {
+                stats.guests = stats.guests.saturating_add(1);
+                continue;
+            }
+            stats.haulers = stats.haulers.saturating_add(1);
             if !snap.creeps.spawning().get(m.row).copied().unwrap_or(true) {
                 stats.working = stats.working.saturating_add(1);
             }
@@ -555,6 +576,7 @@ impl Hauling {
                     let asked = spawner.request(SpawnRequest {
                         home: name,
                         role: Role::Hauler,
+                        remote: None,
                         body: BodySpec::Exact(body),
                         budget: EnergyBudget::Capacity,
                         priority: PRIORITY_HAULER,
@@ -872,7 +894,7 @@ impl Hauling {
         };
         let mut due = 0u32;
         for i in members.0..members.1 {
-            let Some(m) = self.members.get(i).copied() else {
+            let Some(m) = self.members.get(i).copied().filter(|m| !m.guest) else {
                 continue;
             };
             let Some(j) = kept_at(self.hauler(m.handle), &self.wants) else {
@@ -885,7 +907,7 @@ impl Hauling {
             }
         }
         for i in members.0..members.1 {
-            let Some(m) = self.members.get(i).copied() else {
+            let Some(m) = self.members.get(i).copied().filter(|m| !m.guest) else {
                 continue;
             };
             if kept_at(self.hauler(m.handle), &self.wants).is_some() {
@@ -974,7 +996,8 @@ impl Hauling {
                 if let Some(hm) = self.hauler_mut(i, snap) {
                     hm.from_store = false;
                 }
-            } else if store.free() == 0 {
+            } else if store.free() == 0 || m.guest {
+                // A guest only delivers (P6.2).
                 mode = Mode::Deliver;
             }
             if mode == Mode::Gather {

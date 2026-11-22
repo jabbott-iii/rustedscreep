@@ -91,6 +91,7 @@ const ROWS = [
   ['20 Links (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'link-sim.mjs')], true],
   ['21 Planner (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'planner-sim.mjs')], true],
   ['22 Split wasm (sandbox, plain build in 3 parts)', 'node', [join(ROOT, 'js', 'tools', 'split-sim.mjs')], true],
+  ['23 Remote mining (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'remote-sim.mjs')], true],
 ];
 
 function main() {

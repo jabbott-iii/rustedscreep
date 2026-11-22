@@ -22,12 +22,16 @@
 //! - [`remote_profit`]: remote mining's profit model (P6.1): what a room the bot mines without
 //!   owning it earns and costs per creep life, in energy and in CPU, with or without a reserver
 //!   and roads, and the plan to run it by ([`best_plan`]).
+//! - [`Remotes`]: remote mining's manager and creeps (P6.2, ADR-029): each home's candidate rooms,
+//!   what the bot saw of them, their ways and prices, the rooms it mines, and the scouts,
+//!   reservers, remote miners and remote haulers.
 
 mod hauling;
 mod mining;
 mod opening;
 pub mod placement;
 mod remote;
+mod remotes;
 pub mod sizing;
 mod upgrading;
 mod watchdog;
@@ -42,8 +46,14 @@ pub use mining::{
 };
 
 pub use remote::{
-    RemoteHome, RemotePlan, RemoteProfit, RemoteRoom, RemoteSource, RemoteWay, RoadTiles,
-    best_plan, intent_ucpu, remote_container_hits, remote_miner_work, remote_profit, reserver_body,
+    RemoteCrew, RemoteHome, RemotePlan, RemoteProfit, RemoteRoom, RemoteSource, RemoteWay,
+    RoadTiles, SourceCrew, best_plan, intent_ucpu, remote_container_hits, remote_crew,
+    remote_miner_work, remote_profit, reserver_body,
+};
+pub use remotes::{
+    Intel, PRIORITY_REMOTE_HAULER, PRIORITY_REMOTE_MINER, PRIORITY_RESERVER, PRIORITY_SCOUT,
+    Remote, RemoteSite, RemoteStats, RemoteWays, Remotes, SourceWay, WaySearch, candidates,
+    is_guest, is_remote_room,
 };
 
 pub use opening::{
@@ -58,5 +68,7 @@ pub use watchdog::{Event, Observation, Watchdog};
 
 #[cfg(test)]
 mod remote_tests;
+#[cfg(test)]
+mod remotes_tests;
 #[cfg(test)]
 mod tests;

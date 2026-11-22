@@ -1040,6 +1040,7 @@ impl Mining {
                 let asked = spawner.request(SpawnRequest {
                     home: name,
                     role: Role::Miner,
+                    remote: None,
                     body: BodySpec::Exact(body),
                     budget: EnergyBudget::Capacity,
                     priority: PRIORITY_MINER,

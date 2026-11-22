@@ -311,12 +311,14 @@ export function spawnSim(dir = join(ROOT, 'dist')) {
     if (!c.isArray || JSON.stringify(c.body) !== JSON.stringify(BODY)) problems.push(`offset ${c.offset}: body ${JSON.stringify(c.body)}, expected ${JSON.stringify(BODY)}`);
   }
   // No request can be served while SpawnA is held and SpawnB busy, nor on the quiet tick (no request), nor once both
-  // are busy again, nor on the tick with a null Memory (no request): no spawn job runs, so the plain build reads the clock in its loop only for the economy's five
-  // jobs, one unit each for W1N1 with a sample before and after (10: the P3.1 static miners' Critical job, the P3.3
-  // haulers' Critical job, the P2.4 opening's Critical and Standard jobs, and the Optional site placement of ADR-020;
-  // was 8 before P3.3, 6 before P3.1 and 0 before P2.4; the haulers' Standard job has a unit only for a room with a
-  // hauler to store; the constants self-check is done by then; movement's next rescan is 50 ticks after the first).
-  const OPENING_SAMPLES = 10;
+  // are busy again, nor on the tick with a null Memory (no request): no spawn job runs, so the plain build reads the clock in its loop only for the economy's seven
+  // jobs, one unit each for W1N1 with a sample before and after (14: the P3.1 static miners' Critical job, the P3.3
+  // haulers' Critical job, the P2.4 opening's Critical and Standard jobs, the Optional site placement of ADR-020, and
+  // the P6.2 remote manager's Critical job and Optional placement; was 10 before P6.2, 8 before P3.3, 6 before P3.1
+  // and 0 before P2.4; the haulers' Standard job has a unit only for a room with a hauler to store, the remote
+  // creeps' only with a remote creep; the constants self-check is done by then; movement's next rescan is 50 ticks
+  // after the first).
+  const OPENING_SAMPLES = 14;
   const idle = [];
   for (let o = AGAIN_AT + 1; o < B_FREE; o++) idle.push(o);
   // The tick with a null Memory has no request either.

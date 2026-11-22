@@ -535,12 +535,14 @@ pub fn remote_profit(
         let trip = s.way.trip(plan.roads);
         let yielded = yield_per_life(capacity);
         gross = gross.saturating_add(yielded);
+        let crew = source_crew(s, plan, home)?;
 
         // The miner: at its post every tick of the life.
-        let work = remote_miner_work(capacity)?;
-        let miner = miner_body_work(work, 1, capacity, trip, home.energy)?;
-        let walk = walk_ticks(trip, work, parts(&miner, Part::Move))?;
-        let stay = LIFE.checked_sub(u64::from(walk)).filter(|&s| s > 0)?;
+        let work = crew.work;
+        let miner = crew.miner;
+        let stay = LIFE
+            .checked_sub(u64::from(crew.miner_walk))
+            .filter(|&s| s > 0)?;
         ledger.post(&miner, trip.tiles, LIFE, stay);
         let harvests = share(
             harvest_ticks(capacity, work),
@@ -562,14 +564,7 @@ pub fn remote_profit(
         // The haulers: what reaches the container, in whole loads.
         let roads = plan.roads && s.road.tiles() > 0;
         let repair_work = u32::from(roads);
-        let (hauler, n) = hauler_plan_with(
-            capacity,
-            trip,
-            home.energy,
-            home.margin_pct,
-            home.unload,
-            repair_work,
-        )?;
+        let (hauler, n) = (crew.hauler, crew.haulers);
         ledger.crew(&hauler, n);
         haulers = haulers.saturating_add(n);
         let load = u64::from(parts(&hauler, Part::Carry)).saturating_mul(u64::from(CARRY_CAPACITY));
@@ -606,9 +601,8 @@ pub fn remote_profit(
     // The reserver: CLAIM parts at the controller for the ticks that hold the reservation.
     if plan.reserve {
         let trip = room.controller?.trip(plan.roads);
-        let reserver = reserver_body(trip, home.energy)?;
+        let (reserver, walk) = reserver_crew(room, plan, home)?;
         let claim = parts(&reserver, Part::Claim);
-        let walk = walk_ticks(trip, claim, parts(&reserver, Part::Move))?;
         let stay = u64::from(CREEP_CLAIM_LIFE_TIME)
             .checked_sub(u64::from(walk))
             .filter(|&s| s > 0)?;
@@ -640,6 +634,104 @@ pub fn remote_profit(
         cpu_ucpu,
         spawn_ticks: ledger.spawn_ticks,
         haulers,
+    })
+}
+
+/// The creeps one source of a remote room needs under a plan ([`remote_crew`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceCrew {
+    /// The miner's WORK parts ([`remote_miner_work`]). Unit: parts.
+    pub work: u32,
+    /// The miner: `work` WORK parts, one CARRY part and the MOVE parts [`miner_body_work`] solves.
+    pub miner: Body,
+    /// Its walk out from the home ([`walk_ticks`], a lower bound). Unit: ticks.
+    pub miner_walk: u32,
+    /// The haulers' body ([`hauler_plan_with`], one WORK part on a way with roads).
+    pub hauler: Body,
+    /// Haulers the source keeps. Unit: creeps.
+    pub haulers: u32,
+    /// A hauler's walk one way, loaded ([`walk_ticks`]). Unit: ticks.
+    pub hauler_walk: u32,
+}
+
+/// The creeps a remote room needs under a plan: what [`remote_profit`] prices, so the manager
+/// (P6.2) spawns the bodies the model counted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteCrew {
+    pub plan: RemotePlan,
+    /// One per source, in [`RemoteRoom::sources`]' order.
+    pub sources: Vec<SourceCrew>,
+    /// The reserver's body ([`reserver_body`]) and its walk to the controller, with a reserver plan.
+    pub reserver: Option<(Body, u32)>,
+}
+
+/// The creeps of one source under `plan`, sized for `home`; `None` as in [`remote_profit`].
+///
+/// Uses: [`remote_miner_work`], [`miner_body_work`], [`hauler_plan_with`], [`walk_ticks`],
+/// `CREEP_LIFE_TIME`.
+fn source_crew(s: &RemoteSource, plan: RemotePlan, home: RemoteHome) -> Option<SourceCrew> {
+    let capacity = plan.capacity();
+    let trip = s.way.trip(plan.roads);
+    let work = remote_miner_work(capacity)?;
+    let miner = miner_body_work(work, 1, capacity, trip, home.energy)?;
+    let miner_walk = walk_ticks(trip, work, parts(&miner, Part::Move))?;
+    LIFE.checked_sub(u64::from(miner_walk)).filter(|&s| s > 0)?;
+    let repair_work = u32::from(plan.roads && s.road.tiles() > 0);
+    let (hauler, haulers) = hauler_plan_with(
+        capacity,
+        trip,
+        home.energy,
+        home.margin_pct,
+        home.unload,
+        repair_work,
+    )?;
+    let weight = parts(&hauler, Part::Carry).saturating_add(parts(&hauler, Part::Work));
+    let hauler_walk = walk_ticks(trip, weight, parts(&hauler, Part::Move))?;
+    Some(SourceCrew {
+        work,
+        miner,
+        miner_walk,
+        hauler,
+        haulers,
+        hauler_walk,
+    })
+}
+
+/// The reserver's body and walk under a reserver plan, `None` without a controller or a body.
+///
+/// Uses: [`reserver_body`], [`walk_ticks`].
+fn reserver_crew(room: &RemoteRoom<'_>, plan: RemotePlan, home: RemoteHome) -> Option<(Body, u32)> {
+    let trip = room.controller?.trip(plan.roads);
+    let reserver = reserver_body(trip, home.energy)?;
+    let walk = walk_ticks(
+        trip,
+        parts(&reserver, Part::Claim),
+        parts(&reserver, Part::Move),
+    )?;
+    Some((reserver, walk))
+}
+
+/// The creeps `room` needs under `plan` ([`RemoteCrew`]), or `None` where [`remote_profit`] has no
+/// figure for the plan.
+pub fn remote_crew(
+    room: &RemoteRoom<'_>,
+    plan: RemotePlan,
+    home: RemoteHome,
+) -> Option<RemoteCrew> {
+    let sources = room
+        .sources
+        .iter()
+        .map(|s| source_crew(s, plan, home))
+        .collect::<Option<Vec<_>>>()?;
+    let reserver = if plan.reserve {
+        Some(reserver_crew(room, plan, home)?)
+    } else {
+        None
+    };
+    Some(RemoteCrew {
+        plan,
+        sources,
+        reserver,
     })
 }
 

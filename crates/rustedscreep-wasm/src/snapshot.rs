@@ -28,6 +28,15 @@
 //!   its position and type);
 //!   hostile creep: 5 (`get`, `id`, the id copy, `pos`, `__packedPos`; hostile results never
 //!   include spawning creeps, V101);
+//! - remote room (P6.2, ADR-029: a visible room the bot does not own that an own creep's name gives
+//!   as its remote room; `push_remote`): an owned room's 6 `find` calls and room objects, then the
+//!   controller as an object (`id`, the copy, its position and type when first seen, `reservation`,
+//!   and for a reservation its `username` and `ticksToEnd`, V268), `FIND_HOSTILE_STRUCTURES` and
+//!   its `length` (V267), and on ticks divisible by `remote.road_read_ticks`, in a room an own remote
+//!   hauler stands in, the roads through the engine's filter, each with `get`, `id`, the copy,
+//!   `hits` and `hitsMax`, and its position and type (the handle is released between reads). The
+//!   rooms an own scout stands in are read the same way (its tour, ADR-029). The bot's username:
+//!   an own creep's `owner` and `username`, once a global;
 //! - structure: 3 (`get`, `id`, the id copy), plus on the tick it is first seen `structureType`,
 //!   and `pos` and `__packedPos` when the type is known (again every tick while that read fails).
 //!   With `cache.structure_static` off (the naive baseline, P1.10) those three are read every tick.
@@ -51,17 +60,18 @@
 use std::fmt::Write as _;
 
 use js_sys::{Array, Object, Reflect};
-use rustedscreep_core::config::CacheConfig;
+use rustedscreep_core::config::{CacheConfig, RemoteConfig};
 use rustedscreep_core::snapshot::{
     Controller, ControllerState, CreepRow, CreepStore, ObjectKey, ObjectKind, ObjectRow,
-    ObjectStatic, RoomEnergy, SkipCounts, SkipLog, SkipReason, SkipReport, Snapshot,
-    StructureStatic, TickContext, known_structure_type, parse_room_name, position_from_packed,
+    ObjectStatic, RemoteRead, Reservation, RoomEnergy, SkipCounts, SkipLog, SkipReason, SkipReport,
+    Snapshot, StructureStatic, TickContext, known_structure_type, parse_room_name,
+    position_from_packed,
 };
-use rustedscreep_core::spawning::{CreepName, Identity};
+use rustedscreep_core::spawning::{CreepName, Identity, Role};
 use screeps::{
     ConstructionSite, Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Position,
-    Resource, ResourceType, Room, RoomObject, Source, Store, Structure, StructureController,
-    StructureLink, StructureSpawn, StructureType, find, game,
+    Resource, ResourceType, Room, RoomName, RoomObject, Source, Store, Structure,
+    StructureController, StructureLink, StructureSpawn, StructureType, find, game,
 };
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
@@ -116,6 +126,33 @@ extern "C" {
 
     #[wasm_bindgen(method, getter = id)]
     fn id_value(this: &WithId) -> JsValue;
+
+    /// A controller, for `reservation` as a plain value (undefined without one; P6.2, V263).
+    type Reserving;
+
+    #[wasm_bindgen(method, getter = reservation)]
+    fn reservation_value(this: &Reserving) -> JsValue;
+
+    /// A reservation (`{username, ticksToEnd}`), or an owner (`{username}`), read as plain values.
+    type UserRecord;
+
+    #[wasm_bindgen(method, getter = username)]
+    fn username_value(this: &UserRecord) -> JsValue;
+
+    #[wasm_bindgen(method, getter = ticksToEnd)]
+    fn ticks_to_end_value(this: &UserRecord) -> JsValue;
+
+    /// A creep, for its `owner` as a plain value (the bot's username, P6.2).
+    type HasOwner;
+
+    #[wasm_bindgen(method, getter = owner)]
+    fn owner_value(this: &HasOwner) -> JsValue;
+
+    /// A structure, for `hitsMax` (a road's, P6.2).
+    type WithHitsMax;
+
+    #[wasm_bindgen(method, getter = hitsMax)]
+    fn hits_max_value(this: &WithHitsMax) -> JsValue;
 }
 
 /// This tick's JS objects, index-aligned with the snapshot's rows. They are stale after this tick
@@ -125,11 +162,23 @@ pub struct JsWorld {
     pub rooms: Vec<Room>,
     pub creeps: Vec<Creep>,
     pub structures: Vec<Structure>,
-    /// Sources, own sites, piles, tombstones, ruins and containers of owned rooms (P2.4).
+    /// Sources, own sites, piles, tombstones, ruins and containers of owned rooms (P2.4), and of
+    /// remote rooms with their controllers and roads (P6.2).
     pub objects: Vec<RoomObject>,
     /// `{filter: {structureType: "container"}}`, built once per global: a plain object, not a
     /// game object, so it stays valid across ticks.
     container_filter: Option<JsValue>,
+    /// `{filter: {structureType: "road"}}`, likewise (P6.2).
+    road_filter: Option<JsValue>,
+    /// The bot's username, read once per global from an own creep's `owner` (P6.2): a remote
+    /// room's reservation is the bot's when it names it.
+    username: Option<String>,
+    /// Scratch: the remote rooms own creeps' names give this tick, and the rooms own scouts stand
+    /// in (their tour's rooms), sorted (P6.2).
+    remote_names: Vec<RoomName>,
+    /// Scratch: the rooms an own remote hauler stands in this tick, sorted: only their roads are
+    /// read (P6.2).
+    hauler_rooms: Vec<RoomName>,
 }
 
 impl JsWorld {
@@ -150,20 +199,29 @@ impl JsWorld {
 
     /// The container filter, built on first use (2 objects and 2 `Reflect.set` calls).
     fn container_filter(&mut self) -> &JsValue {
-        self.container_filter.get_or_insert_with(|| {
-            let inner = Object::new();
-            let opts = Object::new();
-            // A fresh plain object never refuses a property; a failure leaves the filter empty,
-            // which `find` reads as no filter, so only the type check below drops non-containers.
-            let _ = Reflect::set(&inner, &"structureType".into(), &"container".into());
-            let _ = Reflect::set(&opts, &"filter".into(), &inner);
-            opts.into()
-        })
+        self.container_filter
+            .get_or_insert_with(|| type_filter("container"))
+    }
+
+    /// The road filter, built on first use like the container filter (P6.2).
+    fn road_filter(&mut self) -> &JsValue {
+        self.road_filter.get_or_insert_with(|| type_filter("road"))
     }
 }
 
+/// `{filter: {structureType: kind}}`. A fresh plain object never refuses a property; a failure
+/// leaves the filter empty, which `find` reads as no filter, so only the readers' type checks drop
+/// other structures.
+fn type_filter(kind: &str) -> JsValue {
+    let inner = Object::new();
+    let opts = Object::new();
+    let _ = Reflect::set(&inner, &"structureType".into(), &kind.into());
+    let _ = Reflect::set(&opts, &"filter".into(), &inner);
+    opts.into()
+}
+
 /// Takes this tick's snapshot, with the cache toggles in force.
-pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld, cache: &CacheConfig) {
+pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld, cache: &CacheConfig, remote: &RemoteConfig) {
     js.clear();
     snapshot.structures.set_static_cache(cache.structure_static);
     snapshot.begin(TickContext::from_raw(
@@ -175,8 +233,31 @@ pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld, cache: &CacheConfig) {
     for creep in game::creeps().values() {
         push_creep(snapshot, js, creep, true);
     }
+    // P6.2: the remote rooms own creeps' names give, the rooms own scouts stand in, and the rooms
+    // own remote haulers stand in (identities and positions are read before the rooms).
+    js.remote_names.clear();
+    js.hauler_rooms.clear();
+    let creeps = &snapshot.creeps;
+    for (id, pos) in creeps.identities().iter().zip(creeps.positions()) {
+        let Some(id) = id else {
+            continue;
+        };
+        let here = pos.room_name();
+        if let Some(r) = id.remote {
+            insert_sorted(&mut js.remote_names, r);
+        }
+        match id.role {
+            Role::Scout => insert_sorted(&mut js.remote_names, here),
+            Role::RemoteHauler => insert_sorted(&mut js.hauler_rooms, here),
+            _ => {}
+        }
+    }
+    let road_tick = snapshot
+        .tick
+        .time
+        .is_multiple_of(remote.road_read_ticks.max(1));
     for room in game::rooms().values() {
-        push_room(snapshot, js, room);
+        push_room(snapshot, js, room, road_tick);
     }
     let structures = Object::values(&Game::structures_object());
     for index in 0..structures.length() {
@@ -185,7 +266,7 @@ pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld, cache: &CacheConfig) {
     snapshot.finish();
 }
 
-fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room) {
+fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room, road_tick: bool) {
     // `parse_room_name` has `RoomName::from_str`'s semantics without its str slicing, which links
     // about 8 KB of Unicode and Debug tables into the release wasm (V114). Anything that parses a
     // room name through the crate brings them back: `Room::name`, `RoomName::new`, `str::parse`,
@@ -231,8 +312,132 @@ fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room) {
                 .set_controller_state(row, controller_state(c, level));
         }
         push_objects(snapshot, js, room.unchecked_ref::<Findable>());
+    } else if js
+        .remote_names
+        .binary_search_by_key(&name.packed_repr(), |n| n.packed_repr())
+        .is_ok()
+    {
+        let roads = road_tick
+            && js
+                .hauler_rooms
+                .binary_search_by_key(&name.packed_repr(), |n| n.packed_repr())
+                .is_ok();
+        let read = push_remote(snapshot, js, &room, controller_object.as_ref(), roads);
+        snapshot.rooms.set_remote(row, read);
     }
     js.rooms.push(room);
+}
+
+/// A remote room (P6.2, ADR-029): a visible room the bot does not own that an own creep's name
+/// gives, or that an own scout stands in. Its room objects as an owned room's (`push_objects`), then its controller as an object
+/// (`get`, `id`, the id copy, its position and type when first seen, and `reservation`: undefined,
+/// or its `username` and `ticksToEnd`), `FIND_HOSTILE_STRUCTURES` and its `length`, and on a road
+/// tick (every `remote.road_read_ticks`) its roads through the engine's filter, each with `get`,
+/// `id`, the id copy, `hits` and `hitsMax` (its position and type when first seen).
+fn push_remote(
+    snapshot: &mut Snapshot,
+    js: &mut JsWorld,
+    room: &Room,
+    controller: Option<&StructureController>,
+    roads: bool,
+) -> RemoteRead {
+    let finder = room.unchecked_ref::<Findable>();
+    push_objects(snapshot, js, finder);
+    let mut read = RemoteRead {
+        read: true,
+        ..RemoteRead::default()
+    };
+    if let Some(c) = controller {
+        let value = c.unchecked_ref::<Reserving>().reservation_value();
+        let ticks = if value.is_object() {
+            let r = value.unchecked_ref::<UserRecord>();
+            let ticks = r
+                .ticks_to_end_value()
+                .as_f64()
+                .filter(|t| t.is_finite() && *t >= 0.0)
+                .map_or(0, |t| t as u32);
+            let user = r.username_value().as_string();
+            ensure_username(snapshot, js);
+            read.reservation = match (user, js.username.as_deref()) {
+                (Some(u), Some(me)) if u == me => Reservation::Mine { ticks },
+                _ => Reservation::Other { ticks },
+            };
+            ticks
+        } else {
+            0
+        };
+        let row = ObjectRow {
+            amount: ticks,
+            total: 0,
+            hits: 0,
+        };
+        push_object(
+            snapshot,
+            js,
+            c.clone().unchecked_into(),
+            |_| Ok(ObjectKind::Controller),
+            row,
+        );
+    }
+    read.hostile_structures = finder
+        .find_array(find::HOSTILE_STRUCTURES.find_code())
+        .length();
+    if roads {
+        read.roads = true;
+        let list = finder.find_filtered(find::STRUCTURES.find_code(), js.road_filter());
+        for i in 0..list.length() {
+            let object: RoomObject = list.get(i).unchecked_into();
+            let hits = object.unchecked_ref::<Structure>().hits();
+            let total = object
+                .unchecked_ref::<WithHitsMax>()
+                .hits_max_value()
+                .as_f64()
+                .filter(|t| t.is_finite() && *t >= 0.0)
+                .map_or(0, |t| t as u32);
+            let row = ObjectRow {
+                amount: 0,
+                total,
+                hits,
+            };
+            let check = |o: &RoomObject| {
+                if o.unchecked_ref::<Structure>().structure_type() != StructureType::Road {
+                    return Err(SkipReason::UnknownStructureType);
+                }
+                Ok(ObjectKind::Road)
+            };
+            push_object(snapshot, js, object, check, row);
+        }
+    }
+    read
+}
+
+/// Reads the bot's username once per global from the first own creep's `owner.username` (3 calls)
+/// into `js.username` (P6.2).
+fn ensure_username(snapshot: &Snapshot, js: &mut JsWorld) {
+    if js.username.is_none() {
+        let first = snapshot
+            .creeps
+            .my()
+            .iter()
+            .position(|&m| m)
+            .and_then(|row| js.creeps.get(row));
+        if let Some(creep) = first {
+            let owner = creep.unchecked_ref::<HasOwner>().owner_value();
+            if owner.is_object() {
+                js.username = owner
+                    .unchecked_ref::<UserRecord>()
+                    .username_value()
+                    .as_string();
+            }
+        }
+    }
+}
+
+/// Inserts `room` into the sorted list once.
+fn insert_sorted(list: &mut Vec<RoomName>, room: RoomName) {
+    if let Err(at) = list.binary_search_by_key(&room.packed_repr(), |n| n.packed_repr()) {
+        list.insert(at, room);
+    }
 }
 
 /// An owned controller's progress and timers (P2.4): 3 calls, each `Option` from the crate's

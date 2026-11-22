@@ -26,6 +26,7 @@ mod opening;
 mod persist;
 mod planner;
 mod profiler;
+mod remote;
 mod route;
 mod scheduler;
 mod snapshot;
@@ -56,6 +57,8 @@ struct State {
     opening: opening::OpeningGlue,
     /// The base planner (P4.3): each owned room's plan, built in the Optional tier.
     planner: planner::PlannerGlue,
+    /// Remote mining (P6.2, ADR-029): the remote rooms, their creeps and their sites.
+    remote: remote::RemoteGlue,
     persist: persist::Persist,
     /// The constants self-check, once per global (P1.11).
     consts: consts_check::ConstsCheck,
@@ -108,6 +111,7 @@ pub fn game_loop() {
                     spawn,
                     opening,
                     planner,
+                    remote,
                     persist,
                     consts,
                     profiler: prof,
@@ -116,7 +120,7 @@ pub fn game_loop() {
                 } = &mut *state;
                 let mut probe = profiler::Probe::start();
                 let cfg = *runtime.get();
-                snapshot::take(snapshot, js, &cfg.cache);
+                snapshot::take(snapshot, js, &cfg.cache, &cfg.remote);
                 // Movement's tick starts with the snapshot (no JS call); its room reads are jobs.
                 movement.begin(snapshot, &cfg.movement, &cfg.cache);
                 snapshot::log_skips(skip_log, snapshot, cfg.log.skip_window_ticks);
@@ -124,6 +128,7 @@ pub fn game_loop() {
                 act.begin(snapshot);
                 spawn.begin(snapshot, &cfg.spawn, |room| opening.worker_body(room));
                 opening.begin(snapshot, &mut movement.core);
+                remote.begin(snapshot);
                 // With no segment for the planner's record (ADR-027), plan from what stands at once.
                 if !persist.has_planner_segment() {
                     planner.no_record();
@@ -132,6 +137,24 @@ pub fn game_loop() {
                 let mut tick = sched.begin(&snapshot.tick, &cfg.scheduler, scheduler::GameClock);
                 // Critical: the rooms movement needs before anything in them can move, first.
                 movement.read_first(&mut tick, snapshot, js, &cfg.movement);
+                // Critical: remote mining's rooms and spawn requests (P6.2; the requests only while the
+                // Standard tier runs), before the spawn job, and its energy for the upgraders' budget,
+                // before the upgrading job.
+                {
+                    let (hauling, upgrading) = opening.haul_parts();
+                    remote.plan(
+                        &mut tick,
+                        snapshot,
+                        &mut movement.core,
+                        spawn.spawner_mut(),
+                        hauling,
+                        upgrading,
+                        &cfg.remote,
+                        &cfg.hauling,
+                        &cfg.spawn,
+                        &cfg.movement,
+                    );
+                }
                 // Critical: the static miners (P3.1), the haulers (P3.3), the upgraders' plan
                 // (P3.4), the opening's workers and their spawn requests (P2.4), then the spawn
                 // plan, after the Critical jobs that request creeps (P2.3).
@@ -164,6 +187,15 @@ pub fn game_loop() {
                 );
                 // Standard: the link sends (P3.2), from the `mining` job's rooms.
                 opening.send_links(&mut tick, &cfg.links);
+                // Standard: the remote creeps' work (P6.2).
+                remote.work(
+                    &mut tick,
+                    snapshot,
+                    &mut movement.core,
+                    &mut act.buffer,
+                    &cfg.remote,
+                    &cfg.movement,
+                );
                 // Standard: the periodic room rescans, then the console's move order.
                 movement.rescan(&mut tick, snapshot, js, &cfg.movement);
                 movement.run_console(&mut tick, snapshot, &cfg.movement);
@@ -190,6 +222,14 @@ pub fn game_loop() {
                     &cfg.planner,
                     &cfg.movement,
                 );
+                // Optional: the remote rooms' ways and sites (P6.2).
+                remote.place(
+                    &mut tick,
+                    snapshot,
+                    &mut movement.core,
+                    &cfg.remote,
+                    &cfg.movement,
+                );
                 act.queue_console_say(snapshot, tick.commit());
                 #[cfg(feature = "act-test")]
                 act_test.queue(&mut act.buffer, snapshot, tick.commit());
@@ -214,6 +254,7 @@ pub fn game_loop() {
                 // ADR-023, ADR-024, P4.3), the link sends (P3.2), then the creep intents.
                 opening.issue_destroys(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
                 opening.issue_sites(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
+                remote.issue_sites(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
                 opening.issue_links(
                     snapshot,
                     js,
@@ -378,6 +419,21 @@ pub fn planner_summary() -> String {
             Err(_) => String::from("rustedscreep planner: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep planner: state unavailable"))
+}
+
+/// Exported to JS as `remoteSummary`, for the `rustedscreep.remote()` console command: one line with
+/// each owned home's candidate rooms, what the bot knows of them, the rooms it mines with their plan
+/// and figures, their creeps, and the sites placed since boot (P6.2).
+#[wasm_bindgen(js_name = "remoteSummary")]
+pub fn remote_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state
+                .remote
+                .summary(&state.snapshot, &state.config.get().remote),
+            Err(_) => String::from("rustedscreep remote: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep remote: state unavailable"))
 }
 
 /// Exported to JS as `profilerSummary`, for the `rustedscreep.profiler()` console command: one line

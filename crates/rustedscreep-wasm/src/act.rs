@@ -90,6 +90,14 @@ extern "C" {
     /// `pickup(resource)` (P2.4, V190).
     #[wasm_bindgen(method, catch, js_name = pickup)]
     fn pickup(this: &Actor, target: &JsValue) -> Result<f64, JsValue>;
+
+    /// `reserveController(controller)` (P6.2, V263).
+    #[wasm_bindgen(method, catch, js_name = reserveController)]
+    fn reserve_controller(this: &Actor, target: &JsValue) -> Result<f64, JsValue>;
+
+    /// `suicide()` (P6.2, V108).
+    #[wasm_bindgen(method, catch, js_name = suicide)]
+    fn suicide(this: &Actor) -> Result<f64, JsValue>;
 }
 
 /// The job name act faults are logged under.
@@ -274,6 +282,8 @@ fn call(actor: &Actor, issue: &Issue, js: &JsWorld) -> Option<Result<f64, JsValu
         CreepIntent::Repair { .. } | CreepIntent::RepairObject { .. } => actor.repair(target()?),
         CreepIntent::UpgradeController { .. } => actor.upgrade_controller(target()?),
         CreepIntent::Pull { .. } => actor.pull(target()?),
+        CreepIntent::ReserveController { .. } => actor.reserve_controller(target()?),
+        CreepIntent::Suicide => actor.suicide(),
     })
 }
 
@@ -296,6 +306,8 @@ const fn threw(intent: &CreepIntent) -> &'static str {
         CreepIntent::Repair { .. } | CreepIntent::RepairObject { .. } => "the repair call threw",
         CreepIntent::UpgradeController { .. } => "the upgradeController call threw",
         CreepIntent::Pull { .. } => "the pull call threw",
+        CreepIntent::ReserveController { .. } => "the reserveController call threw",
+        CreepIntent::Suicide => "the suicide call threw",
     }
 }
 

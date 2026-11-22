@@ -702,10 +702,31 @@ pub const PLANNER_MMO: PlannerConfig = PlannerConfig {
 };
 
 /// Remote mining (ROADMAP P6): the prices of the profit model (`economy::remote_profit`) and its
-/// choice of a plan for a room (`economy::best_plan`). `docs/TUNING.md` gives each one's rationale
-/// and safe range.
+/// choice of a plan for a room (`economy::best_plan`), and the remote manager's limits (P6.2,
+/// ADR-029, `economy::Remotes`). `docs/TUNING.md` gives each one's rationale and safe range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RemoteConfig {
+    /// Runs remote mining: the scouts, the choice of remote rooms and their creeps' requests. Off,
+    /// no remote creep is requested, and the ones alive keep working until they die.
+    pub enabled: bool,
+    /// The most remote rooms one home mines at once. Unit: rooms.
+    pub max_rooms: u32,
+    /// The least controller level a home mines remote rooms at. Unit: RCL.
+    pub min_level: u32,
+    /// The most of each of the home's spawns' time its remote rooms' creeps may take, by the
+    /// profit model's spawn ticks over a creep life. Unit: per mille of a spawn's time.
+    pub spawn_permille: u32,
+    /// The most own construction sites one remote room holds before its placement waits (one site
+    /// a tick goes out: the containers, then the roads). Unit: sites.
+    pub max_sites: u32,
+    /// A remote miner repairs its container below this share of `CONTAINER_HITS`. Unit: percent.
+    pub container_repair_pct: u32,
+    /// The snapshot reads a remote room's roads (for their hits) every this many ticks, on the
+    /// ticks divisible by it. Unit: ticks.
+    pub road_read_ticks: u32,
+    /// A candidate room seen longer ago than this, and not mined, is scouted again when the home
+    /// wants another remote room. Unit: ticks.
+    pub rescout_ticks: u32,
     /// The bot's own CPU for each remote creep each tick it is alive (its share of the snapshot,
     /// the decisions and the act step's calls), on top of `INTENT_CPU_COST` for each billed intent.
     /// Unit: µCPU (millionths of a CPU).
@@ -722,6 +743,14 @@ pub struct RemoteConfig {
 
 /// Remote mining values for the official MMO.
 pub const REMOTE_MMO: RemoteConfig = RemoteConfig {
+    enabled: true,
+    max_rooms: 2,
+    min_level: 3,
+    spawn_permille: 400,
+    max_sites: 5,
+    container_repair_pct: 80,
+    road_read_ticks: 5,
+    rescout_ticks: 20_000,
     creep_ucpu: 10_000,
     horizon_ticks: 30_000,
     slack_pct: 2,
@@ -936,7 +965,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 101;
+pub const FIELD_COUNT: usize = 109;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1218,6 +1247,28 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(planner, "PlannerConfig", verify_ticks, 10, 10_000, true),
     number!(planner, "PlannerConfig", hub_clearance, 2, 5, false),
     number!(planner, "PlannerConfig", exposed_penalty, 0, 50, false),
+    flag!(remote, "RemoteConfig", enabled, true),
+    number!(remote, "RemoteConfig", max_rooms, 1, 8, true),
+    number!(remote, "RemoteConfig", min_level, 1, 8, true),
+    number!(remote, "RemoteConfig", spawn_permille, 0, 1000, true),
+    number!(
+        remote,
+        "RemoteConfig",
+        max_sites,
+        1,
+        MAX_CONSTRUCTION_SITES,
+        true
+    ),
+    number!(remote, "RemoteConfig", container_repair_pct, 1, 99, true),
+    number!(remote, "RemoteConfig", road_read_ticks, 1, 100, true),
+    number!(
+        remote,
+        "RemoteConfig",
+        rescout_ticks,
+        CREEP_LIFE_TIME,
+        1_500_000,
+        true
+    ),
     number!(remote, "RemoteConfig", creep_ucpu, 0, 1_000_000, true),
     number!(
         remote,
@@ -1511,6 +1562,14 @@ mod tests {
             exposed_penalty: _,
         } = PLANNER_MMO;
         let RemoteConfig {
+            enabled: _,
+            max_rooms: _,
+            min_level: _,
+            spawn_permille: _,
+            max_sites: _,
+            container_repair_pct: _,
+            road_read_ticks: _,
+            rescout_ticks: _,
             creep_ucpu: _,
             horizon_ticks: _,
             slack_pct: _,
@@ -1667,7 +1726,22 @@ mod tests {
                     "exposed_penalty",
                 ],
             ),
-            ("remote", &["creep_ucpu", "horizon_ticks", "slack_pct"]),
+            (
+                "remote",
+                &[
+                    "enabled",
+                    "max_rooms",
+                    "min_level",
+                    "spawn_permille",
+                    "max_sites",
+                    "container_repair_pct",
+                    "road_read_ticks",
+                    "rescout_ticks",
+                    "creep_ucpu",
+                    "horizon_ticks",
+                    "slack_pct",
+                ],
+            ),
         ];
         let mut total = 0;
         for (group, names) in expected {

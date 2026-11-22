@@ -75,12 +75,18 @@ extern "C" {
     #[wasm_bindgen(js_namespace = Game, js_name = notify, catch)]
     fn game_notify(message: &str) -> Result<(), JsValue>;
 
-    /// A room, for `createConstructionSite` (engine rooms.js; V200, V203).
-    type SiteRoom;
+    /// A room, for `createConstructionSite` (engine rooms.js; V200, V203). The remote glue places
+    /// its sites through it too (P6.2).
+    pub(crate) type SiteRoom;
 
     /// `createConstructionSite(x, y, structureType)`; the type crosses as its string.
     #[wasm_bindgen(method, catch, js_name = createConstructionSite)]
-    fn create_site(this: &SiteRoom, x: u8, y: u8, kind: StructureType) -> Result<f64, JsValue>;
+    pub(crate) fn create_site(
+        this: &SiteRoom,
+        x: u8,
+        y: u8,
+        kind: StructureType,
+    ) -> Result<f64, JsValue>;
 
     /// A link, for `transferEnergy` (engine game/structures.js L488-533 at a90d26f, V216). Bound
     /// here, not through screeps-game-api's `transfer_energy`, which unwraps the return code (V111).
@@ -486,6 +492,12 @@ impl OpeningGlue {
     /// The placement (P4.3's console summary reads its census and totals).
     pub fn placement(&self) -> &Placement {
         &self.placement
+    }
+
+    /// The hauling state, which delivers what the remote haulers bring, and the upgrading state,
+    /// whose budget counts it (P6.2, for the remote glue).
+    pub fn haul_parts(&mut self) -> (&Hauling, &mut Upgrading) {
+        (&self.hauling, &mut self.upgrading)
     }
 
     /// Calls `destroy` for this tick's off-plan structures (ADR-026) and records each outcome.

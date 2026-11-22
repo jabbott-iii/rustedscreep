@@ -150,6 +150,7 @@ fn worker(home: &str, budget: EnergyBudget, priority: u8) -> SpawnRequest {
     SpawnRequest {
         home: room(home),
         role: Role::Worker,
+        remote: None,
         body: BodySpec::Scaled {
             pattern: &WORKER_PATTERN,
             max_repeats: u8::MAX,
@@ -214,6 +215,7 @@ fn an_idle_spawn_takes_the_top_request_sized_to_capacity() {
         id,
         Identity {
             role: Role::Worker,
+            remote: None,
             home: room("W1N1"),
             serial: serial(T0, 0).expect("serial")
         }

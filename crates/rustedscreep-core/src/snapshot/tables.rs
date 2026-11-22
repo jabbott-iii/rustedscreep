@@ -100,6 +100,34 @@ pub struct ControllerState {
     pub upgrade_blocked: bool,
 }
 
+/// Who holds a controller's reservation (`controller.reservation`, V263, V264), read in remote
+/// rooms (P6.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Reservation {
+    /// No reservation, or a room not read for one.
+    #[default]
+    None,
+    /// The bot's own, ending in `ticks` (`ticksToEnd`). Unit: ticks.
+    Mine { ticks: u32 },
+    /// Another user's (another player's, or an NPC invader core's, V101). Unit: ticks.
+    Other { ticks: u32 },
+}
+
+/// What the snapshot reads in a remote room (P6.2, ADR-029): a visible room the bot does not own
+/// that an own creep's name gives as its remote room. Default (not read) for every other room.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RemoteRead {
+    /// The room was read as a remote room this tick: its room objects, its controller's
+    /// reservation and its hostile structures.
+    pub read: bool,
+    pub reservation: Reservation,
+    /// Structures of other users (`FIND_HOSTILE_STRUCTURES`: an invader core or a source keeper's
+    /// lair among them). Unit: structures.
+    pub hostile_structures: u32,
+    /// Its roads were read this tick (they are read every `remote.road_read_ticks`).
+    pub roads: bool,
+}
+
 /// Visible rooms (`Game.rooms`). Rooms are keyed by name, so they need no handles.
 #[derive(Default)]
 pub struct Rooms {
@@ -107,6 +135,7 @@ pub struct Rooms {
     controller: Vec<Controller>,
     energy: Vec<RoomEnergy>,
     state: Vec<ControllerState>,
+    remote: Vec<RemoteRead>,
 }
 
 impl Rooms {
@@ -115,17 +144,31 @@ impl Rooms {
         self.controller.clear();
         self.energy.clear();
         self.state.clear();
+        self.remote.clear();
     }
 
     /// Adds a room and returns its row. Its energy and controller state are 0 until
-    /// [`Self::set_energy`] and [`Self::set_controller_state`].
+    /// [`Self::set_energy`] and [`Self::set_controller_state`], and it is not read as a remote room
+    /// until [`Self::set_remote`].
     pub fn push(&mut self, name: RoomName, controller: Controller) -> usize {
         let row = self.name.len();
         self.name.push(name);
         self.controller.push(controller);
         self.energy.push(RoomEnergy::default());
         self.state.push(ControllerState::default());
+        self.remote.push(RemoteRead::default());
         row
+    }
+
+    /// Sets what was read in the remote room at `row` (P6.2); nothing for a row that does not exist.
+    pub fn set_remote(&mut self, row: usize, read: RemoteRead) {
+        if let Some(r) = self.remote.get_mut(row) {
+            *r = read;
+        }
+    }
+
+    pub fn remote_reads(&self) -> &[RemoteRead] {
+        &self.remote
     }
 
     /// Sets the controller state of the room at `row` (P2.4); nothing for a row that does not exist.
@@ -637,6 +680,12 @@ pub enum ObjectKind {
     /// A container (it has no owner, so `Game.structures` leaves it out): `amount` is the energy in
     /// its store, `hits` its hits (P3.5; its `hitsMax` is `CONTAINER_HITS`, V223).
     Container,
+    /// A remote room's controller (P6.2; an owned room's is in `Structures`): `amount` is its
+    /// reservation's `ticksToEnd`, 0 with none.
+    Controller,
+    /// A road in a remote room (P6.2; it has no owner), read every `remote.road_read_ticks`:
+    /// `hits` its hits and `total` its `hitsMax` (`ROAD_HITS` times the terrain's ratio).
+    Road,
 }
 
 impl ObjectKind {
@@ -661,12 +710,13 @@ pub struct ObjectStatic {
 pub struct ObjectRow {
     pub amount: u32,
     pub total: u32,
-    /// A container's hits (P3.5); 0 for every other kind.
+    /// A container's or a road's hits (P3.5, P6.2); 0 for every other kind.
     pub hits: u32,
 }
 
 /// Room objects the opening works with (P2.4), read in the bot's owned rooms: sources, own
-/// construction sites, dropped resources, tombstones, ruins and containers.
+/// construction sites, dropped resources, tombstones, ruins and containers; in remote rooms (P6.2)
+/// also the controller and, every `remote.road_read_ticks`, the roads.
 #[derive(Default)]
 pub struct RoomObjects {
     ids: Interner<ObjectClass, ObjectStatic>,
@@ -1048,6 +1098,7 @@ mod tests {
         use crate::spawning::{Identity, Role};
         let id = Identity {
             role: Role::Worker,
+            remote: None,
             home: room("W1N1"),
             serial: 7,
         };

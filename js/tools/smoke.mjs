@@ -317,9 +317,10 @@ const SCHEDULER_EXPECTED = {
     // Standard job has no unit while no hauler stores), the opening's two jobs for W1N1 (P2.4, Critical and Standard: was samples 4,
     // units 2 before them), and the persistence load job's two steps in one run, the config segment's
     // look-up (P1.10) and the planner record segment's (ADR-027: was samples 12, units 6 before it, one more
-    // step and one more clock sample). Tier-off skips 2 (was 1 before ADR-020): the constants self-check and
-    // the site placement.
-    'samples 13 (bad 0), units 7, budget stops 0, tier-off skips 2, out of order 0, faults 0',
+    // step and one more clock sample), and the remote manager's Critical job for W1N1 (P6.2: was samples 13,
+    // units 7 before it; its Standard job has no unit with no remote creep). Tier-off skips 3 (was 1 before
+    // ADR-020, 2 before P6.2): the constants self-check, the site placement and the remote placement.
+    'samples 15 (bad 0), units 8, budget stops 0, tier-off skips 3, out of order 0, faults 0',
     'faults since boot 0 (this window 0)',
   ],
   4: ['(loop 3 of this global)', 'optional on (cap 30.0)', ' | clock now '],
@@ -476,13 +477,17 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [], wasmForm = 'bin
   // the owned W1N1 on every loop, a sample before and after each, so 4 per loop (was 0 before P2.4), the static
   // miners' Critical job (P3.1), one unit for W1N1 on every loop, two more (was 0 before it), the haulers' Critical
   // job (P3.3), one unit for W1N1 on every loop, two more (was 0 before it; their Standard job has a unit only for a
-  // room with a hauler to store, and here none), and from the second loop the site placement's Optional job
-  // (ADR-020), one unit for W1N1, two more (was 0 before it).
+  // room with a hauler to store, and here none), the remote manager's Critical job (P6.2), one unit for W1N1
+  // on every loop, two more (was 0 before it; its Standard job has no unit with no remote creep), and from the
+  // second loop the site placement's Optional job (ADR-020) and the remote placement's (P6.2), one unit each
+  // for W1N1, two more each (was 0 before them).
   const OPENING_SAMPLES = 4;
   const MINING_SAMPLES = 2;
   const HAULING_SAMPLES = 2;
-  const PLACEMENT_SAMPLES = 2;
-  const perLoop = (features.includes('profiler') ? 6 : 0) + OPENING_SAMPLES + MINING_SAMPLES + HAULING_SAMPLES;
+  const REMOTE_SAMPLES = 2;
+  const PLACEMENT_SAMPLES = 2 + 2;
+  const perLoop = (features.includes('profiler') ? 6 : 0) + OPENING_SAMPLES + MINING_SAMPLES + HAULING_SAMPLES
+    + REMOTE_SAMPLES;
   const constsLines = world.logs.filter((l) => l.startsWith('rustedscreep consts:'));
   const constsDone = constsLines.length === 1 ? CONSTS_DONE.exec(constsLines[0]) : null;
   if (!constsDone) throw new Error(`constants self-check: expected one line matching ${CONSTS_DONE}, got ${constsLines.join(' / ') || 'none'}`);

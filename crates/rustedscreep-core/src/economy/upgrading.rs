@@ -270,6 +270,8 @@ struct UpgradeRoom {
     /// Posts movement found no way to, each skipped until the tick given
     /// (`movement.route_retry_ticks` later). At most [`UNREACHABLE_MAX`], oldest dropped first.
     unreachable: Vec<(Position, u32)>,
+    /// The energy its remote rooms bring it in a creep life ([`Upgrading::set_remote`], P6.2).
+    remote: u64,
     stats: UpgradeStats,
 }
 
@@ -353,6 +355,7 @@ impl Upgrading {
                         miner_at: None,
                         hauler_at: None,
                         unreachable: Vec::new(),
+                        remote: 0,
                         stats: UpgradeStats::default(),
                     },
                 ),
@@ -507,6 +510,19 @@ impl Upgrading {
     /// and `workers` the opening's last plan
     /// (`Opening::plan`); `cap`, the most energy the opening's watchdog saw the room hold while it
     /// never filled (`Watchdog::cap`), holds back an upgrader that costs more.
+    /// Sets the energy `room`'s remote rooms bring it in a creep life (`economy::Remotes::delivered`,
+    /// P6.2), which the upgraders' budget counts while the controller container stands. It holds
+    /// until set again; a room with none set counts 0.
+    pub fn set_remote(&mut self, room: RoomName, energy: u64) {
+        if let Ok(i) = self
+            .rooms
+            .binary_search_by_key(&room.packed_repr(), |r| r.name.packed_repr())
+            && let Some(r) = self.rooms.get_mut(i)
+        {
+            r.remote = energy;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn plan_room(
         &mut self,
@@ -616,6 +632,7 @@ impl Upgrading {
                     let asked = spawner.request(SpawnRequest {
                         home: name,
                         role: Role::Upgrader,
+                        remote: None,
                         body: BodySpec::Exact(body),
                         budget: EnergyBudget::Capacity,
                         priority: PRIORITY_UPGRADER,
@@ -992,7 +1009,10 @@ impl Upgrading {
                 .filter(|s| delivery(s, haul, ways).is_some())
                 .map(|s| s.source)
         };
-        let delivered = delivered(mine, haul, &self.sources, ways);
+        // P6.2: the remote rooms' energy reaches the controller container through the room's
+        // haulers (ADR-029's "home sinks"), so it counts while that container stands.
+        let remote = if ways.container { r.remote } else { 0 };
+        let delivered = delivered(mine, haul, &self.sources, ways).saturating_add(remote);
         let upkeep = upkeep(mine, haul, workers);
         let Some((grid, version)) = movement.room_grid(name, mcfg, commit) else {
             return;

@@ -237,10 +237,13 @@ export function profilerSim() {
     // The opening (P2.4): its Critical and Standard jobs run one unit each for W1N1 on every loop, a sample before
     // and after each (4 more than before P2.4), the mining job (P3.1) one unit on every loop (2 more), the haulers'
     // Critical job (P3.3) one unit on every loop (2 more; their Standard job has a unit only for a room with a
-    // hauler to store), and its Optional placement job (ADR-020) one unit from the second loop (2 more).
+    // hauler to store), and its Optional placement job (ADR-020) one unit from the second loop (2 more). The
+    // remote manager (P6.2): its Critical job one unit for W1N1 on every loop (2 more; its Standard job has no unit
+    // with no remote creep), and its Optional placement one unit from the second loop (2 more).
     const opening = 4 + 2 + 2 + (offset >= 2 ? 2 : 0);
+    const remote = 2 + (offset >= 2 ? 2 : 0);
     const reads = (closing.has(offset) && offset !== closeAt(noRawMemory.window) ? 1 : 0) + config;
-    const want = { getUsed: (closing.has(offset) ? 7 : 6) + LOAD_SAMPLES * config + 2 * rescan + opening, segments: reads };
+    const want = { getUsed: (closing.has(offset) ? 7 : 6) + LOAD_SAMPLES * config + 2 * rescan + opening + remote, segments: reads };
     const checking = offset <= constsLast;
     const usedOk = checking ? c.getUsed >= want.getUsed && c.getUsed <= want.getUsed + 64 : c.getUsed === want.getUsed;
     if (!usedOk || c.segments !== want.segments) {

@@ -666,6 +666,7 @@ impl Opening {
             let _ = spawner.request(SpawnRequest {
                 home: name,
                 role: Role::Worker,
+                remote: None,
                 body: BodySpec::Exact(body),
                 budget,
                 priority,

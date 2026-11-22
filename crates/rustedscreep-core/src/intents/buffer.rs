@@ -191,6 +191,12 @@ pub enum CreepIntent {
     Pull {
         target: CreepHandle,
     },
+    /// `reserveController(controller)` on a remote room's controller (P6.2, V263, V264).
+    ReserveController {
+        target: ObjectHandle,
+    },
+    /// `suicide()` (P6.2: a scout with nothing left to see).
+    Suicide,
 }
 
 impl CreepIntent {
@@ -209,6 +215,8 @@ impl CreepIntent {
             Self::Say { .. } => CreepAction::Say,
             Self::UpgradeController { .. } => CreepAction::UpgradeController,
             Self::Pull { .. } => CreepAction::Pull,
+            Self::ReserveController { .. } => CreepAction::ReserveController,
+            Self::Suicide => CreepAction::Suicide,
         }
     }
 
@@ -237,8 +245,9 @@ impl CreepIntent {
             | Self::Harvest { target }
             | Self::Build { target }
             | Self::Pickup { target }
-            | Self::RepairObject { target } => Some(Target::Object(target)),
-            Self::Drop { .. } | Self::Move { .. } | Self::Say { .. } => None,
+            | Self::RepairObject { target }
+            | Self::ReserveController { target } => Some(Target::Object(target)),
+            Self::Drop { .. } | Self::Move { .. } | Self::Say { .. } | Self::Suicide => None,
         }
     }
 
@@ -253,13 +262,14 @@ impl CreepIntent {
             | Self::Pickup { .. }
             | Self::Heal { .. }
             | Self::Pull { .. }
-            | Self::MoveToward { .. } => Some(1),
+            | Self::MoveToward { .. }
+            | Self::ReserveController { .. } => Some(1),
             Self::RangedHeal { .. }
             | Self::Repair { .. }
             | Self::RepairObject { .. }
             | Self::UpgradeController { .. }
             | Self::Build { .. } => Some(3),
-            Self::Drop { .. } | Self::Move { .. } | Self::Say { .. } => None,
+            Self::Drop { .. } | Self::Move { .. } | Self::Say { .. } | Self::Suicide => None,
         }
     }
 }
@@ -545,11 +555,18 @@ impl IntentBuffer {
             return Err(Rejected::ZeroAmount);
         }
         // The game side refuses first what it refuses (V221); the processor then skips a repair at
-        // full hits. Uses: CONTAINER_HITS, a container's `hitsMax` (V223).
-        if let (CreepIntent::RepairObject { .. }, Some(TargetRow::Object(t))) = (intent, target)
-            && snap.objects.hits().get(t as usize).copied().unwrap_or(0) >= CONTAINER_HITS
-        {
-            return Err(Rejected::FullHits);
+        // full hits. Uses: CONTAINER_HITS, a container's `hitsMax` (V223); a road's `hitsMax` as
+        // read (P6.2).
+        if let (CreepIntent::RepairObject { .. }, Some(TargetRow::Object(t))) = (intent, target) {
+            let t = t as usize;
+            let objects = &snap.objects;
+            let full = match objects.kinds().get(t) {
+                Some(ObjectKind::Road) => objects.totals().get(t).copied().unwrap_or(0),
+                _ => CONTAINER_HITS,
+            };
+            if objects.hits().get(t).copied().unwrap_or(0) >= full {
+                return Err(Rejected::FullHits);
+            }
         }
         Ok((row_u32(row)?, target))
     }
@@ -681,9 +698,11 @@ const fn accepts_object(intent: &CreepIntent, kind: ObjectKind) -> bool {
             kind,
             ObjectKind::Tombstone | ObjectKind::Ruin | ObjectKind::Container
         ),
-        CreepIntent::Transfer { .. } | CreepIntent::RepairObject { .. } => {
-            matches!(kind, ObjectKind::Container)
+        CreepIntent::Transfer { .. } => matches!(kind, ObjectKind::Container),
+        CreepIntent::RepairObject { .. } => {
+            matches!(kind, ObjectKind::Container | ObjectKind::Road)
         }
+        CreepIntent::ReserveController { .. } => matches!(kind, ObjectKind::Controller),
         _ => false,
     }
 }
@@ -1545,15 +1564,18 @@ mod tests {
             | CreepIntent::Harvest { target }
             | CreepIntent::Build { target }
             | CreepIntent::Pickup { target }
-            | CreepIntent::RepairObject { target } => {
+            | CreepIntent::RepairObject { target }
+            | CreepIntent::ReserveController { target } => {
                 let Some(&(_, at, kind)) = w.objects.iter().find(|o| o.0 == target) else {
                     return Err(Rejected::GoneTarget);
                 };
                 let ok = match intent {
                     // The fixture's container has 0 hits, below its `hitsMax`.
-                    CreepIntent::Transfer { .. } | CreepIntent::RepairObject { .. } => {
-                        kind == ObjectKind::Container
+                    CreepIntent::Transfer { .. } => kind == ObjectKind::Container,
+                    CreepIntent::RepairObject { .. } => {
+                        matches!(kind, ObjectKind::Container | ObjectKind::Road)
                     }
+                    CreepIntent::ReserveController { .. } => kind == ObjectKind::Controller,
                     CreepIntent::WithdrawObject { .. } => matches!(
                         kind,
                         ObjectKind::Tombstone | ObjectKind::Ruin | ObjectKind::Container
@@ -1575,9 +1597,10 @@ mod tests {
                 };
                 (Some(at), range)
             }
-            CreepIntent::Drop { .. } | CreepIntent::Move { .. } | CreepIntent::Say { .. } => {
-                (None, 0)
-            }
+            CreepIntent::Drop { .. }
+            | CreepIntent::Move { .. }
+            | CreepIntent::Say { .. }
+            | CreepIntent::Suicide => (None, 0),
         };
         if at.is_some_and(|at| !near(at, range)) {
             return Err(Rejected::NotInRange);

@@ -112,7 +112,7 @@ function pos(roomName, x, y) {
 
 /** The Creep methods the act layer binds (crates/rustedscreep-wasm/src/act.rs; engine game/creeps.js, V108). */
 export const CREEP_METHODS = ['move', 'say', 'drop', 'transfer', 'withdraw', 'heal', 'rangedHeal', 'repair', 'upgradeController', 'pull',
-  'harvest', 'build', 'pickup'];
+  'harvest', 'build', 'pickup', 'reserveController', 'suicide'];
 
 /** How a recorded call shows an argument: a game object by name (or structure type), undefined as a marker. */
 export function describeArg(arg) {
