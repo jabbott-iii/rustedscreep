@@ -148,10 +148,10 @@ Modules:
 - [x] Pre-spawn replacement timed to spawn time plus travel time.
 - [x] No wasted energy (no body or energy left idle while the queue is non-empty).
 
-**Gate:**
-- [ ] Replacement-timing tests pass.
-- [ ] A live run shows no idle spawn time with a non-empty queue, beyond the energy wait.
-- [ ] Creep handover gaps are measured.
+**Gate:** passed 2026-11-21.
+- [x] Replacement-timing tests pass.
+- [x] A live run shows no idle spawn time with a non-empty queue, beyond the energy wait.
+- [x] Creep handover gaps are measured.
 
 ## P6 Remote mining (SPEC §3.5)
 - [ ] Profit model per CPU and per energy, with tests.
