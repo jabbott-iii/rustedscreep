@@ -23,8 +23,9 @@ paths:
   1. A JS exception from a Rust trap.
   2. A tick aborted by the CPU limit. Detect it with a "running" flag left set at the start of the next tick.
   3. A compile or instantiate failure.
-- ADR-003 compared two strategies by measured cost and chose a hybrid: option 2 is the default, measured on the MMO over 10 traps
-  in a row (V148), and option 1 stays behind a config flag until its own 10-trap MMO run:
+- Compare two strategies and choose one by measured cost. ADR-003 chose a hybrid before any measurement: option 2 is the default
+  (it recovered from 10 forced traps in a row on the MMO, V148), and option 1 stays behind a config flag, off by default. Option 1
+  becomes the default only if its own MMO trap-test shows it correct over 10 traps in a row and cheaper than a halt plus a recompile:
   1. Drop the poisoned instance and its wasm-bindgen glue (the generated JS bindings), then re-instantiate from the cached
      `WebAssembly.Module` on the next tick.
   2. `Game.cpu.halt()`, which costs a full global reset (a fresh JS global, with all heap state lost) and a recompile.

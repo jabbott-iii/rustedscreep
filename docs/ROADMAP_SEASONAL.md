@@ -15,7 +15,7 @@ Each season changes the rules. screeps-game-api 0.23.5 (the Rust bindings to the
 
 ## SE1 Season verification (builds on P12)
 Modules:
-- [ ] Feature probe (a check of the WebAssembly, or wasm, features and JavaScript syntax the server accepts) on the Seasonal server, with results in VERIFICATION_LOG section D. Re-check ADR-002 and ADR-008 (the wasm features the build keeps and the loader's JavaScript target) against them.
+- [ ] Feature probe (console checks of the WebAssembly, or wasm, features and JavaScript syntax the server accepts, the API globals it defines, and its CPU, shard, and heap values) on the Seasonal server, with results in VERIFICATION_LOG section D. Re-check ADR-002 and ADR-008 (the wasm features the build keeps and the loader's JavaScript target) against them.
 - [ ] Check whether the screeps-game-api release then current has a feature for that season. If it has none, the bot uses its own `season`
   cargo feature, and any season-only API it needs goes through `rustedscreep-wasm` like any other binding.
 - [ ] Verify that season's rules: season-specific objects, resources and scoring, the CPU rules on Seasonal (not found in P0, the core's kickoff research, V35), and any

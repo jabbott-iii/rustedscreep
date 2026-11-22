@@ -26,7 +26,8 @@ and an exact proposed change for the main session to apply.
   features, and orders the fallbacks if a server rejects one).
 - The glue (wasm-bindgen's generated JS bindings) needs `TextDecoder`/`TextEncoder`, which may be missing.
 - The bundle may use syntax newer than the server's JS level. Since ADR-008 the loader is compiled by `tsc` (no Babel), then bundled
-  by Rollup, so check the `target` in `js/tsconfig.json` against the server's probed level.
+  by Rollup together with the wasm-bindgen glue in `js/pkg`, which `tsc` does not compile and nothing lowers. So check both the
+  `target` in `js/tsconfig.json` and the glue's syntax against the server's probed level.
 - Cargo profiles may be defined in a member crate, where they are ignored. Profiles belong in the workspace root.
 - `--target` mismatch between the wasm-pack/wasm-bindgen output and the loader's `initSync({ module })` usage.
 

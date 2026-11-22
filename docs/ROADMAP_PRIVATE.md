@@ -21,7 +21,7 @@ Modules:
 - [ ] `config.yml`, mods, world reset, and the bot user, written up in `docs/TEST_PLAN.md` §3 so the setup can be rebuilt from scratch.
 - [ ] A `private` server profile in `config.rs` and `docs/TUNING.md`, and the deploy and capture path into `logs/` for the private server, chosen here in an ADR (there are no API tools, ADR-021; a `private` entry in `.screeps.yaml`, in V93's screepers unified credentials format, only if that path reads one).
   The profile handles an unlimited CPU setting, where `Game.cpu.limit` and `bucket` (the reserve of unused CPU) read `Infinity` (V37).
-- [ ] Feature probe (a check of the WebAssembly, or wasm, features and JavaScript syntax the server accepts) on the private server, with results in VERIFICATION_LOG section D. Re-check ADR-002 and ADR-008 (the wasm features the build keeps and the loader's JavaScript target) against them.
+- [ ] Feature probe (console checks of the WebAssembly, or wasm, features and JavaScript syntax the server accepts, the API globals it defines, and its CPU, shard, and heap values) on the private server, with results in VERIFICATION_LOG section D. Re-check ADR-002 and ADR-008 (the wasm features the build keeps and the loader's JavaScript target) against them.
 - [ ] Cold-start cost measured on the private server, and the `private` profile's boot gate (the bucket level the loader waits for before it loads the wasm) set from it.
 
 **Gate:**

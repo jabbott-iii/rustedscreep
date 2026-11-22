@@ -17,9 +17,10 @@ Review the path or diff named in the task. If none is named, review `git diff` p
 1. **JS crossings** (calls from Rust out to JS, each with a CPU cost). Repeated getters such as `pos()`, `store()`, `hits()`, or
    `room()` on the same object within a tick. Crossings inside per-creep or per-tile loops. `find`/`look*` in loops. Per-tick
    construction of JS cost matrices that could be cached.
-2. **Intents** (actions ordered each tick by structures and by creeps, which are the player's units). No-op intents (fatigued moves,
-   full repairs, transfers into full stores, duplicate orders). More than one move per creep. Combinations that the engine priority
-   table blocks. `moveTo` where a Rust path exists.
+2. **Intents** (the state-changing game actions, such as a move, a transfer, or a construction-site placement, that the bot's calls
+   record for its creeps, structures, and rooms during a tick and that the game applies after the `loop`; creeps are the player's
+   units). No-op intents (fatigued moves, full repairs, transfers into full stores, duplicate orders). More than one move per creep.
+   Combinations that the engine priority table blocks. `moveTo` where a Rust path exists.
 3. **Allocation.** `Vec::new()`, `collect()`, `format!`, `to_string()`, `clone()` of large structs, or default-hasher maps in hot loops.
    Scratch buffers that are reallocated rather than cleared.
 4. **Memory and persistence.** Any `Memory` access in the tick path. RawMemory writes (to the game's persistent strings) when

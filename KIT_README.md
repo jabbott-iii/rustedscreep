@@ -1,6 +1,6 @@
 # Claude Code kit: Screeps Rust/WASM bot
 
-This kit turns your spec (`docs/SPEC.md`, verbatim) into a phase-gated Claude Code workflow with guardrails (each phase closes only when its exit gate, a set of checks with recorded evidence, passes).
+This kit turns your spec (`docs/SPEC.md`, verbatim) into a phase-gated Claude Code workflow (each phase closes only when its exit gate, a set of checks with recorded evidence, passes) with guardrails (hooks and permission rules that block risky commands and edits, or ask first).
 
 ## Install
 1. Copy the contents of this folder into the root of a new, empty repository, then run `git init`.

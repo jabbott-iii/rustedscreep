@@ -122,7 +122,8 @@ The live server's constants are the ground truth for that server. At init, the b
   Re-probe any other server first (PS1, SE1: the private and Seasonal tracks' first phases, which probe their servers).
 - A wasm trap can leave wasm-bindgen glue state (in the generated JS bindings) poisoned. The starter loader (from screeps-starter-rust) calls `Game.cpu.halt()` (which forces a global reset) on the tick after a `loop` that did not finish.
   ADR-003 (trap recovery) chose a hybrid: this halt is the default, measured on the MMO over 10 traps in a row (V148),
-  and a cheaper re-instantiate stays behind a config flag until its own 10-trap MMO run.
+  and re-instantiating (2 ticks per trap instead of 3, with no halt, in the sandbox, V99) stays behind a config flag, off by
+  default, until its own 10-trap MMO run shows it correct and cheaper than a halt plus recompile.
 - Engine intent priorities: `heal` is never blocked, and it blocks `dismantle`, `attack`, `rangedHeal`, and others, even when the target is at full HP.
   A breaker cannot heal and dismantle in the same tick. Design every combat role around the verified table.
 - Cargo profiles only apply from the workspace root `Cargo.toml`. `[package.metadata.wasm-pack...]` belongs in `rustedscreep-wasm`.

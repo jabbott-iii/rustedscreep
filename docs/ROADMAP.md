@@ -17,8 +17,8 @@ Evidence conventions:
   (the bot's log lines, the `rustedscreep.*` summaries, and segment 99 read in the console; segment 99 is the profiler's stats segment, one of
   the 100 numbered RawMemory segments, persistent strings the game stores for each player), recorded in STATUS.md and VERIFICATION_LOG.md
   (ADR-017 for P1, ADR-021 from P2 on: the decisions that make the user's console output the live evidence; there are no API tools). A
-  deploy to the MMO is a push of the staged `deploy/` folder through the GitHub link (the game's repository sync, which copies the linked
-  folder's files into the game as the bot's code on every push to `main`; ADR-012). Claude stages it only when the user names `mmo`, and the user pushes.
+  deploy to the MMO is a push of the staged `deploy/` folder through the GitHub link (the game's repository sync, which on every push to `main` replaces the bot's code in the game with exactly the linked
+  folder's files, deleting any other module; ADR-012, V145). Claude stages it only when the user names `mmo`, and the user pushes.
 - **Native scenario test:** a pure-Rust test in `rustedscreep-core` that drives a decision module (bootstrap recovery, combat sim,
   formations, offense state machines, breaker solver; P11's siege breaker is one heavily armored unit, or creep, that dismantles enemy structures)
   through a scripted situation, with expectations derived from constants.
@@ -41,7 +41,7 @@ Evidence conventions:
 ## P0 Kickoff and verification (no bot code): `/kickoff`
 - [x] Clarifying questions answered and recorded in `docs/PROJECT_CONTEXT.md`.
 - [x] Seeded findings (the log's pre-filled rows) re-verified. The `tooling`, `cpu-memory`, and `pipeline` groups verified.
-- [x] Feature probe (a check of the WebAssembly, or wasm, features and JavaScript syntax the server accepts) run on the official MMO, with results in VERIFICATION_LOG. The private server is probed in PS1 (private server setup) and Seasonal in SE1 (season verification).
+- [x] Feature probe (console checks of the WebAssembly, or wasm, features and JavaScript syntax the server accepts, the API globals it defines, and its CPU, shard, and heap values) run on the official MMO, with results in VERIFICATION_LOG. The private server is probed in PS1 (private server setup) and Seasonal in SE1 (season verification).
 - [x] ADR-001..006 and ADR-008 (build toolchain, wasm target, trap recovery, persistence encoding, test constants, dependencies, and loader language) proposed with evidence.
 
 **Gate:** passed 2026-11-13.
@@ -64,7 +64,7 @@ Modules:
    - Trap (a wasm abort, such as the one a Rust panic causes) and aborted-tick (a tick the engine killed for running too long) detection, with recovery per ADR-003 and backoff.
    - `console.error` routing and one notification per incident.
    - `trap-test` export wired to a console command.
-   - At boot, logs the build ID, `Game.time`, the type of the value `require()` returned for the wasm, and a hash over its bytes (V77, the open question whether the GitHub link delivers the wasm intact).
+   - At boot, logs the build ID, `Game.time`, the type of the value `require()` returned for the wasm, and a hash over its bytes (V77, the question whether the GitHub link delivers the wasm intact; V136 and V137 found that a binary `.wasm` cannot travel through it, so ADR-015 ships it as base64 text).
 5. [x] Snapshot (the per-tick copy of game state into Rust): one pass building SoA (structure-of-arrays) structs with interned handles. The tick context includes time, CPU limit, tickLimit (the most CPU this tick may use), and bucket.
 6. [x] Scheduler:
    - Critical, Standard, and Optional tiers (priority classes that decide which work runs at each bucket level).
@@ -176,7 +176,7 @@ Modules:
 - [ ] Threat assessment from hostile bodies and boosts (mineral compounds that labs apply to body parts to strengthen them).
 - [ ] Tower focus fire and heal priority, driven by the combat sim.
 - [ ] Rampart upkeep.
-- [ ] Safe-mode triggers (when to activate safe mode, which stops hostile creeps from acting in the room for a time).
+- [ ] Safe-mode triggers (when to activate safe mode, which for a limited time stops every creep but the owner's in the room from using any method that affects the owner's creeps or objects; exactly what it blocks is VERIFICATION_LOG R25, still unverified).
 - [ ] Scaled defenders.
 - [ ] Remote evacuation.
 

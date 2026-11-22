@@ -65,8 +65,9 @@ who needs every detail.
 ## In doc comments
 
 A reader lands on one item's page, not at the top of the crate. Explain a term once, in the module docs (`//!`) or on
-the item that defines it. Elsewhere, link to that explanation with an intra-doc link such as ``[`Body`]`` or
-``[`crate::spawning::lead_ticks`]`` instead of repeating it on every item.
+the item that defines it. Elsewhere, link to that explanation with an intra-doc link such as ``[`crate::spawning::Body`]`` or
+``[`crate::spawning::lead_ticks`]`` instead of repeating it on every item. A link resolves from the item's own scope, so a bare
+``[`Body`]`` works only where `Body` is in scope, and from another crate the path starts with the crate's name.
 
 ## Use American English
 

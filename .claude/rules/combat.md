@@ -12,7 +12,8 @@ paths:
 - Encode the engine's intent-priority table as data in `rustedscreep_core::intents`, with the engine commit SHA in a comment, and test it.
   An intent is an action that a creep (a player's unit) or a structure orders during a tick (one game turn). The table lists which
   intents block which on the same creep.
-- Verified table (V44 to V47, read from the engine; it supersedes the seeded finding this rule began with):
+- Verified table (V44 to V46, read from the engine at commit a90d26f, with the docs' simultaneous-action rules in V47; it
+  supersedes the seeded finding this rule began with):
   `heal` is never blocked. `dismantle` is blocked by `attackController`, `rangedHeal`, and `heal`.
   `attack` is blocked by `build`, `repair`, `dismantle`, `attackController`, `rangedHeal`, and `heal`. `rangedAttack` is blocked by `rangedMassAttack`, `build`, `repair`, and
   `rangedHeal`. Move, transfer, withdraw, pickup, and drop are outside the table. A heal on a target at full hit points (HP) still blocks.
