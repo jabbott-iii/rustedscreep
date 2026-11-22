@@ -387,7 +387,7 @@ pub fn container_upkeep() -> u32 {
 /// a tick or an energy too far). At least 1. Unit: hits.
 ///
 /// Uses: `REPAIR_COST`.
-fn hits_per_energy() -> u32 {
+pub(super) fn hits_per_energy() -> u32 {
     let hits = (1.0 / f64::from(REPAIR_COST)).round();
     if hits.is_finite() && hits >= 1.0 {
         hits.min(f64::from(u32::MAX)) as u32
@@ -791,7 +791,23 @@ pub fn miner_body(capacity: u32, trip: Trip, energy: u32) -> Option<Body> {
 /// Uses: `BODYPART_COST` (`Part::cost`), `ENERGY_REGEN_TIME`, `MAX_CREEP_SIZE`, [`miner_work`],
 /// [`walk_ticks`].
 pub fn miner_body_with(capacity: u32, trip: Trip, energy: u32, carry: u32) -> Option<Body> {
-    let work = miner_work(capacity);
+    miner_body_work(miner_work(capacity), carry, capacity, trip, energy)
+}
+
+/// A static miner's body as [`miner_body_with`] gives it, with `work` WORK parts instead of
+/// [`miner_work`]'s (P6.1: a remote miner also repairs its container, so it takes more,
+/// [`crate::economy::remote_miner_work`]). The MOVE parts are solved as in [`miner_body`], against
+/// the walk loss of a source of `capacity`. `None` for no WORK part, or when the parts with one
+/// MOVE cost more than `energy` or pass `MAX_CREEP_SIZE`.
+///
+/// Uses: `BODYPART_COST` (`Part::cost`), `ENERGY_REGEN_TIME`, `MAX_CREEP_SIZE`, [`walk_ticks`].
+pub fn miner_body_work(
+    work: u32,
+    carry: u32,
+    capacity: u32,
+    trip: Trip,
+    energy: u32,
+) -> Option<Body> {
     if work == 0 {
         return None;
     }
@@ -913,28 +929,49 @@ pub fn hauler_plan(
     margin_pct: u32,
     unload: u32,
 ) -> Option<(Body, u32)> {
+    hauler_plan_with(capacity, trip, energy, margin_pct, unload, 0)
+}
+
+/// The haulers [`hauler_plan`] gives, each with `work` WORK parts before its CARRY parts (P6.1: a
+/// remote hauler repairs the road under it as it walks, and a `repair` and a `move` run in the
+/// same tick, V45, V46). A WORK part makes fatigue loaded and empty (V54), so it weighs in both
+/// walks of the round ([`haul_round`]), and it costs its `BODYPART_COST` and a share of
+/// `MAX_CREEP_SIZE`. With `work` 0 this is [`hauler_plan`]. `None` as for [`hauler_plan`], or when
+/// the WORK parts, one CARRY and one MOVE cost more than `energy` or pass `MAX_CREEP_SIZE`.
+///
+/// Uses: `BODYPART_COST` (`Part::cost`), `MAX_CREEP_SIZE`, `CONTAINER_CAPACITY`, `CARRY_CAPACITY`,
+/// [`haul_round`], [`haulers_for`].
+pub fn hauler_plan_with(
+    capacity: u32,
+    trip: Trip,
+    energy: u32,
+    margin_pct: u32,
+    unload: u32,
+    work: u32,
+) -> Option<(Body, u32)> {
     if capacity == 0 {
         return None;
     }
     let carry_cost = Part::Carry.cost();
     let move_cost = Part::Move.cost();
+    let work_cost = Part::Work.cost().saturating_mul(work);
     // (haulers, energy for all of them, MOVE parts, CARRY parts)
     let mut best: Option<(u32, u64, u32, u32)> = None;
     let most = CONTAINER_CAPACITY
         .checked_div(CARRY_CAPACITY)
         .unwrap_or(0)
-        .min(MAX_CREEP_SIZE.saturating_sub(1));
+        .min(MAX_CREEP_SIZE.saturating_sub(1).saturating_sub(work));
     for carry in 1..=most {
-        let fixed = carry_cost.saturating_mul(carry);
+        let fixed = carry_cost.saturating_mul(carry).saturating_add(work_cost);
         if fixed.saturating_add(move_cost) > energy {
             break;
         }
-        for moves in 1..=MAX_CREEP_SIZE.saturating_sub(carry) {
+        for moves in 1..=MAX_CREEP_SIZE.saturating_sub(carry).saturating_sub(work) {
             let cost = fixed.saturating_add(move_cost.saturating_mul(moves));
             if cost > energy {
                 break;
             }
-            let Some(round) = round_ticks(trip, 0, carry, moves, unload) else {
+            let Some(round) = round_ticks(trip, work, carry, moves, unload) else {
                 break;
             };
             let n = haulers_for(capacity, carry, round, margin_pct);
@@ -942,17 +979,21 @@ pub fn hauler_plan(
             if best.is_none_or(|b| (key.0, key.1, key.2) < (b.0, b.1, b.2)) {
                 best = Some(key);
             }
-            if walk_ticks(trip, carry, moves).is_some_and(|w| w <= trip.tiles) {
+            if walk_ticks(trip, work.saturating_add(carry), moves).is_some_and(|w| w <= trip.tiles)
+            {
                 break;
             }
         }
     }
     let (n, _, moves, carry) = best?;
     let mut parts = [Part::Move; MAX_CREEP_SIZE as usize];
+    let work_n = usize::try_from(work).ok()?;
     let carry_n = usize::try_from(carry).ok()?;
-    let len = carry_n.checked_add(usize::try_from(moves).ok()?)?;
-    for part in parts.iter_mut().take(carry_n) {
-        *part = Part::Carry;
+    let len = work_n
+        .checked_add(carry_n)?
+        .checked_add(usize::try_from(moves).ok()?)?;
+    for (i, part) in parts.iter_mut().enumerate().take(work_n + carry_n) {
+        *part = if i < work_n { Part::Work } else { Part::Carry };
     }
     Some((Body::new(parts.get(..len)?)?, n))
 }

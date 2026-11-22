@@ -701,6 +701,32 @@ pub const PLANNER_MMO: PlannerConfig = PlannerConfig {
     exposed_penalty: 8,
 };
 
+/// Remote mining (ROADMAP P6): the prices of the profit model (`economy::remote_profit`) and its
+/// choice of a plan for a room (`economy::best_plan`). `docs/TUNING.md` gives each one's rationale
+/// and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteConfig {
+    /// The bot's own CPU for each remote creep each tick it is alive (its share of the snapshot,
+    /// the decisions and the act step's calls), on top of `INTENT_CPU_COST` for each billed intent.
+    /// Unit: µCPU (millionths of a CPU).
+    pub creep_ucpu: u32,
+    /// The ticks a remote's one-time builds (a container not standing yet, the road tiles not
+    /// built yet) are spread over: what a remote is expected to be held. A longer horizon favors
+    /// roads. Unit: ticks.
+    pub horizon_ticks: u32,
+    /// The best plan for a room is the one with the least CPU among those whose net energy is
+    /// within this share of the best plan's gross yield of the best net (the model's walks are
+    /// lower bounds). Unit: percent.
+    pub slack_pct: u32,
+}
+
+/// Remote mining values for the official MMO.
+pub const REMOTE_MMO: RemoteConfig = RemoteConfig {
+    creep_ucpu: 10_000,
+    horizon_ticks: 30_000,
+    slack_pct: 2,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -720,6 +746,7 @@ pub struct Config {
     pub hauling: HaulingConfig,
     pub upgrading: UpgradingConfig,
     pub planner: PlannerConfig,
+    pub remote: RemoteConfig,
 }
 
 /// A server profile: a name and its values.
@@ -748,6 +775,7 @@ pub const MMO: Profile = Profile {
         hauling: HAULING_MMO,
         upgrading: UPGRADING_MMO,
         planner: PLANNER_MMO,
+        remote: REMOTE_MMO,
     },
 };
 
@@ -908,7 +936,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 98;
+pub const FIELD_COUNT: usize = 101;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1190,6 +1218,16 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(planner, "PlannerConfig", verify_ticks, 10, 10_000, true),
     number!(planner, "PlannerConfig", hub_clearance, 2, 5, false),
     number!(planner, "PlannerConfig", exposed_penalty, 0, 50, false),
+    number!(remote, "RemoteConfig", creep_ucpu, 0, 1_000_000, true),
+    number!(
+        remote,
+        "RemoteConfig",
+        horizon_ticks,
+        CREEP_LIFE_TIME,
+        1_500_000,
+        true
+    ),
+    number!(remote, "RemoteConfig", slack_pct, 0, 25, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -1410,6 +1448,7 @@ mod tests {
             hauling: _,
             upgrading: _,
             planner: _,
+            remote: _,
         } = MMO.config;
         let SpawnConfig {
             hold_ticks: _,
@@ -1471,7 +1510,12 @@ mod tests {
             hub_clearance: _,
             exposed_penalty: _,
         } = PLANNER_MMO;
-        let expected: [(&str, &[&str]); 15] = [
+        let RemoteConfig {
+            creep_ucpu: _,
+            horizon_ticks: _,
+            slack_pct: _,
+        } = REMOTE_MMO;
+        let expected: [(&str, &[&str]); 16] = [
             (
                 "loader",
                 &[
@@ -1623,6 +1667,7 @@ mod tests {
                     "exposed_penalty",
                 ],
             ),
+            ("remote", &["creep_ucpu", "horizon_ticks", "slack_pct"]),
         ];
         let mut total = 0;
         for (group, names) in expected {

@@ -162,7 +162,7 @@ Modules:
 - [x] Creep handover gaps are measured.
 
 ## P6 Remote mining (SPEC §3.5)
-- [ ] Profit model per CPU and per energy, with tests.
+- [x] Profit model per CPU and per energy, with tests.
 - [ ] Reservers (creeps that reserve a remote room's controller, which raises its sources' capacity; a remote room is one the bot mines without owning it), haulers, and roads.
 - [ ] Auto-abandon of contested or unprofitable rooms, and threat-driven evacuation hooks for P7.
 

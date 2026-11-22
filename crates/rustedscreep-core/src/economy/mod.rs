@@ -19,11 +19,15 @@
 //! - [`Watchdog`]: recovery, the downgrade guard, the spawn wait fallback and stall reports.
 //! - [`placement`]: the interim extension sites (ADR-020), source containers (ADR-023), links
 //!   (ADR-024) and the controller container (ADR-025) until the P4 base planner.
+//! - [`remote_profit`]: remote mining's profit model (P6.1): what a room the bot mines without
+//!   owning it earns and costs per creep life, in energy and in CPU, with or without a reserver
+//!   and roads, and the plan to run it by ([`best_plan`]).
 
 mod hauling;
 mod mining;
 mod opening;
 pub mod placement;
+mod remote;
 pub mod sizing;
 mod upgrading;
 mod watchdog;
@@ -37,6 +41,11 @@ pub use mining::{
     Receiver, SourceHarvest, link_loss, permille,
 };
 
+pub use remote::{
+    RemoteHome, RemotePlan, RemoteProfit, RemoteRoom, RemoteSource, RemoteWay, RoadTiles,
+    best_plan, intent_ucpu, remote_container_hits, remote_miner_work, remote_profit, reserver_body,
+};
+
 pub use opening::{
     Opening, PRIORITY_LOW, PRIORITY_NORMAL, PRIORITY_RECOVERY, Plan, RoomStats, SourcePlan, Task,
     below_share, needs_repair,
@@ -47,5 +56,7 @@ pub use upgrading::{
 };
 pub use watchdog::{Event, Observation, Watchdog};
 
+#[cfg(test)]
+mod remote_tests;
 #[cfg(test)]
 mod tests;
