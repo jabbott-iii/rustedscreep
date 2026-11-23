@@ -79,7 +79,7 @@
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
 import { CREEP_METHODS, findFiltered, makeStore, packPos } from './lib/world.mjs';
-import { ENGINE_CONSTANTS, commandResults, simulate } from './smoke.mjs';
+import { CONFIG_SEGMENT, ENGINE_CONSTANTS, commandResults, configRecord, simulate } from './smoke.mjs';
 
 /** @screeps/common 2.16.0, the fixture the sandbox puts on the global (smoke.mjs ENGINE_CONSTANTS). */
 const C = Object.fromEntries(ENGINE_CONSTANTS.map(([name, json]) => [name, JSON.parse(json)]));
@@ -718,7 +718,10 @@ export function remoteSim(dir = join(ROOT, 'dist')) {
   let finished = false;
   const world = simulate(dir, {
     ticks: RUN,
-    setup: (context) => {
+    setup: (context, w) => {
+      // The controller signer (ADR-030) is off for this run: its spawn requests and route searches are not remote
+      // mining's, and sign-sim.mjs covers them. The record is in segment CONFIG_SEGMENT before the first global.
+      w.segments[CONFIG_SEGMENT] ??= configRecord(['sign.enabled=false']);
       state.context = context;
       context.Creep = EngineCreep;
       context.PathFinder = makePathFinder(state, definePositions(context));

@@ -22,7 +22,7 @@ use core::fmt;
 
 use rustedscreep_consts::{
     CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, LINK_CAPACITY, MAX_CONSTRUCTION_SITES,
-    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP,
+    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, ROOM_SIZE,
 };
 
 /// How the loader recovers after a trap or an aborted tick (ADR-003).
@@ -194,6 +194,10 @@ pub struct PersistConfig {
     /// anchor and adopted containers and links (`planner::record`, ADR-027; 0 to 99). Unit:
     /// segment id.
     pub planner_segment: u8,
+    /// The segment that keeps the controller signer's record across global resets: per room the
+    /// sign it showed, when it was seen, its controller's tile, the seen towers, and the signers
+    /// lost there (`signing::Book`, ADR-030; 0 to 99). Unit: segment id.
+    pub sign_segment: u8,
 }
 
 /// Segment manager values for the official MMO.
@@ -204,6 +208,7 @@ pub const PERSIST_MMO: PersistConfig = PersistConfig {
     self_test_segment: 98,
     config_segment: 97,
     planner_segment: 96,
+    sign_segment: 95,
 };
 
 /// How much the bot logs, least verbose first. rustedscreep-wasm maps it to `log::LevelFilter`
@@ -772,6 +777,59 @@ pub const REMOTE_MMO: RemoteConfig = RemoteConfig {
     slack_pct: 2,
 };
 
+/// The controller signer (ADR-030, `signing::Signing`): one cheap creep for the whole bot that signs
+/// every controller it can reach with `signing::SIGN_TEXT`. `docs/TUNING.md` gives each one's
+/// rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignConfig {
+    /// Runs the signer: its requests, its trips and its signs. Off, no signer is requested, and one
+    /// alive stands where it is until it dies.
+    pub enabled: bool,
+    /// The least controller level a home has before it sends signers: the opening's energy goes to
+    /// the economy first (remote mining starts at the same level, `remote.min_level`). Unit: RCL.
+    pub min_level: u32,
+    /// The farthest a candidate room lies from a home, in rooms (the larger of the two room
+    /// coordinate differences). The default, `CREEP_LIFE_TIME / (ROOM_SIZE - 1) + 1`, is the most
+    /// rooms a straight walk crosses in one life; the route's length is the real bound. Unit: rooms.
+    pub max_distance: u32,
+    /// A room seen with the text is looked at again after this long, for a sign another player
+    /// replaced. Unit: ticks.
+    pub recheck_ticks: u32,
+    /// A room given up on (no route, no body that survives its towers, the server's own sign, too
+    /// many signers lost or signs replaced) is tried again after this long. Unit: ticks.
+    pub retry_ticks: u32,
+    /// Signers lost in one room before it waits `retry_ticks`. Unit: creeps.
+    pub max_deaths: u32,
+    /// Times the text was found replaced in one room before it waits `retry_ticks`. Unit: signs.
+    pub max_overwrites: u32,
+    /// Added to the modeled tower damage before a body is sized for a towered room. Unit: percent.
+    pub damage_margin_pct: u32,
+    /// Ticks of life a trip must leave spare by the walk's estimate. Unit: ticks.
+    pub life_margin_ticks: u32,
+    /// PathFinder's `maxOps` for a trip's route search (V163). Unit: ops.
+    pub route_max_ops: u32,
+    /// PathFinder's `maxRooms` for a trip's route search (at most 64, V163). Unit: rooms.
+    pub route_max_rooms: u32,
+    /// The record is written at most once per this many ticks while it has changes. Unit: ticks.
+    pub save_ticks: u32,
+}
+
+/// Signer values for the official MMO.
+pub const SIGN_MMO: SignConfig = SignConfig {
+    enabled: true,
+    min_level: 3,
+    max_distance: CREEP_LIFE_TIME / (ROOM_SIZE as u32 - 1) + 1,
+    recheck_ticks: 100_000,
+    retry_ticks: 100_000,
+    max_deaths: 2,
+    max_overwrites: 2,
+    damage_margin_pct: 25,
+    life_margin_ticks: 50,
+    route_max_ops: 10_000,
+    route_max_rooms: 64,
+    save_ticks: 100,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -792,6 +850,7 @@ pub struct Config {
     pub upgrading: UpgradingConfig,
     pub planner: PlannerConfig,
     pub remote: RemoteConfig,
+    pub sign: SignConfig,
 }
 
 /// A server profile: a name and its values.
@@ -821,6 +880,7 @@ pub const MMO: Profile = Profile {
         upgrading: UPGRADING_MMO,
         planner: PLANNER_MMO,
         remote: REMOTE_MMO,
+        sign: SIGN_MMO,
     },
 };
 
@@ -981,7 +1041,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 113;
+pub const FIELD_COUNT: usize = 126;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1110,6 +1170,7 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(persist, "PersistConfig", self_test_segment, 0, 99, false),
     number!(persist, "PersistConfig", config_segment, 0, 99, false),
     number!(persist, "PersistConfig", planner_segment, 0, 99, false),
+    number!(persist, "PersistConfig", sign_segment, 0, 99, false),
     Field {
         key: "log.level",
         tuning: "LogConfig::level",
@@ -1320,6 +1381,39 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         true
     ),
     number!(remote, "RemoteConfig", slack_pct, 0, 25, true),
+    flag!(sign, "SignConfig", enabled, true),
+    number!(sign, "SignConfig", min_level, 1, 8, true),
+    number!(sign, "SignConfig", max_distance, 1, 64, true),
+    number!(
+        sign,
+        "SignConfig",
+        recheck_ticks,
+        CREEP_LIFE_TIME,
+        10_000_000,
+        true
+    ),
+    number!(
+        sign,
+        "SignConfig",
+        retry_ticks,
+        CREEP_LIFE_TIME,
+        10_000_000,
+        true
+    ),
+    number!(sign, "SignConfig", max_deaths, 1, 10, true),
+    number!(sign, "SignConfig", max_overwrites, 1, 10, true),
+    number!(sign, "SignConfig", damage_margin_pct, 0, 200, true),
+    number!(
+        sign,
+        "SignConfig",
+        life_margin_ticks,
+        0,
+        CREEP_LIFE_TIME / 2,
+        true
+    ),
+    number!(sign, "SignConfig", route_max_ops, 1000, 100_000, true),
+    number!(sign, "SignConfig", route_max_rooms, 1, 64, true),
+    number!(sign, "SignConfig", save_ticks, 1, 10_000, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -1345,7 +1439,7 @@ pub struct Rule {
 /// `CPU_TICK_LIMIT_MAX`: Standard switches on from the bucket at the start of the tick, and one tick
 /// is billed about tickLimit at most (the scheduler stops every tier at the ceiling and the reserve
 /// covers the rest), so a Standard tick leaves the bucket at or above the boot gate (TUNING.md).
-pub static RULES: [Rule; 12] = [
+pub static RULES: [Rule; 16] = [
     Rule {
         keys: ["loader.backoff_base_ticks", "loader.backoff_max_ticks"],
         text: "loader.backoff_base_ticks must be at most loader.backoff_max_ticks",
@@ -1406,6 +1500,26 @@ pub static RULES: [Rule; 12] = [
         keys: ["persist.planner_segment", "persist.config_segment"],
         text: "persist.planner_segment and persist.config_segment must differ",
         holds: |c| c.persist.planner_segment != c.persist.config_segment,
+    },
+    Rule {
+        keys: ["persist.sign_segment", "profiler.stats_segment"],
+        text: "persist.sign_segment and profiler.stats_segment must differ",
+        holds: |c| c.persist.sign_segment != c.profiler.stats_segment,
+    },
+    Rule {
+        keys: ["persist.sign_segment", "persist.self_test_segment"],
+        text: "persist.sign_segment and persist.self_test_segment must differ",
+        holds: |c| c.persist.sign_segment != c.persist.self_test_segment,
+    },
+    Rule {
+        keys: ["persist.sign_segment", "persist.config_segment"],
+        text: "persist.sign_segment and persist.config_segment must differ",
+        holds: |c| c.persist.sign_segment != c.persist.config_segment,
+    },
+    Rule {
+        keys: ["persist.sign_segment", "persist.planner_segment"],
+        text: "persist.sign_segment and persist.planner_segment must differ",
+        holds: |c| c.persist.sign_segment != c.persist.planner_segment,
     },
     Rule {
         keys: ["repair.walk_pct", "repair.start_pct"],
@@ -1491,6 +1605,7 @@ mod tests {
             self_test_segment: _,
             config_segment: _,
             planner_segment: _,
+            sign_segment: _,
         } = PERSIST_MMO;
         let LogConfig {
             level: _,
@@ -1541,6 +1656,7 @@ mod tests {
             upgrading: _,
             planner: _,
             remote: _,
+            sign: _,
         } = MMO.config;
         let SpawnConfig {
             hold_ticks: _,
@@ -1619,7 +1735,21 @@ mod tests {
             horizon_ticks: _,
             slack_pct: _,
         } = REMOTE_MMO;
-        let expected: [(&str, &[&str]); 16] = [
+        let SignConfig {
+            enabled: _,
+            min_level: _,
+            max_distance: _,
+            recheck_ticks: _,
+            retry_ticks: _,
+            max_deaths: _,
+            max_overwrites: _,
+            damage_margin_pct: _,
+            life_margin_ticks: _,
+            route_max_ops: _,
+            route_max_rooms: _,
+            save_ticks: _,
+        } = SIGN_MMO;
+        let expected: [(&str, &[&str]); 17] = [
             (
                 "loader",
                 &[
@@ -1662,6 +1792,7 @@ mod tests {
                     "self_test_segment",
                     "config_segment",
                     "planner_segment",
+                    "sign_segment",
                 ],
             ),
             ("log", &["level", "skip_window_ticks", "consts_findings"]),
@@ -1789,6 +1920,23 @@ mod tests {
                     "creep_ucpu",
                     "horizon_ticks",
                     "slack_pct",
+                ],
+            ),
+            (
+                "sign",
+                &[
+                    "enabled",
+                    "min_level",
+                    "max_distance",
+                    "recheck_ticks",
+                    "retry_ticks",
+                    "max_deaths",
+                    "max_overwrites",
+                    "damage_margin_pct",
+                    "life_margin_ticks",
+                    "route_max_ops",
+                    "route_max_rooms",
+                    "save_ticks",
                 ],
             ),
         ];

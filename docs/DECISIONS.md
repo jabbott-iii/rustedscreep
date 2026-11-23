@@ -555,3 +555,55 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
   - **Roads.** Roads are read only every `remote.road_read_ticks`, in a room a remote hauler stands in, and road sites go out only on those ticks.
 
   After a global reset, a room with creeps is searched again from the `remote` job, and its creeps hold with a request meanwhile, so movement keeps reading the room. Evidence: `economy/remotes_tests.rs`; `js/tools/remote-sim.mjs` (row 23 of `npm run check`); V267 and V268.
+
+## ADR-030 A controller signer: one cheap creep that signs every controller it can reach, tougher only for towered rooms: Accepted (2026-11-22)
+- Context: the user asked (2026-11-22) for a creep that signs controllers with the text "jabbott.dev rustedscreep bot - https://github.com/jabbott-iii/rustedscreep" (74 characters, under the 100 that common's `userString` keeps, V276). The rules:
+  - It is the cheapest body that reaches a controller and signs it.
+  - It goes to every controller it can physically reach, whoever owns the room.
+  - It is sent to a controller only once a way there is known.
+  - At most one exists at a time, and none is spawned once every reachable controller carries the text.
+  - In a hostile room it carries enough TOUGH parts to survive until it has signed.
+  - Neither `docs/SPEC.md` nor the roadmap has a signer. P8's scouting (`docs/ROADMAP.md`, "Scouting and observers") is the nearest item, so this record adds one.
+- The game's rules it rests on:
+  - `signController` needs range 1. The engine checks only that the creep is not spawning, the target is a controller, and the range. It checks no ownership, reservation, or safe mode, so any controller can be signed (V274, V275). Another player's safe mode blocks attacks and heals, not moves or signs (V280).
+  - A controller with the server's sign (`hardSign`, set for a planned novice or respawn area) shows that sign under the username `Screeps` (`SYSTEM_USERNAME`), and a player's sign stays hidden while it lasts (V275). Such a room counts as unsignable until a recheck.
+  - A sign is a billed intent, 0.2 CPU (`INTENT_CPU_COST`, V276).
+  - One MOVE part costs 50 energy, and a creep made only of MOVE parts never gains fatigue, so it walks one tile a tick on any terrain for its 1500-tick life (V54, V170).
+  - Tower damage is summed and applied in each creep's own tick, after every intent. So a creep signs on the tick it takes lethal damage (V278). Unboosted TOUGH parts are plain hit points (V279). A tower needs `TOWER_ENERGY_COST` (10) energy per shot, and the owner's towers fire during their own safe mode (V281). Damage by range is V239.
+  - A room whose `Game.map.getRoomStatus` differs from the home's is walled off or closed (V168).
+- Decision point 1: how far it goes.
+  - (a) One creep life: every room that can have a controller and that a route from a home spawn reaches within `CREEP_LIFE_TIME`.
+  - (b) A radius of `sign.max_distance` rooms.
+- Decision point 2: what the bot remembers across global resets (a reset discards the heap).
+  - (a) A compact record per room in a new RawMemory segment, written only when it changes. Rooms already signed are rechecked after `sign.recheck_ticks`.
+  - (b) The heap only. After a reset the tour starts again from the rooms nearest home.
+- Decision point 3: the CPU tier.
+  - (a) Optional. Requests and moves run only while the Optional tier runs, and the spawn priority is below every other role.
+  - (b) Standard.
+- Recommendation: 1(a), because it matches "any controller it can physically reach". 2(a), because a reset would otherwise send a creep back to rooms it already signed. 3(a), because the sign is cosmetic and must never take CPU or spawn time from the economy.
+- Decision: 1(a), 2(a), and 3(a), the user's choices on 2026-11-22 ("One creep life", "Persist and recheck", "Optional tier").
+- Design (within the user's rules; each threshold is a `sign.*` config field):
+  - **Rooms.** The candidates are the rooms a room name says can have a controller (not highways or sector centers, the rule `economy::is_remote_room` already uses, V231) within `sign.max_distance` rooms of a home. The default, 31, is `CREEP_LIFE_TIME / (ROOM_SIZE - 1) + 1`: a straight walk crosses at most that many rooms in one life. The route's length is the real bound.
+  - **The way first.** A room is due when the record holds nothing on it, when it was seen without the text, or when a recheck or retry comes due. Before a signer is given a due room, the bot searches a route there with PathFinder (`sign.route_max_ops`, `sign.route_max_rooms`). The search fails at once for a room whose status differs from the start's (V168). The route must be found and fit the signer's remaining life less `sign.life_margin_ticks`. The search avoids rooms whose towers the bot has seen and rooms that killed `sign.max_deaths` signers, except the target, and the route it found is the one the creep walks (searched again from the new signer's first tile). Only the search from a home spawn makes a room unreachable, until `sign.retry_ticks` have passed. A search that fails from where the live signer stands only passes the room over for that signer.
+  - **Look, then sign.** A room no creep has seen is first a look: the signer walks two tiles in, and vision gives the controller's tile, its sign, its owner, and the owner's towers. Then it signs, after a route to a tile next to the controller is found. A controller walled off from every entrance is unreachable.
+  - **The body.** A target whose way crosses no seen tower gets the plain signer, one MOVE part. A towered target gets the cheapest body of TOUGH parts in front and MOVE parts behind, at most `MAX_CREEP_SIZE` parts and within the home's energy capacity, that survives the worst case. In the worst case every seen tower hits it on every tick from the target room's entrance until the tick it signs, each at its range's damage (V239), plus `sign.damage_margin_pct`.
+    - The walk is modeled a tick at a time in the engine's order: the move, then the fatigue the MOVE parts left take off, then the tick's damage (V55, V278). The step's terrain sets the fatigue (V54, V154), and unknown roads count as their terrain.
+    - Damage takes the front parts first (V283): the TOUGH parts, then the MOVE parts one by one. A dead MOVE part stops taking off fatigue, and a dead TOUGH part still weighs (V284). So a body that has lost MOVE parts walks slower and stays longer under the towers.
+    - The body survives when it reaches the tile next to the controller with hits above 0 and a MOVE part for every step before it. Each TOUGH part is 100 hit points for 10 energy (V282), against 50 for a MOVE part, so TOUGH parts make a surviving body cheaper.
+    - A room no body survives is deadly until `sign.retry_ticks` have passed. A creep in a towered room takes at least 150 damage a tick, so even a body of 50 parts lives there about 34 ticks: only short walks under fire can be signed.
+  - **Safety.** A plain signer that walks into a room and sees towers there stands on the entrance edge, so the engine carries it back out (V151), and the room is planned for a tougher signer. A signer that dies before its life ends counts a death in the room it was in. After `sign.max_deaths` deaths, or after `sign.max_overwrites` times that another player replaced the text after it was signed (or a sign did not show on the next read), the room waits `sign.retry_ticks`. Defending creeps are not modeled. A signer that has walked a towered room takes only targets with no modeled damage afterward, since its hit points are not read.
+  - **One at a time.** One signer for the whole bot, requested by the home nearest the next due room, at `PRIORITY_SIGNER` (70, below the scout's 75). A signer with nothing left it can reach ends its life (`suicide`), and none is spawned while nothing is due.
+  - **When it starts.** A home sends signers from `sign.min_level` (3, the level remote mining starts at), so the RCL1 and RCL2 opening keeps every 50 energy. The record's segment is requested only then, and only once the config overrides have loaded, so an override that turns the signer off holds from a global's start. Nothing goes into the book before the record loads.
+  - **The record.** Owner `persist::kind::SIGN` in segment `persist.sign_segment` (95). Per room it holds the state, the tick last seen, the controller's tile, the seen towers' tiles, and the death and overwrite counts. It is written when a room's entry changes, at most once per `sign.save_ticks`.
+- Consequences:
+  - `spawning::Role` gains `Signer` (code `g`, never reused). Its name is `g<home>-<serial>`, so old names parse as before.
+  - The snapshot reads the room a signer stands in: the controller as an object, its `sign` (`username` and `text`), and the hostile towers' tiles.
+  - The act layer gains `signController(target, text)`.
+  - Movement gains a public route search that keeps the route it finds, with rooms to avoid, and a room-status lookup through the installed router.
+  - CPU: while it walks, about one move intent (0.2 CPU) a tick plus movement's share; a route search per target (heavy units, Optional); one sign intent per room. No cost while nothing is due.
+- Risks:
+  - Players whose controllers carry the text see it, and some answer visitors. An owner whose code re-signs its own controller is capped by `sign.max_overwrites`.
+  - Defending creeps can kill a signer the tower model calls safe, which `sign.max_deaths` caps.
+  - While the bucket is below the Optional threshold, the signer does not run; one left on an edge tile then crosses back and forth each tick (V151). The tier rule was kept over a Standard-tier exception for that case.
+  - A route search that runs out of ops before reaching a room marks it unreachable until a retry.
+- Evidence: V274 to V284 (2026-11-22, three screeps-verifier researchers against engine a90d26f and screeps-game-api 0.23.5).

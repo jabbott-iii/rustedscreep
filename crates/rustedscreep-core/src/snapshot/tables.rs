@@ -128,6 +128,53 @@ pub struct RemoteRead {
     pub roads: bool,
 }
 
+/// What a controller's `sign` showed (ADR-030, V275), read in a room an own signer stands in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SignSeen {
+    /// No sign, or a room not read for one.
+    #[default]
+    None,
+    /// The signer's text (`signing::SIGN_TEXT`), whoever wrote it.
+    Ours,
+    /// Another text.
+    Other,
+    /// The server's sign (username `SYSTEM_USERNAME`): a planned novice or respawn area hides any
+    /// player's sign while it lasts (V275).
+    System,
+}
+
+/// The most towers [`SignRead`] keeps: `CONTROLLER_STRUCTURES` for towers at level 8 (a test
+/// checks it).
+pub const SIGN_TOWERS: usize = 6;
+
+/// What the snapshot reads in a room an own signer stands in (ADR-030): its controller's sign and
+/// the other owner's towers. Default (not read) for every other room.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SignRead {
+    /// The room was read for the signer this tick.
+    pub read: bool,
+    pub sign: SignSeen,
+    /// The positions of towers of other users (`FIND_HOSTILE_STRUCTURES` of type tower), the first
+    /// [`SIGN_TOWERS`]; `towers` counts all of them.
+    pub tower_at: [Option<Position>; SIGN_TOWERS],
+    pub towers: u32,
+}
+
+impl SignRead {
+    /// The towers' positions read.
+    pub fn tower_positions(&self) -> impl Iterator<Item = Position> + '_ {
+        self.tower_at.iter().flatten().copied()
+    }
+
+    /// Adds a tower: kept while fewer than [`SIGN_TOWERS`] are, counted always.
+    pub fn add_tower(&mut self, at: Position) {
+        if let Some(slot) = self.tower_at.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(at);
+        }
+        self.towers = self.towers.saturating_add(1);
+    }
+}
+
 /// Visible rooms (`Game.rooms`). Rooms are keyed by name, so they need no handles.
 #[derive(Default)]
 pub struct Rooms {
@@ -136,6 +183,7 @@ pub struct Rooms {
     energy: Vec<RoomEnergy>,
     state: Vec<ControllerState>,
     remote: Vec<RemoteRead>,
+    sign: Vec<SignRead>,
 }
 
 impl Rooms {
@@ -145,6 +193,7 @@ impl Rooms {
         self.energy.clear();
         self.state.clear();
         self.remote.clear();
+        self.sign.clear();
     }
 
     /// Adds a room and returns its row. Its energy and controller state are 0 until
@@ -157,7 +206,20 @@ impl Rooms {
         self.energy.push(RoomEnergy::default());
         self.state.push(ControllerState::default());
         self.remote.push(RemoteRead::default());
+        self.sign.push(SignRead::default());
         row
+    }
+
+    /// Sets what was read for the signer in the room at `row` (ADR-030); nothing for a row that
+    /// does not exist.
+    pub fn set_sign(&mut self, row: usize, read: SignRead) {
+        if let Some(r) = self.sign.get_mut(row) {
+            *r = read;
+        }
+    }
+
+    pub fn sign_reads(&self) -> &[SignRead] {
+        &self.sign
     }
 
     /// Sets what was read in the remote room at `row` (P6.2); nothing for a row that does not exist.

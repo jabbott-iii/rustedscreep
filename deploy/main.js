@@ -605,6 +605,27 @@ function schedulerSummary() {
 }
 
 /**
+ * Exported to JS as `signSummary`, for the `rustedscreep.sign()` console command: one line with
+ * the signer's record, its trip, the next signer's plan and its counts (ADR-030).
+ * @returns {string}
+ */
+function signSummary() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        let ret;
+        __wbg_call_guard();
+        ret = wasm.signSummary();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        __wbg_call_guard();
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * Exported to JS as `snapshotSummary`, for the `rustedscreep.snapshot()` console command: one line
  * with this tick's tick context, table sizes, handle churn and skipped objects.
  * @returns {string}
@@ -696,6 +717,10 @@ function trapTest() {
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
+        __wbg___wbindgen_is_function_741ff2bb612836f5: function(arg0) {
+            const ret = typeof(arg0) === 'function';
+            return ret;
+        },
         __wbg___wbindgen_is_null_c22311b1cc228e3a: function(arg0) {
             const ret = arg0 === null;
             return ret;
@@ -837,8 +862,16 @@ function __wbg_get_imports() {
             const ret = arg0.getRawBuffer();
             return ret;
         }, arguments); },
+        __wbg_getRawBuffer_fe49ada5926118ec: function() { return handleError(function (arg0) {
+            const ret = arg0.getRawBuffer();
+            return ret;
+        }, arguments); },
         __wbg_getRoomStatus_85aa0bdab6980593: function() { return handleError(function (arg0) {
             const ret = Game.map.getRoomStatus(arg0);
+            return ret;
+        }, arguments); },
+        __wbg_getRoomTerrain_88585d21dfb98eff: function() { return handleError(function (arg0) {
+            const ret = Game.map.getRoomTerrain(arg0);
             return ret;
         }, arguments); },
         __wbg_getTerrain_6f901cc94969eb1f: function() { return handleError(function (arg0) {
@@ -1088,6 +1121,22 @@ function __wbg_get_imports() {
         __wbg_set_range_38aca89a65a1a1de: function(arg0, arg1) {
             arg0.range = arg1 >>> 0;
         },
+        __wbg_signController_b0400be3679de84a: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = arg0.signController(arg1, getStringFromWasm0(arg2, arg3));
+            return ret;
+        }, arguments); },
+        __wbg_sign_text_e827113780d545f4: function(arg0) {
+            const ret = arg0.text;
+            return ret;
+        },
+        __wbg_sign_username_95d455a1ee0c5c71: function(arg0) {
+            const ret = arg0.username;
+            return ret;
+        },
+        __wbg_sign_value_b38c2f6adc426c1b: function(arg0) {
+            const ret = arg0.sign;
+            return ret;
+        },
         __wbg_spawnCreep_115fb91e4a4a16ad: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4) {
             const v0 = [];
             let p0 = arg1;
@@ -1119,13 +1168,29 @@ function __wbg_get_imports() {
             const ret = PathFinder.CostMatrix.prototype;
             return ret;
         },
+        __wbg_static_accessor_GLOBAL_THIS_003ee833af9699fc: function() {
+            const ret = typeof globalThis === 'undefined' ? undefined : globalThis;
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
         __wbg_static_accessor_GLOBAL_THIS_2b9a0b79f3f7b8ee: function() {
             const ret = typeof globalThis === 'undefined' ? undefined : globalThis;
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
+        __wbg_static_accessor_GLOBAL_e4293fb22cbe77da: function() {
+            const ret = typeof global === 'undefined' ? undefined : global;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
         __wbg_static_accessor_ROOM_POSITION_PROTOTYPE_a3e59f2133c00861: function() {
             const ret = RoomPosition.prototype;
             return ret;
+        },
+        __wbg_static_accessor_SELF_53bb20457401453d: function() {
+            const ret = typeof self === 'undefined' ? undefined : self;
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
+        __wbg_static_accessor_WINDOW_b5e0810bfecb7feb: function() {
+            const ret = typeof window === 'undefined' ? undefined : window;
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
         __wbg_store_internal_b93d8e18a4a73d36: function(arg0) {
             const ret = arg0.store;
@@ -1211,7 +1276,7 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("string")], shim_idx: 17, ret: Externref, inner_ret: Some(Externref) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("string")], shim_idx: 19, ret: Externref, inner_ret: Some(Externref) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_66fc74bf8055cade___convert__closures_____invoke___wasm_bindgen_66fc74bf8055cade___JsValue__wasm_bindgen_66fc74bf8055cade___JsValue__true_);
             return ret;
         },
@@ -2148,6 +2213,10 @@ class Loader {
     remote() {
         return this.summary('remoteSummary', 'remote summary');
     }
+    /** Console command `rustedscreep.sign()`: the wasm's controller-signer summary (record, signer, plan; ADR-030). */
+    sign() {
+        return this.summary('signSummary', 'sign summary');
+    }
     /**
      * Console command `rustedscreep.spawn(room, role)`: a spawn of `room` spawns one creep of `role` (worker when
      * omitted) sized to the room's capacity, once the room holds its cost; `rustedscreep.spawn()` cancels. Only
@@ -2203,7 +2272,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"08e7b14d93e5-dirty-8fb89259","wasmCrc32":"8fb89259","features":[],"wasmParts":[723460,723460]});
+const BUILD = ({"id":"c4325c988cab-dirty-d68529b5","wasmCrc32":"d68529b5","features":[],"wasmParts":[760612,760612]});
 const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;
@@ -2292,6 +2361,7 @@ const glue = {
     openingSummary: openingSummary,
     plannerSummary: plannerSummary,
     remoteSummary: remoteSummary,
+    signSummary: signSummary,
 };
 const loader = new Loader(env, glue, CONFIG, BUILD);
 const routedError = (...args) => {
@@ -2323,7 +2393,8 @@ function routeConsole() {
 // `rustedscreep.configReset()`, `rustedscreep.consts()`, `rustedscreep.movement()`,
 // `rustedscreep.moveTo("W1N1", 25, 25, 1)` (from another room: `rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1")`;
 // `rustedscreep.moveTo()` cancels), `rustedscreep.spawner()` or `rustedscreep.spawn("W1N1", "worker")`
-// (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`, `rustedscreep.planner()`, `rustedscreep.remote()`.
+// (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`, `rustedscreep.planner()`, `rustedscreep.remote()`,
+// `rustedscreep.sign()`.
 g.rustedscreep = {
     trapTest: (n = 1) => loader.scheduleTraps(Number(n)),
     status: () => loader.status(),
@@ -2346,6 +2417,7 @@ g.rustedscreep = {
     opening: () => loader.opening(),
     planner: () => loader.planner(),
     remote: () => loader.remote(),
+    sign: () => loader.sign(),
 };
 function loop() {
     try {

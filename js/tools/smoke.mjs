@@ -14,6 +14,7 @@ import { performance } from 'node:perf_hooks';
 import vm from 'node:vm';
 import { FIXTURE_DIR, parseFixture } from './consts-fixture.mjs';
 import { ROOT, WASM_MODULE, fail, isMain } from './lib/common.mjs';
+import { crc32 } from './lib/crc32.mjs';
 import { partIndex, partModuleName, wasmModuleTexts } from './lib/wasm-text.mjs';
 import { sceneAt } from './lib/world.mjs';
 
@@ -295,6 +296,28 @@ const SNAPSHOT_EXPECTED = {
 export const CONFIG_SEGMENT = 97;
 /** PERSIST_MMO.planner_segment (crates/rustedscreep-core/src/config.rs): the planner's record (ADR-027). */
 export const PLANNER_SEGMENT = 96;
+/** PERSIST_MMO.sign_segment (crates/rustedscreep-core/src/config.rs): the controller signer's record (ADR-030). */
+export const SIGN_SEGMENT = 95;
+
+/**
+ * A runtime config record for segment CONFIG_SEGMENT, so a sim can start a global with overrides in force from its
+ * first loop that reads the record (config/overrides.rs: frame kind 2, schema 1, one `key=value\n` line per override
+ * in the config's field order). The frame is persist/frame.rs's: `rs1b`, then the base64 of a 12-byte header (kind,
+ * schema, write tick and payload length, little-endian u16, u16, u32 and u32), the CRC-32 of the header and the
+ * payload (little-endian), and the payload, unpadded.
+ */
+export function configRecord(lines, written = 0) {
+  const payload = Buffer.from(lines.map((l) => `${l}\n`).join(''), 'latin1');
+  const head = Buffer.alloc(12);
+  head.writeUInt16LE(2, 0);
+  head.writeUInt16LE(1, 2);
+  head.writeUInt32LE(written >>> 0, 4);
+  head.writeUInt32LE(payload.length, 8);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32LE(crc32(Buffer.concat([head, payload])), 0);
+  // The bot's base64 (persist/base64.rs) has no `=` padding.
+  return `rs1b${Buffer.concat([head, crc, payload]).toString('base64').replace(/=+$/, '')}`;
+}
 
 /**
  * What `rustedscreep.scheduler()` must report after the loops at these offsets. The fake world has CPU limit

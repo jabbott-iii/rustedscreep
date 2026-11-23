@@ -511,10 +511,12 @@ pub struct Movement {
 }
 
 /// What a route search may know of the rooms: the cost grids movement has built, the rooms held
-/// closed after a refused transfer, and the edge tiles paths must not step onto and back from.
+/// closed after a refused transfer, the rooms the search's caller avoids
+/// ([`Movement::search_route`]), and the edge tiles paths must not step onto and back from.
 pub struct RouteRooms<'a> {
     rooms: &'a [RoomNav],
     closed: &'a [(RoomName, u32)],
+    avoid: &'a [RoomName],
     dips: &'a [(RoomName, Tile, u32)],
 }
 
@@ -533,14 +535,18 @@ impl<'a> RouteRooms<'a> {
         self.dips.iter().map(|&(r, _, _)| r)
     }
 
-    /// Whether a creep could not cross into `room` within the last `route_ttl_ticks`.
+    /// Whether the search must not enter `room`: a creep could not cross into it within the last
+    /// `route_ttl_ticks`, or the caller avoids it.
     pub fn closed(&self, room: RoomName) -> bool {
-        self.closed.iter().any(|&(r, _)| r == room)
+        self.closed.iter().any(|&(r, _)| r == room) || self.avoid.contains(&room)
     }
 
-    /// The rooms held closed.
+    /// The rooms held closed, then the avoided ones.
     pub fn closed_rooms(&self) -> impl Iterator<Item = RoomName> + 'a {
-        self.closed.iter().map(|&(r, _)| r)
+        self.closed
+            .iter()
+            .map(|&(r, _)| r)
+            .chain(self.avoid.iter().copied())
     }
 
     /// The room's cost grid and its version, if movement has built one.
@@ -726,6 +732,11 @@ impl Movement {
         self.router = Some(router);
     }
 
+    /// Whether a route search is installed ([`Self::set_router`]).
+    pub fn has_router(&self) -> bool {
+        self.router.is_some()
+    }
+
     /// Rooms whose first read is due (terrain, sources and minerals, and a scan): wanted and not
     /// read yet, or every wanted room with the grid cache off (the naive baseline). Sorted by
     /// name, for the glue's Critical job.
@@ -895,6 +906,71 @@ impl Movement {
             Tier::Optional,
             &mut nothing,
         );
+    }
+
+    /// A route search for a job that must know a creep's way before it sends the creep (ADR-030's
+    /// signer): from `from` to within `range` of `to`, with the job's own PathFinder limits, never
+    /// entering a room in `avoid` (as if held closed; the target's room must not be in it). The path
+    /// goes into `path` (the tiles after `from`, the last within range). A path found across rooms
+    /// is also kept as a route ([`RouteBook`]), so a creep in `from`'s room that then asks to go to
+    /// `to` within `range` follows it. Marks the unit heavy. `None` without an installed router.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_route(
+        &mut self,
+        from: Position,
+        to: Position,
+        range: u8,
+        limits: (u32, u8),
+        avoid: &[RoomName],
+        cfg: &MovementConfig,
+        commit: &mut Commit,
+        path: &mut Vec<Position>,
+    ) -> Option<RouteOutcome> {
+        let now = self.time;
+        let Self {
+            rooms,
+            closed,
+            dips,
+            router,
+            routes,
+            route_legs: legs,
+            path_dips,
+            tick,
+            ..
+        } = self;
+        let router = router.as_mut()?;
+        let p = profile(cfg);
+        let query = RouteQuery {
+            from,
+            to,
+            range: route::pathfinder_range(to, range),
+            plain_cost: p.plain,
+            swamp_cost: p.swamp,
+            max_ops: limits.0,
+            max_rooms: limits.1,
+        };
+        commit.heavy();
+        tick.routes += 1;
+        let known = RouteRooms {
+            rooms: rooms.as_slice(),
+            closed: closed.as_slice(),
+            avoid,
+            dips: dips.as_slice(),
+        };
+        let outcome = router.search(&query, &known, path);
+        if outcome != RouteOutcome::Found {
+            tick.route_failures += 1;
+            return Some(outcome);
+        }
+        if to.room_name() != from.room_name()
+            && route::route_legs(from, path, to.room_name(), legs, path_dips)
+        {
+            for leg in legs.iter_mut() {
+                leg.version = known.grid(leg.room).map_or(0, |(_, v)| v);
+            }
+            routes.add(to, range, legs, now);
+        }
+        Some(outcome)
     }
 
     /// After a request found no way (`NoPath`): a creep that crossed into its room this tick drops
@@ -1745,6 +1821,7 @@ impl Movement {
             let known = RouteRooms {
                 rooms: rooms.as_slice(),
                 closed: closed.as_slice(),
+                avoid: &[],
                 dips: dips.as_slice(),
             };
             let outcome = router.search(&query, &known, route_path);
@@ -1781,6 +1858,7 @@ impl Movement {
         let known = RouteRooms {
             rooms: rooms.as_slice(),
             closed: closed.as_slice(),
+            avoid: &[],
             dips: dips.as_slice(),
         };
         for leg in legs.iter_mut() {

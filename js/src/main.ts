@@ -8,7 +8,7 @@ import {
   configSummary as wasmConfigSummary, configUnset as wasmConfigUnset, constsSummary as wasmConstsSummary, initSync,
   loop as wasmLoop, moveTo as wasmMoveTo, movementSummary as wasmMovementSummary, openingSummary as wasmOpeningSummary,
   persistSummary as wasmPersistSummary, persistTest as wasmPersistTest, plannerSummary as wasmPlannerSummary,
-  profilerSummary as wasmProfilerSummary, remoteSummary as wasmRemoteSummary,
+  profilerSummary as wasmProfilerSummary, remoteSummary as wasmRemoteSummary, signSummary as wasmSignSummary,
   queueSay as wasmQueueSay, schedulerSummary as wasmSchedulerSummary, snapshotSummary as wasmSnapshotSummary,
   spawn as wasmSpawn, spawnerSummary as wasmSpawnerSummary, trapTest as wasmTrapTest,
 } from '../pkg/rustedscreep_wasm.js';
@@ -112,6 +112,7 @@ const glue: Glue = {
   openingSummary: wasmOpeningSummary,
   plannerSummary: wasmPlannerSummary,
   remoteSummary: wasmRemoteSummary,
+  signSummary: wasmSignSummary,
 };
 
 const loader = new Loader(env, glue, CONFIG, BUILD);
@@ -145,7 +146,8 @@ function routeConsole(): void {
 // `rustedscreep.configReset()`, `rustedscreep.consts()`, `rustedscreep.movement()`,
 // `rustedscreep.moveTo("W1N1", 25, 25, 1)` (from another room: `rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1")`;
 // `rustedscreep.moveTo()` cancels), `rustedscreep.spawner()` or `rustedscreep.spawn("W1N1", "worker")`
-// (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`, `rustedscreep.planner()`, `rustedscreep.remote()`.
+// (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`, `rustedscreep.planner()`, `rustedscreep.remote()`,
+// `rustedscreep.sign()`.
 g.rustedscreep = {
   trapTest: (n: unknown = 1) => loader.scheduleTraps(Number(n)),
   status: () => loader.status(),
@@ -169,6 +171,7 @@ g.rustedscreep = {
   opening: () => loader.opening(),
   planner: () => loader.planner(),
   remote: () => loader.remote(),
+  sign: () => loader.sign(),
 };
 
 export function loop(): void {

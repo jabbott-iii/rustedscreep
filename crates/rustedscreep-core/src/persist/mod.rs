@@ -32,4 +32,6 @@ pub mod kind {
     pub const CONFIG: u16 = 2;
     /// The planner's anchors and adopted tiles (`crate::planner::record`, ADR-027).
     pub const PLANNER: u16 = 3;
+    /// The controller signer's rooms (`crate::signing::Book`, ADR-030).
+    pub const SIGN: u16 = 4;
 }

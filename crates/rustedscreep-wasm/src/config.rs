@@ -50,6 +50,13 @@ impl Runtime {
         self.store.config()
     }
 
+    /// Whether the overrides' record has loaded (or failed to): until then a job a console override
+    /// may turn off (the controller signer, ADR-030) does not start, so `sign.enabled=false` in the
+    /// record holds from a global's first loop on.
+    pub fn overrides_loaded(&self) -> bool {
+        !matches!(self.store.record(), Record::Loading)
+    }
+
     /// The record's load finished (from persist.rs): applies it, logs what was refused or clamped,
     /// and sets the log level. Returns whether the segment held a usable record or none at all.
     #[cold]

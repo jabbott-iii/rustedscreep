@@ -25,5 +25,6 @@ pub mod persist;
 pub mod planner;
 pub mod profiler;
 pub mod scheduler;
+pub mod signing;
 pub mod snapshot;
 pub mod spawning;

@@ -29,6 +29,7 @@ mod profiler;
 mod remote;
 mod route;
 mod scheduler;
+mod sign;
 mod snapshot;
 mod spawn;
 
@@ -59,6 +60,8 @@ struct State {
     planner: planner::PlannerGlue,
     /// Remote mining (P6.2, ADR-029): the remote rooms, their creeps and their sites.
     remote: remote::RemoteGlue,
+    /// The controller signer (ADR-030): its record, its trips and the next signer's plan.
+    sign: sign::SignGlue,
     persist: persist::Persist,
     /// The constants self-check, once per global (P1.11).
     consts: consts_check::ConstsCheck,
@@ -112,6 +115,7 @@ pub fn game_loop() {
                     opening,
                     planner,
                     remote,
+                    sign,
                     persist,
                     consts,
                     profiler: prof,
@@ -122,13 +126,24 @@ pub fn game_loop() {
                 let cfg = *runtime.get();
                 snapshot::take(snapshot, js, &cfg.cache, &cfg.remote);
                 // Movement's tick starts with the snapshot (no JS call); its room reads are jobs.
-                movement.begin(snapshot, &cfg.movement, &cfg.cache);
+                movement.begin(snapshot, &cfg.movement, &cfg.cache, &cfg.sign);
                 snapshot::log_skips(skip_log, snapshot, cfg.log.skip_window_ticks);
                 probe.snapshot();
                 act.begin(snapshot);
                 spawn.begin(snapshot, &cfg.spawn, |room| opening.worker_body(room));
                 opening.begin(snapshot, &mut movement.core);
                 remote.begin(snapshot);
+                sign.begin(snapshot, &cfg.sign);
+                // The signer's record (ADR-030) once a home sends signers and the overrides have
+                // loaded (so one that turns it off holds from the start); with no segment for the
+                // record, the tour starts at once.
+                if runtime.overrides_loaded() && sign.wants_record(&cfg.sign) {
+                    if persist.has_sign_segment() {
+                        persist.request_sign_load();
+                    } else {
+                        sign.no_record();
+                    }
+                }
                 // With no segment for the planner's record (ADR-027), plan from what stands at once.
                 if !persist.has_planner_segment() {
                     planner.no_record();
@@ -173,11 +188,14 @@ pub fn game_loop() {
                     &cfg.movement,
                     &cfg.spawn,
                 );
+                // Critical: the planned signer's request (ADR-030; only on a tick that runs the
+                // Optional tier), before the spawn plan.
+                sign.plan(&mut tick, spawn.spawner_mut(), &cfg.sign);
                 spawn.plan(&mut tick, snapshot);
                 // Standard: the persistence loads, then the opening's repairing, building and
                 // upgrading, then the haulers' transfers into the controller container (P3.3), then
                 // the upgraders' withdraws and upgrades (P3.4).
-                persist.load(&mut tick, snapshot.tick.time, runtime, planner);
+                persist.load(&mut tick, snapshot.tick.time, runtime, planner, sign);
                 opening.work(
                     &mut tick,
                     snapshot,
@@ -230,6 +248,18 @@ pub fn game_loop() {
                     &cfg.remote,
                     &cfg.movement,
                 );
+                // Optional: the controller signer's work, or the next signer's plan (ADR-030).
+                sign.work(
+                    &mut tick,
+                    snapshot,
+                    &mut movement.core,
+                    &mut act.buffer,
+                    &cfg.sign,
+                    &cfg.movement,
+                );
+                if sign.take_save(&cfg.sign) {
+                    persist.sign_changed();
+                }
                 act.queue_console_say(snapshot, tick.commit());
                 #[cfg(feature = "act-test")]
                 act_test.queue(&mut act.buffer, snapshot, tick.commit());
@@ -238,6 +268,7 @@ pub fn game_loop() {
                 tick.finish();
                 opening.log_events();
                 remote.log_events(snapshot, js);
+                sign.log_events(&cfg.sign);
                 probe.decide();
                 // After the decide step: the scheduler reads the CPU clock no more (scheduler docs); the
                 // profiler's readings from here on measure the act step outside the budget. The
@@ -275,7 +306,7 @@ pub fn game_loop() {
                 let standard = sched
                     .last_tick()
                     .is_some_and(|r| r.budget.allows(Tier::Standard));
-                persist.flush(snapshot.tick.time, standard, runtime, planner);
+                persist.flush(snapshot.tick.time, standard, runtime, planner, sign);
                 scheduler::log_faults(sched);
                 if prof.finish(probe, &snapshot.tick, act.issues(), &cfg.scheduler) {
                     persist.keys_short();
@@ -420,6 +451,20 @@ pub fn planner_summary() -> String {
             Err(_) => String::from("rustedscreep planner: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep planner: state unavailable"))
+}
+
+/// Exported to JS as `signSummary`, for the `rustedscreep.sign()` console command: one line with
+/// the signer's record, its trip, the next signer's plan and its counts (ADR-030).
+#[wasm_bindgen(js_name = "signSummary")]
+pub fn sign_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state
+                .sign
+                .summary(&state.snapshot, &state.config.get().sign),
+            Err(_) => String::from("rustedscreep sign: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep sign: state unavailable"))
 }
 
 /// Exported to JS as `remoteSummary`, for the `rustedscreep.remote()` console command: one line with

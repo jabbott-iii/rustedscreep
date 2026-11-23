@@ -197,6 +197,11 @@ pub enum CreepIntent {
     },
     /// `suicide()` (P6.2: a scout with nothing left to see).
     Suicide,
+    /// `signController(controller, text)` with `signing::SIGN_TEXT` on any room's controller,
+    /// whoever owns it (ADR-030, V274, V275).
+    SignController {
+        target: ObjectHandle,
+    },
 }
 
 impl CreepIntent {
@@ -216,6 +221,7 @@ impl CreepIntent {
             Self::UpgradeController { .. } => CreepAction::UpgradeController,
             Self::Pull { .. } => CreepAction::Pull,
             Self::ReserveController { .. } => CreepAction::ReserveController,
+            Self::SignController { .. } => CreepAction::SignController,
             Self::Suicide => CreepAction::Suicide,
         }
     }
@@ -246,7 +252,8 @@ impl CreepIntent {
             | Self::Build { target }
             | Self::Pickup { target }
             | Self::RepairObject { target }
-            | Self::ReserveController { target } => Some(Target::Object(target)),
+            | Self::ReserveController { target }
+            | Self::SignController { target } => Some(Target::Object(target)),
             Self::Drop { .. } | Self::Move { .. } | Self::Say { .. } | Self::Suicide => None,
         }
     }
@@ -263,7 +270,8 @@ impl CreepIntent {
             | Self::Heal { .. }
             | Self::Pull { .. }
             | Self::MoveToward { .. }
-            | Self::ReserveController { .. } => Some(1),
+            | Self::ReserveController { .. }
+            | Self::SignController { .. } => Some(1),
             Self::RangedHeal { .. }
             | Self::Repair { .. }
             | Self::RepairObject { .. }
@@ -702,7 +710,9 @@ const fn accepts_object(intent: &CreepIntent, kind: ObjectKind) -> bool {
         CreepIntent::RepairObject { .. } => {
             matches!(kind, ObjectKind::Container | ObjectKind::Road)
         }
-        CreepIntent::ReserveController { .. } => matches!(kind, ObjectKind::Controller),
+        CreepIntent::ReserveController { .. } | CreepIntent::SignController { .. } => {
+            matches!(kind, ObjectKind::Controller)
+        }
         _ => false,
     }
 }
@@ -1565,7 +1575,8 @@ mod tests {
             | CreepIntent::Build { target }
             | CreepIntent::Pickup { target }
             | CreepIntent::RepairObject { target }
-            | CreepIntent::ReserveController { target } => {
+            | CreepIntent::ReserveController { target }
+            | CreepIntent::SignController { target } => {
                 let Some(&(_, at, kind)) = w.objects.iter().find(|o| o.0 == target) else {
                     return Err(Rejected::GoneTarget);
                 };
@@ -1575,7 +1586,9 @@ mod tests {
                     CreepIntent::RepairObject { .. } => {
                         matches!(kind, ObjectKind::Container | ObjectKind::Road)
                     }
-                    CreepIntent::ReserveController { .. } => kind == ObjectKind::Controller,
+                    CreepIntent::ReserveController { .. } | CreepIntent::SignController { .. } => {
+                        kind == ObjectKind::Controller
+                    }
                     CreepIntent::WithdrawObject { .. } => matches!(
                         kind,
                         ObjectKind::Tombstone | ObjectKind::Ruin | ObjectKind::Container

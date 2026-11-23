@@ -38,6 +38,10 @@
 //!   `hits` and `hitsMax`, and its position and type (the handle is released between reads). The
 //!   rooms an own scout stands in are read the same way (its tour, ADR-029). The bot's username:
 //!   an own creep's `owner` and `username`, once a global;
+//! - signer room (ADR-030, `push_sign`: a visible room an own signer stands in, owned or not): its
+//!   controller as an object (unless the remote read pushed it), the controller's `sign` and, for
+//!   one, its `username` and `text` (V275), and `FIND_HOSTILE_STRUCTURES` through the tower filter,
+//!   each tower's `pos` and `__packedPos`;
 //! - structure: 3 (`get`, `id`, the id copy), plus on the tick it is first seen `structureType`,
 //!   and `pos` and `__packedPos` when the type is known (again every tick while that read fails).
 //!   With `cache.structure_static` off (the naive baseline, P1.10) those three are read every tick.
@@ -62,17 +66,18 @@ use std::fmt::Write as _;
 
 use js_sys::{Array, Object, Reflect};
 use rustedscreep_core::config::{CacheConfig, RemoteConfig};
+use rustedscreep_core::signing::SIGN_TEXT;
 use rustedscreep_core::snapshot::{
     Combat, Controller, ControllerState, CreepRow, CreepStore, ObjectKey, ObjectKind, ObjectRow,
-    ObjectStatic, RemoteRead, Reservation, RoomEnergy, SkipCounts, SkipLog, SkipReason, SkipReport,
-    Snapshot, StructureStatic, TickContext, known_structure_type, parse_room_name,
-    position_from_packed,
+    ObjectStatic, RemoteRead, Reservation, RoomEnergy, SignRead, SignSeen, SkipCounts, SkipLog,
+    SkipReason, SkipReport, Snapshot, StructureStatic, TickContext, known_structure_type,
+    parse_room_name, position_from_packed,
 };
 use rustedscreep_core::spawning::{CreepName, Identity, Role};
 use screeps::{
     ConstructionSite, Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Part,
-    Position, Resource, ResourceType, Room, RoomName, RoomObject, Source, Store, Structure,
-    StructureController, StructureLink, StructureSpawn, StructureType, find, game,
+    Position, Resource, ResourceType, Room, RoomName, RoomObject, SYSTEM_USERNAME, Source, Store,
+    Structure, StructureController, StructureLink, StructureSpawn, StructureType, find, game,
 };
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
@@ -149,6 +154,21 @@ extern "C" {
     #[wasm_bindgen(method, getter = owner)]
     fn owner_value(this: &HasOwner) -> JsValue;
 
+    /// A controller, for `sign` as a plain value (undefined without one; ADR-030, V275).
+    type Signed;
+
+    #[wasm_bindgen(method, getter = sign)]
+    fn sign_value(this: &Signed) -> JsValue;
+
+    /// A sign (`{username, text, time, datetime}`), read as plain values (V275).
+    type SignRecord;
+
+    #[wasm_bindgen(method, getter = username)]
+    fn sign_username(this: &SignRecord) -> JsValue;
+
+    #[wasm_bindgen(method, getter = text)]
+    fn sign_text(this: &SignRecord) -> JsValue;
+
     /// A structure, for `hitsMax` (a road's, P6.2).
     type WithHitsMax;
 
@@ -171,6 +191,8 @@ pub struct JsWorld {
     container_filter: Option<JsValue>,
     /// `{filter: {structureType: "road"}}`, likewise (P6.2).
     road_filter: Option<JsValue>,
+    /// `{filter: {structureType: "tower"}}`, likewise (ADR-030).
+    tower_filter: Option<JsValue>,
     /// The bot's username, read once per global from an own creep's `owner` (P6.2): a remote
     /// room's reservation is the bot's when it names it.
     username: Option<String>,
@@ -183,6 +205,9 @@ pub struct JsWorld {
     /// Scratch: the remote rooms named by own creeps other than scouts (the rooms the bot mines),
     /// sorted: only their hostiles' combat parts are read (P6.3).
     crew_rooms: Vec<RoomName>,
+    /// Scratch: the rooms an own signer stands in this tick, sorted: their controller's sign and
+    /// the towers of other users are read (ADR-030).
+    sign_rooms: Vec<RoomName>,
 }
 
 impl JsWorld {
@@ -210,6 +235,12 @@ impl JsWorld {
     /// The road filter, built on first use like the container filter (P6.2).
     fn road_filter(&mut self) -> &JsValue {
         self.road_filter.get_or_insert_with(|| type_filter("road"))
+    }
+
+    /// The tower filter, built on first use like the container filter (ADR-030).
+    fn tower_filter(&mut self) -> &JsValue {
+        self.tower_filter
+            .get_or_insert_with(|| type_filter("tower"))
     }
 }
 
@@ -242,6 +273,7 @@ pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld, cache: &CacheConfig, remo
     js.remote_names.clear();
     js.hauler_rooms.clear();
     js.crew_rooms.clear();
+    js.sign_rooms.clear();
     let creeps = &snapshot.creeps;
     for (id, pos) in creeps.identities().iter().zip(creeps.positions()) {
         let Some(id) = id else {
@@ -257,6 +289,7 @@ pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld, cache: &CacheConfig, remo
         match id.role {
             Role::Scout => insert_sorted(&mut js.remote_names, here),
             Role::RemoteHauler => insert_sorted(&mut js.hauler_rooms, here),
+            Role::Signer => insert_sorted(&mut js.sign_rooms, here),
             _ => {}
         }
     }
@@ -331,6 +364,8 @@ fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room, road_tick: b
     }
     let row = snapshot.rooms.push(name, controller);
     snapshot.rooms.set_energy(row, energy);
+    // Whether this room's controller went into the objects table already (a remote read).
+    let mut controller_pushed = false;
     if matches!(controller, Controller::Mine { .. }) {
         if let (Some(c), Controller::Mine { level }) = (controller_object.as_ref(), controller) {
             snapshot
@@ -350,6 +385,21 @@ fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room, road_tick: b
                 .is_ok();
         let read = push_remote(snapshot, js, &room, controller_object.as_ref(), roads);
         snapshot.rooms.set_remote(row, read);
+        controller_pushed = controller_object.is_some();
+    }
+    if js
+        .sign_rooms
+        .binary_search_by_key(&name.packed_repr(), |n| n.packed_repr())
+        .is_ok()
+    {
+        let read = push_sign(
+            snapshot,
+            js,
+            &room,
+            controller_object.as_ref(),
+            controller_pushed,
+        );
+        snapshot.rooms.set_sign(row, read);
     }
     js.rooms.push(room);
 }
@@ -432,6 +482,59 @@ fn push_remote(
                 Ok(ObjectKind::Road)
             };
             push_object(snapshot, js, object, check, row);
+        }
+    }
+    read
+}
+
+/// A room an own signer stands in (ADR-030), owned or not: its controller as an object (unless the
+/// remote read pushed it: `get`, `id`, the id copy, and its position and type when first seen), the
+/// controller's `sign` and, for one, its `username` and `text` (V275), then
+/// `FIND_HOSTILE_STRUCTURES` through the tower filter and its `length`, and per tower `get`, `pos`
+/// and `__packedPos`.
+fn push_sign(
+    snapshot: &mut Snapshot,
+    js: &mut JsWorld,
+    room: &Room,
+    controller: Option<&StructureController>,
+    controller_pushed: bool,
+) -> SignRead {
+    let mut read = SignRead {
+        read: true,
+        ..SignRead::default()
+    };
+    if let Some(c) = controller {
+        if !controller_pushed {
+            push_object(
+                snapshot,
+                js,
+                c.clone().unchecked_into(),
+                |_| Ok(ObjectKind::Controller),
+                ObjectRow::default(),
+            );
+        }
+        let value = c.unchecked_ref::<Signed>().sign_value();
+        read.sign = if value.is_object() {
+            let sign = value.unchecked_ref::<SignRecord>();
+            if sign.sign_username().as_string().as_deref() == Some(SYSTEM_USERNAME) {
+                SignSeen::System
+            } else if sign.sign_text().as_string().as_deref() == Some(SIGN_TEXT) {
+                SignSeen::Ours
+            } else {
+                SignSeen::Other
+            }
+        } else {
+            SignSeen::None
+        };
+    }
+    let finder = room.unchecked_ref::<Findable>();
+    let list = finder.find_filtered(find::HOSTILE_STRUCTURES.find_code(), js.tower_filter());
+    for i in 0..list.length() {
+        // The filter leaves only towers (a filter that failed to build would leave every hostile
+        // structure, which only counts more towers than stand).
+        let object: RoomObject = list.get(i).unchecked_into();
+        if let Ok(at) = position_of(&object) {
+            read.add_tower(at);
         }
     }
     read

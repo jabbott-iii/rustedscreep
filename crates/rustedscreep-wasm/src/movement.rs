@@ -29,7 +29,7 @@ use std::rc::Rc;
 
 use js_sys::Uint8Array;
 use rustedscreep_consts::{Position, ROOM_AREA, ROOM_SIZE, RoomCoordinate, RoomName};
-use rustedscreep_core::config::{CacheConfig, MovementConfig};
+use rustedscreep_core::config::{CacheConfig, MovementConfig, SignConfig};
 use rustedscreep_core::intents::IntentBuffer;
 use rustedscreep_core::movement::{
     Counts, Footprint, MoveError, MoveTo, Movement, Progress, ShoveCaps, Tile, site_footprint,
@@ -126,7 +126,12 @@ impl Default for MovementGlue {
     fn default() -> Self {
         let mut core = Movement::default();
         let (search, routes) = PathFinderRoutes::new();
-        core.set_router(Box::new(search));
+        // Only where the game's PathFinder and RoomPosition exist (always on a server; a sandbox
+        // may have neither): without them a search would throw outside any `catch` and trap, so
+        // movement then has no route search and a request for another room answers `OtherRoom`.
+        if pathfinder_present() {
+            core.set_router(Box::new(search));
+        }
         Self {
             core,
             terrain: Box::new([0; ROOM_AREA]),
@@ -145,15 +150,21 @@ impl Default for MovementGlue {
 
 impl MovementGlue {
     /// The snapshot step's part (no JS call): starts movement's tick.
-    pub fn begin(&mut self, snapshot: &Snapshot, cfg: &MovementConfig, cache: &CacheConfig) {
+    pub fn begin(
+        &mut self,
+        snapshot: &Snapshot,
+        cfg: &MovementConfig,
+        cache: &CacheConfig,
+        sign: &SignConfig,
+    ) {
         self.core.begin(snapshot, cfg);
         self.core.set_cache(cfg, cache);
         if let Ok(mut routes) = self.routes.try_borrow_mut() {
-            // A search indexes at most `route_max_rooms` rooms, and each can have 4 neighbours it
-            // blocks (blocked rooms take no slot, V165): keep that many statuses at least.
-            let statuses = cfg
-                .route_cache_size
-                .max(u32::from(cfg.route_max_rooms).saturating_mul(5));
+            // A search indexes at most its `maxRooms` rooms, and each can have 4 neighbours it
+            // blocks (blocked rooms take no slot, V165): keep that many statuses at least, for
+            // movement's searches and the controller signer's (`sign.route_max_rooms`, ADR-030).
+            let rooms = u32::from(cfg.route_max_rooms).max(sign.route_max_rooms);
+            let statuses = cfg.route_cache_size.max(rooms.saturating_mul(5));
             routes.begin(snapshot.tick.time, cfg.route_ttl_ticks, statuses);
         }
     }
@@ -616,4 +627,17 @@ fn scan(movement: &mut Movement, name: RoomName, room: &Room) -> u32 {
             .chain(deposit_footprints),
     );
     skipped.get()
+}
+
+/// Whether the globals a route search needs exist: `PathFinder.search` and the `RoomPosition`
+/// constructor (`Reflect.get` on the global object, 3 calls, once a global).
+fn pathfinder_present() -> bool {
+    let global = js_sys::global();
+    let get = |o: &wasm_bindgen::JsValue, k: &str| {
+        js_sys::Reflect::get(o, &wasm_bindgen::JsValue::from_str(k)).unwrap_or_default()
+    };
+    let finder = get(&global, "PathFinder");
+    finder.is_object()
+        && get(&finder, "search").is_function()
+        && get(&global, "RoomPosition").is_function()
 }

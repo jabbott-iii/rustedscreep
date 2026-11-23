@@ -98,6 +98,10 @@ extern "C" {
     /// `suicide()` (P6.2, V108).
     #[wasm_bindgen(method, catch, js_name = suicide)]
     fn suicide(this: &Actor) -> Result<f64, JsValue>;
+
+    /// `signController(controller, text)` (ADR-030, V275, V277): the text crosses as a JS string.
+    #[wasm_bindgen(method, catch, js_name = signController)]
+    fn sign_controller(this: &Actor, target: &JsValue, text: &str) -> Result<f64, JsValue>;
 }
 
 /// The job name act faults are logged under.
@@ -284,6 +288,9 @@ fn call(actor: &Actor, issue: &Issue, js: &JsWorld) -> Option<Result<f64, JsValu
         CreepIntent::Pull { .. } => actor.pull(target()?),
         CreepIntent::ReserveController { .. } => actor.reserve_controller(target()?),
         CreepIntent::Suicide => actor.suicide(),
+        CreepIntent::SignController { .. } => {
+            actor.sign_controller(target()?, rustedscreep_core::signing::SIGN_TEXT)
+        }
     })
 }
 
@@ -308,6 +315,7 @@ const fn threw(intent: &CreepIntent) -> &'static str {
         CreepIntent::Pull { .. } => "the pull call threw",
         CreepIntent::ReserveController { .. } => "the reserveController call threw",
         CreepIntent::Suicide => "the suicide call threw",
+        CreepIntent::SignController { .. } => "the signController call threw",
     }
 }
 

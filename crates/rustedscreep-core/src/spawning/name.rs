@@ -50,11 +50,14 @@ pub enum Role {
     /// carries a remote source's energy home, where the home's hauling delivers it, and builds and
     /// repairs the roads it walks.
     RemoteHauler,
+    /// The controller signer (ADR-030): one MOVE part, or TOUGH and MOVE parts for a towered room;
+    /// it signs every controller it can reach with `signing::SIGN_TEXT`. At most one for the bot.
+    Signer,
 }
 
 impl Role {
     /// Every role, in a fixed order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Worker,
         Self::Miner,
         Self::Hauler,
@@ -63,6 +66,7 @@ impl Role {
         Self::Reserver,
         Self::RemoteMiner,
         Self::RemoteHauler,
+        Self::Signer,
     ];
 
     /// The first byte of the role's creep names. Never change or reuse one (see the module docs).
@@ -76,6 +80,7 @@ impl Role {
             Self::Reserver => b'r',
             Self::RemoteMiner => b'n',
             Self::RemoteHauler => b'c',
+            Self::Signer => b'g',
         }
     }
 
@@ -101,6 +106,7 @@ impl Role {
             Self::Reserver => "reserver",
             Self::RemoteMiner => "remote miner",
             Self::RemoteHauler => "remote hauler",
+            Self::Signer => "signer",
         }
     }
 
@@ -466,7 +472,7 @@ mod tests {
         // The codes creeps alive today carry (a persisted format, module docs).
         assert_eq!(
             Role::ALL.map(Role::code),
-            [b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c'],
+            [b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c', b'g'],
             "never change or reuse a code"
         );
     }

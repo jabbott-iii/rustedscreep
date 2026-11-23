@@ -5,7 +5,9 @@
 //! Owners: the runtime config overrides (`PersistConfig::config_segment`, P1.10; requested when the
 //! global starts, so the first loop looks it up and the next tick reads it after the activation),
 //! the planner's record (`PersistConfig::planner_segment`, ADR-027; requested the same way, and no
-//! room is planned until its load has finished) and the self-test
+//! room is planned until its load has finished), the controller signer's record
+//! (`PersistConfig::sign_segment`, ADR-030; requested once a home reaches `sign.min_level`, and no
+//! signer is planned until its load has finished) and the self-test
 //! (`PersistConfig::self_test_segment`). The manager's limits come from the config in
 //! force (`config::Runtime`), so the overridable ones apply from the tick after a change.
 //!
@@ -42,6 +44,7 @@ use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 
 use crate::config::{PROFILE, Runtime};
 use crate::planner::PlannerGlue;
+use crate::sign::SignGlue;
 
 #[wasm_bindgen]
 extern "C" {
@@ -102,6 +105,9 @@ pub struct Persist {
     test_id: Option<SegmentId>,
     config_id: Option<SegmentId>,
     planner_id: Option<SegmentId>,
+    sign_id: Option<SegmentId>,
+    /// The signer's record was requested this global.
+    sign_requested: bool,
     /// Frame text for writes.
     text: String,
     /// Decoded frame bytes for loads.
@@ -121,7 +127,9 @@ impl Default for Persist {
             SegmentId::new(ids.profiler.stats_segment).map_or(SegmentSet::EMPTY, SegmentSet::of);
         let config_id = SegmentId::new(ids.persist.config_segment);
         let planner_id = SegmentId::new(ids.persist.planner_segment);
+        let sign_id = SegmentId::new(ids.persist.sign_segment);
         let mut mgr = Segments::new(reserved);
+        // The signer's record is requested only once a home sends signers (`request_sign_load`).
         for id in [config_id, planner_id].into_iter().flatten() {
             mgr.request_load(id);
         }
@@ -132,6 +140,8 @@ impl Default for Persist {
             test_id: SegmentId::new(ids.persist.self_test_segment),
             config_id,
             planner_id,
+            sign_id,
+            sign_requested: false,
             text: String::new(),
             bytes: Vec::new(),
             scratch: Vec::new(),
@@ -205,10 +215,11 @@ impl Persist {
         now: u32,
         cfg: &mut Runtime,
         planner: &mut PlannerGlue,
+        sign: &mut SignGlue,
     ) {
         let due = self.mgr.due(now);
         if !due.is_empty() && tick.allows(LOAD.tier) {
-            self.load_due(tick, due, now, cfg, planner);
+            self.load_due(tick, due, now, cfg, planner, sign);
         }
     }
 
@@ -221,6 +232,7 @@ impl Persist {
         now: u32,
         cfg: &mut Runtime,
         planner: &mut PlannerGlue,
+        sign: &mut SignGlue,
     ) {
         let segs = match read_segments() {
             Ok(s) => s,
@@ -230,7 +242,7 @@ impl Persist {
                 for id in due.iter() {
                     let limits = cfg.get().persist;
                     if let Some(err) = self.mgr.absent(id, &limits) {
-                        self.deliver(id, now, err, None, cfg, planner);
+                        self.deliver(id, now, err, None, cfg, planner, sign);
                     }
                 }
                 return;
@@ -240,7 +252,7 @@ impl Persist {
         let mut job = self.job;
         tick.run_steps(&LOAD, &mut job, |_, _| {
             if let Some(id) = ids.next() {
-                self.load_one(&segs, id, now, cfg, planner);
+                self.load_one(&segs, id, now, cfg, planner, sign);
             }
             Ok(if ids.peek().is_some() {
                 Step::More
@@ -258,6 +270,7 @@ impl Persist {
         now: u32,
         cfg: &mut Runtime,
         planner: &mut PlannerGlue,
+        sign: &mut SignGlue,
     ) {
         let testing = Some(id) == self.test_id && matches!(self.test.phase(), Phase::Read { .. });
         let t0 = if testing { game::cpu::get_used() } else { 0.0 };
@@ -271,7 +284,7 @@ impl Persist {
         if value.is_undefined() {
             let limits = cfg.get().persist;
             if let Some(err) = self.mgr.absent(id, &limits) {
-                self.deliver(id, now, err, None, cfg, planner);
+                self.deliver(id, now, err, None, cfg, planner, sign);
             }
             return;
         }
@@ -282,13 +295,14 @@ impl Persist {
             None
         };
         let ok = match text {
-            None => self.deliver(id, now, LoadError::NotText, get, cfg, planner),
-            Some(text) => self.deliver_text(id, now, &text, get, cfg, planner),
+            None => self.deliver(id, now, LoadError::NotText, get, cfg, planner, sign),
+            Some(text) => self.deliver_text(id, now, &text, get, cfg, planner, sign),
         };
         self.mgr.loaded(id, ok);
     }
 
     /// Decodes `text` and hands it to `id`'s owner. Returns whether the owner accepted it.
+    #[allow(clippy::too_many_arguments)]
     fn deliver_text(
         &mut self,
         id: SegmentId,
@@ -297,6 +311,7 @@ impl Persist {
         get: Option<u32>,
         cfg: &mut Runtime,
         planner: &mut PlannerGlue,
+        sign: &mut SignGlue,
     ) -> bool {
         if Some(id) == self.config_id {
             let mut bytes = std::mem::take(&mut self.bytes);
@@ -309,6 +324,13 @@ impl Persist {
             let mut bytes = std::mem::take(&mut self.bytes);
             let frame = frame::decode(text, &mut bytes).map_err(LoadError::Decode);
             let ok = planner.loaded(id.get(), frame);
+            self.bytes = bytes;
+            return ok;
+        }
+        if Some(id) == self.sign_id {
+            let mut bytes = std::mem::take(&mut self.bytes);
+            let frame = frame::decode(text, &mut bytes).map_err(LoadError::Decode);
+            let ok = sign.loaded(id.get(), frame);
             self.bytes = bytes;
             return ok;
         }
@@ -337,6 +359,7 @@ impl Persist {
 
     /// Hands a failed load to `id`'s owner. Returns whether the owner accepted it (the config
     /// store never does for a failed load).
+    #[allow(clippy::too_many_arguments)]
     fn deliver(
         &mut self,
         id: SegmentId,
@@ -345,12 +368,16 @@ impl Persist {
         get: Option<u32>,
         cfg: &mut Runtime,
         planner: &mut PlannerGlue,
+        sign: &mut SignGlue,
     ) -> bool {
         if Some(id) == self.config_id {
             return cfg.loaded(id.get(), Err(err));
         }
         if Some(id) == self.planner_id {
             return planner.loaded(id.get(), Err(err));
+        }
+        if Some(id) == self.sign_id {
+            return sign.loaded(id.get(), Err(err));
         }
         if Some(id) == self.test_id
             && let Some(v) = self.test.loaded(now, Err(err), get, &mut self.scratch)
@@ -363,20 +390,27 @@ impl Persist {
     /// The output step's part, after the act step: writes the dirty records the save cap allows,
     /// then sets the active set if the manager asks. Runs only while the tick runs the Standard tier.
     #[inline]
-    pub fn flush(&mut self, now: u32, standard: bool, cfg: &mut Runtime, planner: &PlannerGlue) {
+    pub fn flush(
+        &mut self,
+        now: u32,
+        standard: bool,
+        cfg: &mut Runtime,
+        planner: &PlannerGlue,
+        sign: &SignGlue,
+    ) {
         let limits = &cfg.get().persist;
         if standard && (!self.mgr.dirty().is_empty() || self.mgr.plan_active(limits).is_some()) {
-            self.flush_work(now, cfg, planner);
+            self.flush_work(now, cfg, planner, sign);
         }
     }
 
     /// Kept out of the per-tick `loop` function: writes and activations are rare.
     #[inline(never)]
-    fn flush_work(&mut self, now: u32, cfg: &mut Runtime, planner: &PlannerGlue) {
+    fn flush_work(&mut self, now: u32, cfg: &mut Runtime, planner: &PlannerGlue, sign: &SignGlue) {
         let limits = cfg.get().persist;
         if !self.mgr.dirty().is_empty() {
             match read_segments() {
-                Ok(segs) => self.write(&segs, now, cfg, planner),
+                Ok(segs) => self.write(&segs, now, cfg, planner, sign),
                 Err(why) => {
                     self.fail(Op::Segments, now, why);
                     self.abort_test_write(now);
@@ -399,7 +433,14 @@ impl Persist {
         }
     }
 
-    fn write(&mut self, segs: &JsValue, now: u32, cfg: &mut Runtime, planner: &PlannerGlue) {
+    fn write(
+        &mut self,
+        segs: &JsValue,
+        now: u32,
+        cfg: &mut Runtime,
+        planner: &PlannerGlue,
+        sign: &SignGlue,
+    ) {
         let (count, present) = match present_keys(segs) {
             Ok(k) => k,
             Err(why) => {
@@ -424,6 +465,8 @@ impl Persist {
                 self.write_config(segs, id, now, cfg)
             } else if Some(id) == self.planner_id {
                 self.write_planner(segs, id, now, planner)
+            } else if Some(id) == self.sign_id {
+                self.write_sign(segs, id, now, sign)
             } else if Some(id) == self.test_id {
                 self.write_test(segs, id, now)
             } else {
@@ -499,6 +542,62 @@ impl Persist {
                 WriteResult::Failed
             }
         }
+    }
+
+    /// Writes the controller signer's record (ADR-030). A failed JS write stays dirty and is tried
+    /// again next tick (logged once per global).
+    fn write_sign(
+        &mut self,
+        segs: &JsValue,
+        id: SegmentId,
+        now: u32,
+        sign: &SignGlue,
+    ) -> WriteResult {
+        self.scratch.clear();
+        sign.payload(&mut self.scratch);
+        let encoded = frame::encode(
+            kind::SIGN,
+            rustedscreep_core::signing::SCHEMA,
+            now,
+            &self.scratch,
+            &mut self.text,
+        );
+        if encoded.is_err() {
+            // 12 bytes a room: more than about 6000 rooms would not fit.
+            log::warn!("rustedscreep sign: the record does not fit a segment; not written");
+            return WriteResult::Rejected;
+        }
+        match set_segment(segs, id, &self.text) {
+            Ok(()) => WriteResult::Written,
+            Err(why) => {
+                self.fail(Op::Set, now, why);
+                WriteResult::Failed
+            }
+        }
+    }
+
+    /// The signer's record changed: it is written on the next output step that runs the Standard
+    /// tier.
+    pub fn sign_changed(&mut self) {
+        if let Some(id) = self.sign_id {
+            self.mgr.mark_dirty(id);
+        }
+    }
+
+    /// Requests the signer's record, once a global: the manager activates its segment on the next
+    /// output step that runs the Standard tier, and the load follows a tick later (V116).
+    pub fn request_sign_load(&mut self) {
+        if !self.sign_requested
+            && let Some(id) = self.sign_id
+        {
+            self.sign_requested = true;
+            self.mgr.request_load(id);
+        }
+    }
+
+    /// Whether a segment keeps the signer's record (a valid `PersistConfig::sign_segment`).
+    pub fn has_sign_segment(&self) -> bool {
+        self.sign_id.is_some()
     }
 
     /// The planner's record changed: it is written on the next output step that runs the

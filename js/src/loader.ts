@@ -88,6 +88,8 @@ export interface Glue {
   plannerSummary?: () => string;
   /** One line about remote mining: per owned home its candidate rooms, the rooms it mines and their creeps (P6.2). */
   remoteSummary?: () => string;
+  /** One line about the controller signer: its record's rooms, the signer and its trip, the next one's plan (ADR-030). */
+  signSummary?: () => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -695,6 +697,11 @@ export class Loader {
     return this.summary('remoteSummary', 'remote summary');
   }
 
+  /** Console command `rustedscreep.sign()`: the wasm's controller-signer summary (record, signer, plan; ADR-030). */
+  sign(): string {
+    return this.summary('signSummary', 'sign summary');
+  }
+
   /**
    * Console command `rustedscreep.spawn(room, role)`: a spawn of `room` spawns one creep of `role` (worker when
    * omitted) sized to the room's capacity, once the room holds its cost; `rustedscreep.spawn()` cancels. Only
@@ -715,7 +722,7 @@ export class Loader {
     name:
       | 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary' | 'persistSummary' | 'configSummary'
       | 'constsSummary' | 'movementSummary' | 'spawnerSummary' | 'openingSummary' | 'plannerSummary'
-      | 'remoteSummary',
+      | 'remoteSummary' | 'signSummary',
     noun: string,
   ): string {
     const call = this.glue[name];

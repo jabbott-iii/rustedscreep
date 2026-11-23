@@ -41,3 +41,11 @@ pub const HALF_WORLD_SIZE: i32 = 128;
 /// (<https://github.com/screeps/engine/blob/a90d26fc9eb943147799e65d0bf9d4d0d79a2722/src/game/structures.js#L1065-L1071>),
 /// VERIFICATION_LOG V171. Last verified: 2026-11-15.
 pub const CREEP_NAME_MAX_LENGTH: usize = 100;
+
+/// Hit points of one creep body part: a creep is created with `100` per part, and its `hits` and
+/// `hitsMax` are `body.length * 100`. The engine writes the literal; the API has no constant.
+///
+/// Source: screeps/engine `src/processor/intents/spawns/create-creep.js` at a90d26f
+/// (<https://github.com/screeps/engine/blob/a90d26fc9eb943147799e65d0bf9d4d0d79a2722/src/processor/intents/spawns/create-creep.js#L71>),
+/// VERIFICATION_LOG V282. Last verified: 2026-11-22.
+pub const BODYPART_HITS: u32 = 100;
