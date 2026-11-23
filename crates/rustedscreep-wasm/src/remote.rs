@@ -22,7 +22,7 @@ use std::fmt::Write as _;
 use rustedscreep_core::config::{
     HaulingConfig, MovementConfig, RemoteConfig, SchedulerConfig, SpawnConfig,
 };
-use rustedscreep_core::economy::{Hauling, Remotes, Upgrading};
+use rustedscreep_core::economy::{AbandonReason, Hauling, RemoteEvent, Remotes, Upgrading};
 use rustedscreep_core::intents::{ActLog, IntentBuffer, Outcome, error_name};
 use rustedscreep_core::movement::Movement;
 use rustedscreep_core::scheduler::{
@@ -31,7 +31,22 @@ use rustedscreep_core::scheduler::{
 use rustedscreep_core::snapshot::{Reservation, Snapshot};
 use rustedscreep_core::spawning::Spawner;
 use screeps::{ErrorCode, StructureType};
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
+
+#[wasm_bindgen]
+extern "C" {
+    /// A creep, for its `owner` as a plain value (V268).
+    type OwnerOf;
+
+    #[wasm_bindgen(method, getter = owner)]
+    fn owner_value(this: &OwnerOf) -> JsValue;
+
+    /// An owner (`{username}`), read as a plain value.
+    type NameOf;
+
+    #[wasm_bindgen(method, getter = username)]
+    fn username_value(this: &NameOf) -> JsValue;
+}
 
 use crate::opening::SiteRoom;
 use crate::snapshot::JsWorld;
@@ -154,6 +169,81 @@ impl RemoteGlue {
         });
     }
 
+    /// Logs this tick's events (P6.3: threats, their end, abandoned rooms; the P6 gate's live record
+    /// of a threat and the bot's response). For a threat it reads each armed hostile's
+    /// `owner.username` (2 calls a creep, only on the tick the threat starts; V268, V272).
+    pub fn log_events(&self, snapshot: &Snapshot, js: &JsWorld) {
+        for event in self.core.events() {
+            match *event {
+                RemoteEvent::Threatened {
+                    home,
+                    room,
+                    armed,
+                    until,
+                } => {
+                    // The owner reads are for the line alone.
+                    if !log::log_enabled!(log::Level::Warn) {
+                        continue;
+                    }
+                    let creeps = &snapshot.creeps;
+                    let (mut attack, mut ranged) = (0u32, 0u32);
+                    let mut owners: Vec<String> = Vec::new();
+                    for (row, ((&my, p), c)) in creeps
+                        .my()
+                        .iter()
+                        .zip(creeps.positions())
+                        .zip(creeps.combat())
+                        .enumerate()
+                    {
+                        if my || p.room_name() != room || !c.armed() {
+                            continue;
+                        }
+                        attack = attack.saturating_add(c.attack);
+                        ranged = ranged.saturating_add(c.ranged_attack);
+                        let owner = js.creeps.get(row).and_then(|creep| {
+                            let o = creep.unchecked_ref::<OwnerOf>().owner_value();
+                            o.is_object()
+                                .then(|| o.unchecked_ref::<NameOf>().username_value().as_string())
+                                .flatten()
+                        });
+                        let name = owner.unwrap_or_else(|| String::from("unknown"));
+                        if !owners.contains(&name) {
+                            owners.push(name);
+                        }
+                    }
+                    log::warn!(
+                        "rustedscreep remote: {room} (of {home}) threatened by {armed} armed hostile \
+                         creep(s) of {} ({attack} ATTACK, {ranged} RANGED_ATTACK parts); its creeps \
+                         wait in {home} until tick {until}",
+                        owners.join(", ")
+                    );
+                }
+                RemoteEvent::Resumed { home, room } => {
+                    log::info!(
+                        "rustedscreep remote: {room} (of {home}): the wait is over, its creeps go back"
+                    );
+                }
+                RemoteEvent::Abandoned {
+                    home,
+                    room,
+                    reason,
+                    until,
+                } => {
+                    let then = match reason {
+                        AbandonReason::Unprofitable => "its creeps work on until they die",
+                        AbandonReason::Contested | AbandonReason::Threats => {
+                            "its haulers bring their loads home and its other creeps end"
+                        }
+                    };
+                    log::warn!(
+                        "rustedscreep remote: {room} (of {home}) abandoned ({}) until tick {until}; {then}",
+                        reason.as_str()
+                    );
+                }
+            }
+        }
+    }
+
     /// Calls `createConstructionSite` for this tick's remote sites and records each outcome. Call
     /// in the act step, after the opening's sites and before the creep intents. A refused tile is
     /// skipped for the rest of the global and logged at info; a call that throws, or a site whose
@@ -261,6 +351,12 @@ impl RemoteGlue {
                 }
                 if r.active {
                     text.push_str(" mined");
+                }
+                if let Some(t) = r.threat.filter(|t| t.until > now) {
+                    let _ = write!(text, " threatened ({} armed) until {}", t.armed, t.until);
+                }
+                if let Some(a) = r.abandoned {
+                    let _ = write!(text, " abandoned ({}) until {}", a.reason.as_str(), a.until);
                 }
                 if let Some(p) = r.profit {
                     let per_tick = |x: i64| x / i64::from(rustedscreep_consts::CREEP_LIFE_TIME);

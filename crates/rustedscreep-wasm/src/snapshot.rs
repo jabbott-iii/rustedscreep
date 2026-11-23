@@ -27,7 +27,8 @@
 //!   `id`, the id copy, its amount, a container's `hits` (P3.5), and on the tick it is first seen
 //!   its position and type);
 //!   hostile creep: 5 (`get`, `id`, the id copy, `pos`, `__packedPos`; hostile results never
-//!   include spawning creeps, V101);
+//!   include spawning creeps, V101), and in a remote room named by an own creep other than a scout
+//!   2 more, `getActiveBodyparts` for ATTACK and for RANGED_ATTACK (P6.3, V269);
 //! - remote room (P6.2, ADR-029: a visible room the bot does not own that an own creep's name gives
 //!   as its remote room; `push_remote`): an owned room's 6 `find` calls and room objects, then the
 //!   controller as an object (`id`, the copy, its position and type when first seen, `reservation`,
@@ -62,15 +63,15 @@ use std::fmt::Write as _;
 use js_sys::{Array, Object, Reflect};
 use rustedscreep_core::config::{CacheConfig, RemoteConfig};
 use rustedscreep_core::snapshot::{
-    Controller, ControllerState, CreepRow, CreepStore, ObjectKey, ObjectKind, ObjectRow,
+    Combat, Controller, ControllerState, CreepRow, CreepStore, ObjectKey, ObjectKind, ObjectRow,
     ObjectStatic, RemoteRead, Reservation, RoomEnergy, SkipCounts, SkipLog, SkipReason, SkipReport,
     Snapshot, StructureStatic, TickContext, known_structure_type, parse_room_name,
     position_from_packed,
 };
 use rustedscreep_core::spawning::{CreepName, Identity, Role};
 use screeps::{
-    ConstructionSite, Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Position,
-    Resource, ResourceType, Room, RoomName, RoomObject, Source, Store, Structure,
+    ConstructionSite, Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Part,
+    Position, Resource, ResourceType, Room, RoomName, RoomObject, Source, Store, Structure,
     StructureController, StructureLink, StructureSpawn, StructureType, find, game,
 };
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
@@ -179,6 +180,9 @@ pub struct JsWorld {
     /// Scratch: the rooms an own remote hauler stands in this tick, sorted: only their roads are
     /// read (P6.2).
     hauler_rooms: Vec<RoomName>,
+    /// Scratch: the remote rooms named by own creeps other than scouts (the rooms the bot mines),
+    /// sorted: only their hostiles' combat parts are read (P6.3).
+    crew_rooms: Vec<RoomName>,
 }
 
 impl JsWorld {
@@ -237,6 +241,7 @@ pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld, cache: &CacheConfig, remo
     // own remote haulers stand in (identities and positions are read before the rooms).
     js.remote_names.clear();
     js.hauler_rooms.clear();
+    js.crew_rooms.clear();
     let creeps = &snapshot.creeps;
     for (id, pos) in creeps.identities().iter().zip(creeps.positions()) {
         let Some(id) = id else {
@@ -245,6 +250,9 @@ pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld, cache: &CacheConfig, remo
         let here = pos.room_name();
         if let Some(r) = id.remote {
             insert_sorted(&mut js.remote_names, r);
+            if id.role != Role::Scout {
+                insert_sorted(&mut js.crew_rooms, r);
+            }
         }
         match id.role {
             Role::Scout => insert_sorted(&mut js.remote_names, here),
@@ -300,8 +308,26 @@ fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room, road_tick: b
     let hostiles = room
         .unchecked_ref::<Findable>()
         .find_array(find::HOSTILE_CREEPS.find_code());
+    // P6.3: in a remote room the bot mines, each hostile's active ATTACK and RANGED_ATTACK parts
+    // (2 calls, after the push succeeded), so a harmless creep (a scout, a hauler) is no threat.
+    let mined = !matches!(controller, Controller::Mine { .. })
+        && js
+            .crew_rooms
+            .binary_search_by_key(&name.packed_repr(), |n| n.packed_repr())
+            .is_ok();
     for index in 0..hostiles.length() {
+        let before = snapshot.creeps.len();
         push_creep(snapshot, js, hostiles.get(index).unchecked_into(), false);
+        if mined
+            && snapshot.creeps.len() > before
+            && let Some(creep) = js.creeps.last()
+        {
+            let combat = Combat {
+                attack: u32::from(creep.get_active_bodyparts(Part::Attack)),
+                ranged_attack: u32::from(creep.get_active_bodyparts(Part::RangedAttack)),
+            };
+            snapshot.creeps.set_combat(before, combat);
+        }
     }
     let row = snapshot.rooms.push(name, controller);
     snapshot.rooms.set_energy(row, energy);

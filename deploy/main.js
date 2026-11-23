@@ -562,6 +562,28 @@ function queueSay(text) {
 }
 
 /**
+ * Exported to JS as `remoteSummary`, for the `rustedscreep.remote()` console command: one line with
+ * each owned home's candidate rooms, what the bot knows of them, the rooms it mines with their plan
+ * and figures, their creeps, and the sites placed since boot (P6.2).
+ * @returns {string}
+ */
+function remoteSummary() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        let ret;
+        __wbg_call_guard();
+        ret = wasm.remoteSummary();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        __wbg_call_guard();
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * Exported to JS as `schedulerSummary`, for the `rustedscreep.scheduler()` console command: one line
  * with the last tick's tier caps, what the scheduler did, and the fault counts.
  * @returns {string}
@@ -687,6 +709,12 @@ function __wbg_get_imports() {
             const ret = arg0 === undefined;
             return ret;
         },
+        __wbg___wbindgen_number_get_934b640d0889af78: function(arg0, arg1) {
+            const obj = arg1;
+            const ret = typeof(obj) === 'number' ? obj : undefined;
+            getDataViewMemory0().setFloat64((arg0 >>> 0) + 8 * 1, isLikeNone(ret) ? 0 : ret, true);
+            getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 0, !isLikeNone(ret), true);
+        },
         __wbg___wbindgen_string_get_7ce8eee7fd327545: function(arg0, arg1) {
             const obj = arg1;
             const ret = typeof(obj) === 'string' ? obj : undefined;
@@ -721,7 +749,7 @@ function __wbg_get_imports() {
             const ret = arg0.cooldown;
             return ret;
         },
-        __wbg_createConstructionSite_a90a513098a438f4: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+        __wbg_createConstructionSite_42a040083aebe316: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg0.createConstructionSite(arg1, arg2, __wbindgen_enum_StructureType[arg3]);
             return ret;
         }, arguments); },
@@ -785,6 +813,10 @@ function __wbg_get_imports() {
             const ret = arg0.find(arg1, arg2);
             return ret;
         },
+        __wbg_getActiveBodyparts_7b56cd5966808609: function(arg0, arg1) {
+            const ret = Creep.prototype.getActiveBodyparts.call(arg0, __wbindgen_enum_Part[arg1]);
+            return ret;
+        },
         __wbg_getCapacity_58e91c34604e6503: function(arg0, arg1) {
             const ret = arg0.getCapacity(__wbindgen_enum_ResourceType[arg1]);
             return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
@@ -844,6 +876,10 @@ function __wbg_get_imports() {
         __wbg_hits_internal_2e8a79b1c6a0434d: function(arg0) {
             const ret = arg0.hits;
             return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
+        __wbg_hits_max_value_cac2891262ceda34: function(arg0) {
+            const ret = arg0.hitsMax;
+            return ret;
         },
         __wbg_id_internal_579e500196cab6ff: function(arg0) {
             const ret = arg0.id;
@@ -941,6 +977,14 @@ function __wbg_get_imports() {
             const ret = arg0.ops;
             return ret;
         },
+        __wbg_owner_value_5b5a740859070f68: function(arg0) {
+            const ret = arg0.owner;
+            return ret;
+        },
+        __wbg_owner_value_7d2f433d09468f52: function(arg0) {
+            const ret = arg0.owner;
+            return ret;
+        },
         __wbg_packed_3bb90a95d7bf1c16: function(arg0) {
             const ret = arg0.__packedPos;
             return ret;
@@ -989,6 +1033,14 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbg_repair_f7ba31b7ee0ca146: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.repair(arg1);
+            return ret;
+        }, arguments); },
+        __wbg_reservation_value_b9e7081c5acd8433: function(arg0) {
+            const ret = arg0.reservation;
+            return ret;
+        },
+        __wbg_reserveController_4ac1df0d784de33e: function() { return handleError(function (arg0, arg1) {
+            const ret = arg0.reserveController(arg1);
             return ret;
         }, arguments); },
         __wbg_resource_type_396cb78ee223f30d: function(arg0) {
@@ -1099,6 +1151,10 @@ function __wbg_get_imports() {
             const ret = Game.structures;
             return ret;
         },
+        __wbg_suicide_575f66139131ee84: function() { return handleError(function (arg0) {
+            const ret = arg0.suicide();
+            return ret;
+        }, arguments); },
         __wbg_swamp_cost_32780161b36344b0: function(arg0, arg1) {
             arg0.swampCost = arg1;
         },
@@ -1109,6 +1165,10 @@ function __wbg_get_imports() {
         __wbg_ticks_to_downgrade_b676132f27fbfc30: function(arg0) {
             const ret = arg0.ticksToDowngrade;
             return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
+        __wbg_ticks_to_end_value_b97f876577dff9d7: function(arg0) {
+            const ret = arg0.ticksToEnd;
+            return ret;
         },
         __wbg_ticks_to_live_internal_819d2d1b62b60d7d: function(arg0) {
             const ret = arg0.ticksToLive;
@@ -1133,6 +1193,14 @@ function __wbg_get_imports() {
         __wbg_upgrade_blocked_11da7f0f81e340d5: function(arg0) {
             const ret = arg0.upgradeBlocked;
             return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
+        __wbg_username_value_2c7fa6f0f922f6d8: function(arg0) {
+            const ret = arg0.username;
+            return ret;
+        },
+        __wbg_username_value_e6765b3332f8437c: function(arg0) {
+            const ret = arg0.username;
+            return ret;
         },
         __wbg_values_01b79ec198898dfb: function(arg0) {
             const ret = Object.values(arg0);
@@ -2076,6 +2144,10 @@ class Loader {
     planner() {
         return this.summary('plannerSummary', 'planner summary');
     }
+    /** Console command `rustedscreep.remote()`: the wasm's remote-mining summary (candidates, mined rooms, creeps). */
+    remote() {
+        return this.summary('remoteSummary', 'remote summary');
+    }
     /**
      * Console command `rustedscreep.spawn(room, role)`: a spawn of `room` spawns one creep of `role` (worker when
      * omitted) sized to the room's capacity, once the room holds its cost; `rustedscreep.spawn()` cancels. Only
@@ -2131,7 +2203,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"d3f481d5b19d-752a5e88","wasmCrc32":"752a5e88","features":[],"wasmParts":[664672,664668]});
+const BUILD = ({"id":"08e7b14d93e5-dirty-8fb89259","wasmCrc32":"8fb89259","features":[],"wasmParts":[723460,723460]});
 const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;
@@ -2219,6 +2291,7 @@ const glue = {
     spawn: spawn,
     openingSummary: openingSummary,
     plannerSummary: plannerSummary,
+    remoteSummary: remoteSummary,
 };
 const loader = new Loader(env, glue, CONFIG, BUILD);
 const routedError = (...args) => {
@@ -2250,7 +2323,7 @@ function routeConsole() {
 // `rustedscreep.configReset()`, `rustedscreep.consts()`, `rustedscreep.movement()`,
 // `rustedscreep.moveTo("W1N1", 25, 25, 1)` (from another room: `rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1")`;
 // `rustedscreep.moveTo()` cancels), `rustedscreep.spawner()` or `rustedscreep.spawn("W1N1", "worker")`
-// (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`, `rustedscreep.planner()`.
+// (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`, `rustedscreep.planner()`, `rustedscreep.remote()`.
 g.rustedscreep = {
     trapTest: (n = 1) => loader.scheduleTraps(Number(n)),
     status: () => loader.status(),
@@ -2272,6 +2345,7 @@ g.rustedscreep = {
     spawn: (room, role) => loader.spawn(room, role),
     opening: () => loader.opening(),
     planner: () => loader.planner(),
+    remote: () => loader.remote(),
 };
 function loop() {
     try {

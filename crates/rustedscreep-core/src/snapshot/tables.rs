@@ -271,6 +271,23 @@ pub struct Creeps {
     /// creep's `ageTime` never changes once set (V170) and the bot never renews a creep, so its
     /// death tick is read once in its life and once after a global reset.
     lives: Vec<Option<(CreepHandle, u32)>>,
+    /// A hostile creep's active combat parts (P6.3, [`Self::set_combat`]), per row.
+    combat: Vec<Combat>,
+}
+
+/// A hostile creep's active combat parts (`getActiveBodyparts`, V269), read in remote rooms only
+/// (P6.3); zero for every other creep. Unit: parts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Combat {
+    pub attack: u32,
+    pub ranged_attack: u32,
+}
+
+impl Combat {
+    /// Whether the creep can hurt the bot's creeps.
+    pub const fn armed(self) -> bool {
+        self.attack > 0 || self.ranged_attack > 0
+    }
 }
 
 impl Creeps {
@@ -284,6 +301,7 @@ impl Creeps {
         self.identity.clear();
         self.store.clear();
         self.death.clear();
+        self.combat.clear();
     }
 
     pub(super) fn finish(&mut self) -> u32 {
@@ -313,6 +331,7 @@ impl Creeps {
         self.fatigue.push(row.fatigue);
         self.identity.push(id);
         self.store.push(CreepStore::default());
+        self.combat.push(Combat::default());
         let death = usize::try_from(handle.slot())
             .ok()
             .and_then(|slot| self.lives.get(slot).copied().flatten())
@@ -339,6 +358,19 @@ impl Creeps {
         if let Some(entry) = self.lives.get_mut(slot) {
             *entry = Some((handle, death));
         }
+    }
+
+    /// Sets the active combat parts of the hostile creep at `row` (P6.3); nothing for a row that
+    /// does not exist.
+    pub fn set_combat(&mut self, row: usize, combat: Combat) {
+        if let Some(c) = self.combat.get_mut(row) {
+            *c = combat;
+        }
+    }
+
+    /// Each creep's active combat parts: read for hostiles in remote rooms only (P6.3).
+    pub fn combat(&self) -> &[Combat] {
+        &self.combat
     }
 
     /// Sets the store of the creep at `row` (P2.4); nothing for a row that does not exist.

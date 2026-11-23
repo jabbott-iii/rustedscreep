@@ -51,9 +51,9 @@ pub use remote::{
     remote_miner_work, remote_profit, reserver_body,
 };
 pub use remotes::{
-    Intel, PRIORITY_REMOTE_HAULER, PRIORITY_REMOTE_MINER, PRIORITY_RESERVER, PRIORITY_SCOUT,
-    Remote, RemoteSite, RemoteStats, RemoteWays, Remotes, SourceWay, WaySearch, candidates,
-    is_guest, is_remote_room,
+    Abandon, AbandonReason, Audit, Intel, PRIORITY_REMOTE_HAULER, PRIORITY_REMOTE_MINER,
+    PRIORITY_RESERVER, PRIORITY_SCOUT, Remote, RemoteEvent, RemoteSite, RemoteStats, RemoteWays,
+    Remotes, SourceWay, Threat, WaySearch, candidates, is_guest, is_remote_room,
 };
 
 pub use opening::{

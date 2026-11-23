@@ -349,7 +349,13 @@ Remote manager (P6.2, ADR-029; `rustedscreep_core::economy::Remotes`, glue in `r
   - A remote hauler takes whole loads at the mining tile and walks home. In its home room with energy it is a guest of the home's `Hauling`, which delivers its load like the room's own haulers. On a roads plan it carries a WORK part, builds road sites within range 3 on the way home, and repairs the road that lacks the most hits when the roads are read.
 - **Placement.** One site a tick per mined, visible room, at most `remote.max_sites`: the containers first, then the roads along each source's path.
 - **Upgraders.** `Upgrading::set_remote` adds each home's mined rooms' net energy (while a remote hauler lives) to its upgraders' budget.
-- **Tiers.** The choice and the requests run in Standard before the Critical jobs, the creeps' work in Standard, and the ways and sites in Optional. Remote mining is spare work under SPEC §2's bucket policy.
+- **Tiers.** The choice and the requests run in the Critical `remote` job, before the spawn job, as every job that requests creeps does, but they request and search only on ticks the Standard tier runs. The creeps' work runs in Standard, and the ways and sites in Optional. Remote mining is spare work under SPEC §2's bucket policy.
+- **Threats, contests and audits (P6.3).** For hostile creeps in a remote room the snapshot reads their active ATTACK and RANGED_ATTACK parts (`snapshot::Combat`, V269).
+  - *Threatened.* Armed hostiles in a mined room start a `Threat` for `remote.evacuate_ticks` after the last sight. The room's creeps wait near the home's first spawn, its haulers' loads are delivered there, and nothing is requested for it until the wait runs out.
+  - *Contested.* Another user's ownership or reservation (an invader core's among them, V273), or a hostile structure, abandons the room. Its miners and reserver `suicide`, since a harvest or a reserve fails there, and its haulers bring their loads home first. The `remote.contest_threats`-th threat within `remote.abandon_ticks` does the same.
+  - *Unprofitable.* An `Audit` window of `remote.audit_ticks` that delivered less energy home than its new creeps' bodies cost abandons the room, though never its first window in a global. Its creeps work on until they die.
+  - *Abandoned.* An abandoned room is not chosen for `remote.abandon_ticks`. Each event is logged by `remote.rs` (the threat's line names the hostiles' owners, read only on that tick).
+  - *P7's hooks.* `Remotes::threats`, `evacuate` and `clear_threat`.
 
 Base planner (P4.2, the two candidate planners and their benchmark; ADR-007 accepted 2026-11-18: `flood` is the planner, `bunker` the comparison baseline; wired in P4.3, the placement of the planned structures, below): `rustedscreep_core::planner` is pure.
 A `PlanInput` (terrain, controller, sources in (x, y) order, mineral, a standing spawn) gives a `Layout`: every structure, road, and

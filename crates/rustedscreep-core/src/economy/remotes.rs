@@ -31,8 +31,7 @@
 //! reserved by anyone else, at least one source, no hostile structure, and no hostile creep when
 //! last seen. A home mines the candidates that net the most, at most `remote.max_rooms`, while the
 //! model's spawn time of all of them stays within `remote.spawn_permille` of each of the home's
-//! spawns. A room whose intel stops allowing it requests no more creeps (P6.3 decides when to
-//! abandon one and when to evacuate it).
+//! spawns. When a mined room is threatened, contested or unprofitable, the next section applies.
 //!
 //! # Creeps
 //!
@@ -62,6 +61,31 @@
 //! The Optional placement places, one site a tick a room, the container sites on the mining tiles,
 //! then, under a plan with roads, the road sites along each source's way, nearest the source first,
 //! at most `remote.max_sites` own sites a room.
+//!
+//! # Threats, contests and audits (P6.3)
+//!
+//! - **Threatened:** hostile creeps with an active ATTACK or RANGED_ATTACK part (the snapshot's
+//!   `Combat`, V269) seen in a mined room start a [`Threat`] of `remote.evacuate_ticks`, extended
+//!   from each later sight. Its creeps (not its scouts) walk home and wait near the first spawn,
+//!   its haulers' loads are delivered there by the home's hauling, and no creep is requested for
+//!   it. When the wait runs out they go back; armed hostiles seen again start a new threat. A
+//!   hostile with no such part (another player's scout or hauler) changes nothing. P7's defense
+//!   can start or end a wait itself ([`Remotes::evacuate`], [`Remotes::clear_threat`]).
+//! - **Contested:** a mined room seen with another player's controller, another user's
+//!   reservation (an invader core's among them, V273), or a hostile structure (V267) is abandoned
+//!   ([`Intel::contested`]). A harvest or a reserve there fails (V182, V263, V271), so its miners
+//!   and reserver call `suicide` (one billed intent, against the bot's work for them each tick of
+//!   their remaining lives), and its haulers bring their loads home first. The `remote.contest_threats`-th
+//!   threat within `remote.abandon_ticks` abandons a room the same way.
+//! - **Unprofitable:** each mined room keeps an [`Audit`] over windows of `remote.audit_ticks`:
+//!   the energy its haulers carry into the home room (counted on the tick one crosses in) against
+//!   its new creeps' bodies (its crew's body for the role). A window that delivered less abandons
+//!   the room, except its first window in a global, which holds its start; its creeps work on
+//!   until they die, since their bodies are paid for.
+//!
+//! An abandoned room is not chosen again for `remote.abandon_ticks`; then, unseen since, it is
+//! scouted again first. Each start, end and abandon is a [`RemoteEvent`] the glue logs. All of it
+//! lives in the heap: a reset forgets it, and the room's own creeps bring its intel back.
 //!
 //! One tick, as rustedscreep-wasm drives it:
 //! 1. [`Remotes::begin`] after the snapshot: the owned homes, the intel of each remote room read
@@ -122,6 +146,10 @@ const WORK_RANGE: u8 = 3;
 /// "into the room" arrives one step past the edge.
 const CENTER: u8 = 25;
 const INSIDE: u8 = 23;
+
+/// How near the home's first spawn an evacuated creep waits (P6.3): in the home room, off the
+/// spawn's own ring. Unit: tiles.
+const EVACUATE_RANGE: u8 = 5;
 
 /// How hard a remote miner's moves push past other creeps (as a home miner's, `economy::mining`).
 const MINER_PRIORITY: u8 = 4;
@@ -187,19 +215,106 @@ pub struct Intel {
     pub hostile_structures: u32,
     /// Hostile creeps in it (other players', NPC invaders, source keepers; V101). Unit: creeps.
     pub hostiles: u32,
+    /// Of them, those with an active ATTACK or RANGED_ATTACK part (P6.3, V269). Unit: creeps.
+    pub armed: u32,
 }
 
 impl Intel {
-    /// Whether the room may be mined: a neutral controller that no one else reserves, at least one
-    /// source, no hostile structure, and no hostile creep when it was seen.
+    /// Whether someone else holds the room (P6.3): another player owns its controller, another user
+    /// reserves it (a player, or an invader core, V273), or a hostile structure stands there (V267).
+    /// A harvest there fails (V182, V271), so a mined room that is contested is abandoned.
+    pub fn contested(&self) -> bool {
+        matches!(self.controller, Controller::Foreign { .. })
+            || matches!(self.reservation, Reservation::Other { .. })
+            || self.hostile_structures > 0
+    }
+
+    /// Whether the room may be chosen: a neutral controller, at least one source, not contested,
+    /// and no hostile creep when it was seen.
     pub fn minable(&self) -> bool {
         matches!(self.controller, Controller::Neutral)
             && self.controller_tile.is_some()
-            && !matches!(self.reservation, Reservation::Other { .. })
+            && !self.contested()
             && !self.sources.is_empty()
-            && self.hostile_structures == 0
             && self.hostiles == 0
     }
+}
+
+/// A threat to a mined room (P6.3): armed hostile creeps seen there, or an evacuation P7 asked for
+/// ([`Remotes::evacuate`]). Its creeps wait in the home until `until`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Threat {
+    /// The tick it started. Unit: game ticks.
+    pub since: u32,
+    /// The tick its creeps go back. Unit: game ticks.
+    pub until: u32,
+    /// Armed hostile creeps when last seen. Unit: creeps.
+    pub armed: u32,
+}
+
+/// Why a room was abandoned (P6.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbandonReason {
+    /// Another user holds it ([`Intel::contested`]).
+    Contested,
+    /// It was threatened `remote.contest_threats` times within `remote.abandon_ticks`.
+    Threats,
+    /// Its haulers brought home less energy than its creeps' bodies cost over a
+    /// `remote.audit_ticks` window.
+    Unprofitable,
+}
+
+impl AbandonReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Contested => "contested",
+            Self::Threats => "threatened too often",
+            Self::Unprofitable => "unprofitable",
+        }
+    }
+}
+
+/// An abandoned room: not chosen again until `until`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Abandon {
+    pub since: u32,
+    pub until: u32,
+    pub reason: AbandonReason,
+}
+
+/// A mined room's energy balance over the current `remote.audit_ticks` window (P6.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Audit {
+    /// The window's first tick; `None` until the room is first mined in this global.
+    pub start: Option<u32>,
+    /// Windows completed in this global (the first is not judged: it holds the room's start).
+    pub windows: u32,
+    /// Energy its haulers carried into the home room this window. Unit: energy.
+    pub delivered: u64,
+    /// Its new creeps' bodies this window. Unit: energy.
+    pub spent: u64,
+    /// The room was threatened during the window (it is then not judged).
+    pub threatened: bool,
+}
+
+/// Something the manager did this tick that the glue logs (P6.3; the P6 gate's live evidence).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteEvent {
+    /// Armed hostiles in a mined room: its creeps go home until `until`.
+    Threatened {
+        home: RoomName,
+        room: RoomName,
+        armed: u32,
+        until: u32,
+    },
+    /// The threat's time ran out: its creeps go back.
+    Resumed { home: RoomName, room: RoomName },
+    Abandoned {
+        home: RoomName,
+        room: RoomName,
+        reason: AbandonReason,
+        until: u32,
+    },
 }
 
 /// One source's way from the home ([`WaySearch::remote`]).
@@ -533,6 +648,15 @@ pub struct Remote {
     /// The home mines it (chosen, or named by a live creep of the home).
     pub active: bool,
     pub stats: RemoteStats,
+    /// Its creeps wait in the home (P6.3).
+    pub threat: Option<Threat>,
+    /// It is not chosen again until then (P6.3).
+    pub abandoned: Option<Abandon>,
+    /// The ticks its threats started within the last `remote.abandon_ticks`.
+    threats_at: Vec<u32>,
+    pub audit: Audit,
+    /// The tick it was last abandoned: it is chosen again only on intel seen after it.
+    pub left_at: Option<u32>,
 }
 
 struct Home {
@@ -567,6 +691,13 @@ struct Worker {
     source: Option<Tile>,
     /// A hauler walking home with its load.
     returning: bool,
+    /// The room it stood in last tick (a hauler that crosses into its home room with energy
+    /// delivers it, for the audit).
+    last: Option<RoomName>,
+    /// Its body is in its room's audit (or it was there before this global's first audit).
+    counted: bool,
+    /// Its load is in its room's audit (cleared once it is empty).
+    delivered: bool,
 }
 
 /// What a remote miner or hauler needs of its source's way and crew this tick.
@@ -596,6 +727,8 @@ pub struct Remotes {
     placed: Vec<(RoomName, Tile, u32)>,
     /// Scratch: objects claimed this tick (handle, energy).
     claimed: Vec<(ObjectHandle, u32)>,
+    /// This tick's events, for the glue's log lines (P6.3).
+    events: Vec<RemoteEvent>,
 }
 
 /// `t` in `room` as a position.
@@ -614,6 +747,7 @@ impl Remotes {
         self.time = snap.tick.time;
         self.sites.clear();
         self.claimed.clear();
+        self.events.clear();
         let rooms = &snap.rooms;
         let mut keep: Vec<RoomName> = Vec::new();
         for row in rooms.owned() {
@@ -675,13 +809,21 @@ impl Remotes {
                     .filter(move |(k, p)| **k == kind && p.room_name() == name)
                     .map(|(_, &p)| Tile::of(p))
             };
-            let hostiles = snap
-                .creeps
+            let creeps = &snap.creeps;
+            let (mut hostiles, mut armed) = (0u32, 0u32);
+            for ((&my, p), c) in creeps
                 .my()
                 .iter()
-                .zip(snap.creeps.positions())
-                .filter(|(m, p)| !**m && p.room_name() == name)
-                .count();
+                .zip(creeps.positions())
+                .zip(creeps.combat())
+            {
+                if !my && p.room_name() == name {
+                    hostiles = hostiles.saturating_add(1);
+                    if c.armed() {
+                        armed = armed.saturating_add(1);
+                    }
+                }
+            }
             let at = match self
                 .intel
                 .binary_search_by_key(&name.packed_repr(), |e| e.0.packed_repr())
@@ -700,6 +842,7 @@ impl Remotes {
                                 sources: Vec::new(),
                                 hostile_structures: 0,
                                 hostiles: 0,
+                                armed: 0,
                             },
                         ),
                     );
@@ -716,7 +859,8 @@ impl Remotes {
                 intel.sources.extend(in_room(ObjectKind::Source));
                 intel.sources.sort_unstable();
                 intel.hostile_structures = read.hostile_structures;
-                intel.hostiles = u32::try_from(hostiles).unwrap_or(u32::MAX);
+                intel.hostiles = hostiles;
+                intel.armed = armed;
             }
         }
 
@@ -819,6 +963,61 @@ impl Remotes {
         }
     }
 
+    /// This tick's events (P6.3), for the glue's log lines.
+    pub fn events(&self) -> &[RemoteEvent] {
+        &self.events
+    }
+
+    /// Every threatened room (P6.3, P7's hook): its home, its name and the threat.
+    pub fn threats(&self) -> impl Iterator<Item = (RoomName, RoomName, Threat)> + '_ {
+        self.homes.iter().flat_map(|h| {
+            h.remotes
+                .iter()
+                .filter_map(move |r| r.threat.map(|t| (h.name, r.room, t)))
+        })
+    }
+
+    /// Evacuates `room` until `until` (P7's hook: its creeps wait in the home, and no replacement is
+    /// ordered), or extends its threat to then. Returns whether some home mines it.
+    pub fn evacuate(&mut self, room: RoomName, until: u32) -> bool {
+        let now = self.time;
+        let mut found = false;
+        for r in self
+            .homes
+            .iter_mut()
+            .flat_map(|h| h.remotes.iter_mut())
+            .filter(|r| r.room == room)
+        {
+            found = true;
+            match r.threat.as_mut() {
+                Some(t) => t.until = t.until.max(until),
+                None => {
+                    r.threat = Some(Threat {
+                        since: now,
+                        until,
+                        armed: 0,
+                    });
+                }
+            }
+        }
+        found
+    }
+
+    /// Ends `room`'s threat now (P7's hook, once its defenders hold the room): its creeps go back.
+    /// Returns whether it had one.
+    pub fn clear_threat(&mut self, room: RoomName) -> bool {
+        let mut cleared = false;
+        for r in self
+            .homes
+            .iter_mut()
+            .flat_map(|h| h.remotes.iter_mut())
+            .filter(|r| r.room == room)
+        {
+            cleared |= r.threat.take().is_some();
+        }
+        cleared
+    }
+
     /// Records that the game accepted `site`: its tile is not offered again for
     /// `placement::APPEAR_TICKS` (an accepted site shows on the next tick, V204, unless the
     /// processor drops it).
@@ -841,7 +1040,7 @@ impl Remotes {
         self.homes.get(i).map_or(0, |h| {
             h.remotes
                 .iter()
-                .filter(|r| r.active && r.stats.haulers > 0)
+                .filter(|r| r.active && r.threat.is_none() && r.stats.haulers > 0)
                 .filter_map(|r| r.profit)
                 .map(|p| u64::try_from(p.net).unwrap_or(0))
                 .fold(0u64, u64::saturating_add)
@@ -909,6 +1108,8 @@ impl Remotes {
         }
         self.price(hi, hcfg, cfg, commit);
         self.count(hi, snap);
+        self.guard(hi, cfg);
+        self.audit_creeps(hi, snap);
         self.choose(hi, cfg);
         self.assign(hi, snap);
         if !spare {
@@ -1046,26 +1247,229 @@ impl Remotes {
         }
     }
 
+    /// The audit's counts (P6.3), after [`Self::guard`] rolled the window over: each new creep's
+    /// body (its role's body in its room's crew; those alive on the tick a room's first window of
+    /// the global starts were paid for before it), and each remote hauler's energy on the tick it
+    /// crosses into its home room.
+    fn audit_creeps(&mut self, hi: usize, snap: &Snapshot) {
+        let Some(h) = self.homes.get(hi) else {
+            return;
+        };
+        let (home, members) = (h.name, h.members);
+        for k in members.0..members.1 {
+            let Some(m) = self.members.get(k).copied() else {
+                continue;
+            };
+            if m.role == Role::Scout {
+                continue;
+            }
+            let here = snap.creeps.positions().get(m.row).map(|p| p.room_name());
+            let energy = snap.creeps.stores().get(m.row).map_or(0, |s| s.energy);
+            let now = self.time;
+            let (cost, paid) = self
+                .homes
+                .get(hi)
+                .and_then(|h| h.remotes.iter().find(|r| r.room == m.remote))
+                .map_or((0, true), |r| {
+                    let fresh = r.audit.windows == 0 && r.audit.start == Some(now);
+                    (
+                        body_cost(r.crew.as_ref(), m.role),
+                        r.audit.start.is_none() || fresh,
+                    )
+                });
+            let Some(w) = self.worker_mut(m.handle) else {
+                continue;
+            };
+            let spend = (!w.counted && !paid).then_some(cost);
+            w.counted = true;
+            let crossed = m.role == Role::RemoteHauler
+                && energy > 0
+                && !w.delivered
+                && here == Some(home)
+                && w.last.is_some_and(|l| l != home);
+            if crossed {
+                w.delivered = true;
+            } else if energy == 0 {
+                w.delivered = false;
+            }
+            w.last = here;
+            if let Some(r) = self
+                .homes
+                .get_mut(hi)
+                .and_then(|h| h.remotes.iter_mut().find(|r| r.room == m.remote))
+            {
+                if let Some(c) = spend {
+                    r.audit.spent = r.audit.spent.saturating_add(c);
+                }
+                if crossed {
+                    r.audit.delivered = r.audit.delivered.saturating_add(u64::from(energy));
+                }
+            }
+        }
+    }
+
+    /// Threats, contests and audits (P6.3), for each room the home mines (chosen or crewed):
+    /// - a threat ends at its `until`; an abandon at its `until`;
+    /// - a room seen contested this tick is abandoned (`Contested`);
+    /// - armed hostiles seen this tick start a threat of `remote.evacuate_ticks` (or extend one),
+    ///   and the `remote.contest_threats`-th start within `remote.abandon_ticks` abandons the room
+    ///   (`Threats`);
+    /// - an audit window of `remote.audit_ticks` that is not the room's first in this global and
+    ///   delivered less than it spent abandons the room (`Unprofitable`).
+    fn guard(&mut self, hi: usize, cfg: &RemoteConfig) {
+        let now = self.time;
+        let Some(h) = self.homes.get(hi) else {
+            return;
+        };
+        let home = h.name;
+        let looks: Vec<(bool, u32, bool)> = h
+            .remotes
+            .iter()
+            .map(|r| {
+                self.intel(r.room).map_or((false, 0, false), |i| {
+                    (i.seen == now, i.armed, i.contested())
+                })
+            })
+            .collect();
+        let mut events: Vec<RemoteEvent> = Vec::new();
+        let Some(h) = self.homes.get_mut(hi) else {
+            return;
+        };
+        for (r, (seen, armed, contested)) in h.remotes.iter_mut().zip(looks) {
+            if r.threat.is_some_and(|t| t.until <= now) {
+                r.threat = None;
+                events.push(RemoteEvent::Resumed { home, room: r.room });
+            }
+            if r.abandoned.is_some_and(|a| a.until <= now) {
+                r.abandoned = None;
+            }
+            r.threats_at
+                .retain(|&t| now.saturating_sub(t) < cfg.abandon_ticks);
+            let crewed = r.stats.reservers + r.stats.miners + r.stats.haulers > 0;
+            // An unprofitable room's creeps work on, so it is still guarded (no audit, no count
+            // of threats); any other abandoned or unmined room is not.
+            let working = r
+                .abandoned
+                .is_none_or(|a| a.reason == AbandonReason::Unprofitable && crewed);
+            if !(r.active || crewed) || !working {
+                r.audit = Audit::default();
+                continue;
+            }
+            let judged = r.abandoned.is_none();
+            let mut abandon = None;
+            if seen && contested {
+                abandon = Some(AbandonReason::Contested);
+            } else if seen && armed > 0 {
+                let until = now.saturating_add(cfg.evacuate_ticks);
+                match r.threat.as_mut() {
+                    Some(t) => {
+                        t.until = t.until.max(until);
+                        t.armed = armed;
+                    }
+                    None => {
+                        r.threat = Some(Threat {
+                            since: now,
+                            until,
+                            armed,
+                        });
+                        r.threats_at.push(now);
+                        events.push(RemoteEvent::Threatened {
+                            home,
+                            room: r.room,
+                            armed,
+                            until,
+                        });
+                        let count = u32::try_from(r.threats_at.len()).unwrap_or(u32::MAX);
+                        if judged && count >= cfg.contest_threats.max(1) {
+                            abandon = Some(AbandonReason::Threats);
+                        }
+                    }
+                }
+            }
+            // The audit window (a window that held a threat is not judged: its creeps waited).
+            if r.threat.is_some() {
+                r.audit.threatened = true;
+            }
+            match r.audit.start {
+                _ if !judged => {}
+                None => {
+                    r.audit = Audit {
+                        start: Some(now),
+                        ..Audit::default()
+                    };
+                }
+                Some(start) if now.saturating_sub(start) >= cfg.audit_ticks.max(1) => {
+                    if abandon.is_none()
+                        && r.audit.windows > 0
+                        && !r.audit.threatened
+                        && r.audit.delivered < r.audit.spent
+                    {
+                        abandon = Some(AbandonReason::Unprofitable);
+                    }
+                    r.audit = Audit {
+                        start: Some(now),
+                        windows: r.audit.windows.saturating_add(1),
+                        ..Audit::default()
+                    };
+                }
+                Some(_) => {}
+            }
+            if let Some(reason) = abandon {
+                let until = now.saturating_add(cfg.abandon_ticks);
+                r.abandoned = Some(Abandon {
+                    since: now,
+                    until,
+                    reason,
+                });
+                r.left_at = Some(now);
+                r.active = false;
+                // Its creeps end or come home now; no wait is left to run out.
+                if reason != AbandonReason::Unprofitable {
+                    r.threat = None;
+                }
+                events.push(RemoteEvent::Abandoned {
+                    home,
+                    room: r.room,
+                    reason,
+                    until,
+                });
+            }
+        }
+        self.events.extend(events);
+    }
+
     /// The rooms the home mines: those its working creeps name, and, while it mines fewer than
-    /// `remote.max_rooms` and the spawn time allows, the priced candidates that net the most. A
-    /// room whose intel stops allowing it is dropped (its creeps work on until they die).
+    /// `remote.max_rooms` and the spawn time allows, the priced candidates that net the most (not
+    /// abandoned, not threatened, and with no hostile creep when seen). A mined room stays mined
+    /// through hostile creeps (threats are [`Self::guard`]'s) until it is contested or abandoned.
     fn choose(&mut self, hi: usize, cfg: &RemoteConfig) {
-        let minable: Vec<bool> = self
+        // (minable: may be chosen; held: may stay mined, hostile creeps aside, which are threats).
+        let looks: Vec<(bool, bool)> = self
             .homes
             .get(hi)
             .map(|h| {
                 h.remotes
                     .iter()
-                    .map(|r| self.intel(r.room).is_some_and(Intel::minable))
+                    .map(|r| {
+                        self.intel(r.room).map_or((false, false), |i| {
+                            // A room abandoned before is chosen again only on a newer look.
+                            let fresh = r.left_at.is_none_or(|t| i.seen > t);
+                            (
+                                i.minable() && fresh,
+                                !i.contested() && i.controller_tile.is_some(),
+                            )
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default();
+        let minable: Vec<bool> = looks.iter().map(|l| l.0).collect();
         let Some(h) = self.homes.get_mut(hi) else {
             return;
         };
-        for (r, &ok) in h.remotes.iter_mut().zip(&minable) {
+        for (r, &(_, held)) in h.remotes.iter_mut().zip(&looks) {
             let crewed = r.stats.reservers + r.stats.miners + r.stats.haulers > 0;
-            r.active = ok && r.profit.is_some() && (r.active || crewed);
+            r.active = held && r.abandoned.is_none() && r.profit.is_some() && (r.active || crewed);
         }
         let budget = u64::from(cfg.spawn_permille).saturating_mul(u64::from(h.spawns.max(1)));
         let mut used: u64 = h
@@ -1091,6 +1495,8 @@ impl Remotes {
                 .filter(|&(k, r)| {
                     !r.active
                         && r.side.is_some()
+                        && r.abandoned.is_none()
+                        && r.threat.is_none()
                         && minable.get(k).copied().unwrap_or(false)
                         && r.profit
                             .is_some_and(|p| used.saturating_add(p.spawn_permille()) <= budget)
@@ -1218,7 +1624,13 @@ impl Remotes {
         let Some(target) = h
             .remotes
             .iter()
-            .find(|r| r.side.is_some() && !r.active && self.needs_look(r.room, cfg))
+            .find(|r| {
+                r.side.is_some()
+                    && !r.active
+                    && r.abandoned.is_none()
+                    && r.threat.is_none()
+                    && (self.needs_look(r.room, cfg) || self.left_unseen(r))
+            })
             .map(|r| r.room)
         else {
             return;
@@ -1242,6 +1654,12 @@ impl Remotes {
         {
             r.stats.requested = r.stats.requested.saturating_add(1);
         }
+    }
+
+    /// Whether `r` was abandoned and not seen since (P6.3): a scout looks again before it is chosen.
+    fn left_unseen(&self, r: &Remote) -> bool {
+        r.left_at
+            .is_some_and(|t| self.intel(r.room).is_none_or(|i| i.seen <= t))
     }
 
     /// Whether `room` needs a look: no intel, or intel older than `remote.rescout_ticks`.
@@ -1274,7 +1692,7 @@ impl Remotes {
             })
             .collect();
         let mut asks: Vec<(RoomName, Role, Body, u8)> = Vec::new();
-        for r in h.remotes.iter().filter(|r| r.active) {
+        for r in h.remotes.iter().filter(|r| r.active && r.threat.is_none()) {
             let (Some(plan), Some(ways)) = (r.crew.as_ref(), r.ways.as_ref()) else {
                 continue;
             };
@@ -1353,6 +1771,9 @@ impl Remotes {
                 handle,
                 source: None,
                 returning: false,
+                last: None,
+                counted: false,
+                delivered: false,
             });
         }
         entry.as_mut()
@@ -1390,6 +1811,7 @@ impl Remotes {
         }
         let source = self.worker(m.handle).and_then(|w| w.source);
         let home = self.homes.get(m.home).ok_or(Fault::new("no home", unit))?;
+        let home_name = home.name;
         let home_spot = home.spawn.and_then(|t| at(home.name, t));
         let remote = home.remotes.iter().find(|r| r.room == m.remote);
         // What this creep needs of its room's ways and crew, copied out (no clone of a list).
@@ -1434,6 +1856,34 @@ impl Remotes {
             );
         };
         let inside = |room: RoomName| Tile::new(CENTER, CENTER).and_then(|t| at(room, t));
+        // P6.3: a threatened room's creeps wait in the home; an abandoned (contested or too often
+        // threatened) room's haulers bring their load home and the rest end their lives (a harvest
+        // or a reserve there fails, V182, V263, V271), while an unprofitable room's work on.
+        let now = self.time;
+        let threatened = remote.is_some_and(|r| r.threat.is_some_and(|t| t.until > now));
+        let given_up = remote
+            .and_then(|r| r.abandoned)
+            .is_some_and(|a| a.reason != AbandonReason::Unprofitable);
+        if m.role != Role::Scout && (threatened || given_up) {
+            let energy = snap.creeps.stores().get(m.row).map_or(0, |s| s.energy);
+            let carries = m.role == Role::RemoteHauler && energy > 0;
+            let spot = home_spot.or_else(|| inside(home_name));
+            if given_up && !carries {
+                let _ = buffer.push(snap, m.handle, CreepIntent::Suicide, commit);
+            } else if let Some(p) = spot {
+                // Walk to within range of the spot (a creep that just crossed in stands on an edge
+                // tile, where a hold would carry it back out, V151), then make way within it.
+                let near = here.room_name() == home_name
+                    && !Tile::of(here).is_edge()
+                    && Tile::of(here).range(Tile::of(p)) <= EVACUATE_RANGE;
+                if near {
+                    movement.give_way(snap, m.handle, Some((p, EVACUATE_RANGE)));
+                } else {
+                    go(movement, p, EVACUATE_RANGE, MOVE_PRIORITY, commit);
+                }
+            }
+            return Ok(());
+        }
         match m.role {
             Role::Scout => match self.scout_goal(m, here, cfg) {
                 Some(room) => {
@@ -1618,12 +2068,21 @@ impl Remotes {
         if unsearched {
             return Some(room);
         }
-        if self.needs_look(m.remote, cfg) {
+        let own_threatened = h
+            .remotes
+            .iter()
+            .any(|r| r.room == m.remote && r.threat.is_some());
+        if self.needs_look(m.remote, cfg) && !own_threatened {
             return Some(m.remote);
         }
         h.remotes
             .iter()
-            .filter(|r| r.side.is_some() && self.needs_look(r.room, cfg))
+            .filter(|r| {
+                r.side.is_some()
+                    && r.threat.is_none()
+                    && r.abandoned.is_none()
+                    && (self.needs_look(r.room, cfg) || self.left_unseen(r))
+            })
             .min_by_key(|r| (room_distance(room, r.room), r.room.packed_repr()))
             .map(|r| r.room)
     }
@@ -1830,7 +2289,7 @@ impl Remotes {
             return Ok(());
         };
         let mut picks: Vec<RemoteSite> = Vec::new();
-        for r in h.remotes.iter().filter(|r| r.active) {
+        for r in h.remotes.iter().filter(|r| r.active && r.threat.is_none()) {
             let (Some(ways), Some(crew)) = (r.ways.as_ref(), r.crew.as_ref()) else {
                 continue;
             };
@@ -1930,7 +2389,27 @@ fn new_remote(room: RoomName, side: Option<Side>) -> Remote {
         priced: None,
         active: false,
         stats: RemoteStats::default(),
+        threat: None,
+        abandoned: None,
+        threats_at: Vec::new(),
+        audit: Audit::default(),
+        left_at: None,
     }
+}
+
+/// A remote creep's body cost for the audit (P6.3): its role's body in the room's crew (the first
+/// source's for a miner or a hauler; a scout's is not the room's). Unit: energy.
+fn body_cost(crew: Option<&RemoteCrew>, role: Role) -> u64 {
+    let Some(c) = crew else {
+        return 0;
+    };
+    let body = match role {
+        Role::Reserver => c.reserver.map(|r| r.0),
+        Role::RemoteMiner => c.sources.first().map(|s| s.miner),
+        Role::RemoteHauler => c.sources.first().map(|s| s.hauler),
+        _ => None,
+    };
+    body.map_or(0, |b| u64::from(b.cost()))
 }
 
 /// The home's spawns: how many, and the tile of the first by id (the ways start next to it).

@@ -8,16 +8,16 @@ use rustedscreep_consts::{
 
 use super::remote::{RemoteHome, RemoteRoom, RemoteSource, remote_crew};
 use super::remotes::{
-    PRIORITY_REMOTE_HAULER, PRIORITY_REMOTE_MINER, PRIORITY_RESERVER, PRIORITY_SCOUT, Remotes,
-    WaySearch, candidates, is_remote_room,
+    AbandonReason, PRIORITY_REMOTE_HAULER, PRIORITY_REMOTE_MINER, PRIORITY_RESERVER,
+    PRIORITY_SCOUT, RemoteEvent, Remotes, WaySearch, candidates, is_remote_room,
 };
 use crate::config::{HAULING_MMO, MOVEMENT_MMO, REMOTE_MMO, RemoteConfig, SPAWN_MMO};
 use crate::intents::{CreepIntent, IntentBuffer};
 use crate::movement::{CostGrid, Footprint, Movement, Side, TerrainGrid, Tile, profile};
 use crate::scheduler::Commit;
 use crate::snapshot::{
-    Controller, CreepRow, CreepStore, ObjectKey, ObjectKind, ObjectRow, ObjectStatic, RemoteRead,
-    Reservation, RoomEnergy, Snapshot, StructureStatic, TickContext,
+    Combat, Controller, CreepRow, CreepStore, ObjectKey, ObjectKind, ObjectRow, ObjectStatic,
+    RemoteRead, Reservation, RoomEnergy, Snapshot, StructureStatic, TickContext,
 };
 use crate::spawning::{Body, BodySpec, Identity, Role, Spawner};
 
@@ -245,6 +245,10 @@ struct World {
     visible: bool,
     hostile_structures: u32,
     creeps: Vec<Creep>,
+    /// Hostile creeps (P6.3): key, place and active combat parts; after the own creeps' rows.
+    hostiles: Vec<(u128, Position, Combat)>,
+    /// The last own creep id given out.
+    next_key: u128,
     objects: Vec<Object>,
     snap: Snapshot,
     movement: Movement,
@@ -299,6 +303,8 @@ impl World {
             visible: true,
             hostile_structures: 0,
             creeps: vec![worker],
+            hostiles: Vec::new(),
+            next_key: 1000,
             objects,
             snap: Snapshot::default(),
             movement: Movement::default(),
@@ -310,7 +316,9 @@ impl World {
     }
 
     fn add(&mut self, role: Role, at: Position, energy: u32, capacity: u32) -> u128 {
-        let key = 1000 + self.creeps.len() as u128;
+        // A fresh id each time, also after a creep is removed: an id is never reused.
+        self.next_key += 1;
+        let key = self.next_key;
         self.creeps.push(Creep {
             key,
             id: Identity {
@@ -350,6 +358,17 @@ impl World {
                 },
             );
             self.snap.creeps.set_death(row, c.death);
+        }
+        for &(key, at, combat) in &self.hostiles {
+            let r = CreepRow {
+                pos: at,
+                my: false,
+                spawning: false,
+                fatigue: 0,
+            };
+            self.snap.creeps.push(ObjectKey(key), r).expect("hostile");
+            let row = self.snap.creeps.len() - 1;
+            self.snap.creeps.set_combat(row, combat);
         }
         let row = self
             .snap
@@ -977,4 +996,373 @@ fn a_reset_searches_a_crewed_room_again() {
     let r = remotes.iter().find(|r| r.room == w.remote).expect("remote");
     assert!(r.ways.is_some(), "searched without the placement job");
     assert!(r.active);
+}
+
+// P6.3: threats, contests and audits, fed to the manager (the P6 gate's scenario tests).
+
+/// A settled world with every post staffed: a reserver, a miner on each mining tile (empty), and
+/// one hauler a source (empty, next to its mining tile). Returns the miners' and haulers' keys.
+fn staffed() -> (World, Vec<u128>, Vec<u128>) {
+    let mut w = World::new();
+    w.settle();
+    w.begin();
+    w.plan(true);
+    let (_, remotes) = w.remotes.home_states().next().expect("home");
+    let ways = remotes
+        .iter()
+        .find(|r| r.room == w.remote)
+        .and_then(|r| r.ways.clone())
+        .expect("ways");
+    let at = pos(w.remote, tile(20, 20));
+    w.add(Role::Reserver, at, 0, 0);
+    let (mut miners, mut haulers) = (Vec::new(), Vec::new());
+    for s in &ways.sources {
+        miners.push(w.add(Role::RemoteMiner, pos(w.remote, s.tile), 0, 50));
+        haulers.push(w.add(Role::RemoteHauler, pos(w.remote, s.path[0]), 0, 100));
+    }
+    w.time += 1;
+    w.begin();
+    w.plan(true);
+    (w, miners, haulers)
+}
+
+fn the_remote(w: &World) -> super::remotes::Remote {
+    let (_, remotes) = w.remotes.home_states().next().expect("home");
+    remotes
+        .iter()
+        .find(|r| r.room == w.remote)
+        .cloned()
+        .expect("remote")
+}
+
+fn tick(w: &mut World) -> Vec<(u128, CreepIntent)> {
+    w.time += 1;
+    w.begin();
+    w.plan(true);
+    w.work();
+    w.intents()
+}
+
+#[test]
+fn an_unarmed_hostile_is_no_threat() {
+    let (mut w, miners, _) = staffed();
+    // Another player's scout or hauler: no ATTACK, no RANGED_ATTACK part.
+    w.hostiles
+        .push((9000, pos(w.remote, tile(30, 30)), Combat::default()));
+    let intents = tick(&mut w);
+    let r = the_remote(&w);
+    assert!(r.threat.is_none() && r.abandoned.is_none() && r.active);
+    assert!(w.remotes.events().is_empty());
+    assert!(
+        intents
+            .iter()
+            .any(|&(k, i)| k == miners[0] && matches!(i, CreepIntent::Harvest { .. })),
+        "the miner works on: {intents:?}"
+    );
+}
+
+#[test]
+fn armed_hostiles_evacuate_a_mined_room_until_the_wait_ends() {
+    let (mut w, miners, _) = staffed();
+    w.cfg.evacuate_ticks = 50;
+    let hostile = (
+        9000,
+        pos(w.remote, tile(30, 30)),
+        Combat {
+            attack: 2,
+            ranged_attack: 0,
+        },
+    );
+    w.hostiles.push(hostile);
+    let intents = tick(&mut w);
+    let start = w.time;
+    let r = the_remote(&w);
+    let t = r.threat.expect("threatened");
+    assert_eq!((t.since, t.until, t.armed), (start, start + 50, 1));
+    assert!(r.active, "a threat pauses the room, it does not drop it");
+    assert_eq!(
+        w.remotes.events(),
+        [RemoteEvent::Threatened {
+            home: w.home,
+            room: w.remote,
+            armed: 1,
+            until: start + 50
+        }]
+    );
+    // Its creeps stop working (they head home), and nothing is requested for it.
+    assert!(
+        !intents
+            .iter()
+            .any(|&(k, i)| miners.contains(&k) && !matches!(i, CreepIntent::Move { .. })),
+        "{intents:?}"
+    );
+    assert!(w.requests().iter().all(|a| a.1 != Some(w.remote)));
+    assert_eq!(w.remotes.threats().count(), 1);
+    // Seen again, the wait is extended from the last sight; gone, it runs out.
+    tick(&mut w);
+    let extended = the_remote(&w).threat.expect("still threatened").until;
+    assert_eq!(extended, w.time + 50);
+    w.hostiles.clear();
+    while w.time < extended {
+        tick(&mut w);
+        assert!(w.remotes.events().is_empty() || w.time == extended);
+    }
+    assert_eq!(
+        w.remotes.events(),
+        [RemoteEvent::Resumed {
+            home: w.home,
+            room: w.remote
+        }]
+    );
+    assert!(the_remote(&w).threat.is_none());
+    let intents = tick(&mut w);
+    assert!(
+        intents
+            .iter()
+            .any(|&(k, i)| miners.contains(&k) && matches!(i, CreepIntent::Harvest { .. })),
+        "back at work: {intents:?}"
+    );
+}
+
+#[test]
+fn contested_rooms_are_abandoned_and_their_creeps_end() {
+    for contest in ["reserved", "core"] {
+        let (mut w, miners, haulers) = staffed();
+        // One hauler carries a load: it goes home first.
+        let loaded = haulers[0];
+        w.creeps
+            .iter_mut()
+            .find(|c| c.key == loaded)
+            .expect("h")
+            .energy = 60;
+        match contest {
+            "reserved" => w.reservation = Reservation::Other { ticks: 3000 },
+            _ => w.hostile_structures = 1,
+        }
+        let intents = tick(&mut w);
+        let now = w.time;
+        let r = the_remote(&w);
+        let a = r.abandoned.expect("abandoned");
+        assert_eq!(a.reason, AbandonReason::Contested, "{contest}");
+        assert_eq!(a.until, now + w.cfg.abandon_ticks);
+        assert!(!r.active);
+        assert!(w.remotes.events().contains(&RemoteEvent::Abandoned {
+            home: w.home,
+            room: w.remote,
+            reason: AbandonReason::Contested,
+            until: now + w.cfg.abandon_ticks,
+        }));
+        let suicides: Vec<u128> = intents
+            .iter()
+            .filter(|(_, i)| matches!(i, CreepIntent::Suicide))
+            .map(|&(k, _)| k)
+            .collect();
+        for m in &miners {
+            assert!(suicides.contains(m), "{contest}: miner {m} ends");
+        }
+        assert!(
+            suicides.contains(&haulers[1]),
+            "{contest}: the empty hauler ends"
+        );
+        assert!(
+            !suicides.contains(&loaded),
+            "{contest}: the loaded one goes home"
+        );
+        // Not chosen again while abandoned, even once the room is free.
+        w.reservation = Reservation::None;
+        w.hostile_structures = 0;
+        w.creeps.retain(|c| !suicides.contains(&c.key));
+        tick(&mut w);
+        assert!(!the_remote(&w).active);
+        assert!(
+            w.requests().iter().all(|a| a.1 != Some(w.remote)),
+            "{contest}"
+        );
+    }
+}
+
+#[test]
+fn repeated_threats_abandon_a_room() {
+    let (mut w, _, _) = staffed();
+    w.cfg.evacuate_ticks = 5;
+    w.cfg.contest_threats = 2;
+    let armed = Combat {
+        attack: 0,
+        ranged_attack: 3,
+    };
+    for round in 0..2 {
+        w.hostiles = vec![(9000 + round, pos(w.remote, tile(30, 30)), armed)];
+        tick(&mut w);
+        w.hostiles.clear();
+        if round == 0 {
+            assert!(the_remote(&w).abandoned.is_none());
+            for _ in 0..6 {
+                tick(&mut w);
+            }
+            assert!(the_remote(&w).threat.is_none(), "the first wait ran out");
+        }
+    }
+    let a = the_remote(&w).abandoned.expect("abandoned");
+    assert_eq!(a.reason, AbandonReason::Threats);
+}
+
+#[test]
+fn an_unprofitable_room_is_abandoned_after_its_first_window() {
+    let (mut w, miners, haulers) = staffed();
+    w.cfg.audit_ticks = rustedscreep_consts::CREEP_LIFE_TIME;
+    // Each window a new creep (its body is spent) and nothing delivered home.
+    let window = w.cfg.audit_ticks;
+    let mut windows = 0;
+    while the_remote(&w).abandoned.is_none() && windows < 4 {
+        let at = pos(w.remote, tile(20, 21));
+        let key = w.add(Role::RemoteHauler, at, 0, 100);
+        let born = w.time;
+        while w.time < born + window {
+            tick(&mut w);
+        }
+        w.creeps.retain(|c| c.key != key);
+        windows += 1;
+    }
+    let a = the_remote(&w).abandoned.expect("abandoned as unprofitable");
+    assert_eq!(a.reason, AbandonReason::Unprofitable);
+    assert!(windows >= 2, "never on the room's first window");
+    // Its creeps work on: no suicide.
+    let intents = tick(&mut w);
+    assert!(
+        !intents
+            .iter()
+            .any(|&(k, i)| (miners.contains(&k) || haulers.contains(&k))
+                && matches!(i, CreepIntent::Suicide)),
+        "{intents:?}"
+    );
+}
+
+#[test]
+fn a_room_that_delivers_more_than_it_spends_stays_mined() {
+    let (mut w, _, haulers) = staffed();
+    w.cfg.audit_ticks = rustedscreep_consts::CREEP_LIFE_TIME;
+    let hauler = haulers[0];
+    let home_spot = pos(w.home, tile(40, 25));
+    let remote_spot = pos(w.remote, tile(20, 21));
+    let start = w.time;
+    while w.time < start + 3 * w.cfg.audit_ticks {
+        // Every 100 ticks a load of 100 crosses into the home room.
+        let crossing = (w.time - start) % 100;
+        let c = w.creeps.iter_mut().find(|c| c.key == hauler).expect("h");
+        if crossing == 0 {
+            c.at = remote_spot;
+            c.energy = 100;
+        } else if crossing == 1 {
+            c.at = home_spot;
+        }
+        tick(&mut w);
+    }
+    let r = the_remote(&w);
+    assert!(r.abandoned.is_none(), "{:?}", r.audit);
+    assert!(r.active);
+}
+
+#[test]
+fn p7_can_evacuate_a_room_and_end_it() {
+    let (mut w, miners, _) = staffed();
+    tick(&mut w);
+    let until = w.time + 100;
+    assert!(w.remotes.evacuate(w.remote, until));
+    assert!(
+        !w.remotes.evacuate(room("E9N9"), until),
+        "a room no home mines"
+    );
+    let listed: Vec<_> = w.remotes.threats().collect();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (listed[0].0, listed[0].1, listed[0].2.until),
+        (w.home, w.remote, until)
+    );
+    let intents = tick(&mut w);
+    assert!(
+        !intents
+            .iter()
+            .any(|&(k, i)| miners.contains(&k) && matches!(i, CreepIntent::Harvest { .. }))
+    );
+    assert!(w.remotes.clear_threat(w.remote));
+    assert!(!w.remotes.clear_threat(w.remote));
+    let intents = tick(&mut w);
+    assert!(
+        intents
+            .iter()
+            .any(|&(k, i)| miners.contains(&k) && matches!(i, CreepIntent::Harvest { .. }))
+    );
+}
+
+/// An evacuee that just crossed into the home stands on the home's edge: it walks in (a hold there
+/// would carry it back out, V151), and makes way once within range of the spawn.
+#[test]
+fn an_evacuee_on_the_home_edge_walks_in() {
+    let (mut w, miners, _) = staffed();
+    w.hostiles.push((
+        9000,
+        pos(w.remote, tile(30, 30)),
+        Combat {
+            attack: 1,
+            ranged_attack: 0,
+        },
+    ));
+    tick(&mut w);
+    assert!(the_remote(&w).threat.is_some());
+    // The remote room is to the home's right: its edge is x = 49.
+    let miner = miners[0];
+    w.creeps.iter_mut().find(|c| c.key == miner).expect("m").at = pos(w.home, tile(49, 25));
+    // On the edge it asks movement for a step; near the spawn it only makes way (no request), so
+    // the tick's requests differ by exactly that one, everything else the same.
+    tick(&mut w);
+    let on_edge = w.movement.tick().requests;
+    w.creeps.iter_mut().find(|c| c.key == miner).expect("m").at = pos(w.home, tile(27, 25));
+    tick(&mut w);
+    let near = w.movement.tick().requests;
+    assert_eq!(on_edge, near + 1, "it steps off the edge, then waits");
+}
+
+/// A room abandoned as unprofitable keeps its working creeps guarded: armed hostiles still send
+/// them home, and a contest still ends them.
+#[test]
+fn an_unprofitable_room_is_still_guarded() {
+    let (mut w, miners, _) = staffed();
+    w.cfg.audit_ticks = rustedscreep_consts::CREEP_LIFE_TIME;
+    let window = w.cfg.audit_ticks;
+    let mut windows = 0;
+    while the_remote(&w).abandoned.is_none() && windows < 4 {
+        let key = w.add(Role::RemoteHauler, pos(w.remote, tile(20, 21)), 0, 100);
+        let born = w.time;
+        while w.time < born + window {
+            tick(&mut w);
+        }
+        w.creeps.retain(|c| c.key != key);
+        windows += 1;
+    }
+    assert_eq!(
+        the_remote(&w).abandoned.map(|a| a.reason),
+        Some(AbandonReason::Unprofitable)
+    );
+    w.hostiles.push((
+        9000,
+        pos(w.remote, tile(30, 30)),
+        Combat {
+            attack: 0,
+            ranged_attack: 1,
+        },
+    ));
+    tick(&mut w);
+    assert!(the_remote(&w).threat.is_some(), "threats still evacuate it");
+    w.hostiles.clear();
+    w.reservation = Reservation::Other { ticks: 100 };
+    let intents = tick(&mut w);
+    assert_eq!(
+        the_remote(&w).abandoned.map(|a| a.reason),
+        Some(AbandonReason::Contested)
+    );
+    assert!(
+        intents
+            .iter()
+            .any(|&(k, i)| miners.contains(&k) && matches!(i, CreepIntent::Suicide))
+    );
 }

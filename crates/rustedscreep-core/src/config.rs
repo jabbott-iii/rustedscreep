@@ -727,6 +727,18 @@ pub struct RemoteConfig {
     /// A candidate room seen longer ago than this, and not mined, is scouted again when the home
     /// wants another remote room. Unit: ticks.
     pub rescout_ticks: u32,
+    /// A mined room where armed hostile creeps are seen has its creeps wait in the home this long
+    /// after the last sight of them (P6.3; P7's defenders may end it sooner). Unit: ticks.
+    pub evacuate_ticks: u32,
+    /// An abandoned room is not chosen again for this long (P6.3), and the threats that abandon a
+    /// room are counted within it. Unit: ticks.
+    pub abandon_ticks: u32,
+    /// This many threats within `abandon_ticks` abandon a room (P6.3). Unit: threats.
+    pub contest_threats: u32,
+    /// The window over which a mined room's delivered energy is set against its creeps' bodies
+    /// (P6.3); a window that delivered less abandons the room, but not a room's first window in a
+    /// global. Unit: ticks.
+    pub audit_ticks: u32,
     /// The bot's own CPU for each remote creep each tick it is alive (its share of the snapshot,
     /// the decisions and the act step's calls), on top of `INTENT_CPU_COST` for each billed intent.
     /// Unit: µCPU (millionths of a CPU).
@@ -751,6 +763,10 @@ pub const REMOTE_MMO: RemoteConfig = RemoteConfig {
     container_repair_pct: 80,
     road_read_ticks: 5,
     rescout_ticks: 20_000,
+    evacuate_ticks: 1500,
+    abandon_ticks: 20_000,
+    contest_threats: 3,
+    audit_ticks: 3000,
     creep_ucpu: 10_000,
     horizon_ticks: 30_000,
     slack_pct: 2,
@@ -965,7 +981,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 109;
+pub const FIELD_COUNT: usize = 113;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1269,6 +1285,31 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         1_500_000,
         true
     ),
+    number!(
+        remote,
+        "RemoteConfig",
+        evacuate_ticks,
+        1,
+        CREEP_LIFE_TIME * 10,
+        true
+    ),
+    number!(
+        remote,
+        "RemoteConfig",
+        abandon_ticks,
+        CREEP_LIFE_TIME,
+        1_500_000,
+        true
+    ),
+    number!(remote, "RemoteConfig", contest_threats, 1, 100, true),
+    number!(
+        remote,
+        "RemoteConfig",
+        audit_ticks,
+        CREEP_LIFE_TIME,
+        150_000,
+        true
+    ),
     number!(remote, "RemoteConfig", creep_ucpu, 0, 1_000_000, true),
     number!(
         remote,
@@ -1570,6 +1611,10 @@ mod tests {
             container_repair_pct: _,
             road_read_ticks: _,
             rescout_ticks: _,
+            evacuate_ticks: _,
+            abandon_ticks: _,
+            contest_threats: _,
+            audit_ticks: _,
             creep_ucpu: _,
             horizon_ticks: _,
             slack_pct: _,
@@ -1737,6 +1782,10 @@ mod tests {
                     "container_repair_pct",
                     "road_read_ticks",
                     "rescout_ticks",
+                    "evacuate_ticks",
+                    "abandon_ticks",
+                    "contest_threats",
+                    "audit_ticks",
                     "creep_ucpu",
                     "horizon_ticks",
                     "slack_pct",

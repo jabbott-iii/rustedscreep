@@ -24,8 +24,8 @@ mod tick;
 pub use intern::{Handle, Interner, ObjectKey};
 pub use room_name::parse_room_name;
 pub use tables::{
-    Controller, ControllerState, CreepClass, CreepHandle, CreepRow, CreepStore, Creeps, Links,
-    ObjectClass, ObjectHandle, ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation,
+    Combat, Controller, ControllerState, CreepClass, CreepHandle, CreepRow, CreepStore, Creeps,
+    Links, ObjectClass, ObjectHandle, ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation,
     RoomEnergy, RoomObjects, Rooms, Spawns, StructureClass, StructureHandle, StructureStatic,
     Structures, known_structure_type, position_from_packed,
 };

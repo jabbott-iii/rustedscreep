@@ -237,6 +237,7 @@ pub fn game_loop() {
                 movement.resolve(&mut tick, snapshot, &mut act.buffer, &cfg.movement);
                 tick.finish();
                 opening.log_events();
+                remote.log_events(snapshot, js);
                 probe.decide();
                 // After the decide step: the scheduler reads the CPU clock no more (scheduler docs); the
                 // profiler's readings from here on measure the act step outside the budget. The
