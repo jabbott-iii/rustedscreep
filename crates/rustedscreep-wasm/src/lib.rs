@@ -129,7 +129,7 @@ pub fn game_loop() {
                 } = &mut *state;
                 let mut probe = profiler::Probe::start();
                 let cfg = *runtime.get();
-                snapshot::take(snapshot, js, &cfg.cache, &cfg.remote);
+                snapshot::take(snapshot, js, &cfg.cache, &cfg.remote, &cfg.upkeep);
                 // Movement's tick starts with the snapshot (no JS call); its room reads are jobs.
                 movement.begin(snapshot, &cfg.movement, &cfg.cache, &cfg.sign);
                 snapshot::log_skips(skip_log, snapshot, cfg.log.skip_window_ticks);
@@ -194,6 +194,7 @@ pub fn game_loop() {
                     &cfg.mining,
                     &cfg.links,
                     &cfg.repair,
+                    &cfg.upkeep,
                     &cfg.hauling,
                     &cfg.upgrading,
                     &cfg.movement,
@@ -214,6 +215,10 @@ pub fn game_loop() {
                     &mut act.buffer,
                     &cfg.movement,
                 );
+                // P7.3: the roads and ramparts next tick's snapshot reads for the repairers the
+                // Standard work just ran (none on a tick it did not run).
+                let (roads, ramparts) = opening.upkeep_reads();
+                js.set_upkeep_reads(roads, ramparts);
                 // Standard: the link sends (P3.2), from the `mining` job's rooms.
                 opening.send_links(&mut tick, &cfg.links);
                 // Standard: the remote creeps' work (P6.2).

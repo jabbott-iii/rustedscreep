@@ -18,14 +18,16 @@
 // - `spawnCreep` follows the runtime's checks and writes `Memory.creeps[name]` on OK (V171, V181), and the processor
 //   drops every accepted order (V173), so no creep appears; the worker's calls return OK and do nothing.
 // It runs three phases, each until the placement has been quiet for QUIET loops: the profile's config with
-// `planner.towers` off (a config record in segment CONFIG_SEGMENT before the first global, since P7.2 turned the
-// profile's towers on); then `planner.storage` on; then `planner.towers` on again. It checks:
+// `planner.towers` and `planner.ramparts` off (a config record in segment CONFIG_SEGMENT before the first global,
+// since P7.2 and P7.3 turned the profile's towers and ramparts on); then `planner.storage` on; then `planner.towers`
+// and `planner.ramparts` on again. It checks:
 // - one planner line, `rustedscreep planner: E7N57 planned in N steps: M items, anchor (43, 21), valid`;
 // - the first phase places only roads and destroys nothing (the extensions on the plan are kept, the planned slots
 //   beyond CONTROLLER_STRUCTURES.extension[4] wait, the storage and the towers are off);
 // - the second phase destroys exactly the extension on the storage's tile (41, 21), places an extension site on a
 //   planned slot (the freed count) and the storage site on (41, 21), and never leaves the room below 19 extensions;
-//   the third destroys exactly the extension on the first tower's tile (43, 19) and places the tower's site there;
+//   the third destroys exactly the extension on the first tower's tile (43, 19) and places the tower's site there,
+//   and rampart sites (P7.3, ADR-032), each on a distinct tile of the plan's line, none needing a destroy;
 // - every site call returns OK on a tile the harness allows, with fewer than PLANNER_MMO.max_sites sites open;
 //   every destroy returns OK;
 // - `rustedscreep.planner()` at the end of the phases: the room's plan ready with the anchor, `destroys 2 (accepted 2,
@@ -306,7 +308,7 @@ export function plannerSim(dir = join(ROOT, 'dist')) {
     setup: (context, w) => {
       state.context = context;
       // The first phase's towers off (module docs), in segment CONFIG_SEGMENT before the first global.
-      w.segments[CONFIG_SEGMENT] ??= configRecord(['planner.towers=false']);
+      w.segments[CONFIG_SEGMENT] ??= configRecord(['planner.towers=false', 'planner.ramparts=false']);
     },
     scene: (offset) => sceneFor(state, offset),
     command: (w) => {
@@ -332,7 +334,7 @@ export function plannerSim(dir = join(ROOT, 'dist')) {
       state.phase += 1;
       state.phaseAt.push(offset);
       if (state.phase === 1) return set('planner.storage', 'true');
-      if (state.phase === 2) return set('planner.towers', 'true');
+      if (state.phase === 2) return `${set('planner.ramparts', 'true')}, ${set('planner.towers', 'true')}`;
       if (state.phase === 7) {
         finished = true;
         records.push(w.segments[PLANNER_SEGMENT]);
@@ -406,7 +408,11 @@ export function plannerSim(dir = join(ROOT, 'dist')) {
   };
   const second = phase(storageOn, towersOn, STORAGE, 'storage') ?? [];
   if (!second.some((c) => c.type === 'extension' && !same(c, STORAGE))) problems.push('no extension site took the freed count');
-  phase(towersOn, end, TOWER, 'tower');
+  const third = phase(towersOn, end, TOWER, 'tower') ?? [];
+  // P7.3: the ramparts' sites go out with the towers' gate, on distinct tiles; the one destroy above is the tower's.
+  const ramparts = third.filter((c) => c.type === 'rampart');
+  if (!ramparts.length) problems.push(`no rampart site after offset ${towersOn}`);
+  if (new Set(ramparts.map(at)).size !== ramparts.length) problems.push(`rampart sites repeat a tile: ${JSON.stringify(ramparts.map(at))}`);
   if (state.minExtensions < EXTENSIONS.length - 1) problems.push(`extensions fell to ${state.minExtensions}`);
 
   const summaries = commandResults(world, SUMMARY);

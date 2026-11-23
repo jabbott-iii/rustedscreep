@@ -49,7 +49,7 @@ use std::fmt::Write as _;
 
 use rustedscreep_core::config::{
     HaulingConfig, LinkConfig, MiningConfig, MovementConfig, OpeningConfig, PlannerConfig,
-    RepairConfig, SchedulerConfig, SpawnConfig, UpgradingConfig,
+    RepairConfig, SchedulerConfig, SpawnConfig, UpgradingConfig, UpkeepConfig,
 };
 use rustedscreep_core::economy::placement::{DestroyTarget, Placement};
 use rustedscreep_core::economy::{
@@ -61,7 +61,7 @@ use rustedscreep_core::movement::Movement;
 use rustedscreep_core::scheduler::{
     Clock, Fault, FaultRecord, Job, JobState, Scheduler, TickCpu, Tier,
 };
-use rustedscreep_core::snapshot::{ObjectKind, Snapshot};
+use rustedscreep_core::snapshot::{ObjectKey, ObjectKind, Snapshot, StructureHandle};
 use rustedscreep_core::spawning::{Body, EnergyBudget, Spawner};
 use screeps::{Part, RoomName, StructureType};
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
@@ -260,6 +260,7 @@ impl OpeningGlue {
         mining_cfg: &MiningConfig,
         link_cfg: &LinkConfig,
         repair_cfg: &RepairConfig,
+        upkeep_cfg: &UpkeepConfig,
         hauling_cfg: &HaulingConfig,
         upgrading_cfg: &UpgradingConfig,
         mcfg: &MovementConfig,
@@ -375,6 +376,7 @@ impl OpeningGlue {
                 buffer,
                 cfg,
                 repair_cfg,
+                upkeep_cfg,
                 mcfg,
                 hauling_cfg.tower_refill_min,
                 mined,
@@ -385,6 +387,13 @@ impl OpeningGlue {
                 commit,
             )
         });
+    }
+
+    /// What the next tick's snapshot reads for upkeep (P7.3, `Opening::upkeep_reads`), from this
+    /// tick's Standard work: the roads by id and the own ramparts whose repairer stands within one
+    /// step of reach of them.
+    pub fn upkeep_reads(&self) -> (&[ObjectKey], &[StructureHandle]) {
+        self.core.upkeep_reads()
     }
 
     /// The Standard `opening work` job (one unit per owned room), then the Standard `hauling work`
@@ -795,6 +804,29 @@ impl OpeningGlue {
                     stats.containers, stats.repairing
                 );
                 if let Some(h) = stats.lowest_hits {
+                    let _ = write!(text, ", lowest hits {h}");
+                }
+                text.push(')');
+            }
+            // P7.3: the roads and ramparts the workers keep up.
+            if stats.roads > 0 {
+                let _ = write!(
+                    text,
+                    ", roads {} (to repair {}",
+                    stats.roads, stats.worn_roads
+                );
+                if let Some(p) = stats.lowest_road_pct {
+                    let _ = write!(text, ", lowest {p}%");
+                }
+                text.push(')');
+            }
+            if stats.ramparts > 0 {
+                let _ = write!(
+                    text,
+                    ", ramparts {} (target {}, below it {}",
+                    stats.ramparts, stats.rampart_goal, stats.low_ramparts
+                );
+                if let Some(h) = stats.lowest_rampart {
                     let _ = write!(text, ", lowest hits {h}");
                 }
                 text.push(')');

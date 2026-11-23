@@ -203,6 +203,9 @@ pub struct Rooms {
     state: Vec<ControllerState>,
     remote: Vec<RemoteRead>,
     sign: Vec<SignRead>,
+    /// Whether every road's and own rampart's hits were read in the room this tick (P7.3,
+    /// `upkeep.read_ticks`).
+    upkeep: Vec<bool>,
 }
 
 impl Rooms {
@@ -213,6 +216,7 @@ impl Rooms {
         self.state.clear();
         self.remote.clear();
         self.sign.clear();
+        self.upkeep.clear();
     }
 
     /// Adds a room and returns its row. Its energy and controller state are 0 until
@@ -226,7 +230,22 @@ impl Rooms {
         self.state.push(ControllerState::default());
         self.remote.push(RemoteRead::default());
         self.sign.push(SignRead::default());
+        self.upkeep.push(false);
         row
+    }
+
+    /// Marks the room at `row` as read in full for upkeep this tick (P7.3): every road with its
+    /// `hits` and `hitsMax` is in [`RoomObjects`], and every own rampart's hits in
+    /// [`Structures::hits`]. Nothing for a row that does not exist.
+    pub fn set_upkeep_read(&mut self, row: usize) {
+        if let Some(r) = self.upkeep.get_mut(row) {
+            *r = true;
+        }
+    }
+
+    /// Per room, whether it was read in full for upkeep this tick ([`Self::set_upkeep_read`]).
+    pub fn upkeep_reads(&self) -> &[bool] {
+        &self.upkeep
     }
 
     /// Sets what was read for the signer in the room at `row` (ADR-030); nothing for a row that
@@ -935,6 +954,7 @@ pub struct Structures {
     kind: Vec<StructureType>,
     pos: Vec<Position>,
     free_energy: Vec<u32>,
+    hits: Vec<u32>,
     /// The static-data cache is off (`CacheConfig::structure_static` false): read every push.
     reread_static: bool,
 }
@@ -946,6 +966,7 @@ impl Structures {
         self.kind.clear();
         self.pos.clear();
         self.free_energy.clear();
+        self.hits.clear();
     }
 
     pub(super) fn finish(&mut self) -> u32 {
@@ -978,7 +999,23 @@ impl Structures {
         self.kind.push(data.kind);
         self.pos.push(data.pos);
         self.free_energy.push(0);
+        self.hits.push(0);
         Ok(handle)
+    }
+
+    /// Sets the hits read for the structure at `row` (P7.3: an own rampart); nothing for a row that
+    /// does not exist.
+    pub fn set_hits(&mut self, row: usize, hits: u32) {
+        if let Some(h) = self.hits.get_mut(row) {
+            *h = hits;
+        }
+    }
+
+    /// Hits per structure (P7.3), read only for own ramparts: on a room's upkeep read, when first
+    /// seen, and for the one a worker is about to repair; 0 when not read this tick (a standing
+    /// structure always has at least 1).
+    pub fn hits(&self) -> &[u32] {
+        &self.hits
     }
 
     /// Sets the room for energy of the structure at `row` (P2.4); nothing for a row that does not exist.
@@ -1067,8 +1104,9 @@ pub enum ObjectKind {
     /// A remote room's controller (P6.2; an owned room's is in `Structures`): `amount` is its
     /// reservation's `ticksToEnd`, 0 with none.
     Controller,
-    /// A road in a remote room (P6.2; it has no owner), read every `remote.road_read_ticks`:
-    /// `hits` its hits and `total` its `hitsMax` (`ROAD_HITS` times the terrain's ratio).
+    /// A road (it has no owner): in a remote room (P6.2) read every `remote.road_read_ticks`, in an
+    /// owned room (P7.3) every `upkeep.read_ticks` and when a worker is about to repair it: `hits`
+    /// its hits and `total` its `hitsMax` (`ROAD_HITS` times the terrain's ratio, V186).
     Road,
 }
 

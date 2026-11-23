@@ -1414,16 +1414,17 @@ mod tests {
         }
     }
 
-    /// C14: under the MMO profile's gates no storage, rampart, wall or late structure (terminal,
-    /// extractor and mineral container, lab, factory, power spawn, nuker, observer) is due at any
-    /// level, so none is counted or offered; the tower is due, and offered, from the first level
-    /// that allows it (P7.2 turned the towers' gate on, ADR-026); with every gate on, each is due
-    /// at the top level.
+    /// C14: under the MMO profile's gates no storage or late structure (terminal, extractor and
+    /// mineral container, lab, factory, power spawn, nuker, observer) is due at any level, so none
+    /// is counted or offered; the tower, the rampart and the wall are due from the first level that
+    /// allows each (P7.2 turned the towers' gate on, P7.3 the ramparts' and with it the walls',
+    /// ADR-026, ADR-032), and the one of them first in the planner's kind order is offered; with
+    /// every gate on, each is due at the top level.
     ///
     /// Uses: `PLANNER_MMO` (its gates), `CONTROLLER_STRUCTURES` (through `earliest_level`: each
     /// at the first level that allows it), `MAX_LEVEL`.
     #[test]
-    fn the_mmo_gates_leave_out_storage_ramparts_and_late_structures() {
+    fn the_mmo_gates_leave_out_storage_and_late_structures() {
         let t = open();
         let kinds = [
             StructureType::Storage,
@@ -1464,21 +1465,21 @@ mod tests {
             let mut a = ask(&l, &t, level);
             a.gates = Gates::from_config(&PLANNER_MMO);
             let (n, c) = next(&a, &g, &mut s);
-            let tower = level >= first(StructureType::Tower);
-            assert_eq!(c.due, u32::from(tower), "level {level}: {c:?}");
-            if tower {
-                assert!(
-                    matches!(
-                        n,
-                        Next::Site {
-                            kind: StructureType::Tower,
-                            ..
-                        }
-                    ),
+            let due: Vec<StructureType> = [
+                StructureType::Tower,
+                StructureType::Rampart,
+                StructureType::Wall,
+            ]
+            .into_iter()
+            .filter(|&k| level >= first(k))
+            .collect();
+            assert_eq!(c.due as usize, due.len(), "level {level}: {c:?}");
+            match due.iter().copied().min_by_key(|&k| kind_rank(k)) {
+                Some(want) => assert!(
+                    matches!(n, Next::Site { kind, .. } if kind == want),
                     "level {level}: {n:?}"
-                );
-            } else {
-                assert_eq!(n, Next::Idle, "level {level}");
+                ),
+                None => assert_eq!(n, Next::Idle, "level {level}"),
             }
         }
         let mut a = ask(&l, &t, MAX_LEVEL);

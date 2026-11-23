@@ -50,7 +50,8 @@
 //    exactly one `reservation` read (undefined until the first reserve, then the bot's username and a positive
 //    ticksToEnd), one FIND_HOSTILE_STRUCTURES find, one container-filtered FIND_STRUCTURES find (push_objects reads it
 //    as an owned room's objects), and, only on the loops whose Game.time is divisible by remote.road_read_ticks (5),
-//    one road-filtered FIND_STRUCTURES find with one `hits` and one `hitsMax` read a road; none of these in W1N1, and
+//    one road-filtered FIND_STRUCTURES find with one `hits` and one `hitsMax` read a road; none of these in W1N1 (an
+//    owned room) but its own road-filtered find on the loops whose Game.time upkeep.read_ticks (50) divides (P7.3), and
 //    `owner` read from an own creep exactly once a global: on the first loop whose reservation read gave an object;
 // 2. `rustedscreep.remote()` on the first loop names W2N1 seen with 2 sources and the creeps s1 r1, not mined; before the
 //    halt it shows W2N1 mined under a reserve plan, the reserver, the reservation the last read gave, and the sites
@@ -116,6 +117,8 @@ const SCOUT_BODY = ['move'];
 const PINNED = C.CONTROLLER_RESERVE_MAX - CLAIM * C.CONTROLLER_RESERVE + 1;
 /** REMOTE_MMO (crates/rustedscreep-core/src/config.rs). */
 const REMOTE_CFG = { maxRooms: 2, spawnPermille: 400, maxSites: 5, roadReadTicks: 5 };
+/** `UpkeepConfig::read_ticks` (P7.3, ADR-032): on loops whose Game.time it divides, an owned room's roads are read. */
+const UPKEEP_READ_TICKS = 50;
 const GROW = 4;
 const PIN = 4;
 const RELEASE = 6;
@@ -846,7 +849,8 @@ export function remoteSim(dir = join(ROOT, 'dist')) {
       'road hitsMax reads': [r.roadHitsMax, roadTick ? ROADS.length : 0],
       'W1N1 reservation reads': [r.homeReservation, 0],
       'W1N1 hostile-structures finds': [r.finds[HOME][C.FIND_HOSTILE_STRUCTURES] ?? 0, 0],
-      'W1N1 road finds': [r.finds[HOME][`${C.FIND_STRUCTURES}:road`] ?? 0, 0],
+      // P7.3: the owned home's roads, on the upkeep read loops.
+      'W1N1 road finds': [r.finds[HOME][`${C.FIND_STRUCTURES}:road`] ?? 0, r.snapshots > 0 && (T0 + r.offset) % UPKEEP_READ_TICKS === 0 ? 1 : 0],
     };
     for (const [what, [got, exp]] of Object.entries(want)) {
       if (got !== exp) problems.push(`offset ${r.offset} (Game.time ${T0 + r.offset}): ${what} ${got}, expected ${exp}`);

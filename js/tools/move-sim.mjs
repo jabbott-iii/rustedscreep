@@ -58,6 +58,8 @@ const APPEAR_TICKS = 10;
 const LOST_MAX = 3;
 const ROOM = 'W1N1';
 const T0 = 50000000;
+/** `UpkeepConfig::read_ticks` (P7.3, ADR-032): on loops whose Game.time it divides, the owned room's roads are read. */
+const UPKEEP_READ_TICKS = 50;
 const ORDER_AT = 2;
 const BAD_ORDER_AT = 3;
 const RECOVER_AT = 15;
@@ -176,8 +178,10 @@ function sceneFor(state, offset) {
     name: ROOM,
     controller,
     find(type, opts) {
-      // A find with a filter (the opening's containers, P2.4) is recorded apart from the plain ones.
-      (opts?.filter ? state.filtered : state.finds).push([offset, type]);
+      // A find with a filter (the opening's containers, P2.4; the upkeep read's roads, P7.3) is recorded apart from
+      // the plain ones, with the type it filters for.
+      if (opts?.filter) state.filtered.push([offset, type, opts.filter.structureType]);
+      else state.finds.push([offset, type]);
       const list = {
         [FIND.HOSTILE_CREEPS]: [hostile],
         [FIND.STRUCTURES]: STRUCTURES,
@@ -301,9 +305,17 @@ export function moveSim(dir = join(ROOT, 'dist')) {
   }
   const unknown = state.finds.filter(([, t]) => !Object.values(FIND).includes(t));
   if (unknown.length) problems.push(`finds of other types: ${JSON.stringify(unknown.slice(0, 4))}`);
-  // The opening's containers: FIND_STRUCTURES with a filter, once per loop.
-  const filtered = state.filtered.map(([o, t]) => (t === FIND.STRUCTURES ? o : `type ${t} at ${o}`));
-  if (JSON.stringify(filtered) !== JSON.stringify(loops)) problems.push(`filtered finds ${JSON.stringify(filtered)}, expected find(${FIND.STRUCTURES}) at ${JSON.stringify(loops)}`);
+  // The opening's containers: FIND_STRUCTURES with a filter, once per loop; P7.3's upkeep read: the roads, once on
+  // each loop whose Game.time `upkeep.read_ticks` divides.
+  const filteredFor = (kind) => state.filtered.filter(([, , k]) => k === kind).map(([o, t]) => (t === FIND.STRUCTURES ? o : `type ${t} at ${o}`));
+  const upkeepLoops = loops.filter((o) => (T0 + o) % UPKEEP_READ_TICKS === 0);
+  for (const [kind, want] of [['container', loops], ['road', upkeepLoops]]) {
+    const got = filteredFor(kind);
+    if (JSON.stringify(got) !== JSON.stringify(want)) problems.push(`${kind}-filtered finds ${JSON.stringify(got)}, expected find(${FIND.STRUCTURES}) at ${JSON.stringify(want)}`);
+  }
+  const otherFilters = state.filtered.filter(([, , k]) => k !== 'container' && k !== 'road');
+  if (otherFilters.length) problems.push(`other filtered finds ${JSON.stringify(otherFilters.slice(0, 4))}`);
+  if (!upkeepLoops.length) problems.push('no upkeep read in the run');
   // Inert: no watchdog line (a spawnCreep or work call would throw here, the creeps and the spawn have no such
   // method, and show as a fault line above), and no refused site.
   const opening = world.logs.filter((l) => l.startsWith('rustedscreep opening:'));

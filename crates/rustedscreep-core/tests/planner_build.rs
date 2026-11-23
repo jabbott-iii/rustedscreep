@@ -338,9 +338,9 @@ fn the_live_room_keeps_its_extensions_until_a_due_structure_needs_one() {
     let level = 4;
     let extensions = allowed(StructureType::Extension, level);
 
-    // P4's gates (the MMO's before P7.2 turned the towers on): the storage and the towers wait,
-    // so nothing is destroyed; the extensions the plan has are kept, the planned slots beyond
-    // the level's count wait, the roads go out.
+    // P4's gates (the MMO's before P7.2 and P7.3 turned the towers and the ramparts on): the
+    // storage and the towers wait, so nothing is destroyed; the extensions the plan has are kept,
+    // the planned slots beyond the level's count wait, the roads go out.
     let base = Ask {
         layout: &layout,
         terrain: &terrain,
@@ -348,6 +348,7 @@ fn the_live_room_keeps_its_extensions_until_a_due_structure_needs_one() {
         level,
         gates: Gates {
             towers: false,
+            ramparts: false,
             ..Gates::from_config(&PLANNER_MMO)
         },
         replace: PLANNER_MMO.replace,
@@ -372,10 +373,13 @@ fn the_live_room_keeps_its_extensions_until_a_due_structure_needs_one() {
         assert!(standing.contains(&(StructureType::Extension, t)));
     }
 
-    // The MMO's gates since P7.2 (the towers on): the level's first tower stands on an ADR-020
-    // extension, which goes first, one destroy in all, then the tower's site there; a planned
-    // extension takes the freed count.
-    let gates = Gates::from_config(&PLANNER_MMO);
+    // P7.2's gates (the towers on): the level's first tower stands on an ADR-020 extension,
+    // which goes first, one destroy in all, then the tower's site there; a planned extension
+    // takes the freed count.
+    let gates = Gates {
+        ramparts: false,
+        ..Gates::from_config(&PLANNER_MMO)
+    };
     assert!(gates.towers && !gates.storage);
     let tower = layout
         .of(StructureType::Tower)
@@ -408,6 +412,34 @@ fn the_live_room_keeps_its_extensions_until_a_due_structure_needs_one() {
         allowed(StructureType::Tower, level)
     );
     assert_eq!(census.cut_off, 0);
+
+    // The MMO's gates since P7.3 (the ramparts on too, ADR-032): still the one destroy, and every
+    // rampart due at the level is sited, none in the way of anything (a rampart may go over any
+    // structure, V237) and none cut off.
+    let gates = Gates::from_config(&PLANNER_MMO);
+    assert!(gates.towers && gates.ramparts && !gates.storage);
+    let mut standing = start.clone();
+    let (actions, census) = play(&layout, &Ask { gates, ..base }, &mut standing);
+    let destroys = actions
+        .iter()
+        .filter(|a| matches!(a, Next::Destroy { .. }))
+        .count();
+    assert_eq!(destroys, 1, "{actions:?}");
+    let due = layout
+        .items
+        .iter()
+        .filter(|i| {
+            i.kind == StructureType::Rampart
+                && gates.due_level(&layout, i).is_some_and(|l| l <= level)
+        })
+        .count();
+    assert!(due > 0, "the line is due at RCL{level}");
+    let ramparts = standing
+        .iter()
+        .filter(|(k, _)| *k == StructureType::Rampart)
+        .count();
+    assert_eq!(ramparts, due);
+    assert_eq!((census.blocked, census.cut_off), (0, 0), "{census:?}");
 
     // With the storage's gate on, the extension on its tile goes first, then a planned extension
     // takes the freed count before the storage's own site; one destroy at a time.
@@ -990,13 +1022,11 @@ fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
     }
 }
 
-/// The types the MMO's gates never place (`PLANNER_MMO`: the storage, the ramparts and walls and
-/// the late structures off; the towers are on since P7.2; the containers and links are the
-/// economy's or a gated one's, the mineral container and the hub link).
-const NOT_UNDER_MMO: [StructureType; 12] = [
+/// The types the MMO's gates never place (`PLANNER_MMO`: the storage and the late structures off;
+/// the towers are on since P7.2, the ramparts and walls since P7.3; the containers and links are
+/// the economy's or a gated one's, the mineral container and the hub link).
+const NOT_UNDER_MMO: [StructureType; 10] = [
     StructureType::Storage,
-    StructureType::Rampart,
-    StructureType::Wall,
     StructureType::Terminal,
     StructureType::Extractor,
     StructureType::Lab,
@@ -1010,16 +1040,17 @@ const NOT_UNDER_MMO: [StructureType; 12] = [
 
 /// Under the MMO's gates every plan builds up level by level from its first spawn, with the
 /// economy's containers and links standing as `economy::mining` places them, and `build::next`
-/// offers only spawns, extensions, towers (on since P7.2) and the roads due for them (C14): no
+/// offers only spawns, extensions, towers (on since P7.2), ramparts and walls (on since P7.3) and
+/// the roads due for them (C14): no
 /// destroy, no site of a gated type or of the economy's, every item it places built at each level,
 /// and at the top the room holds exactly those, the economy's and the first spawn.
 ///
 /// Uses: `PLANNER_MMO` (the gates, `replace`, `max_sites`), `CONTROLLER_STRUCTURES` (through
 /// `allowed`: each level's count), `MAX_LEVEL`.
 #[test]
-fn the_mmo_gates_place_only_spawns_extensions_towers_and_their_roads() {
+fn the_mmo_gates_place_only_spawns_extensions_towers_ramparts_and_their_roads() {
     let gates = Gates::from_config(&PLANNER_MMO);
-    assert!(!gates.storage && gates.towers && !gates.ramparts && !gates.late);
+    assert!(!gates.storage && gates.towers && gates.ramparts && !gates.late);
     let mut s = Scratch::default();
     let (mut rooms, mut sites) = (0u32, 0usize);
     harness::each(|room, mode, input| {
@@ -1068,7 +1099,10 @@ fn the_mmo_gates_place_only_spawns_extensions_towers_and_their_roads() {
                         sites += 1;
                         assert!(!NOT_UNDER_MMO.contains(&kind), "{what}: {kind:?} {tile:?}");
                         assert!(
-                            matches!(Gate::of(kind, tile, roles), Gate::Base | Gate::Towers),
+                            matches!(
+                                Gate::of(kind, tile, roles),
+                                Gate::Base | Gate::Towers | Gate::Ramparts
+                            ),
                             "{what}"
                         );
                         assert!(

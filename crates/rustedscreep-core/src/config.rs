@@ -22,7 +22,8 @@ use core::fmt;
 
 use rustedscreep_consts::{
     CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, LINK_CAPACITY, MAX_CONSTRUCTION_SITES,
-    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, ROOM_SIZE, TOWER_CAPACITY,
+    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, RAMPART_DECAY_AMOUNT,
+    RAMPART_DECAY_TIME, RAMPART_HITS_MAX_RCL2, ROOM_SIZE, TOWER_CAPACITY,
 };
 
 /// How the loader recovers after a trap or an aborted tick (ADR-003).
@@ -673,7 +674,8 @@ pub struct PlannerConfig {
     pub storage: bool,
     /// Places the towers (filled and fired since P7.2).
     pub towers: bool,
-    /// Places the ramparts (when ramparts are built is P7's, ADR-007).
+    /// Places the ramparts (when ramparts are built is P7's, ADR-007; on since P7.3, ADR-032, whose
+    /// workers keep them at [`UpkeepConfig::rampart_permille`] of their level's hits).
     pub ramparts: bool,
     /// Places the terminal, the extractor and its container, the labs, the factory, the power spawn,
     /// the nuker and the observer (nothing uses them before P9).
@@ -703,7 +705,7 @@ pub const PLANNER_MMO: PlannerConfig = PlannerConfig {
     replace: true,
     storage: false,
     towers: true,
-    ramparts: false,
+    ramparts: true,
     late: false,
     max_sites: 10,
     verify_ticks: 500,
@@ -866,6 +868,48 @@ pub const DEFENSE_MMO: DefenseConfig = DefenseConfig {
     miss_ticks: 3,
 };
 
+/// Upkeep (ROADMAP P7.3, ADR-032): the opening's workers repair the roads and own ramparts of their
+/// owned rooms (the containers are [`RepairConfig`]'s). Towers repair nothing (the user's choice,
+/// 2026-11-23: their energy is for fights). `docs/TUNING.md` gives each one's rationale and safe
+/// range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpkeepConfig {
+    /// Lets the workers repair roads and ramparts. Off, neither is read or repaired, and a new
+    /// rampart is gone at its first decay (V304).
+    pub enabled: bool,
+    /// Every this many ticks the snapshot reads every road's and own rampart's hits in each owned
+    /// room; between reads only the one a worker stands next to is read. Below
+    /// `RAMPART_DECAY_TIME`, so no rampart takes two decay steps between reads. Unit: ticks.
+    pub read_ticks: u32,
+    /// A road is repaired once its hits fall below this share of its `hitsMax`, and then up to
+    /// full, when the room has no site to build. Unit: percent.
+    pub road_start_pct: u32,
+    /// Below this share of its `hitsMax` a road is repaired before the room's sites are built.
+    /// At most `road_start_pct`. Unit: percent.
+    pub road_urgent_pct: u32,
+    /// A rampart is kept at this share of `rampart_hits_max` at its room's level (V236). Unit:
+    /// permille.
+    pub rampart_permille: u32,
+    /// A rampart is raised to its target once it falls below this share of it, when the room has
+    /// no site to build. Unit: percent.
+    pub rampart_start_pct: u32,
+    /// Below this many hits (or its target, if lower) a rampart is repaired before the room's
+    /// sites are built: a new one has `RAMPART_HITS` (1) and is gone at its first decay step,
+    /// about `RAMPART_DECAY_TIME` ticks after it is built (V302, V304). Unit: hits.
+    pub rampart_floor: u32,
+}
+
+/// Upkeep values for the official MMO.
+pub const UPKEEP_MMO: UpkeepConfig = UpkeepConfig {
+    enabled: true,
+    read_ticks: 50,
+    road_start_pct: 50,
+    road_urgent_pct: 20,
+    rampart_permille: 10,
+    rampart_start_pct: 90,
+    rampart_floor: 10 * RAMPART_DECAY_AMOUNT,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -888,6 +932,7 @@ pub struct Config {
     pub remote: RemoteConfig,
     pub sign: SignConfig,
     pub defense: DefenseConfig,
+    pub upkeep: UpkeepConfig,
 }
 
 /// A server profile: a name and its values.
@@ -919,6 +964,7 @@ pub const MMO: Profile = Profile {
         remote: REMOTE_MMO,
         sign: SIGN_MMO,
         defense: DEFENSE_MMO,
+        upkeep: UPKEEP_MMO,
     },
 };
 
@@ -1079,7 +1125,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 132;
+pub const FIELD_COUNT: usize = 139;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1486,6 +1532,27 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         true
     ),
     number!(defense, "DefenseConfig", miss_ticks, 1, 100, true),
+    flag!(upkeep, "UpkeepConfig", enabled, true),
+    number!(
+        upkeep,
+        "UpkeepConfig",
+        read_ticks,
+        10,
+        RAMPART_DECAY_TIME - 1,
+        true
+    ),
+    number!(upkeep, "UpkeepConfig", road_start_pct, 5, 99, true),
+    number!(upkeep, "UpkeepConfig", road_urgent_pct, 1, 99, true),
+    number!(upkeep, "UpkeepConfig", rampart_permille, 1, 1000, true),
+    number!(upkeep, "UpkeepConfig", rampart_start_pct, 10, 99, true),
+    number!(
+        upkeep,
+        "UpkeepConfig",
+        rampart_floor,
+        RAMPART_DECAY_AMOUNT + 1,
+        RAMPART_HITS_MAX_RCL2,
+        true
+    ),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -1511,7 +1578,7 @@ pub struct Rule {
 /// `CPU_TICK_LIMIT_MAX`: Standard switches on from the bucket at the start of the tick, and one tick
 /// is billed about tickLimit at most (the scheduler stops every tier at the ceiling and the reserve
 /// covers the rest), so a Standard tick leaves the bucket at or above the boot gate (TUNING.md).
-pub static RULES: [Rule; 16] = [
+pub static RULES: [Rule; 17] = [
     Rule {
         keys: ["loader.backoff_base_ticks", "loader.backoff_max_ticks"],
         text: "loader.backoff_base_ticks must be at most loader.backoff_max_ticks",
@@ -1597,6 +1664,11 @@ pub static RULES: [Rule; 16] = [
         keys: ["repair.walk_pct", "repair.start_pct"],
         text: "repair.walk_pct must be at most repair.start_pct",
         holds: |c| c.repair.walk_pct <= c.repair.start_pct,
+    },
+    Rule {
+        keys: ["upkeep.road_urgent_pct", "upkeep.road_start_pct"],
+        text: "upkeep.road_urgent_pct must be at most upkeep.road_start_pct",
+        holds: |c| c.upkeep.road_urgent_pct <= c.upkeep.road_start_pct,
     },
 ];
 
@@ -1730,6 +1802,7 @@ mod tests {
             remote: _,
             sign: _,
             defense: _,
+            upkeep: _,
         } = MMO.config;
         let SpawnConfig {
             hold_ticks: _,
@@ -1830,7 +1903,16 @@ mod tests {
             heal_reserve: _,
             miss_ticks: _,
         } = DEFENSE_MMO;
-        let expected: [(&str, &[&str]); 18] = [
+        let UpkeepConfig {
+            enabled: _,
+            read_ticks: _,
+            road_start_pct: _,
+            road_urgent_pct: _,
+            rampart_permille: _,
+            rampart_start_pct: _,
+            rampart_floor: _,
+        } = UPKEEP_MMO;
+        let expected: [(&str, &[&str]); 19] = [
             (
                 "loader",
                 &[
@@ -2029,6 +2111,18 @@ mod tests {
                     "max_kill_ticks",
                     "heal_reserve",
                     "miss_ticks",
+                ],
+            ),
+            (
+                "upkeep",
+                &[
+                    "enabled",
+                    "read_ticks",
+                    "road_start_pct",
+                    "road_urgent_pct",
+                    "rampart_permille",
+                    "rampart_start_pct",
+                    "rampart_floor",
                 ],
             ),
         ];

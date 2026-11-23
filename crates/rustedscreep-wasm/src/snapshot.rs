@@ -57,7 +57,13 @@
 //!   `store` and `getUsedCapacity` for energy every tick, and `cooldown` while it holds energy (an
 //!   empty link cannot send, so its cooldown is never read) (P3.2, V216). A tower adds `store`,
 //!   `getUsedCapacity` and `getFreeCapacity` for energy on a tick its room is full, has an
-//!   assessed hostile, or had an open threat (P7.2, V196; `tower_wanted`).
+//!   assessed hostile, or had an open threat (P7.2, V196; `tower_wanted`). An own rampart adds
+//!   `hits` on an upkeep read tick, on the tick it is first seen, and while a worker repairing it
+//!   stands within one step of reach (P7.3, V307);
+//! - upkeep (P7.3, ADR-032): in each owned room, on ticks divisible by `upkeep.read_ticks`, the
+//!   roads as a remote room's (`push_roads`); between reads each road a worker repairing it stands
+//!   within one step of reach of, by id (`Game.getObjectById`, V308), then `id`, the copy, `hits`,
+//!   `hitsMax`, and its position and type.
 //!
 //! Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and one
 //! `__externref_table_alloc` (with a JS `Table.set`) per object returned through an `Option`: every
@@ -73,19 +79,20 @@
 use std::fmt::Write as _;
 
 use js_sys::{Array, Object, Reflect};
-use rustedscreep_core::config::{CacheConfig, RemoteConfig};
+use rustedscreep_core::config::{CacheConfig, RemoteConfig, UpkeepConfig};
 use rustedscreep_core::signing::SIGN_TEXT;
 use rustedscreep_core::snapshot::{
     BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepRow, CreepStore, ObjectKey,
     ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation, RoomEnergy, SignRead, SignSeen,
-    SkipCounts, SkipLog, SkipReason, SkipReport, Snapshot, StructureStatic, TickContext,
-    known_structure_type, parse_room_name, position_from_packed,
+    SkipCounts, SkipLog, SkipReason, SkipReport, Snapshot, StructureHandle, StructureStatic,
+    TickContext, known_structure_type, parse_room_name, position_from_packed,
 };
 use rustedscreep_core::spawning::{CreepName, Identity, Role};
 use screeps::{
     ConstructionSite, Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Part,
-    Position, Resource, ResourceType, Room, RoomName, RoomObject, SYSTEM_USERNAME, Source, Store,
-    Structure, StructureController, StructureLink, StructureSpawn, StructureType, find, game,
+    Position, RawObjectId, Resource, ResourceType, Room, RoomName, RoomObject, SYSTEM_USERNAME,
+    Source, Store, Structure, StructureController, StructureLink, StructureSpawn, StructureType,
+    find, game,
 };
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
@@ -219,6 +226,10 @@ pub struct JsWorld {
     /// The owned rooms with an open threat at the end of last tick, sorted (P7.2): own creeps'
     /// `hits` and `hitsMax` are read there, for the towers' heals.
     threat_rooms: Vec<RoomName>,
+    /// What the opening asked last tick for its repairers (P7.3): the roads to read by id, and the
+    /// own ramparts whose `hits` to read, by handle slot.
+    upkeep_roads: Vec<ObjectKey>,
+    upkeep_ramparts: Vec<StructureHandle>,
 }
 
 impl JsWorld {
@@ -229,6 +240,16 @@ impl JsWorld {
         self.threat_rooms.extend(rooms);
         self.threat_rooms.sort_unstable_by_key(|n| n.packed_repr());
         self.threat_rooms.dedup();
+    }
+
+    /// Sets what the next snapshot reads for the opening's repairers (P7.3,
+    /// `Opening::upkeep_reads`): the roads by id, and the own ramparts' `hits`.
+    pub fn set_upkeep_reads(&mut self, roads: &[ObjectKey], ramparts: &[StructureHandle]) {
+        self.upkeep_roads.clear();
+        self.upkeep_roads.extend_from_slice(roads);
+        self.upkeep_ramparts.clear();
+        self.upkeep_ramparts.extend_from_slice(ramparts);
+        self.upkeep_ramparts.sort_unstable_by_key(|h| h.slot());
     }
 
     fn clear(&mut self) {
@@ -276,7 +297,13 @@ fn type_filter(kind: &str) -> JsValue {
 }
 
 /// Takes this tick's snapshot, with the cache toggles in force.
-pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld, cache: &CacheConfig, remote: &RemoteConfig) {
+pub fn take(
+    snapshot: &mut Snapshot,
+    js: &mut JsWorld,
+    cache: &CacheConfig,
+    remote: &RemoteConfig,
+    upkeep: &UpkeepConfig,
+) {
     js.clear();
     snapshot.structures.set_static_cache(cache.structure_static);
     snapshot.begin(TickContext::from_raw(
@@ -317,17 +344,55 @@ pub fn take(snapshot: &mut Snapshot, js: &mut JsWorld, cache: &CacheConfig, remo
         .tick
         .time
         .is_multiple_of(remote.road_read_ticks.max(1));
+    // P7.3: every road and own rampart of the owned rooms on an upkeep read tick.
+    let upkeep_tick = upkeep.enabled && snapshot.tick.time.is_multiple_of(upkeep.read_ticks.max(1));
     for room in game::rooms().values() {
-        push_room(snapshot, js, room, road_tick);
+        push_room(snapshot, js, room, road_tick, upkeep_tick);
+    }
+    if upkeep.enabled && !upkeep_tick {
+        push_asked_roads(snapshot, js);
     }
     let structures = Object::values(&Game::structures_object());
     for index in 0..structures.length() {
-        push_structure(snapshot, js, structures.get(index).unchecked_into());
+        push_structure(
+            snapshot,
+            js,
+            structures.get(index).unchecked_into(),
+            upkeep.enabled,
+            upkeep_tick,
+        );
     }
     snapshot.finish();
 }
 
-fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room, road_tick: bool) {
+/// The roads the opening asked for (P7.3, [`JsWorld::set_upkeep_reads`]), each by id
+/// (`Game.getObjectById`, V308) unless already read this tick, as `push_roads` reads them. A road
+/// that is gone is not pushed, and the opening drops it.
+fn push_asked_roads(snapshot: &mut Snapshot, js: &mut JsWorld) {
+    let keys = std::mem::take(&mut js.upkeep_roads);
+    for &key in &keys {
+        let read = snapshot
+            .objects
+            .handle_of(key)
+            .and_then(|h| snapshot.objects.row_of(h))
+            .is_some();
+        if read {
+            continue;
+        }
+        if let Some(object) = game::get_object_by_id_erased(&RawObjectId::from_packed(key.0)) {
+            push_road(snapshot, js, object);
+        }
+    }
+    js.upkeep_roads = keys;
+}
+
+fn push_room(
+    snapshot: &mut Snapshot,
+    js: &mut JsWorld,
+    room: Room,
+    road_tick: bool,
+    upkeep_tick: bool,
+) {
     // `parse_room_name` has `RoomName::from_str`'s semantics without its str slicing, which links
     // about 8 KB of Unicode and Debug tables into the release wasm (V114). Anything that parses a
     // room name through the crate brings them back: `Room::name`, `RoomName::new`, `str::parse`,
@@ -413,6 +478,10 @@ fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room, road_tick: b
                 .set_controller_state(row, controller_state(c, level));
         }
         push_objects(snapshot, js, room.unchecked_ref::<Findable>());
+        if upkeep_tick {
+            push_roads(snapshot, js, room.unchecked_ref::<Findable>());
+            snapshot.rooms.set_upkeep_read(row);
+        }
     } else if js
         .remote_names
         .binary_search_by_key(&name.packed_repr(), |n| n.packed_repr())
@@ -500,31 +569,42 @@ fn push_remote(
         .length();
     if roads {
         read.roads = true;
-        let list = finder.find_filtered(find::STRUCTURES.find_code(), js.road_filter());
-        for i in 0..list.length() {
-            let object: RoomObject = list.get(i).unchecked_into();
-            let hits = object.unchecked_ref::<Structure>().hits();
-            let total = object
-                .unchecked_ref::<WithHitsMax>()
-                .hits_max_value()
-                .as_f64()
-                .filter(|t| t.is_finite() && *t >= 0.0)
-                .map_or(0, |t| t as u32);
-            let row = ObjectRow {
-                amount: 0,
-                total,
-                hits,
-            };
-            let check = |o: &RoomObject| {
-                if o.unchecked_ref::<Structure>().structure_type() != StructureType::Road {
-                    return Err(SkipReason::UnknownStructureType);
-                }
-                Ok(ObjectKind::Road)
-            };
-            push_object(snapshot, js, object, check, row);
-        }
+        push_roads(snapshot, js, finder);
     }
     read
+}
+
+/// A room's roads through the engine's filter (P6.2, P7.3): per road `get`, then `push_road`.
+fn push_roads(snapshot: &mut Snapshot, js: &mut JsWorld, finder: &Findable) {
+    let list = finder.find_filtered(find::STRUCTURES.find_code(), js.road_filter());
+    for i in 0..list.length() {
+        push_road(snapshot, js, list.get(i).unchecked_into());
+    }
+}
+
+/// One road (P6.2, P7.3): `hits`, `hitsMax`, `id` and the copy, and its type and position when
+/// first seen this pass (the handle is released between reads); an object that is not a road is
+/// skipped.
+fn push_road(snapshot: &mut Snapshot, js: &mut JsWorld, object: RoomObject) {
+    let hits = object.unchecked_ref::<Structure>().hits();
+    let total = object
+        .unchecked_ref::<WithHitsMax>()
+        .hits_max_value()
+        .as_f64()
+        .filter(|t| t.is_finite() && *t >= 0.0)
+        .map_or(0, |t| t as u32);
+    let row = ObjectRow {
+        amount: 0,
+        total,
+        hits,
+    };
+    let check = |o: &RoomObject| {
+        if o.unchecked_ref::<Structure>().structure_type() != StructureType::Road {
+            return Err(SkipReason::UnknownStructureType);
+        }
+        Ok(ObjectKind::Road)
+    };
+    push_object(snapshot, js, object, check, row);
 }
 
 /// A room an own signer stands in (ADR-030), owned or not: its controller as an object (unless the
@@ -843,8 +923,20 @@ fn identity_of(creep: &Creep) -> Option<Identity> {
     CreepName::parse(name.as_bytes())
 }
 
-fn push_structure(snapshot: &mut Snapshot, js: &mut JsWorld, structure: Structure) {
-    let pushed = key_of(Some(structure.js_raw_id())).and_then(|key| {
+fn push_structure(
+    snapshot: &mut Snapshot,
+    js: &mut JsWorld,
+    structure: Structure,
+    upkeep: bool,
+    upkeep_tick: bool,
+) {
+    let key = key_of(Some(structure.js_raw_id()));
+    // P7.3: new this pass when the last pass had no live handle for its id (with the static-data
+    // cache off, the static read below runs on every push, so it cannot tell).
+    let first_seen = key
+        .as_ref()
+        .is_ok_and(|&k| snapshot.structures.handle_of(k).is_none());
+    let pushed = key.and_then(|key| {
         snapshot.structures.push(key, || {
             let kind = known_structure_type(structure.structure_type())
                 .ok_or(SkipReason::UnknownStructureType)?;
@@ -858,6 +950,19 @@ fn push_structure(snapshot: &mut Snapshot, js: &mut JsWorld, structure: Structur
         Ok(handle) => {
             let row = snapshot.structures.len().saturating_sub(1);
             let kind = snapshot.structures.kinds().last().copied();
+            // P7.3: an own rampart's `hits` (V307) on an upkeep read, when first seen, and while
+            // its repairer stands within one step of reach.
+            if upkeep
+                && kind == Some(StructureType::Rampart)
+                && (upkeep_tick
+                    || first_seen
+                    || js
+                        .upkeep_ramparts
+                        .binary_search_by_key(&handle.slot(), |h| h.slot())
+                        .is_ok_and(|i| js.upkeep_ramparts.get(i) == Some(&handle)))
+            {
+                snapshot.structures.set_hits(row, structure.hits());
+            }
             if matches!(kind, Some(StructureType::Spawn | StructureType::Extension)) {
                 read_free_energy(snapshot, &structure, row);
             }

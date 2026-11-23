@@ -44,8 +44,8 @@
 //! `Memory`.
 
 use rustedscreep_consts::{
-    BUILD_POWER, CONTAINER_HITS, HARVEST_POWER, Part, Position, ResourceType, RoomName,
-    StructureType, extension_energy_capacity,
+    BUILD_POWER, CONTAINER_HITS, HARVEST_POWER, Part, Position, REPAIR_POWER, ResourceType,
+    RoomName, StructureType, extension_energy_capacity, rampart_hits_max,
 };
 
 use super::hauling::HaulView;
@@ -56,13 +56,13 @@ use super::sizing::{
 };
 use super::upgrading::UpgradeView;
 use super::watchdog::{Event, Observation, Watchdog};
-use crate::config::{MovementConfig, OpeningConfig, RepairConfig};
+use crate::config::{MovementConfig, OpeningConfig, RepairConfig, UpkeepConfig};
 use crate::intents::{CreepIntent, IntentBuffer, Target};
 use crate::movement::{Dial, FlowField, Goal, MoveError, MoveTo, Movement, Tile, UNREACHED};
 use crate::scheduler::{Commit, Fault, Tier};
 use crate::snapshot::RoomEnergy;
 use crate::snapshot::{
-    Controller, CreepHandle, ObjectHandle, ObjectKind, Snapshot, StructureHandle,
+    Controller, CreepHandle, ObjectHandle, ObjectKey, ObjectKind, Snapshot, StructureHandle,
 };
 use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner};
 
@@ -82,6 +82,19 @@ const NEAR: u8 = 1;
 /// waits next to it could not be shoved off without leaving its goal.
 const WAIT_RANGE: u8 = 2;
 
+/// What a worker repairs (P3.5, P7.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fix {
+    /// A container on the mining plan's tiles (P3.5): a room object, read every tick.
+    Container(ObjectHandle),
+    /// A road (P7.3), by its tile (one road a tile, V237): a room object read only every
+    /// `upkeep.read_ticks` and on the ticks its repairer stands within reach of it, so its handle
+    /// does not last between reads.
+    Road(Position),
+    /// An own rampart (P7.3): a structure, in every snapshot (its hits are not).
+    Rampart(StructureHandle),
+}
+
 /// What a worker does this tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Task {
@@ -93,8 +106,8 @@ pub enum Task {
     /// Transfer energy to a spawn or an extension.
     Fill(StructureHandle),
     Build(ObjectHandle),
-    /// `repair` of a container (P3.5).
-    Repair(ObjectHandle),
+    /// `repair` of a container (P3.5), a road or a rampart (P7.3).
+    Repair(Fix),
     /// `upgradeController`; `guard` when it is the downgrade guard's upgrader (Critical).
     Upgrade {
         controller: StructureHandle,
@@ -281,6 +294,51 @@ pub struct RoomStats {
     pub containers: u32,
     pub repairing: u32,
     pub lowest_hits: Option<u32>,
+    /// Roads known from the last upkeep read (P7.3), those to repair (below `upkeep.road_start_pct`
+    /// of their `hitsMax`, or being repaired up to full), and the lowest share of `hitsMax` among
+    /// them (`None` without one). Unit: roads, percent.
+    pub roads: u32,
+    pub worn_roads: u32,
+    pub lowest_road_pct: Option<u32>,
+    /// Own ramparts with known hits (P7.3), those below their target, the fewest hits among them
+    /// (`None` without one), and the target at the room's level ([`rampart_goal`]). Unit:
+    /// ramparts, hits.
+    pub ramparts: u32,
+    pub low_ramparts: u32,
+    pub lowest_rampart: Option<u32>,
+    pub rampart_goal: u32,
+}
+
+/// A road as the last upkeep read saw it (P7.3): its tile, its id (to read it again by id), its
+/// hits and its `hitsMax`, the hits updated by each read of it since; whether it is under repair
+/// (below `upkeep.road_start_pct` once and not full since), and whether this tick's read saw it.
+#[derive(Clone, Copy, Debug)]
+struct RoadSeen {
+    pos: Position,
+    key: ObjectKey,
+    hits: u32,
+    max: u32,
+    under: bool,
+    seen: bool,
+}
+
+/// Something to repair this tick (P3.5, P7.3): what, where, its hits, the hits it is repaired up
+/// to, and whether a worker may walk to it (a container above `repair.walk_pct` is repaired only by
+/// a worker already within reach of it).
+#[derive(Clone, Copy, Debug)]
+struct Worn {
+    fix: Fix,
+    pos: Position,
+    hits: u32,
+    goal: u32,
+    walk: bool,
+}
+
+impl Worn {
+    /// Its hits as a share of its goal, the order repairs are handed out in. Unit: permille.
+    fn share(&self) -> u64 {
+        u64::from(self.hits) * 1000 / u64::from(self.goal.max(1))
+    }
 }
 
 struct RoomState {
@@ -297,9 +355,20 @@ struct RoomState {
     /// worker once a second one failed on it too (`None`), so one worker that can reach nothing
     /// does not close the room to the others. At most [`UNREACHABLE_MAX`], oldest dropped first.
     unreachable: Vec<(Position, u32, Option<CreepHandle>)>,
-    /// Containers under repair (P3.5): below `repair.start_pct` of their `hitsMax` once, and not
-    /// full since. A global reset forgets them; they are found again below the share.
-    repairing: Vec<ObjectHandle>,
+    /// The containers under repair (P3.5): below `repair.start_pct` of their `hitsMax` once and not
+    /// full since. A global reset forgets them; they are found again below the share. The roads and
+    /// ramparts under repair (P7.3) are flagged in `roads` and `ramparts`.
+    repairing: Vec<Fix>,
+    /// The room's roads from the last upkeep read (P7.3), by tile ([`tile_key`]).
+    roads: Vec<RoadSeen>,
+    /// The room's own ramparts (P7.3), by handle slot: their last read hits, and whether they are
+    /// under repair (below `upkeep.rampart_start_pct` of the target once and not at it since).
+    ramparts: Vec<(StructureHandle, u32, bool)>,
+    /// The road tiles whose roads the next snapshot was asked to read (P7.3,
+    /// [`Opening::upkeep_reads`]), and the tick they were asked on: one asked for on the tick before
+    /// and not found is gone (a room whose run was skipped asked nothing for this tick).
+    asked: Vec<Position>,
+    asked_at: u32,
     /// What its workers take this tick (P3.4): each pushed pickup or withdraw's target and the
     /// taker's free room, cleared in [`Opening::begin`]. Unit: energy.
     took: Vec<(Target, u32)>,
@@ -345,6 +414,12 @@ struct Facts {
     /// Containers on the mining plan's tiles (P3.5): handle, place, hits. Others in the room (a
     /// previous owner's, say) are never repaired; their energy is still taken (`loose`).
     containers: Vec<(ObjectHandle, Position, u32)>,
+    /// Roads (P7.3), from the room's memory: place, hits, `hitsMax`, under repair.
+    roads: Vec<(Position, u32, u32, bool)>,
+    /// Own ramparts with known hits (P7.3): handle, place, hits, under repair.
+    ramparts: Vec<(StructureHandle, Position, u32, bool)>,
+    /// The hits the room's ramparts are kept at ([`rampart_goal`]), 0 while upkeep is off.
+    rampart_goal: u32,
 }
 
 /// The opening's state for one global.
@@ -367,8 +442,17 @@ pub struct Opening {
     working: Vec<(usize, Position, u32, Task, u8)>,
     left: Vec<(usize, Position, u32, Task, u8)>,
     assigned: Vec<(usize, Task)>,
-    /// The room's containers to repair this tick (P3.5), as in `Facts::containers`.
-    repairs: Vec<(ObjectHandle, Position, u32)>,
+    /// The room's repairs this tick (P3.5, P7.3): those that go before its sites are built, and
+    /// those that wait for a room with none.
+    repairs: Vec<Worn>,
+    later: Vec<Worn>,
+    /// What the next tick's snapshot reads for upkeep (P7.3), every room's, from this tick's
+    /// Standard work: the roads by id and the ramparts whose repairer stands within reach of them.
+    read_roads: Vec<ObjectKey>,
+    read_ramparts: Vec<StructureHandle>,
+    /// Scratch: the road tiles read this tick in the room being run (P7.3).
+    road_tiles: Vec<Position>,
+    old_ramparts: Vec<(StructureHandle, u32, bool)>,
     /// This tick's unreachable targets of the room being run: for every worker, and for one.
     blocked: Vec<Position>,
     private: Vec<(Position, CreepHandle)>,
@@ -387,6 +471,8 @@ impl Opening {
     pub fn begin(&mut self, snap: &Snapshot) {
         self.time = snap.tick.time;
         self.site_left.clear();
+        self.read_roads.clear();
+        self.read_ramparts.clear();
         let rooms = &snap.rooms;
         for state in &mut self.rooms {
             state.row = None;
@@ -415,6 +501,10 @@ impl Opening {
                         members: (0, 0),
                         unreachable: Vec::new(),
                         repairing: Vec::new(),
+                        roads: Vec::new(),
+                        ramparts: Vec::new(),
+                        asked: Vec::new(),
+                        asked_at: 0,
                         took: Vec::new(),
                         sized: None,
                     },
@@ -522,6 +612,7 @@ impl Opening {
         buffer: &mut IntentBuffer,
         cfg: &OpeningConfig,
         rcfg: &RepairConfig,
+        ucfg: &UpkeepConfig,
         mcfg: &MovementConfig,
         tower_refill_min: u32,
         mined: &[Mined],
@@ -549,6 +640,7 @@ impl Opening {
             haul,
             tower_refill_min,
         );
+        self.gather_upkeep(ri, snap, row, ucfg);
         // The capacity the room's workers are sized at: its own; for an owned room without a spawn
         // (one that lost it), at most that of the nearest spawn room that would serve it (P5.1), so
         // its worker fits there and its plan stays put while the nearest room does.
@@ -692,6 +784,7 @@ impl Opening {
             members,
             cfg,
             rcfg,
+            ucfg,
             guard && !state.upgrade_blocked,
             state,
             !haul.fills || recovering || refill,
@@ -725,9 +818,23 @@ impl Opening {
         }
         let sources = u32::try_from(self.facts.sources.len()).unwrap_or(u32::MAX);
         let sites = u32::try_from(self.facts.sites.len()).unwrap_or(u32::MAX);
-        let containers = u32::try_from(self.facts.containers.len()).unwrap_or(u32::MAX);
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let containers = count(self.facts.containers.len());
         let lowest_hits = self.facts.containers.iter().map(|c| c.2).min();
+        let goal = self.facts.rampart_goal;
+        let roads = count(self.facts.roads.len());
+        let lowest_road_pct = self
+            .facts
+            .roads
+            .iter()
+            .map(|r| u32::try_from(u64::from(r.1) * 100 / u64::from(r.2.max(1))).unwrap_or(100))
+            .min();
+        let ramparts = count(self.facts.ramparts.len());
+        let low_ramparts = count(self.facts.ramparts.iter().filter(|r| r.2 < goal).count());
+        let lowest_rampart = self.facts.ramparts.iter().map(|r| r.2).min();
         if let Some(r) = self.rooms.get_mut(ri) {
+            let repairing = count(r.repairing.len());
+            let worn_roads = count(r.roads.iter().filter(|x| x.under).count());
             r.stats = RoomStats {
                 time: self.time,
                 alive,
@@ -739,8 +846,15 @@ impl Opening {
                 sites,
                 loose,
                 containers,
-                repairing: u32::try_from(r.repairing.len()).unwrap_or(u32::MAX),
+                repairing,
                 lowest_hits,
+                roads,
+                worn_roads,
+                lowest_road_pct,
+                ramparts,
+                low_ramparts,
+                lowest_rampart,
+                rampart_goal: goal,
             };
         }
         Ok(())
@@ -770,6 +884,7 @@ impl Opening {
                 self.act(ri, i, task, snap, movement, buffer, mcfg, commit);
             }
         }
+        self.ask_upkeep_reads(ri, snap, members);
         Ok(())
     }
 
@@ -965,6 +1080,202 @@ impl Opening {
         }
         // Sources in a fixed order (rows follow the engine's, V102): by place.
         f.sources.sort_unstable_by_key(|s| tile_key(s.1));
+    }
+
+    /// Room `ri`'s roads and own ramparts this tick (P7.3), into its memory and `self.facts`. A room
+    /// read in full for upkeep (`Rooms::upkeep_reads`) replaces its road list; otherwise the roads
+    /// read this tick (the ones asked for, [`Self::upkeep_reads`]) update theirs, and a road asked
+    /// for and not read is gone. Ramparts come from every snapshot's structures, each with the hits
+    /// read this tick or else the last known (0, unknown, leaves it out). Off, the room forgets both.
+    fn gather_upkeep(&mut self, ri: usize, snap: &Snapshot, row: usize, ucfg: &UpkeepConfig) {
+        let f = &mut self.facts;
+        f.roads.clear();
+        f.ramparts.clear();
+        f.rampart_goal = 0;
+        let Some(r) = self.rooms.get_mut(ri) else {
+            return;
+        };
+        if !ucfg.enabled {
+            r.roads.clear();
+            r.ramparts.clear();
+            r.asked.clear();
+            r.repairing.retain(|x| matches!(x, Fix::Container(_)));
+            return;
+        }
+        let name = r.name;
+        let level = match snap.rooms.controllers().get(row) {
+            Some(Controller::Mine { level }) => *level,
+            _ => 0,
+        };
+        f.rampart_goal = rampart_goal(level, ucfg.rampart_permille);
+        // A full read keeps each road it sees (and its flag) and drops the rest.
+        let full = snap.rooms.upkeep_reads().get(row).copied().unwrap_or(false);
+        for x in &mut r.roads {
+            x.seen = false;
+        }
+        let tiles = &mut self.road_tiles;
+        tiles.clear();
+        let ob = &snap.objects;
+        for ((((&h, &kind), &pos), &total), &hits) in ob
+            .handles()
+            .iter()
+            .zip(ob.kinds())
+            .zip(ob.positions())
+            .zip(ob.totals())
+            .zip(ob.hits())
+        {
+            if kind != ObjectKind::Road || pos.room_name() != name {
+                continue;
+            }
+            let Some(key) = ob.key_of(h) else {
+                continue;
+            };
+            tiles.push(pos);
+            match r
+                .roads
+                .binary_search_by_key(&tile_key(pos), |x| tile_key(x.pos))
+            {
+                Ok(i) => {
+                    if let Some(x) = r.roads.get_mut(i) {
+                        // A road built again on the tile has a new id; its repair starts afresh.
+                        let under = x.under && x.key == key;
+                        *x = RoadSeen {
+                            pos,
+                            key,
+                            hits,
+                            max: total,
+                            under,
+                            seen: true,
+                        };
+                    }
+                }
+                Err(i) => r.roads.insert(
+                    i,
+                    RoadSeen {
+                        pos,
+                        key,
+                        hits,
+                        max: total,
+                        under: false,
+                        seen: true,
+                    },
+                ),
+            }
+        }
+        if full {
+            r.roads.retain(|x| x.seen);
+        } else if r.asked_at.wrapping_add(1) == self.time {
+            for p in &r.asked {
+                if !tiles.contains(p)
+                    && let Ok(i) = r
+                        .roads
+                        .binary_search_by_key(&tile_key(*p), |x| tile_key(x.pos))
+                {
+                    r.roads.remove(i);
+                }
+            }
+        }
+        r.asked.clear();
+        f.roads
+            .extend(r.roads.iter().map(|x| (x.pos, x.hits, x.max, x.under)));
+        let old = &mut self.old_ramparts;
+        old.clear();
+        old.append(&mut r.ramparts);
+        let st = &snap.structures;
+        for (((&h, &kind), &pos), &read) in st
+            .handles()
+            .iter()
+            .zip(st.kinds())
+            .zip(st.positions())
+            .zip(st.hits())
+        {
+            if kind != StructureType::Rampart || pos.room_name() != name {
+                continue;
+            }
+            let last = old
+                .binary_search_by_key(&h.slot(), |x| x.0.slot())
+                .ok()
+                .and_then(|i| old.get(i))
+                .filter(|x| x.0 == h);
+            let hits = if read > 0 {
+                read
+            } else {
+                last.map_or(0, |x| x.1)
+            };
+            let under = last.is_some_and(|x| x.2);
+            r.ramparts.push((h, hits, under));
+            if hits > 0 {
+                f.ramparts.push((h, pos, hits, under));
+            }
+        }
+        r.ramparts.sort_unstable_by_key(|x| x.0.slot());
+    }
+
+    /// What the next tick's snapshot reads for room `ri` (P7.3), from the Standard work: the road or
+    /// rampart of each worker that repairs one and stands within one step of reach of it (a creep
+    /// moves one tile a tick, so every tick it is within reach is read). A road whose last read
+    /// hits leave at most one repair of the plan's worker (`REPAIR_POWER` a WORK part) also asks for
+    /// the other roads under repair within that reach, so the worker's next road is read when it
+    /// takes it.
+    fn ask_upkeep_reads(&mut self, ri: usize, snap: &Snapshot, members: (usize, usize)) {
+        let now = self.time;
+        let work = self
+            .rooms
+            .get(ri)
+            .and_then(|r| r.plan.as_ref())
+            .and_then(|p| p.body)
+            .map_or(1, |b| {
+                u32::try_from(b.count(Part::Work)).unwrap_or(u32::MAX)
+            });
+        if let Some(r) = self.rooms.get_mut(ri) {
+            r.asked_at = now;
+        }
+        for i in members.0..members.1 {
+            let Some(m) = self.members.get(i).copied() else {
+                continue;
+            };
+            let Some(Task::Repair(fix)) = self.worker(m.handle).map(|w| w.task) else {
+                continue;
+            };
+            let Some(&at) = snap.creeps.positions().get(m.row) else {
+                continue;
+            };
+            let near = |p: Position| range(at, p) <= WORK_RANGE.saturating_add(1);
+            match fix {
+                Fix::Road(p) if near(p) => {
+                    let Some(r) = self.rooms.get_mut(ri) else {
+                        continue;
+                    };
+                    let Ok(j) = r
+                        .roads
+                        .binary_search_by_key(&tile_key(p), |x| tile_key(x.pos))
+                    else {
+                        continue;
+                    };
+                    let finishing = r.roads.get(j).is_some_and(|x| {
+                        x.max.saturating_sub(x.hits) <= work.saturating_mul(REPAIR_POWER)
+                    });
+                    for x in &r.roads {
+                        let next = finishing && x.under && x.pos != p && near(x.pos);
+                        if (x.pos == p || next) && !r.asked.contains(&x.pos) {
+                            self.read_roads.push(x.key);
+                            r.asked.push(x.pos);
+                        }
+                    }
+                }
+                Fix::Rampart(h) if self.facts.ramparts.iter().any(|x| x.0 == h && near(x.1)) => {
+                    self.read_ramparts.push(h);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// What the next tick's snapshot reads for upkeep (P7.3), from this tick's Standard work (empty
+    /// on a tick it did not run): the roads by id, and the own ramparts by handle, whose repairer
+    /// stands within one step of reach.
+    pub fn upkeep_reads(&self) -> (&[ObjectKey], &[StructureHandle]) {
+        (&self.read_roads, &self.read_ramparts)
     }
 
     /// Builds room `ri`'s plan when it has none, or movement's grid version or `capacity` changed
@@ -1238,6 +1549,7 @@ impl Opening {
         members: (usize, usize),
         cfg: &OpeningConfig,
         rcfg: &RepairConfig,
+        ucfg: &UpkeepConfig,
         guard: bool,
         controller: crate::snapshot::ControllerState,
         fill: bool,
@@ -1539,28 +1851,112 @@ impl Opening {
                 ));
             }
         }
-        // The containers to repair (P3.5): below `repair.start_pct` of their `hitsMax`, or under
-        // repair and not full. The room remembers them before the unreachable ones are left out, so
-        // one that is cut off for a while is repaired up to full once it is reached again.
+        // What to repair (P3.5, P7.3). The room remembers it before the unreachable ones are left
+        // out, so one that is cut off for a while is repaired up to its goal once it is reached
+        // again: containers below `repair.start_pct` of their `hitsMax`, or under repair and not
+        // full; roads below `upkeep.road_start_pct` of theirs, or under repair and not full;
+        // ramparts below `upkeep.rampart_start_pct` of their goal or below `upkeep.rampart_floor`,
+        // or under repair and below the goal. The containers, the roads below
+        // `upkeep.road_urgent_pct` and the ramparts below the floor (or the goal, if lower) go
+        // before the room's sites; the rest wait for a room with none.
         let mut repairs = std::mem::take(&mut self.repairs);
+        let mut later = std::mem::take(&mut self.later);
         repairs.clear();
-        if rcfg.enabled {
+        later.clear();
+        {
             let repairing = self.rooms.get(ri).map_or(&[][..], |r| &r.repairing[..]);
-            repairs.extend(
-                self.facts
-                    .containers
-                    .iter()
-                    .filter(|c| needs_repair(c.2, rcfg.start_pct, repairing.contains(&c.0)))
-                    .copied(),
-            );
+            let under = |f: Fix| repairing.contains(&f);
+            let facts = &self.facts;
+            if rcfg.enabled {
+                repairs.extend(
+                    facts
+                        .containers
+                        .iter()
+                        .filter(|c| needs_repair(c.2, rcfg.start_pct, under(Fix::Container(c.0))))
+                        .map(|c| Worn {
+                            fix: Fix::Container(c.0),
+                            pos: c.1,
+                            hits: c.2,
+                            goal: CONTAINER_HITS,
+                            walk: below_share(c.2, rcfg.walk_pct),
+                        }),
+                );
+            }
+            for &(pos, hits, max, was) in &facts.roads {
+                let fix = Fix::Road(pos);
+                if hits < max && (below_pct(hits, max, ucfg.road_start_pct) || was) {
+                    let w = Worn {
+                        fix,
+                        pos,
+                        hits,
+                        goal: max,
+                        walk: true,
+                    };
+                    if below_pct(hits, max, ucfg.road_urgent_pct) {
+                        repairs.push(w);
+                    } else {
+                        later.push(w);
+                    }
+                }
+            }
+            let goal = facts.rampart_goal;
+            let floor = ucfg.rampart_floor.min(goal);
+            for &(h, pos, hits, was) in &facts.ramparts {
+                let fix = Fix::Rampart(h);
+                if hits < goal
+                    && (below_pct(hits, goal, ucfg.rampart_start_pct) || hits < floor || was)
+                {
+                    let w = Worn {
+                        fix,
+                        pos,
+                        hits,
+                        goal,
+                        walk: true,
+                    };
+                    if hits < floor {
+                        repairs.push(w);
+                    } else {
+                        later.push(w);
+                    }
+                }
+            }
         }
         if let Some(r) = self.rooms.get_mut(ri) {
             r.repairing.clear();
-            r.repairing.extend(repairs.iter().map(|c| c.0));
+            for x in &mut r.roads {
+                x.under = false;
+            }
+            for x in &mut r.ramparts {
+                x.2 = false;
+            }
+            for w in repairs.iter().chain(later.iter()) {
+                match w.fix {
+                    Fix::Container(_) => r.repairing.push(w.fix),
+                    Fix::Road(p) => {
+                        if let Ok(i) = r
+                            .roads
+                            .binary_search_by_key(&tile_key(p), |x| tile_key(x.pos))
+                            && let Some(x) = r.roads.get_mut(i)
+                        {
+                            x.under = true;
+                        }
+                    }
+                    Fix::Rampart(h) => {
+                        if let Ok(i) = r.ramparts.binary_search_by_key(&h.slot(), |x| x.0.slot())
+                            && let Some(x) = r.ramparts.get_mut(i).filter(|x| x.0 == h)
+                        {
+                            x.2 = true;
+                        }
+                    }
+                }
+            }
         }
-        repairs.retain(|c| !self.blocked.contains(&c.1));
+        let blocked = &self.blocked;
+        repairs.retain(|w| !blocked.contains(&w.pos));
+        later.retain(|w| !blocked.contains(&w.pos));
         // `min_upgraders` (the guard's counts), then repairing, building, upgrading.
         let other_work = !repairs.is_empty()
+            || !later.is_empty()
             || self
                 .facts
                 .sites
@@ -1604,59 +2000,40 @@ impl Opening {
                 upgraders += 1;
             }
         }
-        // One worker per container, from the workers already within repair range of it (at an
-        // unlinked source its gatherers take their loads there), or below `repair.walk_pct` any (a
-        // linked source's container, which no gatherer comes to). First last tick's repairers keep
-        // their container while they still may repair it, so none swaps between two; then each
-        // container left, fewest hits first, takes the nearest. `can_upgrade` tells whether the
-        // worker skips a target on its own.
-        let may_repair = |i: usize, at: Position, c: &(ObjectHandle, Position, u32)| {
-            can_upgrade(i, c.1) && (below_share(c.2, rcfg.walk_pct) || range(at, c.1) <= WORK_RANGE)
-        };
-        let mut k = 0;
-        while k < left.len() {
-            let Some(&(i, at, _, prev, _)) = left.get(k) else {
-                break;
-            };
-            let kept = match prev {
-                Task::Repair(h) => repairs
-                    .iter()
-                    .position(|c| c.0 == h && may_repair(i, at, c)),
-                _ => None,
-            };
-            match kept {
-                Some(j) => {
-                    let (h, ..) = repairs.swap_remove(j);
-                    left.remove(k);
-                    assigned.push((i, Task::Repair(h)));
-                }
-                None => k += 1,
+        // A road a worker repaired last tick goes before the sites too, so it is finished first
+        // (a few ticks) and its worker does not leave it for another as it passes
+        // `upkeep.road_urgent_pct`; a rampart's raise still waits (P7.3).
+        for k in 0..left.len() {
+            if let Some(&(_, _, _, Task::Repair(f @ Fix::Road(_)), _)) = left.get(k)
+                && let Some(j) = later.iter().position(|w| w.fix == f)
+            {
+                repairs.push(later.swap_remove(j));
             }
         }
-        while !left.is_empty() {
-            let Some(j) = repairs
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, c)| (c.2, tile_key(c.1)))
-                .map(|(j, _)| j)
-            else {
-                break;
-            };
-            let c = repairs.swap_remove(j);
-            let pick = left
-                .iter()
-                .enumerate()
-                .filter(|&(_, &(i, at, ..))| may_repair(i, at, &c))
-                .min_by_key(|&(_, &(i, at, ..))| (range(at, c.1), key_of(&self.members, i)))
-                .map(|(k, _)| k);
-            let h = c.0;
-            if let Some(k) = pick {
-                let (i, ..) = left.remove(k);
-                assigned.push((i, Task::Repair(h)));
-            }
-        }
+        // One worker per repair that goes before the sites (P3.5, P7.3): a container from the
+        // workers already within repair range of it (at an unlinked source its gatherers take
+        // their loads there), or below `repair.walk_pct` any (a linked source's container, which
+        // no gatherer comes to); a road or a rampart from any ([`assign_repairs`]).
+        assign_repairs(
+            &mut repairs,
+            &mut left,
+            &mut assigned,
+            &self.members,
+            &self.private,
+        );
         self.repairs = repairs;
         let site = best_site(&self.facts.sites, &self.blocked);
+        // The repairs that wait (P7.3) take workers only in a room with no site to build.
+        if site.is_none() {
+            assign_repairs(
+                &mut later,
+                &mut left,
+                &mut assigned,
+                &self.members,
+                &self.private,
+            );
+        }
+        self.later = later;
         let holds = |i: usize| {
             upgraders_take
                 && self
@@ -1856,61 +2233,75 @@ impl Opening {
             snap.structures.positions().get(row).copied()
         };
         let energy = ResourceType::Energy;
-        let plan = match task {
-            Task::Harvest(h) => {
-                object(h).map(|(pos, _)| (pos, NEAR, Some(CreepIntent::Harvest { target: h })))
-            }
-            Task::Take(h) => object(h).map(|(pos, kind)| {
-                let intent = if kind == ObjectKind::Energy {
-                    CreepIntent::Pickup { target: h }
-                } else {
-                    CreepIntent::WithdrawObject {
+        let plan =
+            match task {
+                Task::Harvest(h) => {
+                    object(h).map(|(pos, _)| (pos, NEAR, Some(CreepIntent::Harvest { target: h })))
+                }
+                Task::Take(h) => object(h).map(|(pos, kind)| {
+                    let intent = if kind == ObjectKind::Energy {
+                        CreepIntent::Pickup { target: h }
+                    } else {
+                        CreepIntent::WithdrawObject {
+                            target: h,
+                            resource: energy,
+                            amount: None,
+                        }
+                    };
+                    (pos, NEAR, Some(intent))
+                }),
+                Task::Withdraw(h) => structure(h).map(|pos| {
+                    let intent = CreepIntent::Withdraw {
                         target: h,
                         resource: energy,
                         amount: None,
-                    }
-                };
-                (pos, NEAR, Some(intent))
-            }),
-            Task::Withdraw(h) => structure(h).map(|pos| {
-                let intent = CreepIntent::Withdraw {
-                    target: h,
-                    resource: energy,
-                    amount: None,
-                };
-                (pos, NEAR, Some(intent))
-            }),
-            Task::Fill(h) => structure(h).map(|pos| {
-                let intent = CreepIntent::Transfer {
-                    target: Target::Structure(h),
-                    resource: energy,
-                    amount: None,
-                };
-                (pos, NEAR, Some(intent))
-            }),
-            Task::Build(h) => {
-                object(h).map(|(pos, _)| (pos, WORK_RANGE, Some(CreepIntent::Build { target: h })))
-            }
-            Task::Repair(h) => object(h).map(|(pos, _)| {
-                (
-                    pos,
-                    WORK_RANGE,
-                    Some(CreepIntent::RepairObject { target: h }),
-                )
-            }),
-            Task::Upgrade { controller, .. } => structure(controller).map(|pos| {
-                (
-                    pos,
-                    WORK_RANGE,
-                    Some(CreepIntent::UpgradeController { target: controller }),
-                )
-            }),
-            Task::Wait(tile) => {
-                let receiver = self.facts.mined.iter().any(|m| m.link == Some(tile));
-                Some((tile, if receiver { WAIT_RANGE } else { NEAR }, None))
-            }
-            Task::Idle => None,
-        };
+                    };
+                    (pos, NEAR, Some(intent))
+                }),
+                Task::Fill(h) => structure(h).map(|pos| {
+                    let intent = CreepIntent::Transfer {
+                        target: Target::Structure(h),
+                        resource: energy,
+                        amount: None,
+                    };
+                    (pos, NEAR, Some(intent))
+                }),
+                Task::Build(h) => object(h)
+                    .map(|(pos, _)| (pos, WORK_RANGE, Some(CreepIntent::Build { target: h }))),
+                Task::Repair(Fix::Container(h)) => object(h).map(|(pos, _)| {
+                    (
+                        pos,
+                        WORK_RANGE,
+                        Some(CreepIntent::RepairObject { target: h }),
+                    )
+                }),
+                // A road is in this tick's objects only on a read (P7.3): until then its repairer walks.
+                Task::Repair(Fix::Road(pos)) => {
+                    let target = self
+                        .rooms
+                        .get(ri)
+                        .and_then(|r| road_at(snap, &r.roads, pos));
+                    Some((
+                        pos,
+                        WORK_RANGE,
+                        target.map(|target| CreepIntent::RepairObject { target }),
+                    ))
+                }
+                Task::Repair(Fix::Rampart(h)) => structure(h)
+                    .map(|pos| (pos, WORK_RANGE, Some(CreepIntent::Repair { target: h }))),
+                Task::Upgrade { controller, .. } => structure(controller).map(|pos| {
+                    (
+                        pos,
+                        WORK_RANGE,
+                        Some(CreepIntent::UpgradeController { target: controller }),
+                    )
+                }),
+                Task::Wait(tile) => {
+                    let receiver = self.facts.mined.iter().any(|m| m.link == Some(tile));
+                    Some((tile, if receiver { WAIT_RANGE } else { NEAR }, None))
+                }
+                Task::Idle => None,
+            };
         let Some((target, reach, intent)) = plan else {
             movement.give_way(snap, m.handle, None);
             return;
@@ -1993,6 +2384,94 @@ impl Opening {
                     w.source = None;
                 }
             }
+        }
+    }
+}
+
+/// The hits a rampart is kept at in a room of controller level `level` (P7.3, ADR-032):
+/// `permille` of `rampart_hits_max(level)` (V236), so 0 below RCL2, where no rampart stands.
+///
+/// Uses: rampart_hits_max (RAMPART_HITS_MAX_RCL2 to RAMPART_HITS_MAX_RCL8).
+pub fn rampart_goal(level: u8, permille: u32) -> u32 {
+    let max = u64::from(rampart_hits_max(u32::from(level)));
+    u32::try_from(max * u64::from(permille.min(1000)) / 1000).unwrap_or(u32::MAX)
+}
+
+/// Whether `hits` are below `pct` percent of `max` (P7.3: a road's `hitsMax`, a rampart's goal).
+pub fn below_pct(hits: u32, max: u32, pct: u32) -> bool {
+    u64::from(hits) * 100 < u64::from(max) * u64::from(pct)
+}
+
+/// The road on `pos` in this tick's objects (P7.3), if it was read this tick: by its id from the
+/// room's road memory.
+fn road_at(snap: &Snapshot, roads: &[RoadSeen], pos: Position) -> Option<ObjectHandle> {
+    let i = roads
+        .binary_search_by_key(&tile_key(pos), |x| tile_key(x.pos))
+        .ok()?;
+    let h = snap.objects.handle_of(roads.get(i)?.key)?;
+    snap.objects.row_of(h).map(|_| h)
+}
+
+/// Hands out `list`'s repairs to the workers in `left` (P3.5, P7.3), one worker each. First last
+/// tick's repairers keep theirs while they still may repair it, so none swaps between two; then
+/// each repair left, lowest share of its goal first ([`Worn::share`]), takes the nearest worker
+/// that may repair it: one that does not skip its tile on its own, and, for a repair no worker
+/// walks to ([`Worn::walk`]), one already within reach. The workers given one leave `left`.
+fn assign_repairs(
+    list: &mut Vec<Worn>,
+    left: &mut Vec<(usize, Position, u32, Task, u8)>,
+    assigned: &mut Vec<(usize, Task)>,
+    members: &[Member],
+    private: &[(Position, CreepHandle)],
+) {
+    let may = |i: usize, at: Position, w: &Worn| {
+        members
+            .get(i)
+            .is_none_or(|m| !skipped_by(private, w.pos, m.handle))
+            && (w.walk || range(at, w.pos) <= WORK_RANGE)
+    };
+    let mut k = 0;
+    while k < left.len() {
+        let Some(&(i, at, _, prev, _)) = left.get(k) else {
+            break;
+        };
+        let kept = match prev {
+            Task::Repair(f) => list.iter().position(|w| w.fix == f && may(i, at, w)),
+            _ => None,
+        };
+        match kept {
+            Some(j) => {
+                let w = list.swap_remove(j);
+                left.remove(k);
+                assigned.push((i, Task::Repair(w.fix)));
+            }
+            None => k += 1,
+        }
+    }
+    while !left.is_empty() {
+        let Some(j) = list
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, w)| (w.share(), tile_key(w.pos)))
+            .map(|(j, _)| j)
+        else {
+            break;
+        };
+        let w = list.swap_remove(j);
+        let pick = left
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(i, at, ..))| may(i, at, &w))
+            .min_by_key(|&(_, &(i, at, ..))| {
+                (
+                    range(at, w.pos),
+                    members.get(i).map_or(u128::MAX, |m| m.key),
+                )
+            })
+            .map(|(k, _)| k);
+        if let Some(k) = pick {
+            let (i, ..) = left.remove(k);
+            assigned.push((i, Task::Repair(w.fix)));
         }
     }
 }

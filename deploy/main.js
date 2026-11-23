@@ -862,6 +862,10 @@ function __wbg_get_imports() {
             const ret = arg0.getFreeCapacity(__wbindgen_enum_ResourceType[arg1]);
             return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >> 0;
         },
+        __wbg_getObjectById_6ea41838c80a7662: function(arg0) {
+            const ret = Game.getObjectById(arg0);
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
         __wbg_getOwnPropertyDescriptor_3a5a5757a1ebc308: function() { return handleError(function (arg0, arg1) {
             const ret = Object.getOwnPropertyDescriptor(arg0, arg1);
             return ret;
@@ -2300,7 +2304,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"42a94e0b1805-dirty-8883819a","wasmCrc32":"8883819a","features":[],"wasmParts":[823412,823408]});
+const BUILD = ({"id":"137131369c69-dirty-83e81a71","wasmCrc32":"83e81a71","features":[],"wasmParts":[842404,842404]});
 const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;
