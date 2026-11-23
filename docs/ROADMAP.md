@@ -166,11 +166,12 @@ Modules:
 - [x] Reservers (creeps that reserve a remote room's controller, which raises its sources' capacity; a remote room is one the bot mines without owning it), haulers, and roads.
 - [x] Auto-abandon of contested or unprofitable rooms, and threat-driven evacuation hooks for P7.
 
-**Gate:**
-- [ ] Model tests pass.
-- [ ] Native scenario tests feed threat and contest inputs to the remote manager and show abandon and evacuation.
-- [ ] Net energy per CPU is recorded from a live run. Any natural threat event in a remote room (for example NPC invaders, the game's non-player-character raiders) is logged with the
-  bot's response. Scripted invaders are a private-track scenario (PS3).
+**Gate:** passed 2026-11-22 (its live reading carried by ADR-031).
+- [x] Model tests pass.
+- [x] Native scenario tests feed threat and contest inputs to the remote manager and show abandon and evacuation.
+- [x] A live run is recorded. ADR-031 (the reading waits for a remote room the bot can mine) amended this item: none of E7N57's three neighbors could be mined in the
+  first live run, so net energy per CPU, and any natural threat event in a remote room (for example NPC invaders, the game's non-player-character raiders) logged with the
+  bot's response, come from the first live run in which a home mines a remote room, with P8's gate as the backstop. Scripted invaders are a private-track scenario (PS3).
 
 ## P7 Defense (SPEC §3.6)
 - [ ] Threat assessment from hostile bodies and boosts (mineral compounds that labs apply to body parts to strengthen them).
@@ -197,6 +198,8 @@ Modules:
 - [ ] Scoring tests pass.
 - [ ] Once GCL allows a second room (VERIFICATION_LOG R28, the GCL-to-room-count rule, still unverified), a live run claims and bootstraps it without lowering the home room's RCL
   progress below the threshold in TUNING.
+- [ ] P6's carried reading (ADR-031): net energy per CPU from a live run that mines a remote room is recorded, or the record shows that no home had a remote room it could mine
+  during P8's live run.
 
 ## P9 Late game (SPEC §3.8)
 - [ ] Minerals.
