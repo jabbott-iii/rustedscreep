@@ -214,8 +214,10 @@ at `UPGRADE_CONTROLLER_POWER` per WORK) and the workers a source keeps busy: eno
 `sizing::worker_plan`) is solved from those targets: of the WORK, CARRY, and MOVE bodies within the energy, the ones whose workers, counted
 as fractions, put the most energy to use over a creep life net of their bodies (`worker_value`: each source's yield carried on its rounds;
 when the workers' energy is by the controller, a linked source's or the builders' while upgraders take, the time of their duties too:
-the build work on the spawn-to-controller trip, the mining containers' repairs, and the fills while no hauler fills), and within
-`opening.body_slack_pct` of the best the fewest workers; without upgraders a linked source's workers walk their duties empty at a
+the build work on the spawn-to-controller trip, the mining containers' repairs, and the fills while no hauler fills; and in any room
+the decay of its roads and own ramparts over a life, `sizing::road_decay` and `sizing::rampart_decay`, on repair rounds to them, ADR-032's
+amendment), and within `opening.body_slack_pct` of the best the fewest workers. The room keeps at least the whole workers its sources'
+fractions and all its repairs take together (P7.3), so the repairs never wait for the time the builds leave; without upgraders a linked source's workers walk their duties empty at a
 tile a tick. A request below the plan's capacity (recovery, the wait fallback) is solved at its energy, cached per room. `Opening` keeps one plan per owned
 room (the sources' open tiles, trips, and counts, from a flow field from the controller on movement's grid, built again when the grid
 version or the room's capacity changes), and per worker (own creeps whose name says `worker` and the room) a mode, a source, and a
@@ -229,7 +231,7 @@ left, fewest hits first, takes the nearest worker within 3 tiles, or below `repa
 of their `hitsMax` or repaired on the tick before, and the own ramparts below `upkeep.rampart_floor` (or their target, if lower), one
 worker each, any worker walking to them, lowest share of its goal first), then build the room's best site, then, in a room with no site, the other repairs of P7.3 (a
 road below `upkeep.road_start_pct`, up to full; a rampart below `upkeep.rampart_start_pct` of its target, `upkeep.rampart_permille` of
-`rampart_hits_max` at the level, up to it; `economy::Fix` says which, a road by its tile, a rampart by its handle), then upgrade (the guard's upgrader keeps upgrading until it is empty). A target movement finds no way to goes on the room's unreachable
+`rampart_hits_max` at the level, up to it; `economy::Fix` says which, a road by its tile, a rampart by its handle; a rampart started below the floor stays before the sites up to `upkeep.rampart_refill`, ADR-032's amendment; the plan's constructed walls, by tile, are held as ramparts, and a rampart a wall replaces is left to decay, ADR-033), then upgrade (the guard's upgrader keeps upgrading until it is empty). A target movement finds no way to goes on the room's unreachable
 list for `movement.route_retry_ticks` (at most 16): skipped by the worker that failed, and by every worker once a second one fails on
 it, so one walled-in worker cannot close the room; the worker's task is dropped at once. A harvest or a build is pushed only while
 this tick's earlier pushes (a lower bound each: `HARVEST_POWER`, or `BUILD_POWER` capped by the builder's energy) leave the target
@@ -400,7 +402,9 @@ position (hub, the tile where the base's filler creep stands, next to the storag
 holds a run's working state and checks the site rules (V237, `checkConstructionSite`'s tile rules) and the level counts (V234, `CONTROLLER_STRUCTURES` per level) on every placement. Two candidates, `bunker`
 and `flood`, each a `Run` that does one phase per `step` (`scheduler::Step`), share `sites` (the economy's tiles), `roads` (A* at the
 fatigue rates, reusing planned roads), `score` (the hub's anchor cost), `defence` and `mincut` (the minimum cut on a vertex-split graph,
-by Dinic's max-flow algorithm), `transform` (the Chebyshev distance transform), and `validate` (the one referee, which also measures). A `Scratch` holds the
+by Dinic's max-flow algorithm; since ADR-033 the cut is constructed walls, which never decay, but for its gates: ramparts where a
+planned road crosses it, where no wall may stand, and one per outside region own creeps must still reach from the hub, nearest the
+towers, `defence::gates`), `transform` (the Chebyshev distance transform), and `validate` (the one referee, which also measures). A `Scratch` holds the
 buffers a run reuses; a run's own state is in its `Run`, so a run stepped with a new scratch each step gives the same plan. Since
 P4.3 a `Board` holds its own copy of the terrain and `flood::Run` borrows nothing: each `step` is given the input the run was made
 from, so a job keeps a run across ticks.

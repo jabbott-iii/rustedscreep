@@ -9,7 +9,8 @@
 use rustedscreep_consts::{
     BUILD_POWER, CARRY_CAPACITY, CONTAINER_CAPACITY, CONTAINER_DECAY, CONTAINER_DECAY_TIME_OWNED,
     CREEP_LIFE_TIME, CREEP_SPAWN_TIME, ENERGY_REGEN_TIME, HARVEST_POWER, MAX_CREEP_SIZE,
-    MOVE_COST_PLAIN, MOVE_POWER, Part, REPAIR_COST, REPAIR_POWER, UPGRADE_CONTROLLER_POWER,
+    MOVE_COST_PLAIN, MOVE_POWER, Part, RAMPART_DECAY_AMOUNT, RAMPART_DECAY_TIME, REPAIR_COST,
+    REPAIR_POWER, ROAD_DECAY_AMOUNT, ROAD_DECAY_TIME, ROAD_HITS, UPGRADE_CONTROLLER_POWER,
 };
 
 use crate::spawning::Body;
@@ -233,7 +234,8 @@ pub struct WorkerTargets<'a> {
     pub sources: &'a [WorkerSource],
     /// The room's upgraders take the controller's energy (P3.4): the sources they spend want no
     /// worker, linked sources are not pooled, and the room keeps `min` workers even when no source
-    /// wants one; those beyond the sources' build ([`build_round`]).
+    /// wants one (or the workers its repairs take, [`worker_value`]); those beyond the sources'
+    /// build ([`build_round`]).
     pub upgraders: bool,
     /// `opening.min_workers` and `opening.max_workers`. Unit: creeps.
     pub min: u32,
@@ -256,6 +258,13 @@ pub struct WorkerTargets<'a> {
     /// What one transfer into a fill takes at most (the level's `EXTENSION_ENERGY_CAPACITY`), for
     /// the transfers a fill load needs ([`haul_round`]'s rule). Unit: energy.
     pub unload: u32,
+    /// What the room's roads and own ramparts lose to decay over one creep life, which the workers
+    /// repair (P7.3, ADR-032: [`road_decay`], [`rampart_decay`], [`repair_energy`]). Unit: energy.
+    pub repair: u32,
+    /// The way between the energy a worker takes by the controller and those roads and ramparts:
+    /// their ways' mean, each weighted by what it loses. `None` when none of them is reached, and
+    /// then no repair counts.
+    pub repair_trip: Option<Trip>,
     /// `opening.body_slack_pct`: [`worker_plan`] takes the fewest workers among the bodies whose
     /// value is within this share of what is at stake of the best one. Unit: percent.
     pub slack_pct: u32,
@@ -382,6 +391,48 @@ pub fn container_upkeep() -> u32 {
     u32::try_from(hits.div_ceil(u64::from(hits_per_energy()))).unwrap_or(u32::MAX)
 }
 
+/// What one own rampart loses to decay over one creep life, whatever its hits: `RAMPART_DECAY_AMOUNT`
+/// a step, one step every `RAMPART_DECAY_TIME` − 1 ticks (V304: the step runs once the tick reaches
+/// `nextDecayTime` − 1 and sets the next one `RAMPART_DECAY_TIME` after it, as a container's does,
+/// V214). Unit: hits.
+///
+/// Uses: `CREEP_LIFE_TIME`, `RAMPART_DECAY_AMOUNT`, `RAMPART_DECAY_TIME`.
+pub fn rampart_decay() -> u64 {
+    u64::from(CREEP_LIFE_TIME).saturating_mul(u64::from(RAMPART_DECAY_AMOUNT))
+        / u64::from(RAMPART_DECAY_TIME.saturating_sub(1).max(1))
+}
+
+/// What one road of `max` hits loses to decay over one creep life. Its `hitsMax` is `ROAD_HITS`
+/// times its terrain's ratio (V186), and each step removes `ROAD_DECAY_AMOUNT` times the same ratio,
+/// one step every `ROAD_DECAY_TIME` ticks (V242). A lower bound: each creep's step on it brings the
+/// next step forward by `ROAD_WEAROUT` a body part (V54), and that wear is not counted. Unit: hits.
+///
+/// Uses: `CREEP_LIFE_TIME`, `ROAD_DECAY_AMOUNT`, `ROAD_DECAY_TIME`, `ROAD_HITS`.
+pub fn road_decay(max: u32) -> u64 {
+    u64::from(CREEP_LIFE_TIME)
+        .saturating_mul(u64::from(ROAD_DECAY_AMOUNT))
+        .saturating_mul(u64::from(max))
+        / u64::from(ROAD_HITS)
+            .saturating_mul(u64::from(ROAD_DECAY_TIME))
+            .max(1)
+}
+
+/// The energy that repairs `hits`, rounded up ([`hits_per_energy`] hits an energy, V222). Unit:
+/// energy.
+///
+/// Uses: `REPAIR_COST`.
+pub fn repair_energy(hits: u64) -> u32 {
+    u32::try_from(hits.div_ceil(u64::from(hits_per_energy()))).unwrap_or(u32::MAX)
+}
+
+/// A repairer's round ([`repair_ticks`]) for `body` on `trip`. `None` for a body that cannot repair,
+/// carry or move. A lower bound, as [`walk_ticks`] is. Unit: ticks.
+///
+/// Uses: `CARRY_CAPACITY`, `REPAIR_POWER`, `REPAIR_COST`, [`walk_ticks`].
+pub fn repair_round(body: &Body, trip: Trip) -> Option<u32> {
+    repair_ticks(Parts::of(body), trip)
+}
+
 /// The hits one energy repairs: `1 / REPAIR_COST` (V222), rounded to a whole number, since the
 /// crate's `REPAIR_COST` is an `f32` (0.01 widens to 0.0099999998, which a division would round up
 /// a tick or an energy too far). At least 1. Unit: hits.
@@ -491,17 +542,22 @@ fn fraction(capacity: u32, open: u32, load: u32, round: Round) -> u128 {
 /// ([`WorkerTargets::duties`]), the time of those duties adds to it: the build work on
 /// [`build_round`]s, each mined source's container ([`container_upkeep`]) on repair rounds along
 /// its trip, and, while no hauler fills, the fills (the workers' bodies and the others' in
-/// [`WorkerTargets::fill`]) on fill rounds along the build trip. Without upgraders the room keeps
-/// the sum within `min..=max` (none when nothing wants a worker); with upgraders it keeps its
-/// whole count for `wants` (`min_workers` when the upgraders spend every source), and the builds
-/// are what the workers put to use. When the room keeps fewer than the time needs, they carry and
+/// [`WorkerTargets::fill`]) on fill rounds along the build trip. Whether or not they walk for
+/// those, the decay of the room's roads and own ramparts ([`WorkerTargets::repair`]) adds repair
+/// rounds on [`WorkerTargets::repair_trip`] (P7.3). Without upgraders the room keeps the sum within
+/// `min..=max` (none when nothing wants a worker); with upgraders it keeps its whole count for
+/// `wants` (`min_workers` when the upgraders spend every source), and the builds are what the
+/// workers put to use. Either way the count is at least the whole workers that the sources'
+/// fractions and the repairs (containers, roads and ramparts) take together, within `min..=max`:
+/// a structure whose decay the workers cannot keep up with is lost, so the repairs never wait for
+/// the time the builds leave. When the room keeps fewer than the time needs, they carry and
 /// build that share. Every worker kept costs its body once a life (`BODYPART_COST`). Counted whole, smaller bodies would look cheaper only by
 /// rounding (a source's last worker partly idle); counted as fractions, bodies of the same
 /// proportions tie, and [`worker_plan`] takes the larger (fewer creeps, fewer intents). Unit:
 /// (energy, creeps: the whole workers the room keeps for `wants`).
 ///
 /// Uses: `BODYPART_COST` (`Part::cost`), `CREEP_LIFE_TIME`, `ENERGY_REGEN_TIME`, [`yield_per_life`],
-/// [`build_round`], [`container_upkeep`].
+/// [`build_round`], [`container_upkeep`], [`repair_round`].
 pub fn worker_value(t: &WorkerTargets<'_>, body: &Body, wants: &[u32]) -> (i64, u32) {
     value_of(t, Parts::of(body), body.cost(), wants)
 }
@@ -533,8 +589,20 @@ fn value_of(t: &WorkerTargets<'_>, p: Parts, cost: u32, wants: &[u32]) -> (i64, 
     if pooled && let Some(r) = round_of(p, NO_WALK, true) {
         add(pool_cap, pool_open, r);
     }
-    // The duties: a body that cannot make one of them is worth nothing here.
+    // The duties: a body that cannot make one of them is worth nothing here. `repairs` is their
+    // share that keeps structures from decaying away: the room keeps the workers it takes (below).
     let mut duties = 0u128;
+    let mut repairs = 0u128;
+    // Roads and ramparts (P7.3): away from any round, wherever the workers' energy is.
+    if t.repair > 0
+        && let Some(trip) = t.repair_trip
+    {
+        let Some(r) = repair_ticks(p, trip) else {
+            return (i64::MIN, n);
+        };
+        repairs = duty(u128::from(t.repair), load, r);
+        duties = repairs;
+    }
     if t.duties() {
         if t.build > 0
             && let Some(trip) = t.build_trip
@@ -554,7 +622,9 @@ fn value_of(t: &WorkerTargets<'_>, p: Parts, cost: u32, wants: &[u32]) -> (i64, 
             let Some(r) = repair_ticks(p, trip) else {
                 return (i64::MIN, n);
             };
-            duties = duties.saturating_add(duty(upkeep, load, r));
+            let d = duty(upkeep, load, r);
+            duties = duties.saturating_add(d);
+            repairs = repairs.saturating_add(d);
         }
         if let (Some(others), Some(trip)) = (t.fill, t.build_trip) {
             let Some(r) = fill_ticks(p, trip, t.unload) else {
@@ -569,6 +639,15 @@ fn value_of(t: &WorkerTargets<'_>, p: Parts, cost: u32, wants: &[u32]) -> (i64, 
             duties = duties.saturating_add(duty(filled, load, r));
         }
     }
+    // The room keeps the whole workers its sources and repairs take together, when the sources'
+    // own rounding leaves too little time for the repairs: a structure the workers cannot keep up
+    // with decays away (P7.3).
+    let whole = u32::try_from(workers.saturating_add(repairs).div_ceil(MICRO)).unwrap_or(u32::MAX);
+    let n = if repairs > 0 {
+        t.room_want(sum.max(whole))
+    } else {
+        n
+    };
     let need = workers.saturating_add(duties);
     let kept = if t.upgraders {
         // The room keeps `n` workers (`min_workers` when the upgraders spend every source): no
@@ -695,6 +774,8 @@ fn each_worker(
             .iter()
             .filter_map(|s| s.trip)
             .chain(t.build_trip)
+            // A way of no tiles (every road and rampart by the controller) has no floor to reach.
+            .chain(t.repair_trip.filter(|r| t.repair > 0 && r.tiles > 0))
             .all(floor)
     };
     // Without upgraders, workers whose rounds have no walk (a linked source's) walk their duties'

@@ -177,7 +177,7 @@ fn get<T: Copy>(v: &[Option<T>], t: Tile) -> Option<T> {
 }
 
 /// The tiles within Chebyshev `r` of `t` (itself included), inside the room.
-fn within(t: Tile, r: u8) -> impl Iterator<Item = Tile> {
+pub(super) fn within(t: Tile, r: u8) -> impl Iterator<Item = Tile> {
     let r = i16::from(r);
     let (x, y) = (i16::from(t.x()), i16::from(t.y()));
     (-r..=r).flat_map(move |dx| {

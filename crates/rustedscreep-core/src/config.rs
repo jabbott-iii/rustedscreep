@@ -897,6 +897,11 @@ pub struct UpkeepConfig {
     /// sites are built: a new one has `RAMPART_HITS` (1) and is gone at its first decay step,
     /// about `RAMPART_DECAY_TIME` ticks after it is built (V302, V304). Unit: hits.
     pub rampart_floor: u32,
+    /// A rampart a worker has started below `rampart_floor` stays before the room's sites until
+    /// it reaches this many hits (or its target, if lower): each visit then gives a rampart near
+    /// the floor this much before its worker moves on, rather than the few hits that take it back
+    /// over the floor. At least `rampart_floor`. Unit: hits.
+    pub rampart_refill: u32,
 }
 
 /// Upkeep values for the official MMO.
@@ -908,6 +913,7 @@ pub const UPKEEP_MMO: UpkeepConfig = UpkeepConfig {
     rampart_permille: 10,
     rampart_start_pct: 90,
     rampart_floor: 10 * RAMPART_DECAY_AMOUNT,
+    rampart_refill: 20 * RAMPART_DECAY_AMOUNT,
 };
 
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
@@ -1125,7 +1131,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 139;
+pub const FIELD_COUNT: usize = 140;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1553,6 +1559,14 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         RAMPART_HITS_MAX_RCL2,
         true
     ),
+    number!(
+        upkeep,
+        "UpkeepConfig",
+        rampart_refill,
+        RAMPART_DECAY_AMOUNT + 1,
+        RAMPART_HITS_MAX_RCL2,
+        true
+    ),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -1578,7 +1592,7 @@ pub struct Rule {
 /// `CPU_TICK_LIMIT_MAX`: Standard switches on from the bucket at the start of the tick, and one tick
 /// is billed about tickLimit at most (the scheduler stops every tier at the ceiling and the reserve
 /// covers the rest), so a Standard tick leaves the bucket at or above the boot gate (TUNING.md).
-pub static RULES: [Rule; 17] = [
+pub static RULES: [Rule; 18] = [
     Rule {
         keys: ["loader.backoff_base_ticks", "loader.backoff_max_ticks"],
         text: "loader.backoff_base_ticks must be at most loader.backoff_max_ticks",
@@ -1669,6 +1683,11 @@ pub static RULES: [Rule; 17] = [
         keys: ["upkeep.road_urgent_pct", "upkeep.road_start_pct"],
         text: "upkeep.road_urgent_pct must be at most upkeep.road_start_pct",
         holds: |c| c.upkeep.road_urgent_pct <= c.upkeep.road_start_pct,
+    },
+    Rule {
+        keys: ["upkeep.rampart_floor", "upkeep.rampart_refill"],
+        text: "upkeep.rampart_floor must be at most upkeep.rampart_refill",
+        holds: |c| c.upkeep.rampart_floor <= c.upkeep.rampart_refill,
     },
 ];
 
@@ -1911,6 +1930,7 @@ mod tests {
             rampart_permille: _,
             rampart_start_pct: _,
             rampart_floor: _,
+            rampart_refill: _,
         } = UPKEEP_MMO;
         let expected: [(&str, &[&str]); 19] = [
             (
@@ -2123,6 +2143,7 @@ mod tests {
                     "rampart_permille",
                     "rampart_start_pct",
                     "rampart_floor",
+                    "rampart_refill",
                 ],
             ),
         ];

@@ -1108,6 +1108,10 @@ pub enum ObjectKind {
     /// owned room (P7.3) every `upkeep.read_ticks` and when a worker is about to repair it: `hits`
     /// its hits and `total` its `hitsMax` (`ROAD_HITS` times the terrain's ratio, V186).
     Road,
+    /// A constructed wall in an owned room (it has no owner, V314, V315; ADR-033): read every
+    /// `upkeep.read_ticks` and when a worker is about to repair it: `hits` its hits and `total` its
+    /// `hitsMax` (`WALL_HITS_MAX` from RCL2, V310).
+    Wall,
 }
 
 impl ObjectKind {

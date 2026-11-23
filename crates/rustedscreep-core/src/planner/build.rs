@@ -39,7 +39,8 @@ use std::collections::VecDeque;
 use rustedscreep_consts::{ROOM_AREA, StructureType};
 
 use super::layout::{Gate, KINDS, Layout, Roles, kind_rank};
-use super::rules::{allowed, blocks};
+use super::rules::{REPAIR_REACH, allowed, blocks};
+use super::validate::within;
 use crate::config::PlannerConfig;
 use crate::movement::{TerrainGrid, TerrainKind, Tile};
 
@@ -304,12 +305,19 @@ pub enum TileState {
 /// is not placed under an obstacle, which it may clear as other types do (ADR-026's amendment;
 /// [`next`] narrows a road's clear to an extension, [`road_clears`]), and a road standing under
 /// one is judged as missing; every other type is refused by any costed structure that is not a
-/// road or a rampart.
+/// road or a rampart. A wall counts as built on an obstacle of unknown type (ADR-033), and its site
+/// may go under an own rampart (V312), which the wall then replaces.
 pub fn tile_state(ground: &Ground, kind: StructureType, t: Tile, destroy: bool) -> TileState {
     // A road that stands under an obstacle (one built over it by hand) is not the plan's road: its
     // tile is judged as if the road were missing, so the obstacle may clear.
     let covered = kind == StructureType::Road && ground.obstructed(t);
     if ground.stands(kind, t) && !covered {
+        return TileState::Built;
+    }
+    // A constructed wall has no owner (V314, V315): the snapshot holds none, and movement's scan
+    // shows it as an obstacle of unknown type. Any such obstacle on a wall's tile closes the tile
+    // as the wall would (ADR-033), so it counts as built.
+    if kind == StructureType::Wall && ground.what(t) == FOREIGN {
         return TileState::Built;
     }
     match ground.site_at(t) {
@@ -485,8 +493,12 @@ pub fn next(ask: &Ask<'_>, ground: &Ground, s: &mut Scratch) -> (Next, Census) {
             census.capped += 1;
             continue;
         }
+        // A wall is built and repaired from up to `REPAIR_REACH` away (V185, V222), as the
+        // validator judges it; the walls of a line stand next to each other (ADR-033).
         let reached = item.kind == StructureType::Road
             || item.kind == StructureType::Rampart
+            || (item.kind == StructureType::Wall
+                && within(item.tile, REPAIR_REACH).any(|n| get(&s.reached, n, false)))
             || item
                 .tile
                 .neighbors()
@@ -1775,6 +1787,66 @@ mod tests {
         let (n, c) = next(&ask(&l, &t, level), &g, &mut Scratch::default());
         assert_eq!(n, Next::Idle);
         assert_eq!((c.due, c.blocked), (1, 1), "{c:?}");
+    }
+
+    /// ADR-033, V312: a wall's site may go under an own rampart (a rampart is not an obstacle), and
+    /// the wall then replaces it; an obstacle of unknown type on the wall's tile (a constructed
+    /// wall, which has no owner, so only movement's scan shows it, V315) is the wall built, where
+    /// another type finds it in the way; a wall whose only reached ground is within
+    /// `REPAIR_REACH` but not next to it is reached, as the validator judges walls (V185, V222).
+    ///
+    /// Uses: `CONTROLLER_STRUCTURES` (through `earliest_level`), `REPAIR_REACH`.
+    #[test]
+    fn a_wall_goes_under_a_rampart_and_an_unknown_obstacle_is_the_wall() {
+        let t = open();
+        let level = first(StructureType::Wall);
+        let at = tile(30, 25);
+        let mut w = World::spawned();
+        let mut g = w.ground();
+        g.structure(StructureType::Rampart, at);
+        for destroy in [true, false] {
+            assert_eq!(
+                tile_state(&g, StructureType::Wall, at, destroy),
+                TileState::Free
+            );
+        }
+        let l = layout(vec![item_on(StructureType::Wall, at, level)]);
+        fn walls_on(mut a: Ask<'_>) -> Ask<'_> {
+            a.gates = Gates::from_config(&PLANNER_MMO);
+            a
+        }
+        let (n, c) = next(&walls_on(ask(&l, &t, level)), &g, &mut Scratch::default());
+        assert_eq!(
+            n,
+            Next::Site {
+                kind: StructureType::Wall,
+                tile: at
+            },
+            "{c:?}"
+        );
+        let mut g = w.ground();
+        g.obstacle(at);
+        assert_eq!(
+            tile_state(&g, StructureType::Wall, at, true),
+            TileState::Built
+        );
+        assert_eq!(
+            tile_state(&g, StructureType::Extension, at, true),
+            TileState::Blocked
+        );
+        let (n, c) = next(&walls_on(ask(&l, &t, level)), &g, &mut Scratch::default());
+        assert_eq!((n, c.built), (Next::Idle, 1), "{c:?}");
+        // A wall ringed by walls (planned) is still reached within REPAIR_REACH of open ground.
+        let ring: Vec<Item> = at
+            .neighbors()
+            .map(|(_, n)| item_on(StructureType::Wall, n, level))
+            .chain([item_on(StructureType::Wall, at, level)])
+            .collect();
+        let l = layout(ring);
+        w.sites.clear();
+        let g = w.ground();
+        let (_, c) = next(&walls_on(ask(&l, &t, level)), &g, &mut Scratch::default());
+        assert_eq!((c.due, c.cut_off), (9, 0), "{c:?}");
     }
 
     /// X0: an own site of an obstacle type blocks reach like the structure would: a planned slot

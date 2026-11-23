@@ -43,10 +43,10 @@ use super::placement::{
 };
 use super::sizing::{
     Round, Trip, WorkerScratch, WorkerSource, WorkerTargets, build_round, carry_round,
-    container_upkeep, haul_round, hauler_plan, haulers_for, miner_body, miner_work,
-    smallest_worker, source_wants, upgraded, upgrader_carry, upgrader_plan, upgrader_upgrade,
-    walk_ticks, walk_ticks_max, worker_plan, worker_round, worker_value, workers_for_source,
-    yield_per_life,
+    container_upkeep, haul_round, hauler_plan, haulers_for, miner_body, miner_work, rampart_decay,
+    repair_energy, repair_round, road_decay, smallest_worker, source_wants, upgraded,
+    upgrader_carry, upgrader_plan, upgrader_upgrade, walk_ticks, walk_ticks_max, worker_plan,
+    worker_round, worker_value, workers_for_source, yield_per_life,
 };
 use super::upgrading::{POST_STEP, upgrader_lead};
 use super::*;
@@ -66,7 +66,8 @@ use crate::snapshot::{
 };
 use crate::spawning::{Body, EnergyBudget, Identity, Role, Spawner};
 use rustedscreep_consts::{
-    BUILD_POWER, CARRY_CAPACITY, CONTAINER_CAPACITY, CONTAINER_DECAY, CONTAINER_DECAY_TIME,
+    BUILD_POWER, CARRY_CAPACITY, CONSTRUCTION_COST_ROAD_SWAMP_RATIO,
+    CONSTRUCTION_COST_ROAD_WALL_RATIO, CONTAINER_CAPACITY, CONTAINER_DECAY, CONTAINER_DECAY_TIME,
     CONTAINER_DECAY_TIME_OWNED, CONTAINER_HITS, CONTROLLER_DOWNGRADE_RESTORE,
     CONTROLLER_MAX_UPGRADE_PER_TICK, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, ENERGY_DECAY,
     ENERGY_REGEN_TIME, ErrorCode, HARVEST_POWER, LINK_CAPACITY, LINK_COOLDOWN, MAX_CREEP_SIZE,
@@ -75,8 +76,8 @@ use rustedscreep_consts::{
     ROAD_DECAY_AMOUNT, ROAD_DECAY_TIME, ROAD_HITS, RoomCoordinate, RoomName,
     SOURCE_ENERGY_CAPACITY, SOURCE_ENERGY_KEEPER_CAPACITY, SOURCE_ENERGY_NEUTRAL_CAPACITY,
     SPAWN_ENERGY_CAPACITY, SPAWN_ENERGY_START, StructureType, TOMBSTONE_DECAY_PER_PART,
-    TOWER_CAPACITY, Terrain, UPGRADE_CONTROLLER_POWER, controller_downgrade, controller_levels,
-    extension_energy_capacity, rampart_hits_max,
+    TOWER_CAPACITY, Terrain, UPGRADE_CONTROLLER_POWER, WALL_HITS, WALL_HITS_MAX,
+    controller_downgrade, controller_levels, extension_energy_capacity, rampart_hits_max,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -378,6 +379,8 @@ fn targets(
         build_trip: Some(build_trip),
         fill: None,
         unload: extension_energy_capacity(3),
+        repair: 0,
+        repair_trip: None,
         slack_pct: OPENING_MMO.body_slack_pct,
     }
 }
@@ -544,6 +547,113 @@ fn a_build_round_from_constants() {
 fn a_container_upkeep_from_constants() {
     let hits = CREEP_LIFE_TIME * CONTAINER_DECAY / (CONTAINER_DECAY_TIME_OWNED - 1);
     assert_eq!(container_upkeep(), hits.div_ceil(hits_per_energy()));
+}
+
+/// Uses: CREEP_LIFE_TIME, RAMPART_DECAY_AMOUNT, RAMPART_DECAY_TIME, ROAD_HITS, ROAD_DECAY_AMOUNT,
+/// ROAD_DECAY_TIME, CONSTRUCTION_COST_ROAD_SWAMP_RATIO, CONSTRUCTION_COST_ROAD_WALL_RATIO,
+/// REPAIR_COST. A rampart loses `RAMPART_DECAY_AMOUNT` every `RAMPART_DECAY_TIME` − 1 ticks
+/// whatever its hits (V304, as the world model decays it); a road loses `ROAD_DECAY_AMOUNT` times
+/// its terrain's ratio every `ROAD_DECAY_TIME` ticks (V242), the ratio being its `hitsMax` over
+/// `ROAD_HITS` (V186): what each loses over a creep life, and the energy that repairs it.
+#[test]
+fn road_and_rampart_decay_from_constants() {
+    let life = u64::from(CREEP_LIFE_TIME);
+    assert_eq!(
+        rampart_decay(),
+        life * u64::from(RAMPART_DECAY_AMOUNT) / u64::from(RAMPART_DECAY_TIME - 1)
+    );
+    let plain = life * u64::from(ROAD_DECAY_AMOUNT) / u64::from(ROAD_DECAY_TIME);
+    assert_eq!(road_decay(ROAD_HITS), plain);
+    for ratio in [
+        CONSTRUCTION_COST_ROAD_SWAMP_RATIO,
+        CONSTRUCTION_COST_ROAD_WALL_RATIO,
+    ] {
+        assert_eq!(road_decay(ROAD_HITS * ratio), plain * u64::from(ratio));
+    }
+    let hits = rampart_decay();
+    assert_eq!(
+        u64::from(repair_energy(hits)),
+        hits.div_ceil(u64::from(hits_per_energy()))
+    );
+    assert_eq!(repair_energy(0), 0);
+}
+
+/// What `n` workers of `body` repair over a creep life on repair rounds of `trip` and nothing
+/// else, in millionths of a worker's whole time, against what `repair` energy a life takes:
+/// `(n × MICRO, repair × round × MICRO / (load × CREEP_LIFE_TIME))`. Uses: CARRY_CAPACITY,
+/// CREEP_LIFE_TIME, REPAIR_POWER, REPAIR_COST (through `repair_round`).
+fn repair_share(body: &Body, trip: Trip, repair: u32, n: u32) -> (u128, u128) {
+    let round = repair_round(body, trip).expect("a worker repairs");
+    let load = count(body, Part::Carry) * CARRY_CAPACITY;
+    (
+        u128::from(n) * MICRO,
+        u128::from(repair) * u128::from(round) * MICRO
+            / (u128::from(load) * u128::from(CREEP_LIFE_TIME)),
+    )
+}
+
+/// Uses: CREEP_LIFE_TIME, CARRY_CAPACITY, REPAIR_POWER, REPAIR_COST, RAMPART_DECAY_AMOUNT,
+/// RAMPART_DECAY_TIME, BODYPART_COST, MAX_CREEP_SIZE, the level capacities. While the upgraders
+/// spend every source the room keeps `min_workers` (P3.4) unless its roads' and ramparts' decay
+/// takes more (P7.3): for lines of 0 to 60 ramparts on plain, road and swamp ways of 10 to 45
+/// tiles at RCL3 to RCL8's capacities, the solved body's count is within
+/// `min_workers..=max_workers`, and below `max_workers` it is the fewest whole workers of that body
+/// whose repair rounds cover what the line loses a life (`repair_share`), or `min_workers`; with no
+/// line the body and count are those solved without repairs. A pinned case: E7N57's 37 ramparts
+/// about 40 plain tiles from the controller take more than one 1 WORK 1 CARRY 1 MOVE worker's
+/// rounds, more than two such workers' whole time.
+#[test]
+fn the_room_keeps_the_workers_its_repairs_take() {
+    let near = trip_of(5, MOVE_COST_ROAD);
+    // Linked, so the upgraders spend both; unmined, so no container's repairs count.
+    let sources = two_sources(near, false, true);
+    let (min, max) = (OPENING_MMO.min_workers, OPENING_MMO.max_workers);
+    let mut wants = Vec::new();
+    for trip in [
+        trip_of(10, MOVE_COST_PLAIN),
+        trip_of(25, MOVE_COST_ROAD),
+        trip_of(40, MOVE_COST_PLAIN),
+        trip_of(45, MOVE_COST_SWAMP),
+    ] {
+        for rcl in 3..=8 {
+            let energy = capacity_at(rcl);
+            for ramparts in (0..=60u64).step_by(5) {
+                let repair = repair_energy(rampart_decay() * ramparts);
+                let t = WorkerTargets {
+                    repair,
+                    repair_trip: Some(trip),
+                    ..targets(&sources, true, 0, near)
+                };
+                let body =
+                    worker_plan(&t, energy, &mut WorkerScratch::default()).expect("a worker fits");
+                source_wants(&t, &body, &mut wants);
+                let (_, n) = worker_value(&t, &body, &wants);
+                let tag = format!("{trip:?} RCL{rcl} {ramparts} ramparts: {body:?} x{n}");
+                assert!((min..=max).contains(&n), "{tag}");
+                if ramparts == 0 {
+                    let bare = targets(&sources, true, 0, near);
+                    let plain =
+                        worker_plan(&bare, energy, &mut WorkerScratch::default()).expect("fits");
+                    assert_eq!(body, plain, "{tag}");
+                    assert_eq!(n, min, "{tag}");
+                    continue;
+                }
+                let (kept, need) = repair_share(&body, trip, repair, n);
+                if n < max {
+                    assert!(kept >= need, "{tag}: covers {need}");
+                }
+                if n > min {
+                    assert!(
+                        kept - MICRO < need,
+                        "{tag}: one fewer would not cover {need}"
+                    );
+                }
+            }
+        }
+    }
+    let line = repair_energy(rampart_decay() * 37);
+    let (_, need) = repair_share(&wcm(1, 1, 1), trip_of(40, MOVE_COST_PLAIN), line, 0);
+    assert!(need > 2 * MICRO, "{need}");
 }
 
 /// Millionths of a worker, as `worker_value` counts them.
@@ -1366,6 +1476,15 @@ struct SimRoad {
     decay_at: u32,
 }
 
+/// A constructed wall (ADR-033): `WALL_HITS` when built, never decaying (V309, V310), repaired up
+/// to `WALL_HITS_MAX` from RCL2; an obstacle to every creep (V313).
+#[derive(Clone, Debug)]
+struct SimWall {
+    key: u128,
+    at: Tile,
+    hits: u32,
+}
+
 /// An own rampart (P7.3): `RAMPART_HITS` when built, `RAMPART_DECAY_AMOUNT` lost once the tick
 /// reaches `decay_at` − 1 and the next step `RAMPART_DECAY_TIME` later, gone at 0 or below (V302,
 /// V304); `rampart_hits_max` at the room's level caps its repairs (V236, V305). `seen` once a
@@ -1402,6 +1521,7 @@ enum ObjRow {
     Site(usize),
     Loose(usize),
     Road(usize),
+    Wall(usize),
 }
 
 struct World {
@@ -1418,6 +1538,9 @@ struct World {
     loose: Vec<Loose>,
     /// Roads and own ramparts (P7.3).
     roads: Vec<SimRoad>,
+    walls: Vec<SimWall>,
+    /// The plan's wall tiles (ADR-033), which the placement hands the opening each look.
+    plan_walls: Vec<Tile>,
     ramparts: Vec<SimRampart>,
     creeps: Vec<SimCreep>,
     next_key: u128,
@@ -1465,6 +1588,7 @@ struct World {
     asked_road_reads: u32,
     road_repairs: Vec<Tile>,
     rampart_repairs: Vec<Tile>,
+    wall_repairs: Vec<Tile>,
     roads_lost: u32,
     ramparts_lost: u32,
     /// Sites the bot's placement asked for: extensions accepted, containers accepted, links accepted
@@ -1580,6 +1704,8 @@ impl World {
             sites: Vec::new(),
             loose: Vec::new(),
             roads: Vec::new(),
+            walls: Vec::new(),
+            plan_walls: Vec::new(),
             ramparts: Vec::new(),
             creeps: Vec::new(),
             next_key: 1,
@@ -1616,6 +1742,7 @@ impl World {
             asked_road_reads: 0,
             road_repairs: Vec::new(),
             rampart_repairs: Vec::new(),
+            wall_repairs: Vec::new(),
             roads_lost: 0,
             ramparts_lost: 0,
             placed: 0,
@@ -1731,6 +1858,7 @@ impl World {
             || self.sources.iter().any(|s| s.at == t)
             || self.controller_at == t
             || self.extra_walls.contains(&t)
+            || self.walls.iter().any(|w| w.at == t)
             || self.sites.iter().any(|s| s.at == t && s.kind.is_obstacle())
     }
 
@@ -1742,6 +1870,7 @@ impl World {
             .collect();
         out.push((self.controller_at, Footprint::Blocked));
         out.extend(self.extra_walls.iter().map(|&t| (t, Footprint::Blocked)));
+        out.extend(self.walls.iter().map(|w| (w.at, Footprint::Blocked)));
         out.extend(
             self.sites
                 .iter()
@@ -1952,6 +2081,23 @@ impl World {
             );
             self.obj_rows.push(ObjRow::Road(i));
         }
+        // ADR-033: the walls, read as the roads are.
+        for (i, w) in self.walls.iter().enumerate() {
+            let asked = self.asked_roads.contains(&ObjectKey(w.key));
+            if !(self.upkeep_cfg.enabled && (upkeep_tick || asked)) {
+                continue;
+            }
+            push(
+                &mut self.snap,
+                w.key,
+                ObjectKind::Wall,
+                place(room, w.at),
+                0,
+                WALL_HITS_MAX,
+                w.hits,
+            );
+            self.obj_rows.push(ObjRow::Wall(i));
+        }
         self.snap.finish();
     }
 
@@ -1978,6 +2124,8 @@ impl World {
         let spawn_cfg = self.spawn_cfg;
         self.spawner.begin(&self.snap, &spawn_cfg);
         self.opening.begin(&self.snap);
+        self.opening
+            .set_plan_walls(self.room, self.plan_walls.iter().copied());
         self.mining.begin(&self.snap);
         self.hauling.begin(&self.snap);
         self.upgrading.begin(&self.snap);
@@ -2627,6 +2775,33 @@ impl World {
                 self.road_repairs.push(at);
                 Outcome::Ok
             }
+            (CreepIntent::RepairObject { .. }, Some(TargetRow::Object(row)))
+                if matches!(self.obj_rows[row as usize], ObjRow::Wall(_)) =>
+            {
+                let ObjRow::Wall(i) = self.obj_rows[row as usize] else {
+                    return fail;
+                };
+                let w = &mut self.walls[i];
+                if c.energy == 0 {
+                    return Outcome::Failed(ErrorCode::NotEnough);
+                }
+                if !near(c.at, w.at, 3) {
+                    return Outcome::Failed(ErrorCode::NotInRange);
+                }
+                if w.hits >= WALL_HITS_MAX {
+                    self.repair_noops += 1;
+                    return Outcome::Ok;
+                }
+                let per_energy = hits_per_energy();
+                let effect = (REPAIR_POWER * work)
+                    .min(c.energy * per_energy)
+                    .min(WALL_HITS_MAX - w.hits);
+                w.hits += effect;
+                let at = w.at;
+                self.creeps[actor].energy -= c.energy.min(effect.div_ceil(per_energy));
+                self.wall_repairs.push(at);
+                Outcome::Ok
+            }
             (CreepIntent::Repair { .. }, Some(TargetRow::Structure(row))) => {
                 let StructRow::Rampart(i) = self.struct_rows[row as usize] else {
                     return fail;
@@ -2889,6 +3064,15 @@ impl World {
                     at: s.at,
                     hits: ROAD_HITS,
                     decay_at: now + ROAD_DECAY_TIME,
+                });
+                continue;
+            }
+            if s.kind == StructureType::Wall {
+                let key = self.key();
+                self.walls.push(SimWall {
+                    key,
+                    at: s.at,
+                    hits: WALL_HITS,
                 });
                 continue;
             }
@@ -5909,14 +6093,14 @@ fn rampart_target(w: &World) -> (u32, u32) {
     (goal, UPKEEP_MMO.rampart_floor.min(goal))
 }
 
-/// The tiles of what the workers repair this tick (P7.3): roads and ramparts.
+/// The tiles of what the workers repair this tick (P7.3): roads, ramparts and walls (ADR-033).
 fn upkeep_targets(w: &World) -> Vec<Tile> {
     let snap = &w.snap;
     snap.creeps
         .handles()
         .iter()
         .filter_map(|&h| match w.opening.task(h)? {
-            Task::Repair(Fix::Road(p)) => Some(tile_of(p)),
+            Task::Repair(Fix::Road(p) | Fix::Wall(p)) => Some(tile_of(p)),
             Task::Repair(Fix::Rampart(s)) => {
                 let row = snap.structures.row_of(s)?;
                 snap.structures.positions().get(row).map(|&p| tile_of(p))
@@ -6002,6 +6186,42 @@ fn an_urgent_rampart_goes_before_the_sites_and_the_rest_wait() {
     assert!(
         w.rampart_repairs.contains(&b),
         "b is raised once no site is left"
+    );
+    assert_eq!(w.ramparts_lost, 0);
+}
+
+/// Uses: RAMPART_HITS, RAMPART_DECAY_TIME, CREEP_LIFE_TIME, `upkeep.rampart_floor`,
+/// `upkeep.rampart_refill`. With a site always to build, a new rampart (started below the floor)
+/// is repaired on past the floor up to the refill before its worker leaves it (ADR-032's
+/// amendment), while one at the floor that was never started waits until its first decay step
+/// takes it below.
+#[test]
+fn a_started_rampart_is_refilled_before_the_sites() {
+    let mut w = settled_world();
+    let (a, b) = (tile(LINE[0].0, LINE[0].1), tile(LINE[2].0, LINE[2].1));
+    let (goal, floor) = rampart_target(&w);
+    let refill = UPKEEP_MMO.rampart_refill.min(goal);
+    assert!(refill > floor, "{refill} {floor}");
+    add_rampart(&mut w, a, RAMPART_HITS);
+    add_rampart(&mut w, b, floor);
+    let mut reached = None;
+    for k in 0..CREEP_LIFE_TIME / 2 {
+        if w.sites.is_empty() {
+            add_site(&mut w, tile(40, 40), StructureType::Road);
+        }
+        w.step();
+        if k < RAMPART_DECAY_TIME - 2 {
+            assert!(!upkeep_targets(&w).contains(&b), "b waits at {}", w.time);
+        }
+        if rampart_hits(&w, a).expect("kept") >= refill {
+            reached = Some(k);
+            break;
+        }
+    }
+    assert!(
+        reached.is_some(),
+        "a refilled to {refill}: {:?}",
+        rampart_hits(&w, a)
     );
     assert_eq!(w.ramparts_lost, 0);
 }
@@ -6143,6 +6363,184 @@ fn a_road_gone_between_reads_is_forgotten() {
     assert!(!upkeep_targets(&w).contains(&u), "the worker dropped it");
     let (_, _, _, stats) = w.opening.room_states().next().expect("room");
     assert_eq!(stats.roads, 0);
+}
+
+/// Uses: RAMPART_DECAY_AMOUNT, RAMPART_DECAY_TIME, CREEP_LIFE_TIME, `upkeep.rampart_floor`. A line
+/// of 80 ramparts at the floor, two deep along the room's far edge, about 37 tiles from the
+/// controller,
+/// raises the room's worker count once the plan has read them (P7.3: what they lose a life sizes
+/// the workers, `worker_value`), and over two creep lives the workers keep every one of them at
+/// the floor at least: none decays away.
+#[test]
+fn a_far_rampart_line_raises_the_worker_count_and_is_kept() {
+    let mut w = settled_world();
+    let before = w.want();
+    let (_, floor) = rampart_target(&w);
+    let line: Vec<Tile> = (45..47u8)
+        .flat_map(|y| (5..45u8).map(move |x| tile(x, y)))
+        .collect();
+    for &at in &line {
+        add_rampart(&mut w, at, floor);
+    }
+    w.run(RAMPART_DECAY_TIME);
+    let after = w.want();
+    assert!(after > before, "workers {before} -> {after}");
+    w.run(2 * CREEP_LIFE_TIME);
+    assert_eq!(w.ramparts_lost, 0);
+    let low = line
+        .iter()
+        .map(|&at| rampart_hits(&w, at).expect("kept"))
+        .min()
+        .expect("a line");
+    assert!(low >= floor, "lowest {low} below the floor {floor}");
+}
+
+/// Adds a constructed wall at `at` with `hits`, not yet read by a snapshot, on a tile of the
+/// room's plan (ADR-033).
+fn add_wall(w: &mut World, at: Tile, hits: u32) {
+    let key = w.key();
+    w.walls.push(SimWall { key, at, hits });
+    w.plan_walls.push(at);
+}
+
+fn wall_hits(w: &World, at: Tile) -> Option<u32> {
+    w.walls.iter().find(|x| x.at == at).map(|x| x.hits)
+}
+
+/// Uses: WALL_HITS, `upkeep.rampart_floor`, `upkeep.rampart_refill`, `upkeep.rampart_permille`,
+/// rampart_hits_max, CREEP_LIFE_TIME. ADR-033: a new wall (`WALL_HITS`) is repaired as a new
+/// rampart is: before a site to build up to the refill, then, once no site is left, raised to the
+/// ramparts' target within a creep life, and never past it (no repair billed at full hits); it
+/// never decays (V309), so its hits never fall; the room's summary counts it.
+#[test]
+fn a_wall_is_held_as_a_rampart_is_and_never_decays() {
+    let mut w = settled_world();
+    let at = tile(LINE[0].0, LINE[0].1);
+    let (goal, floor) = rampart_target(&w);
+    let refill = UPKEEP_MMO.rampart_refill.min(goal);
+    assert!(goal > refill && refill > floor, "{goal} {refill} {floor}");
+    add_wall(&mut w, at, WALL_HITS);
+    let mut last = WALL_HITS;
+    let mut refilled = false;
+    for _ in 0..CREEP_LIFE_TIME / 2 {
+        if w.sites.is_empty() {
+            add_site(&mut w, tile(40, 40), StructureType::Road);
+        }
+        w.step();
+        let hits = wall_hits(&w, at).expect("a wall stays");
+        assert!(hits >= last, "a wall never decays: {last} -> {hits}");
+        last = hits;
+        if hits >= refill {
+            refilled = true;
+            break;
+        }
+    }
+    assert!(refilled, "refilled before the sites: {last}");
+    w.sites.clear();
+    let mut reached = false;
+    for _ in 0..CREEP_LIFE_TIME {
+        w.step();
+        let hits = wall_hits(&w, at).expect("a wall stays");
+        assert!(hits >= last, "a wall never decays: {last} -> {hits}");
+        last = hits;
+        if hits >= goal {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "raised to {goal}: {last}");
+    w.run(UPKEEP_MMO.read_ticks * 2);
+    assert!(wall_hits(&w, at).expect("kept") >= goal);
+    assert!(
+        wall_hits(&w, at).expect("kept") < goal + REPAIR_POWER * 50,
+        "not past the target"
+    );
+    assert_eq!(w.repair_noops, 0);
+    let (_, _, _, stats) = w.opening.room_states().next().expect("room");
+    assert_eq!((stats.walls, stats.low_walls), (1, 0));
+}
+
+/// Uses: WALL_HITS, CREEP_LIFE_TIME. ADR-033 (the user's choice): upkeep holds only the plan's
+/// walls. A wall on no tile of the plan (a previous owner's, one built by hand) is never a repair
+/// target, nor counted, while the plan's wall beside it is repaired.
+#[test]
+fn a_wall_off_the_plan_is_never_repaired() {
+    let mut w = settled_world();
+    let (off, planned) = (tile(LINE[0].0, LINE[0].1), tile(LINE[2].0, LINE[2].1));
+    let key = w.key();
+    w.walls.push(SimWall {
+        key,
+        at: off,
+        hits: WALL_HITS,
+    });
+    add_wall(&mut w, planned, WALL_HITS);
+    for _ in 0..CREEP_LIFE_TIME / 2 {
+        w.step();
+        assert!(
+            !upkeep_targets(&w).contains(&off),
+            "no worker at the wall off the plan"
+        );
+    }
+    assert!(!w.wall_repairs.contains(&off));
+    assert!(
+        w.wall_repairs.contains(&planned),
+        "the plan's wall is repaired"
+    );
+    let (_, _, _, stats) = w.opening.room_states().next().expect("room");
+    assert_eq!(stats.walls, 1, "only the plan's wall counts");
+}
+
+/// Uses: CREEP_LIFE_TIME. The walls that seal a novice or respawn area have no `hits`, which the
+/// crate reads as 0 (screeps-game-api 0.23.5 `Structure::hits`): such a wall is never a repair
+/// target, so it pins no worker, while a real wall beside it is repaired.
+#[test]
+fn a_wall_with_no_hits_is_never_repaired() {
+    let mut w = settled_world();
+    let (border, real) = (tile(LINE[0].0, LINE[0].1), tile(LINE[2].0, LINE[2].1));
+    add_wall(&mut w, border, 0);
+    add_wall(&mut w, real, WALL_HITS);
+    for _ in 0..CREEP_LIFE_TIME / 2 {
+        w.step();
+        assert!(
+            !upkeep_targets(&w).contains(&border),
+            "no worker at the border wall"
+        );
+    }
+    assert!(!w.wall_repairs.contains(&border));
+    assert!(w.wall_repairs.contains(&real), "the real wall is repaired");
+    let (_, _, _, stats) = w.opening.room_states().next().expect("room");
+    assert_eq!(stats.walls, 1, "only the real wall counts");
+}
+
+/// Uses: RAMPART_DECAY_AMOUNT, RAMPART_DECAY_TIME, `upkeep.rampart_floor`, CREEP_LIFE_TIME.
+/// ADR-033 (the user's choice): a rampart whose tile takes a wall is left to decay away. With an
+/// own wall site on its tile it is not repaired, nor once the wall the site becomes stands there;
+/// the wall is, and the rampart is gone once its hits run out, about
+/// `floor / RAMPART_DECAY_AMOUNT` decay steps later.
+#[test]
+fn a_rampart_a_wall_replaces_is_left_to_decay() {
+    let mut w = settled_world();
+    let at = tile(LINE[1].0, LINE[1].1);
+    let (_, floor) = rampart_target(&w);
+    add_rampart(&mut w, at, floor);
+    add_site(&mut w, at, StructureType::Wall);
+    w.plan_walls.push(at);
+    let steps = floor.div_ceil(RAMPART_DECAY_AMOUNT) + 1;
+    let mut built = None;
+    for k in 0..steps * RAMPART_DECAY_TIME {
+        w.step();
+        assert!(
+            !w.rampart_repairs.contains(&at),
+            "the rampart is not repaired at {k}"
+        );
+        if built.is_none() && wall_hits(&w, at).is_some() {
+            built = Some(k);
+        }
+    }
+    assert!(built.is_some(), "the wall site is built");
+    assert!(w.wall_repairs.contains(&at), "the wall is repaired");
+    assert_eq!(rampart_hits(&w, at), None, "the rampart decayed away");
+    assert_eq!(w.ramparts_lost, 1);
 }
 
 /// Uses: RAMPART_HITS, RAMPART_DECAY_TIME, ROAD_HITS. With upkeep off nothing is read or

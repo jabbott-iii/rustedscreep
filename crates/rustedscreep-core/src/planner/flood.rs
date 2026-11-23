@@ -25,7 +25,8 @@
 //!    ground nearest the hub, joined to the network by a road.
 //! 8. Ramparts. The minimum cut ([`defence::plan`]) for every protected structure, at
 //!    [`defence::levels`]: the line from the first level ramparts are allowed, the rest over a
-//!    structure from that structure's level.
+//!    structure from that structure's level. The line is constructed walls but for its gates
+//!    ([`defence::gates`], ADR-033): ramparts stay where own creeps must pass.
 //!
 //! Every obstacle the run places stands next to ground that never takes one (a road, a
 //! container or the hub) joined to the hub through more such ground. No placement of the fill or

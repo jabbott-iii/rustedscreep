@@ -491,6 +491,7 @@ impl OpeningGlue {
             return;
         }
         let Self {
+            core,
             placement,
             mining,
             place_job,
@@ -505,6 +506,25 @@ impl OpeningGlue {
                 rustedscreep_core::economy::placement::PlanView::Off,
                 |room| planner.view(room, pcfg),
             );
+            // ADR-033: upkeep holds only the plan's walls; a room whose plan is still being built
+            // keeps the tiles it had, one with no plan has none.
+            if let Some(room) = room {
+                use rustedscreep_core::economy::placement::PlanView;
+                match view {
+                    PlanView::Ready(plan) => core.set_plan_walls(
+                        room,
+                        plan.layout
+                            .items
+                            .iter()
+                            .filter(|i| i.kind == StructureType::Wall)
+                            .map(|i| i.tile),
+                    ),
+                    PlanView::Off | PlanView::Fallback => {
+                        core.set_plan_walls(room, std::iter::empty());
+                    }
+                    PlanView::Waiting => {}
+                }
+            }
             placement.plan_room(
                 unit, snapshot, movement, mcfg, extensions, containers, links, view, pcfg, commit,
             )
@@ -827,6 +847,18 @@ impl OpeningGlue {
                     stats.ramparts, stats.rampart_goal, stats.low_ramparts
                 );
                 if let Some(h) = stats.lowest_rampart {
+                    let _ = write!(text, ", lowest hits {h}");
+                }
+                text.push(')');
+            }
+            // ADR-033: the line's walls, held at the ramparts' target.
+            if stats.walls > 0 {
+                let _ = write!(
+                    text,
+                    ", walls {} (target {}, below it {}",
+                    stats.walls, stats.rampart_goal, stats.low_walls
+                );
+                if let Some(h) = stats.lowest_wall {
                     let _ = write!(text, ", lowest hits {h}");
                 }
                 text.push(')');

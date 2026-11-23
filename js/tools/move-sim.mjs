@@ -306,14 +306,14 @@ export function moveSim(dir = join(ROOT, 'dist')) {
   const unknown = state.finds.filter(([, t]) => !Object.values(FIND).includes(t));
   if (unknown.length) problems.push(`finds of other types: ${JSON.stringify(unknown.slice(0, 4))}`);
   // The opening's containers: FIND_STRUCTURES with a filter, once per loop; P7.3's upkeep read: the roads, once on
-  // each loop whose Game.time `upkeep.read_ticks` divides.
+  // each loop whose Game.time `upkeep.read_ticks` divides, and ADR-033's constructed walls on the same loops.
   const filteredFor = (kind) => state.filtered.filter(([, , k]) => k === kind).map(([o, t]) => (t === FIND.STRUCTURES ? o : `type ${t} at ${o}`));
   const upkeepLoops = loops.filter((o) => (T0 + o) % UPKEEP_READ_TICKS === 0);
-  for (const [kind, want] of [['container', loops], ['road', upkeepLoops]]) {
+  for (const [kind, want] of [['container', loops], ['road', upkeepLoops], ['constructedWall', upkeepLoops]]) {
     const got = filteredFor(kind);
     if (JSON.stringify(got) !== JSON.stringify(want)) problems.push(`${kind}-filtered finds ${JSON.stringify(got)}, expected find(${FIND.STRUCTURES}) at ${JSON.stringify(want)}`);
   }
-  const otherFilters = state.filtered.filter(([, , k]) => k !== 'container' && k !== 'road');
+  const otherFilters = state.filtered.filter(([, , k]) => k !== 'container' && k !== 'road' && k !== 'constructedWall');
   if (otherFilters.length) problems.push(`other filtered finds ${JSON.stringify(otherFilters.slice(0, 4))}`);
   if (!upkeepLoops.length) problems.push('no upkeep read in the run');
   // Inert: no watchdog line (a spawnCreep or work call would throw here, the creeps and the spawn have no such

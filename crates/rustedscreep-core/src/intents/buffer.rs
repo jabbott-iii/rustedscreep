@@ -173,8 +173,9 @@ pub enum CreepIntent {
     Repair {
         target: StructureHandle,
     },
-    /// `repair(container)` (P3.5): a container is a room object here, since it has no owner. It
-    /// shares the `repair` slot with [`CreepIntent::Repair`]: the last push of either is issued.
+    /// `repair(object)` for a structure with no owner, a room object here: a container (P3.5), a
+    /// road (P7.3) or a constructed wall (ADR-033). It shares the `repair` slot with
+    /// [`CreepIntent::Repair`]: the last push of either is issued.
     RepairObject {
         target: ObjectHandle,
     },
@@ -563,13 +564,15 @@ impl IntentBuffer {
             return Err(Rejected::ZeroAmount);
         }
         // The game side refuses first what it refuses (V221); the processor then skips a repair at
-        // full hits. Uses: CONTAINER_HITS, a container's `hitsMax` (V223); a road's `hitsMax` as
-        // read (P6.2).
+        // full hits. Uses: CONTAINER_HITS, a container's `hitsMax` (V223); a road's and a
+        // constructed wall's `hitsMax` as read (P6.2, ADR-033, V310).
         if let (CreepIntent::RepairObject { .. }, Some(TargetRow::Object(t))) = (intent, target) {
             let t = t as usize;
             let objects = &snap.objects;
             let full = match objects.kinds().get(t) {
-                Some(ObjectKind::Road) => objects.totals().get(t).copied().unwrap_or(0),
+                Some(ObjectKind::Road | ObjectKind::Wall) => {
+                    objects.totals().get(t).copied().unwrap_or(0)
+                }
                 _ => CONTAINER_HITS,
             };
             if objects.hits().get(t).copied().unwrap_or(0) >= full {
@@ -708,7 +711,10 @@ const fn accepts_object(intent: &CreepIntent, kind: ObjectKind) -> bool {
         ),
         CreepIntent::Transfer { .. } => matches!(kind, ObjectKind::Container),
         CreepIntent::RepairObject { .. } => {
-            matches!(kind, ObjectKind::Container | ObjectKind::Road)
+            matches!(
+                kind,
+                ObjectKind::Container | ObjectKind::Road | ObjectKind::Wall
+            )
         }
         CreepIntent::ReserveController { .. } | CreepIntent::SignController { .. } => {
             matches!(kind, ObjectKind::Controller)
@@ -1584,7 +1590,10 @@ mod tests {
                     // The fixture's container has 0 hits, below its `hitsMax`.
                     CreepIntent::Transfer { .. } => kind == ObjectKind::Container,
                     CreepIntent::RepairObject { .. } => {
-                        matches!(kind, ObjectKind::Container | ObjectKind::Road)
+                        matches!(
+                            kind,
+                            ObjectKind::Container | ObjectKind::Road | ObjectKind::Wall
+                        )
                     }
                     CreepIntent::ReserveController { .. } | CreepIntent::SignController { .. } => {
                         kind == ObjectKind::Controller

@@ -208,6 +208,8 @@ pub struct JsWorld {
     road_filter: Option<JsValue>,
     /// `{filter: {structureType: "tower"}}`, likewise (ADR-030).
     tower_filter: Option<JsValue>,
+    /// `{filter: {structureType: "constructedWall"}}`, likewise (ADR-033).
+    wall_filter: Option<JsValue>,
     /// The bot's username, read once per global from an own creep's `owner` (P6.2): a remote
     /// room's reservation is the bot's when it names it.
     username: Option<String>,
@@ -226,8 +228,8 @@ pub struct JsWorld {
     /// The owned rooms with an open threat at the end of last tick, sorted (P7.2): own creeps'
     /// `hits` and `hitsMax` are read there, for the towers' heals.
     threat_rooms: Vec<RoomName>,
-    /// What the opening asked last tick for its repairers (P7.3): the roads to read by id, and the
-    /// own ramparts whose `hits` to read, by handle slot.
+    /// What the opening asked last tick for its repairers (P7.3): the roads and constructed walls
+    /// (ADR-033) to read by id, and the own ramparts whose `hits` to read, by handle slot.
     upkeep_roads: Vec<ObjectKey>,
     upkeep_ramparts: Vec<StructureHandle>,
 }
@@ -282,6 +284,12 @@ impl JsWorld {
     fn tower_filter(&mut self) -> &JsValue {
         self.tower_filter
             .get_or_insert_with(|| type_filter("tower"))
+    }
+
+    /// The constructed wall filter, built on first use like the container filter (ADR-033).
+    fn wall_filter(&mut self) -> &JsValue {
+        self.wall_filter
+            .get_or_insert_with(|| type_filter("constructedWall"))
     }
 }
 
@@ -480,6 +488,7 @@ fn push_room(
         push_objects(snapshot, js, room.unchecked_ref::<Findable>());
         if upkeep_tick {
             push_roads(snapshot, js, room.unchecked_ref::<Findable>());
+            push_walls(snapshot, js, room.unchecked_ref::<Findable>());
             snapshot.rooms.set_upkeep_read(row);
         }
     } else if js
@@ -582,9 +591,18 @@ fn push_roads(snapshot: &mut Snapshot, js: &mut JsWorld, finder: &Findable) {
     }
 }
 
-/// One road (P6.2, P7.3): `hits`, `hitsMax`, `id` and the copy, and its type and position when
-/// first seen this pass (the handle is released between reads); an object that is not a road is
-/// skipped.
+/// An owned room's constructed walls through the engine's filter (ADR-033), as `push_roads` reads
+/// roads: per wall `get`, then `push_road`.
+fn push_walls(snapshot: &mut Snapshot, js: &mut JsWorld, finder: &Findable) {
+    let list = finder.find_filtered(find::STRUCTURES.find_code(), js.wall_filter());
+    for i in 0..list.length() {
+        push_road(snapshot, js, list.get(i).unchecked_into());
+    }
+}
+
+/// One road (P6.2, P7.3) or constructed wall (ADR-033): `hits`, `hitsMax`, `id` and the copy, and
+/// its type and position when first seen this pass (the handle is released between reads); an
+/// object of another type is skipped.
 fn push_road(snapshot: &mut Snapshot, js: &mut JsWorld, object: RoomObject) {
     let hits = object.unchecked_ref::<Structure>().hits();
     let total = object
@@ -598,11 +616,10 @@ fn push_road(snapshot: &mut Snapshot, js: &mut JsWorld, object: RoomObject) {
         total,
         hits,
     };
-    let check = |o: &RoomObject| {
-        if o.unchecked_ref::<Structure>().structure_type() != StructureType::Road {
-            return Err(SkipReason::UnknownStructureType);
-        }
-        Ok(ObjectKind::Road)
+    let check = |o: &RoomObject| match o.unchecked_ref::<Structure>().structure_type() {
+        StructureType::Road => Ok(ObjectKind::Road),
+        StructureType::Wall => Ok(ObjectKind::Wall),
+        _ => Err(SkipReason::UnknownStructureType),
     };
     push_object(snapshot, js, object, check, row);
 }
