@@ -35,17 +35,17 @@ use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
 #[wasm_bindgen]
 extern "C" {
-    /// A creep, for its `owner` as a plain value (V268).
-    type OwnerOf;
+    /// A creep, for its `owner` as a plain value (V268). Also the defense glue's (P7.1).
+    pub(crate) type OwnerOf;
 
     #[wasm_bindgen(method, getter = owner)]
-    fn owner_value(this: &OwnerOf) -> JsValue;
+    pub(crate) fn owner_value(this: &OwnerOf) -> JsValue;
 
     /// An owner (`{username}`), read as a plain value.
-    type NameOf;
+    pub(crate) type NameOf;
 
     #[wasm_bindgen(method, getter = username)]
-    fn username_value(this: &NameOf) -> JsValue;
+    pub(crate) fn username_value(this: &NameOf) -> JsValue;
 }
 
 use crate::opening::SiteRoom;

@@ -2,7 +2,9 @@
 //! field, all the same length, and row `i` of every column describes the same object. Columns are
 //! cleared at the start of each tick and keep their capacity, so a steady tick allocates nothing here.
 
-use rustedscreep_consts::{Position, ROOM_SIZE, RoomName, StructureType};
+use rustedscreep_consts::{
+    MAX_CREEP_SIZE, Part, Position, ROOM_SIZE, ResourceType, RoomName, StructureType,
+};
 
 use super::SkipReason;
 use super::intern::{Handle, Interner, ObjectKey};
@@ -74,6 +76,23 @@ impl Controller {
             (true, level) => Self::Mine { level },
             (false, 0) => Self::Neutral,
             (false, level) => Self::Foreign { level },
+        }
+    }
+
+    /// Whether a creep standing in this room may gain or lose a boost from a lab the bot does not
+    /// own (P7.1): a boost changes only within range 1 of an active lab (V240, V290), and a lab is
+    /// active only in a room whose controller its owner holds at a level with a lab allowance
+    /// (V291). So only another player's room at such a level; the bot's own labs never boost a
+    /// hostile creep (no code calls `boostCreep` on one).
+    ///
+    /// Uses: rustedscreep_consts::StructureType::controller_structures (`CONTROLLER_STRUCTURES`,
+    /// V234).
+    pub fn boosts_possible(self) -> bool {
+        match self {
+            Self::Foreign { level } => {
+                StructureType::Lab.controller_structures(u32::from(level)) > 0
+            }
+            Self::Absent | Self::Neutral | Self::Mine { .. } => false,
         }
     }
 }
@@ -335,6 +354,90 @@ pub struct Creeps {
     lives: Vec<Option<(CreepHandle, u32)>>,
     /// A hostile creep's active combat parts (P6.3, [`Self::set_combat`]), per row.
     combat: Vec<Combat>,
+    /// Each creep's `hits` (P7.1, [`Self::set_assessed`]), per row: read for hostile creeps in owned
+    /// rooms only, 0 for every other creep. Unit: hit points.
+    hits: Vec<u32>,
+    /// This tick's rows of hostile creeps in owned rooms (P7.1), in the order they were set.
+    assessed: Vec<u32>,
+    /// The bodies read so far, each with the handle it belongs to (P7.1, [`Self::set_body`]). Kept
+    /// between ticks, so a hostile's body is read once while it stays in the snapshot and out of
+    /// rooms where it may be boosted ([`Self::forget_body`]); the entry of a released handle is
+    /// dropped at the end of the pass. Few hostiles stand in owned rooms at
+    /// once, so a lookup is a short linear search.
+    bodies: Vec<(CreepHandle, BodyRead)>,
+}
+
+/// Parts in the longest body.
+const BODY_PARTS: usize = MAX_CREEP_SIZE as usize;
+
+/// One body part as the snapshot reads it (P7.1, V289): its type and its boost compound, `None` for
+/// an unboosted part. A string the crate does not know reads as the enum's hidden invalid variant,
+/// which matches no part type and no boost, so it adds no power anywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyPartRead {
+    pub part: Part,
+    pub boost: Option<ResourceType>,
+}
+
+/// A creep's body as the snapshot reads it once in its life (P7.1): its parts in `Creep.body`'s
+/// order, the first part first. Damage takes the first parts first (V283). At most
+/// `MAX_CREEP_SIZE` parts, kept inline so a read allocates nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyRead {
+    len: u8,
+    parts: [BodyPartRead; BODY_PARTS],
+}
+
+impl BodyRead {
+    /// A body with no parts.
+    pub const EMPTY: Self = Self {
+        len: 0,
+        parts: [BodyPartRead {
+            part: Part::Move,
+            boost: None,
+        }; BODY_PARTS],
+    };
+
+    /// The body of these parts, or `None` for more than `MAX_CREEP_SIZE`.
+    pub fn of(parts: &[BodyPartRead]) -> Option<Self> {
+        let mut body = Self::EMPTY;
+        for &part in parts {
+            if !body.push(part) {
+                return None;
+            }
+        }
+        Some(body)
+    }
+
+    /// Adds a part after the others; false, with nothing added, once the body holds
+    /// `MAX_CREEP_SIZE` parts.
+    pub fn push(&mut self, part: BodyPartRead) -> bool {
+        let Some(cell) = self.parts.get_mut(usize::from(self.len)) else {
+            return false;
+        };
+        *cell = part;
+        self.len = self.len.saturating_add(1);
+        true
+    }
+
+    /// The parts, the first part first.
+    pub fn parts(&self) -> &[BodyPartRead] {
+        self.parts.get(..usize::from(self.len)).unwrap_or(&[])
+    }
+
+    pub fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Default for BodyRead {
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// A hostile creep's active combat parts (`getActiveBodyparts`, V269), read in remote rooms only
@@ -364,10 +467,15 @@ impl Creeps {
         self.store.clear();
         self.death.clear();
         self.combat.clear();
+        self.hits.clear();
+        self.assessed.clear();
     }
 
     pub(super) fn finish(&mut self) -> u32 {
-        self.ids.end_pass()
+        let released = self.ids.end_pass();
+        let ids = &self.ids;
+        self.bodies.retain(|&(handle, _)| ids.key(handle).is_some());
+        released
     }
 
     /// Adds a creep with no identity and returns its handle. On an error nothing is added.
@@ -394,6 +502,7 @@ impl Creeps {
         self.identity.push(id);
         self.store.push(CreepStore::default());
         self.combat.push(Combat::default());
+        self.hits.push(0);
         let death = usize::try_from(handle.slot())
             .ok()
             .and_then(|slot| self.lives.get(slot).copied().flatten())
@@ -433,6 +542,73 @@ impl Creeps {
     /// Each creep's active combat parts: read for hostiles in remote rooms only (P6.3).
     pub fn combat(&self) -> &[Combat] {
         &self.combat
+    }
+
+    /// Records the `hits` of the hostile creep at `row`, which stands in an owned room (P7.1), and
+    /// lists the row in [`Self::assessed`]. Rows are set in the order they are pushed, so a row that
+    /// does not exist, or is not after the last one set this pass, is left alone.
+    pub fn set_assessed(&mut self, row: usize, hits: u32) {
+        let (Some(cell), Ok(index)) = (self.hits.get_mut(row), u32::try_from(row)) else {
+            return;
+        };
+        if self.assessed.last().is_some_and(|&last| last >= index) {
+            return;
+        }
+        *cell = hits;
+        self.assessed.push(index);
+    }
+
+    /// Each creep's `hits`: read for hostile creeps in owned rooms only (P7.1), 0 otherwise.
+    pub fn hits(&self) -> &[u32] {
+        &self.hits
+    }
+
+    /// This tick's rows of hostile creeps in owned rooms, whose hits and body are read (P7.1).
+    pub fn assessed(&self) -> &[u32] {
+        &self.assessed
+    }
+
+    /// The body read for the creep at `row` (P7.1), if one was read for its handle.
+    pub fn body(&self, row: usize) -> Option<&BodyRead> {
+        let &handle = self.handle.get(row)?;
+        self.bodies
+            .iter()
+            .find(|(h, _)| *h == handle)
+            .map(|(_, body)| body)
+    }
+
+    /// Whether a body is known for the creep at `row` (P7.1): the snapshot reads one only when not.
+    pub fn knows_body(&self, row: usize) -> bool {
+        self.body(row).is_some()
+    }
+
+    /// Keeps `body` for the creep at `row` while its handle lives (P7.1), in place of any body read
+    /// before; nothing for a row that does not exist.
+    pub fn set_body(&mut self, row: usize, body: BodyRead) {
+        let Some(&handle) = self.handle.get(row) else {
+            return;
+        };
+        match self.bodies.iter_mut().find(|(h, _)| *h == handle) {
+            Some(entry) => entry.1 = body,
+            None => self.bodies.push((handle, body)),
+        }
+    }
+
+    /// Drops the body known for the creep at `row` (P7.1): a hostile seen in a room where it may be
+    /// boosted ([`Controller::boosts_possible`]) has its body read again when it comes back into an
+    /// owned room.
+    pub fn forget_body(&mut self, row: usize) {
+        let Some(&handle) = self.handle.get(row) else {
+            return;
+        };
+        if let Some(index) = self.bodies.iter().position(|(h, _)| *h == handle) {
+            self.bodies.swap_remove(index);
+        }
+    }
+
+    /// Bodies kept (P7.1).
+    pub fn bodies_known(&self) -> usize {
+        self.bodies.len()
     }
 
     /// Sets the store of the creep at `row` (P2.4); nothing for a row that does not exist.

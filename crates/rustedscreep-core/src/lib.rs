@@ -18,6 +18,7 @@
 
 pub mod config;
 pub mod consts_check;
+pub mod defense;
 pub mod economy;
 pub mod intents;
 pub mod movement;

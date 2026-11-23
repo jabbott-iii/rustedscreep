@@ -10,7 +10,8 @@
 //! What it holds so far: identity, location and structure type; fatigue (P2.1); room energy, own
 //! spawns and own creeps' name identities (P2.3); own creeps' energy, the room for energy in spawns
 //! and extensions, owned controllers' progress and timers, and the room objects the opening works
-//! with (P2.4). Later modules add the columns they consume, so
+//! with (P2.4); hostile creeps' hits in owned rooms, and their bodies read once per creep (P7.1,
+//! [`Creeps::set_body`]). Later modules add the columns they consume, so
 //! no tick reads data that nothing uses. Row order is the engine's object order, which
 //! is deterministic for the same input but not guaranteed stable across ticks (VERIFICATION_LOG
 //! V102), so a decision that needs a stable order sorts by id (`key_of`), which also survives a
@@ -24,10 +25,11 @@ mod tick;
 pub use intern::{Handle, Interner, ObjectKey};
 pub use room_name::parse_room_name;
 pub use tables::{
-    Combat, Controller, ControllerState, CreepClass, CreepHandle, CreepRow, CreepStore, Creeps,
-    Links, ObjectClass, ObjectHandle, ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation,
-    RoomEnergy, RoomObjects, Rooms, SIGN_TOWERS, SignRead, SignSeen, Spawns, StructureClass,
-    StructureHandle, StructureStatic, Structures, known_structure_type, position_from_packed,
+    BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepClass, CreepHandle, CreepRow,
+    CreepStore, Creeps, Links, ObjectClass, ObjectHandle, ObjectKind, ObjectRow, ObjectStatic,
+    RemoteRead, Reservation, RoomEnergy, RoomObjects, Rooms, SIGN_TOWERS, SignRead, SignSeen,
+    Spawns, StructureClass, StructureHandle, StructureStatic, Structures, known_structure_type,
+    position_from_packed,
 };
 pub use tick::TickContext;
 

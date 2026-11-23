@@ -174,7 +174,7 @@ Modules:
   bot's response, come from the first live run in which a home mines a remote room, with P8's gate as the backstop. Scripted invaders are a private-track scenario (PS3).
 
 ## P7 Defense (SPEC §3.6)
-- [ ] Threat assessment from hostile bodies and boosts (mineral compounds that labs apply to body parts to strengthen them).
+- [x] Threat assessment from hostile bodies and boosts (mineral compounds that labs apply to body parts to strengthen them).
 - [ ] Tower focus fire and heal priority, driven by the combat sim.
 - [ ] Rampart upkeep.
 - [ ] Safe-mode triggers (when to activate safe mode, which for a limited time stops every creep but the owner's in the room from using any method that affects the owner's creeps or objects; exactly what it blocks is VERIFICATION_LOG R25, still unverified).

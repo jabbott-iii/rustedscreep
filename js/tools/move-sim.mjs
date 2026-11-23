@@ -167,7 +167,11 @@ function sceneFor(state, offset) {
     say() { return 0; },
   }));
   const h = state.hostile;
-  const hostile = { id: h.id, name: h.name, my: false, spawning: false, owner: { username: 'Invader' }, pos: pos(h.x, h.y) };
+  // The engine's `body` and `hits` (V289; one MOVE part): the snapshot reads them for a hostile in an owned room (P7.1).
+  const hostile = {
+    id: h.id, name: h.name, my: false, spawning: false, owner: { username: 'Invader' }, pos: pos(h.x, h.y),
+    body: [{ type: 'move', hits: 100 }], hits: 100, hitsMax: 100,
+  };
   const room = {
     name: ROOM,
     controller,

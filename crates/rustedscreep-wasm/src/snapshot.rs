@@ -28,7 +28,11 @@
 //!   its position and type);
 //!   hostile creep: 5 (`get`, `id`, the id copy, `pos`, `__packedPos`; hostile results never
 //!   include spawning creeps, V101), and in a remote room named by an own creep other than a scout
-//!   2 more, `getActiveBodyparts` for ATTACK and for RANGED_ATTACK (P6.3, V269);
+//!   2 more, `getActiveBodyparts` for ATTACK and for RANGED_ATTACK (P6.3, V269); in an owned room 1
+//!   more, `hits` (P7.1), and while no body is known for its handle `body`, the array's `length`,
+//!   and per part the element, `type` and `boost` (3N + 2 for N parts, V289): once while the creep
+//!   stays in the snapshot, since a body is forgotten only when the creep is seen in another
+//!   player's room at a level with labs, where it may be boosted (`read_body`, V290, V291);
 //! - remote room (P6.2, ADR-029: a visible room the bot does not own that an own creep's name gives
 //!   as its remote room; `push_remote`): an owned room's 6 `find` calls and room objects, then the
 //!   controller as an object (`id`, the copy, its position and type when first seen, `reservation`,
@@ -68,10 +72,10 @@ use js_sys::{Array, Object, Reflect};
 use rustedscreep_core::config::{CacheConfig, RemoteConfig};
 use rustedscreep_core::signing::SIGN_TEXT;
 use rustedscreep_core::snapshot::{
-    Combat, Controller, ControllerState, CreepRow, CreepStore, ObjectKey, ObjectKind, ObjectRow,
-    ObjectStatic, RemoteRead, Reservation, RoomEnergy, SignRead, SignSeen, SkipCounts, SkipLog,
-    SkipReason, SkipReport, Snapshot, StructureStatic, TickContext, known_structure_type,
-    parse_room_name, position_from_packed,
+    BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepRow, CreepStore, ObjectKey,
+    ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation, RoomEnergy, SignRead, SignSeen,
+    SkipCounts, SkipLog, SkipReason, SkipReport, Snapshot, StructureStatic, TickContext,
+    known_structure_type, parse_room_name, position_from_packed,
 };
 use rustedscreep_core::spawning::{CreepName, Identity, Role};
 use screeps::{
@@ -343,7 +347,9 @@ fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room, road_tick: b
         .find_array(find::HOSTILE_CREEPS.find_code());
     // P6.3: in a remote room the bot mines, each hostile's active ATTACK and RANGED_ATTACK parts
     // (2 calls, after the push succeeded), so a harmless creep (a scout, a hauler) is no threat.
-    let mined = !matches!(controller, Controller::Mine { .. })
+    let owned = matches!(controller, Controller::Mine { .. });
+    let boosts = controller.boosts_possible();
+    let mined = !owned
         && js
             .crew_rooms
             .binary_search_by_key(&name.packed_repr(), |n| n.packed_repr())
@@ -351,10 +357,28 @@ fn push_room(snapshot: &mut Snapshot, js: &mut JsWorld, room: Room, road_tick: b
     for index in 0..hostiles.length() {
         let before = snapshot.creeps.len();
         push_creep(snapshot, js, hostiles.get(index).unchecked_into(), false);
-        if mined
-            && snapshot.creeps.len() > before
-            && let Some(creep) = js.creeps.last()
-        {
+        if snapshot.creeps.len() <= before {
+            continue;
+        }
+        let Some(creep) = js.creeps.last() else {
+            continue;
+        };
+        if owned {
+            // P7.1: its hits every tick, and its body while none is known for its handle. An
+            // empty read, which the engine never gives, is not kept, so the next tick reads again
+            // and the creep counts as unread meanwhile.
+            snapshot.creeps.set_assessed(before, creep.hits());
+            if !snapshot.creeps.knows_body(before) {
+                let body = read_body(creep);
+                if !body.is_empty() {
+                    snapshot.creeps.set_body(before, body);
+                }
+            }
+        } else if boosts {
+            // A hostile in another player's room with labs may be boosted there (P7.1).
+            snapshot.creeps.forget_body(before);
+        }
+        if mined {
             let combat = Combat {
                 attack: u32::from(creep.get_active_bodyparts(Part::Attack)),
                 ranged_attack: u32::from(creep.get_active_bodyparts(Part::RangedAttack)),
@@ -705,6 +729,24 @@ fn push_object(
         Ok(_) => js.objects.push(object),
         Err(reason) => snapshot.skipped.record(reason),
     }
+}
+
+/// A hostile creep's body (P7.1, V289): each part's `type` and `boost`, the first part first. A
+/// string the crate does not know reads as the enum's hidden invalid variant, which core counts as
+/// no part type and no boost; it never goes back to JS. Parts past `MAX_CREEP_SIZE`, which the
+/// engine never makes, are left out.
+fn read_body(creep: &Creep) -> BodyRead {
+    let mut body = BodyRead::EMPTY;
+    for part in creep.body() {
+        let read = BodyPartRead {
+            part: part.part(),
+            boost: part.boost(),
+        };
+        if !body.push(read) {
+            break;
+        }
+    }
+    body
 }
 
 fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool) {

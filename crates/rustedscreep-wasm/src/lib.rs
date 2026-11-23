@@ -20,6 +20,7 @@ mod act;
 mod act_test;
 mod config;
 mod consts_check;
+mod defense;
 mod logging;
 mod movement;
 mod opening;
@@ -62,6 +63,8 @@ struct State {
     remote: remote::RemoteGlue,
     /// The controller signer (ADR-030): its record, its trips and the next signer's plan.
     sign: sign::SignGlue,
+    /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1).
+    defense: defense::DefenseGlue,
     persist: persist::Persist,
     /// The constants self-check, once per global (P1.11).
     consts: consts_check::ConstsCheck,
@@ -116,6 +119,7 @@ pub fn game_loop() {
                     planner,
                     remote,
                     sign,
+                    defense,
                     persist,
                     consts,
                     profiler: prof,
@@ -134,6 +138,9 @@ pub fn game_loop() {
                 opening.begin(snapshot, &mut movement.core);
                 remote.begin(snapshot);
                 sign.begin(snapshot, &cfg.sign);
+                // Critical: the threat assessment of the hostiles in owned rooms (P7.1), every tick
+                // one stands there or a threat is open; bounded, so outside the scheduler's jobs.
+                defense.begin(snapshot, &cfg.defense);
                 // The signer's record (ADR-030) once a home sends signers and the overrides have
                 // loaded (so one that turns it off holds from the start); with no segment for the
                 // record, the tour starts at once.
@@ -269,6 +276,7 @@ pub fn game_loop() {
                 opening.log_events();
                 remote.log_events(snapshot, js);
                 sign.log_events(&cfg.sign);
+                defense.log_events(snapshot, js);
                 probe.decide();
                 // After the decide step: the scheduler reads the CPU clock no more (scheduler docs); the
                 // profiler's readings from here on measure the act step outside the budget. The

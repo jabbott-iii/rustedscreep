@@ -5,7 +5,9 @@
 // nothing, so the P2.4 opening finds no source in W1N1 and wants no worker), and room.getTerrain() with an
 // open plain room (the movement glue reads it; V156). Positions carry the engine's __packedPos (V103).
 // Creeps and spawns carry an engine-shaped Store (makeStore, V196): a creep one CARRY part's capacity, a spawn
-// its energy; find applies a second argument's `filter` like the engine (findFiltered, V199). Plain objects
+// its energy; find applies a second argument's `filter` like the engine (findFiltered, V199). Each creep has
+// the engine's `body` (one MOVE part of 100 hits, no `boost` key) and `hits` (V289): the snapshot reads a
+// hostile creep's in an owned room (P7.1). Plain objects
 // suffice: the wasm reads properties and never checks instanceof. Each creep has the action methods the act
 // layer calls (crates/rustedscreep-wasm/src/act.rs), and each room `createConstructionSite` (the ADR-020
 // extension placement, V200), which record the call and return a scripted value instead of acting: a site
@@ -131,6 +133,7 @@ function creep(id, name, roomName, x, y, { my = true, spawning = false } = {}, a
   const c = {
     id, name, my, spawning, owner: { username: my ? 'bot' : 'Invader' }, pos: pos(roomName, x, y),
     store: makeStore({}, { capacity: CARRY_CAPACITY }),
+    body: [{ type: 'move', hits: 100 }], hits: 100, hitsMax: 100,
   };
   for (const method of CREEP_METHODS) {
     c[method] = function recorded(...args) {

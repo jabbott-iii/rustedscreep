@@ -830,6 +830,24 @@ pub const SIGN_MMO: SignConfig = SignConfig {
     save_ticks: 100,
 };
 
+/// Defense (ROADMAP P7, `defense::Threats`). `docs/TUNING.md` gives each one's rationale and safe
+/// range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefenseConfig {
+    /// A room's threat ends once no dangerous hostile has been seen there for this long, so a
+    /// hostile that steps out over the edge and back stays one threat. Unit: ticks.
+    pub threat_end_ticks: u32,
+    /// The least time between two log lines that a room's threat changed (its count of dangerous or
+    /// boosted hostiles). Unit: ticks.
+    pub threat_log_ticks: u32,
+}
+
+/// Defense values for the official MMO.
+pub const DEFENSE_MMO: DefenseConfig = DefenseConfig {
+    threat_end_ticks: 20,
+    threat_log_ticks: 50,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -851,6 +869,7 @@ pub struct Config {
     pub planner: PlannerConfig,
     pub remote: RemoteConfig,
     pub sign: SignConfig,
+    pub defense: DefenseConfig,
 }
 
 /// A server profile: a name and its values.
@@ -881,6 +900,7 @@ pub const MMO: Profile = Profile {
         planner: PLANNER_MMO,
         remote: REMOTE_MMO,
         sign: SIGN_MMO,
+        defense: DEFENSE_MMO,
     },
 };
 
@@ -1041,7 +1061,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 126;
+pub const FIELD_COUNT: usize = 128;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1414,6 +1434,15 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(sign, "SignConfig", route_max_ops, 1000, 100_000, true),
     number!(sign, "SignConfig", route_max_rooms, 1, 64, true),
     number!(sign, "SignConfig", save_ticks, 1, 10_000, true),
+    number!(
+        defense,
+        "DefenseConfig",
+        threat_end_ticks,
+        1,
+        CREEP_LIFE_TIME,
+        true
+    ),
+    number!(defense, "DefenseConfig", threat_log_ticks, 1, 10_000, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -1657,6 +1686,7 @@ mod tests {
             planner: _,
             remote: _,
             sign: _,
+            defense: _,
         } = MMO.config;
         let SpawnConfig {
             hold_ticks: _,
@@ -1749,7 +1779,11 @@ mod tests {
             route_max_rooms: _,
             save_ticks: _,
         } = SIGN_MMO;
-        let expected: [(&str, &[&str]); 17] = [
+        let DefenseConfig {
+            threat_end_ticks: _,
+            threat_log_ticks: _,
+        } = DEFENSE_MMO;
+        let expected: [(&str, &[&str]); 18] = [
             (
                 "loader",
                 &[
@@ -1939,6 +1973,7 @@ mod tests {
                     "save_ticks",
                 ],
             ),
+            ("defense", &["threat_end_ticks", "threat_log_ticks"]),
         ];
         let mut total = 0;
         for (group, names) in expected {
