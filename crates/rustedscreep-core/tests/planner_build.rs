@@ -338,14 +338,18 @@ fn the_live_room_keeps_its_extensions_until_a_due_structure_needs_one() {
     let level = 4;
     let extensions = allowed(StructureType::Extension, level);
 
-    // The MMO's gates: the storage and the towers wait, so nothing is destroyed; the extensions
-    // the plan has are kept, the planned slots beyond the level's count wait, the roads go out.
+    // P4's gates (the MMO's before P7.2 turned the towers on): the storage and the towers wait,
+    // so nothing is destroyed; the extensions the plan has are kept, the planned slots beyond
+    // the level's count wait, the roads go out.
     let base = Ask {
         layout: &layout,
         terrain: &terrain,
         anchor: spawn,
         level,
-        gates: Gates::from_config(&PLANNER_MMO),
+        gates: Gates {
+            towers: false,
+            ..Gates::from_config(&PLANNER_MMO)
+        },
         replace: PLANNER_MMO.replace,
         max_sites: PLANNER_MMO.max_sites,
         holding: false,
@@ -367,6 +371,43 @@ fn the_live_room_keeps_its_extensions_until_a_due_structure_needs_one() {
     for &t in &live {
         assert!(standing.contains(&(StructureType::Extension, t)));
     }
+
+    // The MMO's gates since P7.2 (the towers on): the level's first tower stands on an ADR-020
+    // extension, which goes first, one destroy in all, then the tower's site there; a planned
+    // extension takes the freed count.
+    let gates = Gates::from_config(&PLANNER_MMO);
+    assert!(gates.towers && !gates.storage);
+    let tower = layout
+        .of(StructureType::Tower)
+        .find(|i| i.level <= level)
+        .map(|i| i.tile)
+        .expect("a tower at RCL4");
+    assert!(
+        live.contains(&tower),
+        "the first tower stands on an ADR-020 extension"
+    );
+    let mut standing = start.clone();
+    let (actions, census) = play(&layout, &Ask { gates, ..base }, &mut standing);
+    assert_eq!(
+        actions.first(),
+        Some(&Next::Destroy {
+            kind: StructureType::Extension,
+            tile: tower
+        })
+    );
+    let destroys = actions
+        .iter()
+        .filter(|a| matches!(a, Next::Destroy { .. }))
+        .count();
+    assert_eq!(destroys, 1, "{actions:?}");
+    assert!(standing.contains(&(StructureType::Tower, tower)));
+    let built = |k: StructureType| standing.iter().filter(|(x, _)| *x == k).count() as u32;
+    assert_eq!(built(StructureType::Extension), extensions);
+    assert_eq!(
+        built(StructureType::Tower),
+        allowed(StructureType::Tower, level)
+    );
+    assert_eq!(census.cut_off, 0);
 
     // With the storage's gate on, the extension on its tile goes first, then a planned extension
     // takes the freed count before the storage's own site; one destroy at a time.
@@ -832,8 +873,9 @@ fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
     assert!(combos.contains(&mmo) && combos.contains(&ALL));
     let first_road = earliest_level(StructureType::Road, 0).expect("roads are allowed");
     let mut s = Scratch::default();
-    // Per candidate: plans, roads, roads due at the top under the MMO's gates, roads no Base
-    // structure needs, and of those the ones only Late structures need.
+    // Per candidate: plans, roads, roads due at the top under the MMO's gates, roads no structure
+    // of a gate the MMO has on needs (Base, and the towers since P7.2), and of those the ones only
+    // Late structures need.
     let mut tally = [("flood", [0usize; 5]), ("bunker", [0usize; 5])];
     harness::each(|room, mode, input| {
         let candidates = [
@@ -913,8 +955,18 @@ fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
                 if mmo.due_level(&layout, item).is_some_and(|l| l <= MAX_LEVEL) {
                     *due_top += 1;
                 }
-                let base = from[Gate::Base.index()];
-                if base == u8::MAX {
+                let on = |g: Gate| match g {
+                    Gate::Base => true,
+                    Gate::Storage => mmo.storage,
+                    Gate::Towers => mmo.towers,
+                    Gate::Ramparts => mmo.ramparts,
+                    Gate::Late => mmo.late,
+                };
+                let unneeded = Gate::ALL
+                    .iter()
+                    .filter(|&&g| on(g))
+                    .all(|&g| from[g.index()] == u8::MAX);
+                if unneeded {
                     *off_only += 1;
                     let others = Gate::ALL
                         .iter()
@@ -930,20 +982,19 @@ fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
     for (name, [plans, roads, due_top, off_only, late_only]) in tally {
         println!(
             "roads, {name}: {plans} plans, {roads} roads, {due_top} due at RCL{MAX_LEVEL} under \
-             the MMO's gates, {off_only} needed by no Base structure ({late_only} by Late ones \
-             only)"
+             the MMO's gates, {off_only} needed by no structure the MMO's gates place ({late_only} \
+             by Late ones only)"
         );
         assert!(plans > 0 && roads > 0, "{name}");
         assert_eq!(due_top + off_only, roads, "{name}");
     }
 }
 
-/// The types the MMO's gates never place (`PLANNER_MMO`: the storage, the towers, the ramparts
-/// and walls and the late structures off; the containers and links are the economy's or a gated
-/// one's, the mineral container and the hub link).
-const NOT_UNDER_MMO: [StructureType; 13] = [
+/// The types the MMO's gates never place (`PLANNER_MMO`: the storage, the ramparts and walls and
+/// the late structures off; the towers are on since P7.2; the containers and links are the
+/// economy's or a gated one's, the mineral container and the hub link).
+const NOT_UNDER_MMO: [StructureType; 12] = [
     StructureType::Storage,
-    StructureType::Tower,
     StructureType::Rampart,
     StructureType::Wall,
     StructureType::Terminal,
@@ -959,16 +1010,16 @@ const NOT_UNDER_MMO: [StructureType; 13] = [
 
 /// Under the MMO's gates every plan builds up level by level from its first spawn, with the
 /// economy's containers and links standing as `economy::mining` places them, and `build::next`
-/// offers only spawns, extensions and the roads due for them (C14): no destroy, no site of a gated
-/// type or of the economy's, every item it places built at each level, and at the top the room
-/// holds exactly those, the economy's and the first spawn.
+/// offers only spawns, extensions, towers (on since P7.2) and the roads due for them (C14): no
+/// destroy, no site of a gated type or of the economy's, every item it places built at each level,
+/// and at the top the room holds exactly those, the economy's and the first spawn.
 ///
 /// Uses: `PLANNER_MMO` (the gates, `replace`, `max_sites`), `CONTROLLER_STRUCTURES` (through
 /// `allowed`: each level's count), `MAX_LEVEL`.
 #[test]
-fn the_mmo_gates_place_only_spawns_extensions_and_their_roads() {
+fn the_mmo_gates_place_only_spawns_extensions_towers_and_their_roads() {
     let gates = Gates::from_config(&PLANNER_MMO);
-    assert!(!gates.storage && !gates.towers && !gates.ramparts && !gates.late);
+    assert!(!gates.storage && gates.towers && !gates.ramparts && !gates.late);
     let mut s = Scratch::default();
     let (mut rooms, mut sites) = (0u32, 0usize);
     harness::each(|room, mode, input| {
@@ -1016,7 +1067,10 @@ fn the_mmo_gates_place_only_spawns_extensions_and_their_roads() {
                     Next::Site { kind, tile } => {
                         sites += 1;
                         assert!(!NOT_UNDER_MMO.contains(&kind), "{what}: {kind:?} {tile:?}");
-                        assert_eq!(Gate::of(kind, tile, roles), Gate::Base, "{what}");
+                        assert!(
+                            matches!(Gate::of(kind, tile, roles), Gate::Base | Gate::Towers),
+                            "{what}"
+                        );
                         assert!(
                             layout.items.iter().any(|i| i.kind == kind
                                 && i.tile == tile
@@ -1037,7 +1091,11 @@ fn the_mmo_gates_place_only_spawns_extensions_and_their_roads() {
                 (0, 0, 0),
                 "{what}"
             );
-            for kind in [StructureType::Spawn, StructureType::Extension] {
+            for kind in [
+                StructureType::Spawn,
+                StructureType::Extension,
+                StructureType::Tower,
+            ] {
                 let n = standing.iter().filter(|(k, _)| *k == kind).count() as u32;
                 assert!(n <= allowed(kind, level), "{what}: {kind:?} {n}");
             }

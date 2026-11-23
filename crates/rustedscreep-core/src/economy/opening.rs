@@ -523,6 +523,7 @@ impl Opening {
         cfg: &OpeningConfig,
         rcfg: &RepairConfig,
         mcfg: &MovementConfig,
+        tower_refill_min: u32,
         mined: &[Mined],
         mine_tiles: &[Position],
         receivers: &[Receiver],
@@ -539,7 +540,15 @@ impl Opening {
             (r.name, r.row, r.members)
         };
         let row = row.ok_or(Fault::new("room not in this tick", unit))?;
-        self.gather_facts(snap, name, mined, mine_tiles, receivers, haul);
+        self.gather_facts(
+            snap,
+            name,
+            mined,
+            mine_tiles,
+            receivers,
+            haul,
+            tower_refill_min,
+        );
         // The capacity the room's workers are sized at: its own; for an owned room without a spawn
         // (one that lost it), at most that of the nearest spawn room that would serve it (P5.1), so
         // its worker fits there and its plan stays put while the nearest room does.
@@ -845,6 +854,7 @@ impl Opening {
     /// Reads what room `name` holds this tick, its mined sources (a hauled one's energy at the
     /// controller container), the containers on its mining tiles and its controller links, into
     /// `self.facts`; energy the haulers take this tick is left out.
+    #[allow(clippy::too_many_arguments)]
     fn gather_facts(
         &mut self,
         snap: &Snapshot,
@@ -853,6 +863,7 @@ impl Opening {
         mine_tiles: &[Position],
         receivers: &[Receiver],
         haul: &HaulView<'_>,
+        tower_refill_min: u32,
     ) {
         let f = &mut self.facts;
         f.controller = None;
@@ -910,6 +921,16 @@ impl Opening {
                 }
                 _ => {}
             }
+        }
+        // P7.2: the towers, once every spawn and extension is full, each with at least
+        // `hauling.tower_refill_min` room, less what the haulers fill this tick.
+        if f.fills.is_empty() {
+            super::hauling::push_towers(&mut f.fills, snap, name, tower_refill_min);
+            f.fills.retain_mut(|t| {
+                let claim = haul.filled.iter().find(|x| x.0 == t.0);
+                t.2 = t.2.saturating_sub(claim.map_or(0, |x| x.1));
+                !claim.is_some_and(|x| x.2) && t.2 >= tower_refill_min
+            });
         }
         let ob = &snap.objects;
         for (((((&h, &kind), &pos), &amount), &total), &hits) in ob

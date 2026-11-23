@@ -63,7 +63,8 @@ struct State {
     remote: remote::RemoteGlue,
     /// The controller signer (ADR-030): its record, its trips and the next signer's plan.
     sign: sign::SignGlue,
-    /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1).
+    /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1) and the towers
+    /// (P7.2).
     defense: defense::DefenseGlue,
     persist: persist::Persist,
     /// The constants self-check, once per global (P1.11).
@@ -140,7 +141,7 @@ pub fn game_loop() {
                 sign.begin(snapshot, &cfg.sign);
                 // Critical: the threat assessment of the hostiles in owned rooms (P7.1), every tick
                 // one stands there or a threat is open; bounded, so outside the scheduler's jobs.
-                defense.begin(snapshot, &cfg.defense);
+                defense.begin(snapshot, js, &cfg.defense);
                 // The signer's record (ADR-030) once a home sends signers and the overrides have
                 // loaded (so one that turns it off holds from the start); with no segment for the
                 // record, the tour starts at once.
@@ -159,6 +160,9 @@ pub fn game_loop() {
                 let mut tick = sched.begin(&snapshot.tick, &cfg.scheduler, scheduler::GameClock);
                 // Critical: the rooms movement needs before anything in them can move, first.
                 movement.read_first(&mut tick, snapshot, js, &cfg.movement);
+                // Critical: the towers' plan (P7.2), only in a room with a tower and a hostile or a
+                // damaged own creep.
+                defense.plan_towers(&mut tick, snapshot, &cfg.defense);
                 // Critical: remote mining's rooms and spawn requests (P6.2; the requests only while the
                 // Standard tier runs), before the spawn job, and its energy for the upgraders' budget,
                 // before the upgrading job.
@@ -276,7 +280,7 @@ pub fn game_loop() {
                 opening.log_events();
                 remote.log_events(snapshot, js);
                 sign.log_events(&cfg.sign);
-                defense.log_events(snapshot, js);
+                defense.log_events(snapshot, js, &cfg.defense);
                 probe.decide();
                 // After the decide step: the scheduler reads the CPU clock no more (scheduler docs); the
                 // profiler's readings from here on measure the act step outside the budget. The
@@ -289,6 +293,15 @@ pub fn game_loop() {
                     sched,
                     &cfg.scheduler,
                     &cfg.spawn,
+                );
+                // Then the towers' attacks and heals (P7.2): defense before the rest.
+                defense.issue_towers(
+                    snapshot,
+                    js,
+                    act.log_mut(),
+                    sched,
+                    &cfg.scheduler,
+                    &cfg.defense,
                 );
                 // Then the plan's destroys (ADR-026), the sites the placement picked (ADR-020,
                 // ADR-023, ADR-024, P4.3), the link sends (P3.2), then the creep intents.

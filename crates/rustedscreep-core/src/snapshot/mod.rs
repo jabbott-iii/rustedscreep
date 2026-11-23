@@ -28,8 +28,8 @@ pub use tables::{
     BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepClass, CreepHandle, CreepRow,
     CreepStore, Creeps, Links, ObjectClass, ObjectHandle, ObjectKind, ObjectRow, ObjectStatic,
     RemoteRead, Reservation, RoomEnergy, RoomObjects, Rooms, SIGN_TOWERS, SignRead, SignSeen,
-    Spawns, StructureClass, StructureHandle, StructureStatic, Structures, known_structure_type,
-    position_from_packed,
+    Spawns, StructureClass, StructureHandle, StructureStatic, Structures, Towers,
+    known_structure_type, position_from_packed,
 };
 pub use tick::TickContext;
 
@@ -183,6 +183,8 @@ pub struct Snapshot {
     pub spawns: Spawns,
     /// The bot's links (P3.2), a view over `structures`.
     pub links: Links,
+    /// The bot's towers (P7.2), a view over `structures`.
+    pub towers: Towers,
     /// Sources, own sites, piles, tombstones, ruins and containers in owned rooms (P2.4).
     pub objects: RoomObjects,
     pub skipped: SkipCounts,
@@ -197,6 +199,7 @@ impl Snapshot {
         self.structures.begin();
         self.spawns.begin();
         self.links.begin();
+        self.towers.begin();
         self.objects.begin();
         self.skipped = SkipCounts::default();
     }

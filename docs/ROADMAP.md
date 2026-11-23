@@ -175,7 +175,7 @@ Modules:
 
 ## P7 Defense (SPEC §3.6)
 - [x] Threat assessment from hostile bodies and boosts (mineral compounds that labs apply to body parts to strengthen them).
-- [ ] Tower focus fire and heal priority, driven by the combat sim.
+- [x] Tower focus fire and heal priority, driven by the combat sim.
 - [ ] Rampart upkeep.
 - [ ] Safe-mode triggers (when to activate safe mode, which for a limited time stops every creep but the owner's in the room from using any method that affects the owner's creeps or objects; exactly what it blocks is VERIFICATION_LOG R25, still unverified).
 - [ ] Scaled defenders.

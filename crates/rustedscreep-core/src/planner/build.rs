@@ -1414,15 +1414,16 @@ mod tests {
         }
     }
 
-    /// C14: under the MMO profile's gates no storage, tower, rampart, wall or late structure
-    /// (terminal, extractor and mineral container, lab, factory, power spawn, nuker, observer) is
-    /// due at any level, so none is counted or offered; with every gate on, each is due at the
-    /// top level.
+    /// C14: under the MMO profile's gates no storage, rampart, wall or late structure (terminal,
+    /// extractor and mineral container, lab, factory, power spawn, nuker, observer) is due at any
+    /// level, so none is counted or offered; the tower is due, and offered, from the first level
+    /// that allows it (P7.2 turned the towers' gate on, ADR-026); with every gate on, each is due
+    /// at the top level.
     ///
     /// Uses: `PLANNER_MMO` (its gates), `CONTROLLER_STRUCTURES` (through `earliest_level`: each
     /// at the first level that allows it), `MAX_LEVEL`.
     #[test]
-    fn the_mmo_gates_leave_out_storage_towers_ramparts_and_late_structures() {
+    fn the_mmo_gates_leave_out_storage_ramparts_and_late_structures() {
         let t = open();
         let kinds = [
             StructureType::Storage,
@@ -1463,8 +1464,22 @@ mod tests {
             let mut a = ask(&l, &t, level);
             a.gates = Gates::from_config(&PLANNER_MMO);
             let (n, c) = next(&a, &g, &mut s);
-            assert_eq!(c.due, 0, "level {level}: {c:?}");
-            assert_eq!(n, Next::Idle, "level {level}");
+            let tower = level >= first(StructureType::Tower);
+            assert_eq!(c.due, u32::from(tower), "level {level}: {c:?}");
+            if tower {
+                assert!(
+                    matches!(
+                        n,
+                        Next::Site {
+                            kind: StructureType::Tower,
+                            ..
+                        }
+                    ),
+                    "level {level}: {n:?}"
+                );
+            } else {
+                assert_eq!(n, Next::Idle, "level {level}");
+            }
         }
         let mut a = ask(&l, &t, MAX_LEVEL);
         a.gates = gates(ALL_ON);

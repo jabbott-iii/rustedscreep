@@ -368,8 +368,21 @@ impl OpeningGlue {
             let haul = room.map(|room| hauling.view(room)).unwrap_or_default();
             let upgrade = room.map(|room| upgrading.view(room)).unwrap_or_default();
             core.plan_room(
-                unit, snapshot, movement, spawner, buffer, cfg, repair_cfg, mcfg, mined, tiles,
-                receivers, &haul, &upgrade, commit,
+                unit,
+                snapshot,
+                movement,
+                spawner,
+                buffer,
+                cfg,
+                repair_cfg,
+                mcfg,
+                hauling_cfg.tower_refill_min,
+                mined,
+                tiles,
+                receivers,
+                &haul,
+                &upgrade,
+                commit,
             )
         });
     }

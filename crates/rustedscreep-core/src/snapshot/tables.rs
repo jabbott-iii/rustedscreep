@@ -352,11 +352,20 @@ pub struct Creeps {
     /// creep's `ageTime` never changes once set (V170) and the bot never renews a creep, so its
     /// death tick is read once in its life and once after a global reset.
     lives: Vec<Option<(CreepHandle, u32)>>,
+    /// The `hitsMax` known so far for own creeps, by handle slot with the handle that owns the entry
+    /// (P7.2, [`Self::set_own_hits`]): a creep's never changes, so it is read once in its life.
+    max_hits: Vec<Option<(CreepHandle, u32)>>,
+    /// This tick's rows of own creeps whose hits were read (P7.2), in the order they were set.
+    own_hits: Vec<u32>,
     /// A hostile creep's active combat parts (P6.3, [`Self::set_combat`]), per row.
     combat: Vec<Combat>,
     /// Each creep's `hits` (P7.1, [`Self::set_assessed`]), per row: read for hostile creeps in owned
-    /// rooms only, 0 for every other creep. Unit: hit points.
+    /// rooms, and for own creeps in rooms with an open threat (P7.2, [`Self::set_own_hits`]); 0 for
+    /// every other creep. Unit: hit points.
     hits: Vec<u32>,
+    /// Each own creep's `hitsMax` where its `hits` is read (P7.2), per row; 0 otherwise (a hostile's
+    /// follows from its body, `BODYPART_HITS` a part). Unit: hit points.
+    hits_max: Vec<u32>,
     /// This tick's rows of hostile creeps in owned rooms (P7.1), in the order they were set.
     assessed: Vec<u32>,
     /// The bodies read so far, each with the handle it belongs to (P7.1, [`Self::set_body`]). Kept
@@ -468,7 +477,9 @@ impl Creeps {
         self.death.clear();
         self.combat.clear();
         self.hits.clear();
+        self.hits_max.clear();
         self.assessed.clear();
+        self.own_hits.clear();
     }
 
     pub(super) fn finish(&mut self) -> u32 {
@@ -503,6 +514,7 @@ impl Creeps {
         self.store.push(CreepStore::default());
         self.combat.push(Combat::default());
         self.hits.push(0);
+        self.hits_max.push(0);
         let death = usize::try_from(handle.slot())
             .ok()
             .and_then(|slot| self.lives.get(slot).copied().flatten())
@@ -558,9 +570,64 @@ impl Creeps {
         self.assessed.push(index);
     }
 
-    /// Each creep's `hits`: read for hostile creeps in owned rooms only (P7.1), 0 otherwise.
+    /// Records the `hits` and `hitsMax` of the own creep at `row` (P7.2: towers heal it), keeps its
+    /// `hitsMax` for its handle ([`Self::known_hits_max`]), and lists the row in
+    /// [`Self::own_hits_rows`]; nothing for a row that does not exist or was set before.
+    pub fn set_own_hits(&mut self, row: usize, hits: u32, hits_max: u32) {
+        let (Some(h), Some(m), Ok(index)) = (
+            self.hits.get_mut(row),
+            self.hits_max.get_mut(row),
+            u32::try_from(row),
+        ) else {
+            return;
+        };
+        if self.own_hits.last().is_some_and(|&last| last >= index) {
+            return;
+        }
+        *h = hits;
+        *m = hits_max;
+        self.own_hits.push(index);
+        let Some(&handle) = self.handle.get(row) else {
+            return;
+        };
+        let Ok(slot) = usize::try_from(handle.slot()) else {
+            return;
+        };
+        if self.max_hits.len() <= slot {
+            self.max_hits.resize(slot.saturating_add(1), None);
+        }
+        if let Some(entry) = self.max_hits.get_mut(slot) {
+            *entry = Some((handle, hits_max));
+        }
+    }
+
+    /// The `hitsMax` read before for the own creep at `row` (P7.2), if any: the snapshot reads it
+    /// once in a creep's life.
+    pub fn known_hits_max(&self, row: usize) -> Option<u32> {
+        let &handle = self.handle.get(row)?;
+        let slot = usize::try_from(handle.slot()).ok()?;
+        self.max_hits
+            .get(slot)
+            .copied()
+            .flatten()
+            .filter(|&(h, _)| h == handle)
+            .map(|(_, m)| m)
+    }
+
+    /// This tick's rows of own creeps whose hits were read (P7.2).
+    pub fn own_hits_rows(&self) -> &[u32] {
+        &self.own_hits
+    }
+
+    /// Each creep's `hits`: read for hostile creeps in owned rooms (P7.1) and own creeps in rooms
+    /// with an open threat (P7.2), 0 otherwise.
     pub fn hits(&self) -> &[u32] {
         &self.hits
+    }
+
+    /// Each own creep's `hitsMax` where its `hits` is read (P7.2), 0 otherwise.
+    pub fn hits_max(&self) -> &[u32] {
+        &self.hits_max
     }
 
     /// This tick's rows of hostile creeps in owned rooms, whose hits and body are read (P7.1).
@@ -802,6 +869,53 @@ impl Links {
     /// Unit: ticks.
     pub fn cooldowns(&self) -> &[u32] {
         &self.cooldown
+    }
+}
+
+/// The bot's own towers this tick (P7.2), one row per tower in `Game.structures`: its handle, its row
+/// in [`Structures`], and the energy it holds (`store.getUsedCapacity(RESOURCE_ENERGY)`), read every
+/// tick. Its room for more is in [`Structures::free_energy`].
+#[derive(Default)]
+pub struct Towers {
+    structure: Vec<StructureHandle>,
+    row: Vec<u32>,
+    energy: Vec<u32>,
+}
+
+impl Towers {
+    pub(super) fn begin(&mut self) {
+        self.structure.clear();
+        self.row.clear();
+        self.energy.clear();
+    }
+
+    /// Adds a tower: its handle, its row in this tick's [`Structures`], and its energy.
+    pub fn push(&mut self, structure: StructureHandle, row: u32, energy: u32) {
+        self.structure.push(structure);
+        self.row.push(row);
+        self.energy.push(energy);
+    }
+
+    pub fn len(&self) -> usize {
+        self.structure.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.structure.is_empty()
+    }
+
+    pub fn handles(&self) -> &[StructureHandle] {
+        &self.structure
+    }
+
+    /// Each tower's row in this tick's [`Structures`] columns.
+    pub fn rows(&self) -> &[u32] {
+        &self.row
+    }
+
+    /// Unit: energy.
+    pub fn energy(&self) -> &[u32] {
+        &self.energy
     }
 }
 

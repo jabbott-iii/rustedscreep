@@ -17,8 +17,9 @@
 //   its tile);
 // - `spawnCreep` follows the runtime's checks and writes `Memory.creeps[name]` on OK (V171, V181), and the processor
 //   drops every accepted order (V173), so no creep appears; the worker's calls return OK and do nothing.
-// It runs three phases, each until the placement has been quiet for QUIET loops: the profile's config; then
-// `planner.storage` on; then `planner.towers` on. It checks:
+// It runs three phases, each until the placement has been quiet for QUIET loops: the profile's config with
+// `planner.towers` off (a config record in segment CONFIG_SEGMENT before the first global, since P7.2 turned the
+// profile's towers on); then `planner.storage` on; then `planner.towers` on again. It checks:
 // - one planner line, `rustedscreep planner: E7N57 planned in N steps: M items, anchor (43, 21), valid`;
 // - the first phase places only roads and destroys nothing (the extensions on the plan are kept, the planned slots
 //   beyond CONTROLLER_STRUCTURES.extension[4] wait, the storage and the towers are off);
@@ -42,7 +43,7 @@ import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
 import { findFiltered, makeStore, packPos } from './lib/world.mjs';
 import { crc32 } from './lib/crc32.mjs';
-import { ENGINE_CONSTANTS, PLANNER_SEGMENT, commandResults, simulate } from './smoke.mjs';
+import { CONFIG_SEGMENT, ENGINE_CONSTANTS, PLANNER_SEGMENT, commandResults, configRecord, simulate } from './smoke.mjs';
 
 /** @screeps/common 2.16.0, the fixture the sandbox puts on the global (smoke.mjs ENGINE_CONSTANTS). */
 const C = Object.fromEntries(ENGINE_CONSTANTS.map(([name, json]) => [name, JSON.parse(json)]));
@@ -302,8 +303,10 @@ export function plannerSim(dir = join(ROOT, 'dist')) {
   const plannedLines = (w) => w.logs.filter((l) => l.includes(`rustedscreep planner: ${ROOM} planned`)).length;
   const world = simulate(dir, {
     ticks: RUN,
-    setup: (context) => {
+    setup: (context, w) => {
       state.context = context;
+      // The first phase's towers off (module docs), in segment CONFIG_SEGMENT before the first global.
+      w.segments[CONFIG_SEGMENT] ??= configRecord(['planner.towers=false']);
     },
     scene: (offset) => sceneFor(state, offset),
     command: (w) => {

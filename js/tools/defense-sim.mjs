@@ -14,12 +14,21 @@
 //   TOUGH part (V283), changes nothing logged; a second attacker inside the log window waits for one change line
 //   LOG loops after the start; both stepping out for less than END loops keep the threat open, and their return
 //   with the same counts logs nothing; END loops after the last sight one end line;
-// - `owner` is read only on a start or change loop, for the dangerous hostiles alone;
+// - `owner` is read only on a start or change loop, for the dangerous hostiles, and on a loop the towers take a new
+//   target, for that target;
+// - the towers (P7.2): one tower in W1N1 at TOWER, full, whose `attack` and `heal` record their calls. Focus fire:
+//   one `attack` a loop on the scout from its first loop (alone, harmless, and killable), on the boosted attacker from
+//   its first loop (dangerous first), kept on it when the second attacker comes; while
+//   both are out, on the scout (the only killable hostile left), and on the attacker again when it comes back; one
+//   "towers fire" line for each new target, its damage, heal and ticks from the constants (TOWER_POWER_ATTACK, the
+//   falloff, V239; the boosted TOUGH saving, V287). Heal priority: with everyone gone and the threat still open, one
+//   `heal` a loop on the smoke world's Harvester, damaged here (its hits read only while the threat is open, from the
+//   loop after it opened), up to the threat's end;
 // - no fault, error or trap line, and no halt.
 // npm run check runs it (row 25); standalone: node js/tools/defense-sim.mjs [dir].
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
-import { FIND_HOSTILE_CREEPS, findFiltered, packPos, sceneAt } from './lib/world.mjs';
+import { FIND_HOSTILE_CREEPS, IDS, findFiltered, makeStore, packPos, sceneAt } from './lib/world.mjs';
 import { ENGINE_CONSTANTS, commandResults, simulate } from './smoke.mjs';
 
 const C = Object.fromEntries(ENGINE_CONSTANTS.map(([name, json]) => [name, JSON.parse(json)]));
@@ -49,6 +58,10 @@ const RAIDER_A = {
   body: [['tough', TOUGH], ['attack', 'UH2O'], ['attack'], ['ranged_attack', UNKNOWN], ['move'], ['move']],
 };
 const RAIDER_B = { id: id(3), name: 'RaiderB', owner: 'Raider', x: 33, y: 31, body: [['attack'], ['move']] };
+/** The tower (full: its fills are not modelled) and the smoke world's own creep it heals, with its lost hits. */
+const TOWER = { id: id(50), x: 30, y: 25 };
+const HURT_OWN = 'Harvester';
+const OWN_LOST = 40;
 /** The timeline, by loop offset (the first loop runs at offset 1). */
 const SCOUT_FROM = 6;
 const A_FROM = 8;
@@ -106,8 +119,19 @@ function otherRoom(name, controller, hostiles) {
   };
 }
 
-function sceneFor(offset, reads) {
+function sceneFor(offset, reads, calls) {
   const scene = sceneAt(offset);
+  // The tower: an own structure in Game.structures, full, recording its calls by target id.
+  const tower = {
+    id: TOWER.id, structureType: 'tower', my: true,
+    pos: { x: TOWER.x, y: TOWER.y, roomName: ROOM, __packedPos: packPos(ROOM, TOWER.x, TOWER.y) },
+    store: makeStore({ energy: C.TOWER_CAPACITY }, { resourceCapacity: { energy: C.TOWER_CAPACITY } }),
+    attack(target) { calls.push([offset, 'attack', target?.id ?? target?.name]); return 0; },
+    heal(target) { calls.push([offset, 'heal', target?.id ?? target?.name]); return 0; },
+  };
+  scene.structures[TOWER.id] = tower;
+  const own = scene.creeps[HURT_OWN];
+  own.hits -= OWN_LOST;
   const room = scene.rooms[ROOM];
   const base = room.find;
   const here = (name) => inRoom(name, offset).map((h) => hostileObject(h, name, offset, reads));
@@ -145,6 +169,45 @@ function assess(h, hits) {
   return { melee, ranged, boosted, dangerous, hits, effective: hits + Math.round(saving) };
 }
 
+/** The engine's `_applyDamage` (V287) on a body at `hits` (its parts filled from the last, V283), and the towers' sim
+ * (V287's order: damage, then heal, then death) for `damage` a tick and no heal. */
+function taken(h, hits, damage) {
+  const len = h.body.length;
+  if (!h.body.some(([, b]) => b !== undefined)) return damage;
+  let reduce = 0;
+  let left = damage;
+  h.body.forEach(([type, boost], i) => {
+    if (left <= 0) return;
+    const ratio = (boost !== undefined && C.BOOSTS[type]?.[boost]?.damage) || 1;
+    const partHits = Math.min(PART_HITS, Math.max(0, hits - PART_HITS * (len - 1 - i)));
+    const take = Math.min(partHits / ratio, left);
+    reduce += take * (1 - ratio);
+    left -= take;
+  });
+  return damage - Math.round(reduce);
+}
+function killTicks(h, hits, damage) {
+  for (let t = 1; t <= 50; t++) {
+    const after = hits - taken(h, hits, damage);
+    if (after <= 0) return t;
+    hits = after;
+  }
+  return null;
+}
+/** A tower's attack at range (towers/attack.js, V239). */
+function towerDamage(range) {
+  const p = C.TOWER_POWER_ATTACK;
+  if (range <= C.TOWER_OPTIMAL_RANGE) return p;
+  const r = Math.min(range, C.TOWER_FALLOFF_RANGE);
+  return Math.floor(p - p * C.TOWER_FALLOFF * (r - C.TOWER_OPTIMAL_RANGE) / (C.TOWER_FALLOFF_RANGE - C.TOWER_OPTIMAL_RANGE));
+}
+function fireLine(h, offset) {
+  const range = Math.max(Math.abs(h.x - TOWER.x), Math.abs(h.y - TOWER.y));
+  const damage = towerDamage(range);
+  return `rustedscreep defense: ${ROOM} towers fire: 1 tower(s) on the hostile at (${h.x}, ${h.y}) of ${h.owner}, ${damage} damage `
+    + `a tick against 0 heal, dead in ${killTicks(h, hitsAt(h, offset), damage)} tick(s) by the sim`;
+}
+
 function roomLine(offset) {
   const here = inRoom(ROOM, offset).map((h) => assess(h, hitsAt(h, offset)));
   const sum = (k) => here.reduce((n, a) => n + a[k], 0);
@@ -156,10 +219,11 @@ function roomLine(offset) {
 
 export function defenseSim(dir = join(ROOT, 'dist')) {
   const reads = {};
+  const calls = [];
   const state = { configured: null };
   const world = simulate(dir, {
     ticks: TICKS,
-    scene: (offset) => sceneFor(offset, reads),
+    scene: (offset) => sceneFor(offset, reads, calls),
     command: (w) => {
       const offset = w.ticksRun;
       if (offset < CONFIG_AT || state.configured === 'done') return null;
@@ -191,13 +255,19 @@ export function defenseSim(dir = join(ROOT, 'dist')) {
     if (!reply.includes('from the next tick')) problems.push(`${cmd}: ${reply}`);
   }
 
-  // The lines: a start at A_FROM, a change LOG loops later, none at the return (the same counts), an end END loops
-  // after the last sight.
+  // The lines: the scout shot from its first loop (killable and alone; it opens no threat), a start at A_FROM with the
+  // attacker taken over from it (dangerous first), a change LOG loops later, the scout taken while both
+  // attackers are out and the attacker again at their return (the same counts: no change line), an end END loops after
+  // the last sight.
   const lines = world.logs.filter((l) => l.startsWith('rustedscreep defense:'));
   const prefix = `rustedscreep defense: ${ROOM} `;
   const want = [
+    fireLine(SCOUT, SCOUT_FROM),
     `${prefix}threatened by ${roomLine(A_FROM)}`,
+    fireLine(RAIDER_A, A_FROM),
     `${prefix}threat (since tick ${T0 + A_FROM}) now ${roomLine(A_FROM + LOG)}`,
+    fireLine(SCOUT, OUT_FROM),
+    fireLine(RAIDER_A, BACK),
     `${prefix}threat over: no dangerous hostile seen since tick ${T0 + BACK} (it started at tick ${T0 + A_FROM})`,
   ];
   if (JSON.stringify(lines) !== JSON.stringify(want)) {
@@ -222,9 +292,19 @@ export function defenseSim(dir = join(ROOT, 'dist')) {
     }
   }
   const owners = (h) => at(h, 'owner');
-  if (!eq(owners(SCOUT), [])) problems.push(`the scout's owner was read at ${JSON.stringify(owners(SCOUT))}`);
-  if (!eq(owners(RAIDER_A), [A_FROM, A_FROM + LOG])) problems.push(`RaiderA's owner read at ${JSON.stringify(owners(RAIDER_A))}, expected ${JSON.stringify([A_FROM, A_FROM + LOG])}`);
+  if (!eq(owners(SCOUT), [SCOUT_FROM, OUT_FROM])) problems.push(`the scout's owner was read at ${JSON.stringify(owners(SCOUT))}, expected ${JSON.stringify([SCOUT_FROM, OUT_FROM])}`);
+  if (!eq(owners(RAIDER_A), [A_FROM, A_FROM + LOG, BACK])) problems.push(`RaiderA's owner read at ${JSON.stringify(owners(RAIDER_A))}, expected ${JSON.stringify([A_FROM, A_FROM + LOG, BACK])}`);
   if (!eq(owners(RAIDER_B), [A_FROM + LOG])) problems.push(`RaiderB's owner read at ${JSON.stringify(owners(RAIDER_B))}, expected ${JSON.stringify([A_FROM + LOG])}`);
+
+  // The towers' calls: one a loop. Attacks on A while it is in the room, on the scout while A is out; heals on the
+  // damaged own creep from the loop after everyone left until the threat ends (its hits are read while it is open).
+  const wantCalls = [];
+  for (const o of loops) {
+    if (roomOf(RAIDER_A, o) === ROOM) wantCalls.push([o, 'attack', RAIDER_A.id]);
+    else if (roomOf(SCOUT, o) === ROOM) wantCalls.push([o, 'attack', SCOUT.id]);
+    else if (o >= GONE && o <= BACK + END) wantCalls.push([o, 'heal', IDS.harvester]);
+  }
+  if (!eq(calls, wantCalls)) problems.push(`tower calls ${JSON.stringify(calls)}, expected ${JSON.stringify(wantCalls)}`);
 
   if (problems.length) throw new Error(`defense-sim:\n  ${problems.slice(0, 20).join('\n  ')}`);
   return { ticks: world.ticksRun, lines: lines.length, start: lines[0] };

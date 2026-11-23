@@ -22,7 +22,7 @@ use core::fmt;
 
 use rustedscreep_consts::{
     CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, LINK_CAPACITY, MAX_CONSTRUCTION_SITES,
-    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, ROOM_SIZE,
+    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, ROOM_SIZE, TOWER_CAPACITY,
 };
 
 /// How the loader recovers after a trap or an aborted tick (ADR-003).
@@ -597,6 +597,10 @@ pub struct HaulingConfig {
     /// a lower bound (a walk can take a tick more per tile with rounding, and traffic). Unit:
     /// percent.
     pub margin_pct: u32,
+    /// A tower is filled (by haulers, or by the opening's workers where they fill) once its spawns
+    /// and extensions are full and the tower has at least this much room, so no trip is made for a
+    /// shot or two (P7.2). Unit: energy.
+    pub tower_refill_min: u32,
 }
 
 /// Hauling values for the official MMO.
@@ -606,6 +610,7 @@ pub const HAULING_MMO: HaulingConfig = HaulingConfig {
     container_level: 3,
     max_per_source: 4,
     margin_pct: 0,
+    tower_refill_min: 200,
 };
 
 /// Upgraders (ROADMAP P3.4): WORK-heavy creeps at posts next to the controller container and the
@@ -666,7 +671,7 @@ pub struct PlannerConfig {
     /// 2026-11-18). Like every gate here, off it also leaves out the plan's roads that serve only
     /// what it gates (`planner::layout::RoadNeed`).
     pub storage: bool,
-    /// Places the towers (nothing fills or fires them before P7).
+    /// Places the towers (filled and fired since P7.2).
     pub towers: bool,
     /// Places the ramparts (when ramparts are built is P7's, ADR-007).
     pub ramparts: bool,
@@ -697,7 +702,7 @@ pub const PLANNER_MMO: PlannerConfig = PlannerConfig {
     enabled: true,
     replace: true,
     storage: false,
-    towers: false,
+    towers: true,
     ramparts: false,
     late: false,
     max_sites: 10,
@@ -840,12 +845,25 @@ pub struct DefenseConfig {
     /// The least time between two log lines that a room's threat changed (its count of dangerous or
     /// boosted hostiles). Unit: ticks.
     pub threat_log_ticks: u32,
+    /// The most ticks the combat sim may take to kill a hostile for the towers to fire at it (P7.2):
+    /// a target that takes longer, or never dies (its heal matches the towers), is not shot, since
+    /// each shot costs `TOWER_ENERGY_COST`. Unit: ticks.
+    pub max_kill_ticks: u32,
+    /// A tower heals own creeps only while it holds at least this, keeping the rest for shots
+    /// (P7.2). Unit: energy.
+    pub heal_reserve: u32,
+    /// The towers stop firing at a creep whose hits came out above the sim's on this many ticks in
+    /// a row (P7.2: a rampart on its tile, a power effect, an inactive tower). Unit: ticks.
+    pub miss_ticks: u32,
 }
 
 /// Defense values for the official MMO.
 pub const DEFENSE_MMO: DefenseConfig = DefenseConfig {
     threat_end_ticks: 20,
     threat_log_ticks: 50,
+    max_kill_ticks: 50,
+    heal_reserve: TOWER_CAPACITY / 2,
+    miss_ticks: 3,
 };
 
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
@@ -1061,7 +1079,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 128;
+pub const FIELD_COUNT: usize = 132;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1316,6 +1334,14 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(hauling, "HaulingConfig", container_level, 1, 8, true),
     number!(hauling, "HaulingConfig", max_per_source, 1, 10, true),
     number!(hauling, "HaulingConfig", margin_pct, 0, 100, true),
+    number!(
+        hauling,
+        "HaulingConfig",
+        tower_refill_min,
+        1,
+        TOWER_CAPACITY,
+        true
+    ),
     flag!(upgrading, "UpgradingConfig", enabled, true),
     number!(upgrading, "UpgradingConfig", free_tiles, 0, 8, true),
     number!(upgrading, "UpgradingConfig", worker_repeats, 1, 16, true),
@@ -1443,6 +1469,23 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         true
     ),
     number!(defense, "DefenseConfig", threat_log_ticks, 1, 10_000, true),
+    number!(
+        defense,
+        "DefenseConfig",
+        max_kill_ticks,
+        1,
+        CREEP_LIFE_TIME / 3,
+        true
+    ),
+    number!(
+        defense,
+        "DefenseConfig",
+        heal_reserve,
+        0,
+        TOWER_CAPACITY,
+        true
+    ),
+    number!(defense, "DefenseConfig", miss_ticks, 1, 100, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -1729,6 +1772,7 @@ mod tests {
             container_level: _,
             max_per_source: _,
             margin_pct: _,
+            tower_refill_min: _,
         } = HAULING_MMO;
         let UpgradingConfig {
             enabled: _,
@@ -1782,6 +1826,9 @@ mod tests {
         let DefenseConfig {
             threat_end_ticks: _,
             threat_log_ticks: _,
+            max_kill_ticks: _,
+            heal_reserve: _,
+            miss_ticks: _,
         } = DEFENSE_MMO;
         let expected: [(&str, &[&str]); 18] = [
             (
@@ -1910,6 +1957,7 @@ mod tests {
                     "container_level",
                     "max_per_source",
                     "margin_pct",
+                    "tower_refill_min",
                 ],
             ),
             (
@@ -1973,7 +2021,16 @@ mod tests {
                     "save_ticks",
                 ],
             ),
-            ("defense", &["threat_end_ticks", "threat_log_ticks"]),
+            (
+                "defense",
+                &[
+                    "threat_end_ticks",
+                    "threat_log_ticks",
+                    "max_kill_ticks",
+                    "heal_reserve",
+                    "miss_ticks",
+                ],
+            ),
         ];
         let mut total = 0;
         for (group, names) in expected {

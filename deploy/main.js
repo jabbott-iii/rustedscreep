@@ -758,6 +758,18 @@ function __wbg_get_imports() {
             const ret = arg0.amount;
             return ret;
         },
+        __wbg_attack_771f6157371b81ef: function() { return handleError(function (arg0, arg1) {
+            const ret = arg0.attack(arg1);
+            return ret;
+        }, arguments); },
+        __wbg_body_internal_f326517b7e8784f9: function(arg0) {
+            const ret = arg0.body;
+            return ret;
+        },
+        __wbg_boost_a9e9c6b41b38e758: function(arg0) {
+            const ret = arg0.boost;
+            return isLikeNone(ret) ? 109 : ((__wbindgen_enum_ResourceType.indexOf(ret) + 1 || 109) - 1);
+        },
         __wbg_bucket_fad1c4c5f46e674f: function() {
             const ret = Game.cpu.bucket;
             return ret;
@@ -902,13 +914,25 @@ function __wbg_get_imports() {
             const ret = arg0.harvest(arg1);
             return ret;
         }, arguments); },
+        __wbg_heal_2f2e402e3281a087: function() { return handleError(function (arg0, arg1) {
+            const ret = arg0.heal(arg1);
+            return ret;
+        }, arguments); },
         __wbg_heal_d2bc1a58d75e2495: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.heal(arg1);
             return ret;
         }, arguments); },
+        __wbg_hits_internal_1b3b7aa07ffad599: function(arg0) {
+            const ret = arg0.hits;
+            return ret;
+        },
         __wbg_hits_internal_2e8a79b1c6a0434d: function(arg0) {
             const ret = arg0.hits;
             return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
+        __wbg_hits_max_internal_82534dd55aa15333: function(arg0) {
+            const ret = arg0.hitsMax;
+            return ret;
         },
         __wbg_hits_max_value_cac2891262ceda34: function(arg0) {
             const ret = arg0.hitsMax;
@@ -1025,6 +1049,10 @@ function __wbg_get_imports() {
         __wbg_packed_pos_272b8eb5eff3b13b: function(arg0) {
             const ret = arg0.__packedPos;
             return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
+        __wbg_part_4437cd65f09f44cb: function(arg0) {
+            const ret = arg0.type;
+            return (__wbindgen_enum_Part.indexOf(ret) + 1 || 9) - 1;
         },
         __wbg_path_6241a46dd6269a4c: function(arg0) {
             const ret = arg0.path;
@@ -2272,7 +2300,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"c4325c988cab-dirty-d68529b5","wasmCrc32":"d68529b5","features":[],"wasmParts":[760612,760612]});
+const BUILD = ({"id":"42a94e0b1805-dirty-8883819a","wasmCrc32":"8883819a","features":[],"wasmParts":[823412,823408]});
 const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;

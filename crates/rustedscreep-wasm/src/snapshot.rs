@@ -19,7 +19,9 @@
 //!   new `name` and the name copy (P2.3; its identity, `spawning::CreepName`); unless it is
 //!   spawning, `store`, `getUsedCapacity` and `getCapacity` for energy (P2.4, V196, V197), and
 //!   `ticksToLive` on each tick until it reads a number, normally once or twice in its life and
-//!   once after a global reset (P5.2, V198; its death tick is kept with its handle);
+//!   once after a global reset (P5.2, V198; its death tick is kept with its handle), and in a room
+//!   with a tower and an open threat last tick `hits`, with `hitsMax` once in its life (P7.2, for
+//!   the towers' heals);
 //! - room: 8 with a controller (`get`, `name`, the name copy, `controller`, `my`, `level`, `find`,
 //!   `length`), 6 without, plus `energyAvailable` and `energyCapacityAvailable` when the bot owns
 //!   it (P2.3, V175), and for an owned room its controller's 3 progress and timer getters and its
@@ -53,7 +55,9 @@
 //!   through an `Option` (below), and dropping it runs in wasm (V100). A spawn or an extension in a
 //!   room that is not full adds `store` and `getFreeCapacity` for energy (P2.4, V196). A link adds
 //!   `store` and `getUsedCapacity` for energy every tick, and `cooldown` while it holds energy (an
-//!   empty link cannot send, so its cooldown is never read) (P3.2, V216).
+//!   empty link cannot send, so its cooldown is never read) (P3.2, V216). A tower adds `store`,
+//!   `getUsedCapacity` and `getFreeCapacity` for energy on a tick its room is full, has an
+//!   assessed hostile, or had an open threat (P7.2, V196; `tower_wanted`).
 //!
 //! Calls back from JS into wasm: one `__wbindgen_malloc` per id or name copy, and one
 //! `__externref_table_alloc` (with a JS `Table.set`) per object returned through an `Option`: every
@@ -212,9 +216,21 @@ pub struct JsWorld {
     /// Scratch: the rooms an own signer stands in this tick, sorted: their controller's sign and
     /// the towers of other users are read (ADR-030).
     sign_rooms: Vec<RoomName>,
+    /// The owned rooms with an open threat at the end of last tick, sorted (P7.2): own creeps'
+    /// `hits` and `hitsMax` are read there, for the towers' heals.
+    threat_rooms: Vec<RoomName>,
 }
 
 impl JsWorld {
+    /// Sets the rooms whose own creeps' hits the next snapshot reads (P7.2): the rooms with an open
+    /// threat.
+    pub fn set_threat_rooms(&mut self, rooms: impl Iterator<Item = RoomName>) {
+        self.threat_rooms.clear();
+        self.threat_rooms.extend(rooms);
+        self.threat_rooms.sort_unstable_by_key(|n| n.packed_repr());
+        self.threat_rooms.dedup();
+    }
+
     fn clear(&mut self) {
         self.rooms.clear();
         self.creeps.clear();
@@ -795,6 +811,19 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
                     let death = snapshot.tick.time.saturating_add(ttl);
                     snapshot.creeps.set_death(row, death);
                 }
+                // P7.2: `hits` and `hitsMax` in a room with an open threat, for the towers' heals.
+                if js
+                    .threat_rooms
+                    .binary_search_by_key(&pos.room_name().packed_repr(), |n| n.packed_repr())
+                    .is_ok()
+                {
+                    // `hitsMax` once in the creep's life: it never changes.
+                    let max = snapshot
+                        .creeps
+                        .known_hits_max(row)
+                        .unwrap_or_else(|| creep.hits_max());
+                    snapshot.creeps.set_own_hits(row, creep.hits(), max);
+                }
             }
             Ok(handle)
         } else {
@@ -842,6 +871,28 @@ fn push_structure(snapshot: &mut Snapshot, js: &mut JsWorld, structure: Structur
                 let row = u32::try_from(structures.len().saturating_sub(1)).unwrap_or(u32::MAX);
                 snapshot.spawns.push(handle, row, busy);
             }
+            if kind == Some(StructureType::Tower) {
+                // P7.2: `store`, then its energy and its room for more (V196), only where a fill or
+                // a fight can use them; elsewhere both stay 0.
+                let row = structures.len().saturating_sub(1);
+                let wanted = snapshot
+                    .structures
+                    .positions()
+                    .get(row)
+                    .is_some_and(|p| tower_wanted(snapshot, js, p.room_name()));
+                let mut energy = 0;
+                if wanted {
+                    let store = structure.unchecked_ref::<Stored>().store_of();
+                    energy = store.get_used_capacity(Some(ResourceType::Energy));
+                    let free = store.get_free_capacity(Some(ResourceType::Energy));
+                    snapshot
+                        .structures
+                        .set_free_energy(row, u32::try_from(free).unwrap_or(0));
+                }
+                let row = u32::try_from(row).unwrap_or(u32::MAX);
+                snapshot.towers.push(handle, row, energy);
+            }
+            let structures = &snapshot.structures;
             if kind == Some(StructureType::Link) {
                 // `store.energy` behind the getter, and the raw `cooldown || 0` (V216): the crate's
                 // getters read them as u32 (a missing value is 0), with no type check to trap on.
@@ -862,6 +913,29 @@ fn push_structure(snapshot: &mut Snapshot, js: &mut JsWorld, structure: Structur
         }
         Err(reason) => snapshot.skipped.record(reason),
     }
+}
+
+/// Whether a tower in `room` is read this tick (P7.2): its room is full (the fills may take it), a
+/// hostile creep was assessed there this tick (the rooms are read before the structures), or it had
+/// an open threat last tick (its towers may heal).
+fn tower_wanted(snapshot: &Snapshot, js: &JsWorld, room: RoomName) -> bool {
+    let rooms = &snapshot.rooms;
+    let full = rooms
+        .row_of(room)
+        .and_then(|r| rooms.energy().get(r))
+        .is_some_and(|e| e.available >= e.capacity);
+    let creeps = &snapshot.creeps;
+    let hostile = creeps.assessed().iter().any(|&r| {
+        usize::try_from(r)
+            .ok()
+            .and_then(|i| creeps.positions().get(i))
+            .is_some_and(|p| p.room_name() == room)
+    });
+    let threat = js
+        .threat_rooms
+        .binary_search_by_key(&room.packed_repr(), |n| n.packed_repr())
+        .is_ok();
+    full || hostile || threat
 }
 
 /// A spawn's or extension's room for energy (P2.4), only while its room is not full: `store` and

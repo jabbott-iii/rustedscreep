@@ -73,8 +73,8 @@ use rustedscreep_consts::{
     MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, MOVE_POWER, Part, Position, REPAIR_COST,
     REPAIR_POWER, RoomCoordinate, RoomName, SOURCE_ENERGY_CAPACITY, SOURCE_ENERGY_KEEPER_CAPACITY,
     SOURCE_ENERGY_NEUTRAL_CAPACITY, SPAWN_ENERGY_CAPACITY, SPAWN_ENERGY_START, StructureType,
-    TOMBSTONE_DECAY_PER_PART, Terrain, UPGRADE_CONTROLLER_POWER, controller_downgrade,
-    controller_levels, extension_energy_capacity,
+    TOMBSTONE_DECAY_PER_PART, TOWER_CAPACITY, Terrain, UPGRADE_CONTROLLER_POWER,
+    controller_downgrade, controller_levels, extension_energy_capacity,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -1787,6 +1787,13 @@ impl World {
             if kind == StructureType::Link {
                 self.snap.links.push(h, row as u32, s.energy, s.cooldown);
             }
+            if kind == StructureType::Tower {
+                // P7.2: a tower's energy and room every tick, as the snapshot reads them.
+                self.snap
+                    .structures
+                    .set_free_energy(row, s.capacity - s.energy);
+                self.snap.towers.push(h, row as u32, s.energy);
+            }
             self.struct_rows.push(StructRow::Store(i));
         }
         self.obj_rows.clear();
@@ -1979,6 +1986,7 @@ impl World {
                     &cfg,
                     &self.repair_cfg,
                     &mcfg,
+                    self.hauling_cfg.tower_refill_min,
                     &mined,
                     &tiles,
                     &receivers,
@@ -5671,6 +5679,54 @@ fn haulers_raise_the_upgrade_rate() {
 /// carry the rest into the container; the workers (from P3.4 the upgraders) take it there, the
 /// workers are sized with no walk, and fill nothing while a hauler hauls a mined source (unless
 /// the room's spawn queue waits for energy, P5.3).
+/// P7.2: a tower is filled only once every spawn and extension is full (no tick moves energy into
+/// it while one has room), only while it has at least `hauling.tower_refill_min` room, and it ends
+/// within that much of `TOWER_CAPACITY`.
+#[test]
+fn towers_are_filled_once_spawns_and_extensions_are_full() {
+    let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+    let key = w.key();
+    w.stores.push(SimStore {
+        key,
+        kind: StructureType::Tower,
+        at: tile(27, 22),
+        energy: 0,
+        capacity: TOWER_CAPACITY,
+        cooldown: 0,
+    });
+    let min = HAULING_MMO.tower_refill_min;
+    let tower = |w: &World| {
+        w.stores
+            .iter()
+            .find(|s| s.kind == StructureType::Tower)
+            .map_or(0, |s| s.energy)
+    };
+    let (mut early, mut small, mut fills) = (0, 0, 0);
+    for _ in 0..4000 {
+        let spawn_room: u32 = w
+            .stores
+            .iter()
+            .filter(|s| s.spawn_energy())
+            .map(|s| s.capacity - s.energy)
+            .sum();
+        let before = tower(&w);
+        w.step();
+        let after = tower(&w);
+        if after > before {
+            fills += 1;
+            early += u32::from(spawn_room > 0);
+            small += u32::from(TOWER_CAPACITY - before < min);
+        }
+    }
+    assert!(fills > 0, "the tower is filled");
+    assert_eq!(early, 0, "never while a spawn or extension has room");
+    assert_eq!(small, 0, "never with less than tower_refill_min room");
+    assert!(
+        tower(&w) + min > TOWER_CAPACITY,
+        "within tower_refill_min of full"
+    );
+}
+
 #[test]
 fn haulers_carry_a_sources_energy_to_the_controller_container() {
     let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);

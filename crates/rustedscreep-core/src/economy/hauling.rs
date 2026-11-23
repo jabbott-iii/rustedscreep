@@ -30,7 +30,8 @@
 //! have more room than the haulers hold, an empty one takes a whole load from a mining tile no
 //! hauler takes from (a pile before a container), the nearest, else from the controller container;
 //! a load from the controller container is never stored back there (it waits for the spawns' room). Delivering, it fills the spawns and extensions with room (nearest first, reserved per
-//! tick; last tick's fillers first), else the controller container while it has room. Its intent
+//! tick; last tick's fillers first), else, once they are full, the towers with at least
+//! `hauling.tower_refill_min` room (P7.2), else the controller container while it has room. Its intent
 //! goes out on the tick it starts next to the target; its task is chosen again next tick.
 //!
 //! The opening reads [`Hauling::view`]: the sources whose haulers work this tick (its workers take
@@ -311,6 +312,9 @@ pub struct Hauling {
     /// place, room left to reserve), each plan source's haulers this tick, and the delivering
     /// haulers (member index, range to the nearest fill, last tick's task).
     fills: Vec<(StructureHandle, Position, u32)>,
+    /// Whether this tick's `fills` are the towers (P7.2: the spawns and extensions are full), which
+    /// the spawn queue's refill (P5.3) does not count.
+    tower_fills: bool,
     sources: Vec<(Position, u32)>,
     loose: Vec<(ObjectHandle, Position, ObjectKind, u32)>,
     container: Option<(ObjectHandle, Position, u32)>,
@@ -527,7 +531,7 @@ impl Hauling {
             }
             return Ok(());
         }
-        self.gather(snap, name, mine);
+        self.gather(snap, name, mine, cfg.tower_refill_min);
         self.ensure_plan(ri, snap, row, movement, cfg, mcfg, mine, commit);
         self.wants.clear();
         self.leads.clear();
@@ -718,7 +722,13 @@ impl Hauling {
 
     /// Reads room `name`'s spawns and extensions with room, its sources, the piles and containers
     /// on its mining plan's tiles and its controller container into the scratch lists.
-    fn gather(&mut self, snap: &Snapshot, name: RoomName, mine: Option<&MinePlan>) {
+    fn gather(
+        &mut self,
+        snap: &Snapshot,
+        name: RoomName,
+        mine: Option<&MinePlan>,
+        tower_refill_min: u32,
+    ) {
         self.fills.clear();
         self.sources.clear();
         self.loose.clear();
@@ -737,6 +747,13 @@ impl Hauling {
             {
                 self.fills.push((h, pos, free));
             }
+        }
+        // P7.2: the towers, once every spawn and extension is full (spawning first), each with at
+        // least `hauling.tower_refill_min` room.
+        self.tower_fills = false;
+        if self.fills.is_empty() {
+            push_towers(&mut self.fills, snap, name, tower_refill_min);
+            self.tower_fills = !self.fills.is_empty();
         }
         let tile_of =
             |p: Position| mine.is_some_and(|m| m.sources.iter().any(|s| s.tile == Some(p)));
@@ -954,11 +971,15 @@ impl Hauling {
         // P5.3: the room the spawns and extensions have left, and of it what the haulers' loads do
         // not cover yet: a hauler is sent to another store only while some is left, each for its
         // free room.
-        let fill_room = self
-            .fills
-            .iter()
-            .filter(|f| !blocked.contains(&f.1))
-            .fold(0u32, |a, f| a.saturating_add(f.2));
+        // The towers' room is not the spawns' (P7.2): no hauler is sent to a store for it.
+        let fill_room = if self.tower_fills {
+            0
+        } else {
+            self.fills
+                .iter()
+                .filter(|f| !blocked.contains(&f.1))
+                .fold(0u32, |a, f| a.saturating_add(f.2))
+        };
         let held = self
             .members
             .get(members.0..members.1)
@@ -1290,6 +1311,28 @@ impl Hauling {
             if let Some(h) = self.hauler_mut(i, snap) {
                 h.task = HaulTask::Idle;
             }
+        }
+    }
+}
+
+/// The towers of room `name` with at least `min` room for energy, as fills (P7.2), from the
+/// snapshot's towers (their room is read only where a fill or a fight can use it).
+pub(super) fn push_towers(
+    fills: &mut Vec<(StructureHandle, Position, u32)>,
+    snap: &Snapshot,
+    name: RoomName,
+    min: u32,
+) {
+    let st = &snap.structures;
+    for (&row, &h) in snap.towers.rows().iter().zip(snap.towers.handles()) {
+        let Ok(row) = usize::try_from(row) else {
+            continue;
+        };
+        let (Some(&pos), Some(&free)) = (st.positions().get(row), st.free_energy().get(row)) else {
+            continue;
+        };
+        if pos.room_name() == name && free >= min.max(1) {
+            fills.push((h, pos, free));
         }
     }
 }

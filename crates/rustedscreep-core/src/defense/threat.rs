@@ -584,6 +584,11 @@ impl Threats {
         self.watches.len()
     }
 
+    /// The rooms with an open threat, in the order the threats started.
+    pub fn open_rooms(&self) -> impl Iterator<Item = RoomName> + '_ {
+        self.watches.iter().map(|w| w.room)
+    }
+
     /// This tick's events: starts and changes in room order, then ends in the order the threats
     /// started.
     pub fn events(&self) -> &[ThreatEvent] {
