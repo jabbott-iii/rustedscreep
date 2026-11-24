@@ -126,7 +126,7 @@ The repository holds no secret. The workflow names only these:
 | :- | :- | :- | :- |
 | `CARGO_REGISTRY_TOKEN` | secret | `crates-io` | A crates.io API token with the scopes `publish-new` and `publish-update`, limited to the crates `rustedscreep-*` |
 | `STEAM_USERNAME` | secret | `steam-workshop` | The Steam account that uploads the Workshop item |
-| `STEAM_CONFIG_VDF` | secret | `steam-workshop` | That account's SteamCMD `config.vdf`, base64-encoded, saved after a login with Steam Guard (Steam's two-factor check) |
+| `STEAM_CONFIG_VDF` | secret | `steam-workshop` | That account's SteamCMD `config.vdf`, gzip-compressed and base64-encoded, saved after a login with Steam Guard (Steam's two-factor check) |
 | `STEAM_WORKSHOP_ITEM_ID` | variable | `steam-workshop` | The item's id. Leave it unset for the first release, which makes the item |
 
 1. **Environments** (Settings → Environments): make `crates-io`, `release`, and `steam-workshop`. Under "Deployment
@@ -142,13 +142,13 @@ The repository holds no secret. The workflow names only these:
    exist, crates.io's trusted publishing (a short-lived token that crates.io issues to this workflow, with no stored
    secret) can replace it. Until then the token needs `publish-new`, since trusted publishing cannot create a crate.
 4. **The Steam login,** on a trusted machine. Log in once with SteamCMD as the uploading account: `steamcmd +login
-   <account> +quit`, with its password and Steam Guard code. Then store the file it saves, base64-encoded, as
+   <account> +quit`, with its password and Steam Guard code. Then store the file it saves, gzip-compressed and base64-encoded, as
    `STEAM_CONFIG_VDF`.
    - SteamCMD keeps the file in its Steam folder, as `config/config.vdf`. In the image the workflow uses, that is
      `$HOME/Steam/config/config.vdf` (V320). On Linux:
 
      ```bash
-     base64 -w0 ~/Steam/config/config.vdf
+     gzip -c ~/Steam/config/config.vdf | base64 -w0
      ```
 
    - The file holds a login token for the whole Steam account, not only for uploads. Keep the tag ruleset of step 2.
