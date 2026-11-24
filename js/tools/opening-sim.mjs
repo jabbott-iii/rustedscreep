@@ -57,7 +57,7 @@
 // - no fault line, no incident, no halt.
 // npm run check runs it (row 19); standalone: node js/tools/opening-sim.mjs [dir].
 import { join } from 'node:path';
-import { ROOT, fail, isMain } from './lib/common.mjs';
+import { ROOT, escapeRegExp, fail, isMain } from './lib/common.mjs';
 import { findFiltered, makeStore, packPos } from './lib/world.mjs';
 import { ENGINE_CONSTANTS, commandResults, simulate } from './smoke.mjs';
 
@@ -806,7 +806,7 @@ export function openingSim(dir = join(ROOT, 'dist')) {
     }
     if (o === 1) return;
     // One source: the room wants what it wants, within min_workers..=max_workers.
-    const planWant = Number(new RegExp(`${plan.replace(/[()]/g, '\\$&')}(\\d+)`).exec(r)?.[1]);
+    const planWant = Number(new RegExp(`${escapeRegExp(plan)}(\\d+)`).exec(r)?.[1]);
     if (wanted !== Math.min(Math.max(planWant, MIN_WORKERS), MAX_WORKERS)) problems.push(`summary at offset ${o}: wants ${wanted}, the plan's source wants ${planWant}`);
   });
 

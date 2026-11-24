@@ -100,3 +100,11 @@ export function sha256(bytes) {
 export function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'));
 }
+
+/**
+ * `text` with each of RegExp's syntax characters (`^ $ \ . * + ? ( ) [ ] { } |`) escaped, so a RegExp built from it
+ * matches the text literally, with or without the `u` flag. The sims build their patterns from summary fragments.
+ */
+export function escapeRegExp(text) {
+  return text.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+}

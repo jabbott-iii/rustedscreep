@@ -23,7 +23,7 @@ test('anything but the exact form is refused', () => {
   const good = wasmModuleText(Buffer.from([1, 2, 3, 4]));
   for (const bad of [
     `${good}require("x");\n`,
-    good.replace('\n', '\r\n'),
+    good.replaceAll('\n', '\r\n'),
     good.trimEnd(),
     good.replace('AQIDBA==', 'AQIDB-=='),
     good.replace('AQIDBA==', 'AQIDB_=='),

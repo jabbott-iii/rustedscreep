@@ -63,7 +63,7 @@
 // - no fault line, no incident, no link refusal line, no halt, one global.
 // npm run check runs it (row 20); standalone: node js/tools/link-sim.mjs [dir].
 import { join } from 'node:path';
-import { ROOT, fail, isMain } from './lib/common.mjs';
+import { ROOT, escapeRegExp, fail, isMain } from './lib/common.mjs';
 import { findFiltered, makeStore, packPos } from './lib/world.mjs';
 import { ENGINE_CONSTANTS, commandResults, simulate } from './smoke.mjs';
 
@@ -729,7 +729,7 @@ export function linkSim(dir = join(ROOT, 'dist')) {
   const tiles = range(MINE, SPAWN) - 1;
   // The source's harvest record (the P3 gate's recorder) follows its body: no refill comes within the run (a 3000
   // source mined at 10 a tick lasts 300 ticks), so no cycle is counted or kept out.
-  const bodyRe = new RegExp(` link ${at(SOURCE_LINK).replace(/[()]/g, '\\$&')} body ${MINER_WORK} WORK 1 CARRY (\\d+) MOVE \\((\\d+) energy\\), harvest cycles 0, unmined 0, missed 0, handovers 0 \\(gap ticks 0, last -1, most 0\\);`);
+  const bodyRe = new RegExp(` link ${escapeRegExp(at(SOURCE_LINK))} body ${MINER_WORK} WORK 1 CARRY (\\d+) MOVE \\((\\d+) energy\\), harvest cycles 0, unmined 0, missed 0, handovers 0 \\(gap ticks 0, last -1, most 0\\);`);
   loops.forEach((o, k) => {
     const r = results[k] ?? '';
     const sent = state.calls.filter((c) => c.method === 'transferEnergy' && c.offset <= o);

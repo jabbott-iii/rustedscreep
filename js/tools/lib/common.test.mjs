@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { isWasmOptVersion, lockVersion, parseWasmBindgenVersion } from './common.mjs';
+import { escapeRegExp, isWasmOptVersion, lockVersion, parseWasmBindgenVersion } from './common.mjs';
 
 const LOCK = `
 version = 4
@@ -37,4 +37,13 @@ test('wasm-opt --version check accepts an optional suffix and rejects other vers
   assert.ok(isWasmOptVersion('wasm-opt version 133 (version_133)\n', 133));
   assert.ok(!isWasmOptVersion('wasm-opt version 1330\n', 133));
   assert.ok(!isWasmOptVersion('wasm-opt version 132\n', 133));
+});
+
+test('escapeRegExp makes every syntax character literal', () => {
+  const text = 'a^b$c\\d.e*f+g?h(i)j[k]l{m}n|o';
+  for (const flags of ['', 'u']) {
+    assert.ok(new RegExp(`^${escapeRegExp(text)}$`, flags).test(text), flags);
+  }
+  assert.ok(!new RegExp(`^${escapeRegExp('a.c')}$`).test('abc'));
+  assert.equal(escapeRegExp('source (10,12) open 8'), 'source \\(10,12\\) open 8');
 });
