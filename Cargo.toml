@@ -26,6 +26,10 @@ rustc-hash = "=2.1.3"
 # fern (ADR-014). No features (log has no default features): `set_logger` needs none, STATIC_MAX_LEVEL
 # stays Trace, and the runtime level from config is `log::set_max_level` (V127, V128).
 log = "=0.4.35"
+# The workspace's own crates: built from their paths here, and required at this version by the packages
+# crates.io gets. Raise it with `[workspace.package]`'s version (docs/RELEASE.md, "Making a release").
+rustedscreep-consts = { path = "crates/rustedscreep-consts", version = "0.1.0" }
+rustedscreep-core = { path = "crates/rustedscreep-core", version = "0.1.0" }
 # Benches for the planner, flow field and combat sim, native only (ADR-006: a dev-dependency of
 # rustedscreep-core, default features; MSRV 1.86, so Rust 1.100 builds it).
 criterion = "=0.8.2"
@@ -35,7 +39,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT"
-publish = false
+repository = "https://github.com/jabbott-iii/rustedscreep"
+# The release workflow publishes every crate to crates.io, and only there (docs/RELEASE.md, ADR-034).
+publish = ["crates-io"]
 
 # Profiles apply only from this root manifest; member manifests' profiles are ignored (V79).
 # `cargo bench` inherits this profile but always unwinds; `cargo test` uses dev (V80).

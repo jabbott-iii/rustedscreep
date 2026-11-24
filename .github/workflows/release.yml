@@ -1,0 +1,358 @@
+# Publishes a release of rustedscreep when a tag `v<version>` is pushed: the
+# workspace's three crates on crates.io, the files in deploy/ (the bot as the
+# MMO runs it at that commit) on a GitHub release, and the same files as the
+# bot's item in the Steam Workshop of Screeps: World (ADR-034). It is
+# specified in docs/RELEASE.md, with the secrets and settings it needs.
+#
+# Rules for this file:
+# - Pin every action by its full commit SHA, and the one image by its digest,
+#   with the tag in a comment.
+# - Use no actions other than actions/checkout and
+#   actions/upload-artifact / download-artifact; SteamCMD runs from its image.
+# - Install the toolchain with rustup, not with an action.
+# - Only the publishing jobs see secrets or may write, each in an environment
+#   that only `v*` tags may use: `crates` in `crates-io`
+#   (CARGO_REGISTRY_TOKEN), `release` in `release` (contents: write),
+#   `workshop` in `steam-workshop` (STEAM_USERNAME, STEAM_CONFIG_VDF).
+# - Never push to main: a push there is a live MMO deploy (ADR-012).
+#
+# Nothing is built for the release: it ships deploy/ as committed at the tag
+# (`npm run stage` wrote it). crates.io publishes first: it refuses what no
+# check here sees, and nothing else is published until it has taken every
+# crate. The GitHub release and the Workshop item follow, and either can run
+# again.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+# One release at a time, and none canceled: a second tag waits.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Decides whether the tag is a release before anything runs: it must name
+  # the workspace's version, be on main, and have a plain build in deploy/.
+  gate:
+    name: Check the tag
+    if: github.repository == 'jabbott-iii/rustedscreep'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      # All of main's history, to see whether the tag is on it.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The build record is the one `npm run stage` writes into main.js; the
+      # Makefile runs the same check before it tags.
+      - name: Check the tag, the version and deploy/
+        id: check
+        env:
+          TAG: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          version=$(python3 -I -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::The tag is $TAG, but the workspace's version is $version: tag v$version, or raise the version first."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT" origin/main; then
+            echo "::error::$TAG is not on main: a release is made from main's history."
+            exit 1
+          fi
+          if ! git ls-files --error-unmatch deploy/main.js > /dev/null 2>&1 || [ -z "$(git ls-files 'deploy/rustedscreep_wasm*.js')" ]; then
+            echo "::error::deploy/ has no main.js or no wasm module at $TAG: stage a build with npm run stage."
+            exit 1
+          fi
+          build=$(node -e 'const t = require("fs").readFileSync(0, "utf8"); const m = t.match(/^const BUILD = \((\{.*\})\);$/m); if (!m) { console.error("deploy/main.js has no build record: stage a build with npm run stage"); process.exit(1); } const b = JSON.parse(m[1]); if (b.features.length) { console.error("deploy/ holds the feature build " + b.id + ": stage a plain build first"); process.exit(1); } console.log(b.id);' < deploy/main.js) || {
+            echo "::error::deploy/ at $TAG is not a plain staged build (the log above says why)."
+            exit 1
+          }
+          case "$version" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  # The checks that need no wasm toolchain beyond rustup's target: formatting,
+  # lints, the native tests, and deploy/'s files booted in the sandbox as the
+  # GitHub link delivers them (base64 text modules). `npm run check` stays the
+  # full gate, run before the tag (docs/RELEASE.md).
+  check:
+    name: Check the code and deploy/
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # With no toolchain named, rustup installs the one that
+      # rust-toolchain.toml pins, with its components; the wasm target is
+      # added by name too, which does nothing when it is there.
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install --profile minimal --no-self-update
+          rustup target add wasm32-unknown-unknown
+
+      - name: Show the toolchain
+        run: cargo --version --verbose
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lints, native
+        run: cargo clippy --locked -p rustedscreep-core -p rustedscreep-consts --all-targets -- -D warnings
+
+      - name: Lints, wasm
+        run: cargo clippy --locked -p rustedscreep-wasm --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Native tests
+        run: cargo test --locked -p rustedscreep-core -p rustedscreep-consts
+
+      - name: Boot deploy/ in the sandbox
+        run: node js/tools/smoke.mjs deploy base64
+
+      - name: Upload deploy/
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deploy
+          path: deploy/
+          if-no-files-found: error
+
+  # The three crates, in the order of their dependencies. cargo packages and
+  # builds every crate before it uploads one, so a crate that will not build
+  # from its package, or a stale Cargo.lock, stops the release with nothing
+  # published.
+  crates:
+    name: Publish the crates
+    needs: [gate, check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment:
+      name: crates-io
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      # crates.io takes each version once, and cargo refuses to start when
+      # one it was given is there: each attempt leaves out the crates there
+      # already, those a failed attempt or job published. An attempt that
+      # crates.io stops for publishing too many new crates (429), or that
+      # times out waiting for one to show in the index, is tried again
+      # after a wait; any other failure ends the job.
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::The crates-io environment has no CARGO_REGISTRY_TOKEN secret (docs/RELEASE.md)."
+            exit 1
+          fi
+          crates=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.publish == null or ((.publish | index("crates-io")) != null)) | .name')
+          log="$RUNNER_TEMP/publish.log"
+          for attempt in $(seq 1 6); do
+            exclude=()
+            left=()
+            for name in $crates; do
+              status=$(curl -s -o /dev/null -w '%{http_code}' -A "jabbott-iii/rustedscreep release workflow" "https://crates.io/api/v1/crates/$name/$VERSION")
+              if [ "$status" = 200 ]; then
+                exclude+=(--exclude "$name")
+              else
+                left+=("$name")
+              fi
+            done
+            if [ "${#left[@]}" = 0 ]; then
+              echo "Every crate is on crates.io at $VERSION."
+              exit 0
+            fi
+            echo "Attempt $attempt: publishing ${left[*]}"
+            if cargo publish --workspace --locked "${exclude[@]}" 2>&1 | tee "$log"; then
+              exit 0
+            elif grep -q 'status 429' "$log"; then
+              echo "crates.io limits new crates: waiting 10 minutes."
+              sleep 610
+            elif grep -q 'timeout while waiting' "$log"; then
+              sleep 60
+            else
+              exit 1
+            fi
+          done
+          echo "::error::The crates were not all published after 6 attempts."
+          exit 1
+
+  # The GitHub release: deploy/'s files and nothing else, with their SHA-256
+  # sums in the notes. Made as a draft, and published once every file is on
+  # it, so the newest release's files are never half there.
+  release:
+    name: Publish the GitHub release
+    needs: [gate, check, crates]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: release
+    permissions:
+      contents: write
+    steps:
+      - name: Download deploy/
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: deploy
+          path: release
+
+      # A draft left by a failed attempt is filled again; a published
+      # release is never changed.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          PRERELEASE: ${{ needs.gate.outputs.prerelease }}
+          BUILD: ${{ needs.gate.outputs.build }}
+        run: |
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "The bot as the MMO runs it at $TAG: build \`$BUILD\`, the files in \`deploy/\`."
+            echo "Upload them together as one branch's modules, with \`main\` the entry module."
+            echo "The crates are on crates.io at $VERSION: \`rustedscreep-consts\`, \`rustedscreep-core\` and \`rustedscreep-wasm\`."
+            echo
+            echo "SHA-256:"
+            echo
+            echo '```'
+            (cd release && sha256sum -- *)
+            echo '```'
+          } > "$notes"
+          state=$(gh release view "$TAG" --json isDraft --jq .isDraft 2> /dev/null || echo none)
+          if [ "$state" = false ]; then
+            echo "::error::$TAG is published already: a release is never changed."
+            exit 1
+          elif [ "$state" = none ]; then
+            flags=(--draft --verify-tag --title "rustedscreep $VERSION" --notes-file "$notes")
+            if [ "$PRERELEASE" = true ]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$TAG" "${flags[@]}" release/*
+          else
+            gh release edit "$TAG" --notes-file "$notes"
+            gh release upload "$TAG" --clobber release/*
+          fi
+          if [ "$PRERELEASE" = true ]; then
+            gh release edit "$TAG" --draft=false --latest=false
+          else
+            gh release edit "$TAG" --draft=false --latest
+          fi
+
+  # The Workshop item of Screeps: World (app 464350), whose Workshop holds
+  # bots and mods for private servers (VERIFICATION_LOG V318): deploy/'s
+  # files, uploaded with SteamCMD's `workshop_build_item` (V319) from the
+  # steamcmd/steamcmd image, logged in with the account's cached login
+  # (V320). With no STEAM_WORKSHOP_ITEM_ID variable it makes the item,
+  # private, and says to store its id; with one it updates that item, leaving
+  # its title, description and visibility as they are on Steam.
+  workshop:
+    name: Publish the Steam Workshop item
+    needs: [gate, check, crates]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: steam-workshop
+    permissions:
+      contents: read
+    container:
+      image: steamcmd/steamcmd:ubuntu-22@sha256:236c4ea4b0259a9846ca96d94eb517ff4e4cd2d1e0afc05899f6cfb5bc21f6e3 # ubuntu-22
+    steps:
+      - name: Download deploy/
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: deploy
+          path: workshop/content
+
+      # SteamCMD keeps its login in $HOME/Steam/config/config.vdf; the job's
+      # container goes with the runner, and the file is removed before.
+      - name: Upload
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_CONFIG_VDF: ${{ secrets.STEAM_CONFIG_VDF }}
+          ITEM_ID: ${{ vars.STEAM_WORKSHOP_ITEM_ID }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          BUILD: ${{ needs.gate.outputs.build }}
+        run: |
+          if [ -z "$STEAM_USERNAME" ] || [ -z "$STEAM_CONFIG_VDF" ]; then
+            echo "::error::The steam-workshop environment needs the secrets STEAM_USERNAME and STEAM_CONFIG_VDF (docs/RELEASE.md)."
+            exit 1
+          fi
+          if [ -n "$ITEM_ID" ] && ! [[ "$ITEM_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::STEAM_WORKSHOP_ITEM_ID is not a number: $ITEM_ID"
+            exit 1
+          fi
+          config="$HOME/Steam/config/config.vdf"
+          trap 'rm -f "$config"' EXIT
+          mkdir -p "$(dirname "$config")"
+          (umask 077 && printf '%s' "$STEAM_CONFIG_VDF" | base64 -d > "$config")
+          content="$PWD/workshop/content"
+          item="$PWD/workshop/item.vdf"
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          {
+            echo '"workshopitem"'
+            echo '{'
+            echo '  "appid" "464350"'
+            if [ -n "$ITEM_ID" ]; then
+              echo "  \"publishedfileid\" \"$ITEM_ID\""
+            else
+              echo '  "publishedfileid" "0"'
+              echo '  "visibility" "2"'
+              echo '  "title" "rustedscreep"'
+              echo "  \"description\" \"A Screeps bot written in Rust and compiled to WebAssembly. Source and releases: $url\""
+            fi
+            echo "  \"contentfolder\" \"$content\""
+            echo "  \"changenote\" \"rustedscreep $VERSION, build $BUILD: $url/releases/tag/$TAG\""
+            echo '}'
+          } > "$item"
+          # No terminal: a login that needs a password or a code fails
+          # instead of waiting for one.
+          steamcmd +login "$STEAM_USERNAME" +workshop_build_item "$item" +quit < /dev/null
+          id=$(sed -n 's/^[[:space:]]*"publishedfileid"[[:space:]]*"\([0-9]*\)".*/\1/p' "$item")
+          if [ -z "$id" ] || [ "$id" = 0 ]; then
+            echo "::error::SteamCMD gave no item id: the upload did not make an item."
+            exit 1
+          fi
+          if [ -z "$ITEM_ID" ]; then
+            echo "::notice::Made the private Workshop item $id. Store it as the variable STEAM_WORKSHOP_ITEM_ID in the steam-workshop environment, or the next release makes another."
+            echo "Made the private Workshop item [$id](https://steamcommunity.com/sharedfiles/filedetails/?id=$id): store its id as STEAM_WORKSHOP_ITEM_ID." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Updated the Workshop item [$id](https://steamcommunity.com/sharedfiles/filedetails/?id=$id) to $VERSION." >> "$GITHUB_STEP_SUMMARY"
+          fi

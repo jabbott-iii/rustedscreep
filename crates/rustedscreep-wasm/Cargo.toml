@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 publish.workspace = true
 
 [lib]
@@ -26,6 +27,6 @@ log.workspace = true
 js-sys.workspace = true
 # Game objects for the snapshot; no cargo features yet (V2, V87).
 screeps-game-api.workspace = true
-rustedscreep-core = { path = "../rustedscreep-core" }
+rustedscreep-core.workspace = true
 # Constants the API does not export (extra.rs), such as the segment save cap the profiler checks.
-rustedscreep-consts = { path = "../rustedscreep-consts" }
+rustedscreep-consts.workspace = true

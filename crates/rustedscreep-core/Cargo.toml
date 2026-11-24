@@ -5,12 +5,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 publish.workspace = true
 
 [dependencies]
 rustc-hash.workspace = true
 # Game constants and pure local types come in only through the facade (CLAUDE.md).
-rustedscreep-consts = { path = "../rustedscreep-consts" }
+rustedscreep-consts.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

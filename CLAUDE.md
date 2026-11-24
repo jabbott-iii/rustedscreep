@@ -104,6 +104,7 @@ The live server's constants are the ground truth for that server. At init, the b
 | Tool tests (Node) / sizes, upload budget, and the per-module cap (ADR-028) | `npm run test` / `npm run size` |
 | Full gate (same as `/check`) | `npm run check` |
 | Stage the MMO deploy folder for the GitHub link (ask first; the user pushes) | `npm run stage` (`-- --out <dir>` for a dry run, `-- --features trap-test` for the gate's recovery test, `-- --features profiler` for the live CPU measurements) |
+| Tag a release and push the tag, which publishes the crates to crates.io, `deploy/`'s files as a GitHub release, and the same files to the Steam Workshop (the user runs it; agents never tag or push; `docs/RELEASE.md`, ADR-034) | `make release VERSION=v<version>` (`DRY_RUN=1` runs only the checks) |
 
 ## Workflow
 - Start with `/kickoff` (P0, the kickoff and verification phase). Then run `/module` repeatedly. With no argument it takes the next item in STATUS and ROADMAP. Close each phase with `/phase-gate <P#|PS#|SE#>`.

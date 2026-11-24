@@ -703,3 +703,55 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
   - The test harness's ADR-007 comparison (`with_min_cut`) still measures an all-rampart line for the bunker candidate. It is test tooling only.
   - ADR-032's risk that constructed walls are not repaired is resolved here.
 - Evidence: V309 to V316 (screeps-verifier, engine a90d26f, common 2fb779b, crate 0.23.5); the native tests listed in TEST_PLAN.md §1 (Walls, ADR-033); the corpus test `every_line_is_walls_but_its_gates` in `tests/planner_flood.rs`.
+
+## ADR-034 Releases from a version tag: the crates on crates.io, `deploy/` on a GitHub release and in the Steam Workshop: Accepted (2026-11-23)
+- Context: the user asked for "a makefile like the one from Nadir for creating new releases through tag push", and a CD (continuous delivery) workflow that publishes:
+  - the Rust crates to crates.io;
+  - "release files that are just the files in the deploy folder";
+  - a Steam Workshop release "that contains those same files".
+  - Background:
+    - Nadir (the user's other repository) tags with `make release VERSION=v<version>`, which checks first and then pushes the tag; the tag starts its release workflow. That workflow gates on the version, `main`, and CI, then publishes crates.io first and everything else after.
+    - This repository has no CI workflow apart from CodeQL.
+    - Its workspace set `publish = false`.
+    - A push to `main` is a live MMO deploy (ADR-012), and agents never tag, push, or publish (CLAUDE.md, the Bash guard hook).
+  - Screeps: World's Workshop is "Server Mods & Bots", for private servers (V318). Uploads go through SteamCMD's `workshop_build_item` (V319).
+- Options:
+  - What the release ships:
+    - (a) `deploy/` as committed at the tag: the bytes the MMO received from that commit, with their build ID.
+    - (b) a fresh build in the workflow. It needs the wasm-bindgen CLI and binaryen in CI, and gives another build ID than the live one.
+  - How the Workshop job reaches SteamCMD:
+    - (c) the `steamcmd/steamcmd` image, pinned by digest, with the job's own steps;
+    - (d) a third-party action (`m00nl1ght-dev/steam-workshop-deploy` v4), which would hold the Steam login;
+    - (e) Valve's tarball on the runner, whose login folder this session could not verify.
+  - The gate's checks, with no CI to wait for:
+    - (f) the workflow runs a check job itself;
+    - (g) a new CI workflow on `main`. That is a larger change the user did not ask for.
+- Decision: (a), the user's words; (c), Nadir's rule that no third-party action sees a secret, and the same image and login layout as the action (V320); (f). The user accepted it as written (2026-11-23, "Accept ADR-034").
+  - The `Makefile` checks:
+    - that the tag is `v` and HEAD's workspace version;
+    - that HEAD's `deploy/` holds a plain build;
+    - that HEAD is on the remote's `main`;
+    - that the remote lacks the tag.
+    - Then it tags and pushes the tag, or with `DRY_RUN=1` only prints those two commands.
+  - The workflow runs `gate`, then `check` (fmt, both clippy lints, the native tests, and `deploy/` booted in the sandbox), then `crates`, then `release` and `workshop`, each publishing job in its own environment that only `v*` tags may use.
+  - The manifests:
+    - `publish = ["crates-io"]` replaces `publish = false`;
+    - `repository` is added;
+    - the crates name each other through `[workspace.dependencies]` with a path and a version, as crates.io requires.
+  - `docs/RELEASE.md` specifies all of it, with the setup.
+- Consequences:
+  - Publishing is the user's act: pushing a tag publishes to three places, and none can be taken back (a crates.io version can only be yanked).
+  - The first release makes the Workshop item private. Its id must then be stored as `STEAM_WORKSHOP_ITEM_ID`, or each release makes another item.
+  - A release raises three versions in the root `Cargo.toml` and updates `Cargo.lock`.
+  - The release's checks are a subset of `npm run check`, which stays the gate before a tag.
+- Risks:
+  - The Steam secret is a saved login for the whole account. Anyone who can push a `v*` tag can reach it, so the tag ruleset limits who may tag.
+  - Whether an account must own Screeps: World to upload, which visibility value is private (V321, inferred 2), and whether a private server loads these files as a Workshop bot are unverified (VERIFICATION_LOG §E).
+  - A private server's support for the build's wasm features is unprobed (ADR-002; PS1).
+  - The pinned image digest may age out of Docker Hub; `docs/RELEASE.md` says how to move it.
+- Evidence (2026-11-23):
+  - `cargo package --workspace --locked --allow-dirty` packaged and built all three crates from their packages: consts 6 files, 8.4 KiB compressed; core 178 files, 783.9 KiB; wasm 22 files, 91.7 KiB. It printed no warnings. The dry run of the publish command itself is blocked by the guard hook.
+  - `make release VERSION=v0.1.0 DRY_RUN=1` passed every check on HEAD (0821402, build `f24faa96f537-dirty-8ea89287`) and printed the tag and push. A wrong version and a missing `VERSION` were refused, and the build check refused a feature build and a `main.js` without a record.
+  - The workflow parses, and each `run` script passes `bash -n`. The gate's script passed on HEAD and refused a wrong tag. The crate list named the three crates. The Workshop step, with a stub `steamcmd`, wrote the expected `item.vdf`, read back the new id, refused a non-numeric id, and removed the login file. The notes script summed the three files.
+  - `node js/tools/smoke.mjs deploy base64` exits 0 on `deploy/` and 1 on an empty folder.
+  - Facts: V318 to V324.
