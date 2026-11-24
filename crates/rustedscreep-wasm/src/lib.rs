@@ -80,8 +80,8 @@ struct State {
     remote: remote::RemoteGlue,
     /// The controller signer (ADR-030): its record, its trips and the next signer's plan.
     sign: sign::SignGlue,
-    /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1) and the towers
-    /// (P7.2).
+    /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1), the towers
+    /// (P7.2), the safe-mode triggers (P7.4) and the defenders (P7.5).
     defense: defense::DefenseGlue,
     persist: persist::Persist,
     /// The constants self-check, once per global (P1.11).
@@ -185,9 +185,20 @@ pub fn game_loop() {
                 // Critical: the rooms movement needs before anything in them can move, first.
                 movement.read_first(&mut tick, snapshot, js, &cfg.movement);
                 // Critical: the towers' plan (P7.2), only in a room with a tower and a hostile or a
-                // damaged own creep; then the safe-mode triggers (P7.4), only in a room with a
-                // dangerous hostile.
+                // damaged own creep, counting the defenders (P7.5); then the safe-mode triggers
+                // (P7.4), only in a room with a dangerous hostile.
                 defense.plan_towers(&mut tick, snapshot, &cfg.defense);
+                // Critical: the defenders' plan, their spawn requests (before the spawn plan) and
+                // their shots and moves (P7.5), only with a hostile in an owned room or a defender.
+                defense.plan_defenders(
+                    &mut tick,
+                    snapshot,
+                    &mut movement.core,
+                    spawn.spawner_mut(),
+                    &mut act.buffer,
+                    &cfg.defense,
+                    &cfg.movement,
+                );
                 // Critical: remote mining's rooms and spawn requests (P6.2; the requests only while the
                 // Standard tier runs), before the spawn job, and its energy for the upgraders' budget,
                 // before the upgrading job.

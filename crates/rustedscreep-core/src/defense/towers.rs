@@ -44,6 +44,14 @@
 //! the sim kills within the limit, the towers hold fire: shooting into heal that matches them only
 //! drains them (the usual way an attacker empties towers before the real attack).
 //!
+//! The sim counts the bot's defenders too (P7.5, ADR-036, [`TowerControl::set_allies`]): each one
+//! within range 3 of a candidate adds its `rangedAttack` damage there every tick, since a defender
+//! shoots the towers' focus whenever it stands in range of it ([`super::defenders`]). So the towers
+//! fire at a hostile they kill together with the defenders. The one-tick kills of the spare towers
+//! (`split`) count no defender: each shoots only the focus. Nor does the number of towers fired at
+//! a creep with a CLAIM part: P7.4's claim trigger counts only the towers firing at it, so they
+//! fire as many as they would alone (all of them when the kill needs the defenders too).
+//!
 //! Only the fewest towers that kill the target in the ticks all of them would take fire at it,
 //! strongest at it first (`fewest`): one tower kills a scout as soon as six would, and each more
 //! shot is a billed intent and `TOWER_ENERGY_COST` for nothing. When the target dies in one tick,
@@ -77,8 +85,8 @@
 //! so a hostile stepping in and out, or a kill swinging around the limit, cannot fill the log.
 
 use rustedscreep_consts::{
-    Position, RoomName, TOWER_ENERGY_COST, TOWER_FALLOFF, TOWER_FALLOFF_RANGE, TOWER_OPTIMAL_RANGE,
-    TOWER_POWER_ATTACK, TOWER_POWER_HEAL,
+    CREEP_RANGED_ACTION_RANGE, Position, RoomName, TOWER_ENERGY_COST, TOWER_FALLOFF,
+    TOWER_FALLOFF_RANGE, TOWER_OPTIMAL_RANGE, TOWER_POWER_ATTACK, TOWER_POWER_HEAL,
 };
 
 use super::threat::{Power, Threats, damage_taken};
@@ -259,6 +267,8 @@ struct Candidate {
     hits: u32,
     hits_max: u32,
     dangerous: bool,
+    /// Whether it has a live CLAIM part (P7.4's claim trigger reads the towers firing at it).
+    claim: bool,
     ticks: u32,
     heal_power: u32,
     key: u128,
@@ -285,6 +295,9 @@ pub struct TowerControl {
     rooms: Vec<RoomState>,
     /// Creeps the towers no longer fire at, by room (the shot check), while the room's state lives.
     distrust: Vec<(RoomName, CreepHandle)>,
+    /// The bot's defenders this tick, as their position and `rangedAttack` damage a tick
+    /// ([`Self::set_allies`]).
+    allies: Vec<(Position, u32)>,
     orders: Vec<TowerOrder>,
     events: Vec<TowerEvent>,
     /// Scratch.
@@ -463,9 +476,18 @@ impl TowerControl {
         match pick {
             Some(c) => {
                 let all = armed.len();
+                let allies = ally_damage(&self.allies, c.pos);
+                // A CLAIM creep is fired at by as many towers as without the defenders: P7.4's
+                // claim trigger counts only the towers firing at it (`firing_at`), so fewer of them
+                // would make it spend a safe mode on a creep this plan kills.
+                let credit = if c.claim { 0 } else { allies };
                 let (n, damage) = self
-                    .fewest(snap, &mut armed, &c, c.ticks, cfg)
-                    .unwrap_or((all, 0));
+                    .fewest(snap, &mut armed, &c, c.ticks, credit, cfg)
+                    .unwrap_or_else(|| {
+                        let at =
+                            |t: &TowerRef| tower_amount(TOWER_POWER_ATTACK, range(t.pos, c.pos));
+                        (all, armed.iter().fold(0u32, |s, t| s.saturating_add(at(t))))
+                    });
                 for t in armed.iter().take(n) {
                     self.orders.push(TowerOrder::Attack {
                         tower: t.row,
@@ -473,7 +495,9 @@ impl TowerControl {
                     });
                 }
                 next.focus = Some(c.handle);
-                next.expect = self.expected(snap, &c, damage).map(|e| (c.handle, e));
+                // The defenders in range fire at the focus too (module docs).
+                let total = damage.saturating_add(allies);
+                next.expect = self.expected(snap, &c, total).map(|e| (c.handle, e));
                 // A one-tick kill leaves the spare towers for other one-tick kills (module docs).
                 let used = if c.ticks == 1 {
                     self.split(snap, &mut armed, n, c.handle, cfg)
@@ -571,6 +595,7 @@ impl TowerControl {
                 damage: tower_amount(TOWER_POWER_ATTACK, range(t.pos, pos)),
                 shots: t.energy / TOWER_ENERGY_COST,
             }));
+            push_allies(&mut self.shots, &self.allies, pos);
             let heal = heal_on(pos, &self.healers);
             let Some(ticks) = kill_ticks(
                 body.parts(),
@@ -590,6 +615,7 @@ impl TowerControl {
                 hits_max: h.hits_max,
                 dangerous: h.power.dangerous(),
                 ticks,
+                claim: h.power.claim > 0,
                 heal_power: h.power.heal,
                 key: creeps.key_of(handle).map_or(u128::MAX, |k| k.0),
                 damage: self.shots.iter().fold(0, |s, t| s.saturating_add(t.damage)),
@@ -626,6 +652,7 @@ impl TowerControl {
             damage: tower_amount(TOWER_POWER_ATTACK, range(t.pos, pick.pos)),
             shots: t.energy / TOWER_ENERGY_COST,
         }));
+        push_allies(&mut self.shots, &self.allies, pick.pos);
         let mut first: Option<(u32, Candidate)> = None;
         for h in &self.candidates {
             if h.dangerous || h.heal_power == 0 || range(h.pos, pick.pos) > 3 {
@@ -697,7 +724,7 @@ impl TowerControl {
             if rest.is_empty() {
                 break;
             }
-            let Some((k, _)) = self.fewest(snap, rest, d, 1, cfg) else {
+            let Some((k, _)) = self.fewest(snap, rest, d, 1, 0, cfg) else {
                 continue;
             };
             for t in rest.iter().take(k) {
@@ -712,15 +739,18 @@ impl TowerControl {
         used
     }
 
-    /// The fewest of `armed` that kill `c` in the sim's ticks (module docs), and their damage at it:
-    /// sorts `armed` by damage at the target, strongest first, then id, and searches the shortest
-    /// such prefix (one more tower never slows a kill, so the search is a binary one).
+    /// The fewest of `armed` that kill `c` in the sim's ticks (module docs), with `allies` damage a
+    /// tick from the defenders in range besides theirs, and the towers' damage at it: sorts `armed`
+    /// by damage at the target, strongest first, then id, and searches the shortest such prefix (one
+    /// more tower never slows a kill, so the search is a binary one).
+    #[allow(clippy::too_many_arguments)]
     fn fewest(
         &mut self,
         snap: &Snapshot,
         armed: &mut [TowerRef],
         c: &Candidate,
         ticks: u32,
+        allies: u32,
         cfg: &DefenseConfig,
     ) -> Option<(usize, u32)> {
         let at = |t: &TowerRef| tower_amount(TOWER_POWER_ATTACK, range(t.pos, c.pos));
@@ -741,6 +771,12 @@ impl TowerControl {
                 damage: at(t),
                 shots: t.energy / TOWER_ENERGY_COST,
             }));
+            if allies > 0 {
+                shots.push(Shot {
+                    damage: allies,
+                    shots: u32::MAX,
+                });
+            }
             kill_ticks(
                 body.parts(),
                 c.hits,
@@ -871,6 +907,46 @@ impl TowerControl {
     /// Whether the towers of `room` no longer fire at `creep` (the shot check, module docs).
     pub fn distrusts(&self, room: RoomName, creep: CreepHandle) -> bool {
         self.distrust.contains(&(room, creep))
+    }
+
+    /// Sets the bot's defenders for this tick's plans (P7.5): each one's position and its
+    /// `rangedAttack` damage a tick ([`super::defenders::Defenders::allies`]). Call before
+    /// [`Self::plan_room`]; none until set, as before P7.5.
+    pub fn set_allies(&mut self, allies: &[(Position, u32)]) {
+        self.allies.clear();
+        self.allies.extend_from_slice(allies);
+    }
+
+    /// The creep the towers of `room` fire at this tick, if their plan ran there at tick `now` and
+    /// chose one (the defenders shoot it too, P7.5).
+    pub fn focus(&self, room: RoomName, now: u32) -> Option<CreepHandle> {
+        self.rooms
+            .iter()
+            .find(|r| r.room == room && r.seen == now)
+            .and_then(|r| r.focus)
+    }
+}
+
+/// The `rangedAttack` damage a tick the defenders within range 3 of `at` put on a creep there.
+/// Unit: hit points.
+///
+/// Uses: rustedscreep_consts::CREEP_RANGED_ACTION_RANGE (V339).
+pub(super) fn ally_damage(allies: &[(Position, u32)], at: Position) -> u32 {
+    let reach = u32::from(CREEP_RANGED_ACTION_RANGE);
+    allies
+        .iter()
+        .filter(|&&(p, _)| range(p, at) <= reach)
+        .fold(0u32, |sum, &(_, d)| sum.saturating_add(d))
+}
+
+/// Adds the defenders in range of `at` to `shots` as one shooter that never runs out.
+fn push_allies(shots: &mut Vec<Shot>, allies: &[(Position, u32)], at: Position) {
+    let damage = ally_damage(allies, at);
+    if damage > 0 {
+        shots.push(Shot {
+            damage,
+            shots: u32::MAX,
+        });
     }
 }
 

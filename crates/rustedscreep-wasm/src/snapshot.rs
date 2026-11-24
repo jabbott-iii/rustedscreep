@@ -916,18 +916,28 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
                 .creeps
                 .push_named(key, row, || identity_of(&creep))?;
             if !spawning {
+                let row = snapshot.creeps.len().saturating_sub(1);
+                // P7.5: a defender (no CARRY part, nothing reads its store).
+                let defender = snapshot
+                    .creeps
+                    .identities()
+                    .get(row)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|id| id.role == Role::Defender);
                 // P2.4: `store`, `getUsedCapacity` and `getCapacity` for energy; a creep with no
                 // active CARRY part has a capacity of null, read as 0 (V196, V197).
-                let store = creep.store();
-                let energy = ResourceType::Energy;
-                let row = snapshot.creeps.len().saturating_sub(1);
-                snapshot.creeps.set_store(
-                    row,
-                    CreepStore {
-                        energy: store.get_used_capacity(Some(energy)),
-                        capacity: store.get_capacity(Some(energy)),
-                    },
-                );
+                if !defender {
+                    let store = creep.store();
+                    let energy = ResourceType::Energy;
+                    snapshot.creeps.set_store(
+                        row,
+                        CreepStore {
+                            energy: store.get_used_capacity(Some(energy)),
+                            capacity: store.get_capacity(Some(energy)),
+                        },
+                    );
+                }
                 // P5.2: `ticksToLive` until it reads a number (undefined before `ageTime` is set,
                 // V198); its death tick is then kept with the handle, since `ageTime` never
                 // changes and the bot renews no creep (V170).
@@ -955,6 +965,14 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
                         .known_hits_max(row)
                         .unwrap_or_else(|| creep.hits_max());
                     snapshot.creeps.set_own_hits(row, creep.hits(), max);
+                }
+                // P7.5: a defender's body once in its life (its RANGED_ATTACK parts are its
+                // power; the engine never changes a body but by boosts, which the bot gives none).
+                if defender && !snapshot.creeps.knows_body(row) {
+                    let body = read_body(&creep);
+                    if !body.is_empty() {
+                        snapshot.creeps.set_body(row, body);
+                    }
                 }
             }
             Ok(handle)

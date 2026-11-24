@@ -14,6 +14,13 @@
 //! - `safe mode` (Critical; P7.4, ADR-035, `defense::SafeModes`): one unit per owned room with a
 //!   dangerous hostile this tick, right after the towers' plan (it reads their kill times); none,
 //!   and no clock sample, on a tick without. With `defense.safe_mode` off, no unit.
+//! - `defenders` (Critical; P7.5, ADR-036, `defense::Defenders`): one unit per owned room with a
+//!   dangerous hostile this tick, after the safe-mode triggers and before the spawn plan: the
+//!   room's need, its spawn requests and this tick's target. `defender work` (Critical): one unit
+//!   per defender of the bot: its `rangedAttack`, its move, or a give-way. Neither runs, and no
+//!   clock sample is taken, on a tick with no hostile in an owned room and every defender home;
+//!   each defender then only gives way. The defenders' list goes to the towers' plan first, whose
+//!   sim counts them.
 //! - The calls go out in the act step, right after the spawn orders: first `activateSafeMode()` on
 //!   a room's controller (at most once per room per threat; billed when OK, a refusal is free, V325),
 //!   then the towers' `attack(creep)` or `heal(creep)` per order, one JS call each, billed when OK
@@ -21,8 +28,9 @@
 //! - The log lines report each threat's start and changes (warn) and its end (info), the towers'
 //!   new target, a hold of fire with a dangerous hostile in the room, and a target the shot check
 //!   gives up on (warn), a safe-mode call's outcome with its reason and a trigger the room cannot
-//!   meet (warn), and a threat in a room already in its safe mode (info): the live record of the
-//!   event and the bot's response that the P7 gate asks for.
+//!   meet (warn), a threat in a room already in its safe mode (info), and the defenders a room
+//!   needs and a hostile beyond them (warn): the live record of the event and the bot's response
+//!   that the P7 gate asks for.
 //!
 //! JS calls of its own: the towers' calls; and on a tick a threat starts or changes, or the towers
 //! take a new target, each named hostile's `owner` and its `username` (4 JS calls a creep in the
@@ -30,16 +38,18 @@
 //! only while warn is on (V268, as the remote threat line does). Everything else comes from the
 //! snapshot.
 
-use rustedscreep_core::config::{DefenseConfig, SchedulerConfig};
+use rustedscreep_core::config::{DefenseConfig, MovementConfig, SchedulerConfig};
 use rustedscreep_core::defense::{
-    Blocked, Reason, RoomThreat, SafeModeEvent, SafeModes, ThreatEvent, Threats, TowerControl,
-    TowerEvent, TowerOrder,
+    Blocked, DefenderEvent, Defenders, Reason, RoomThreat, SafeModeEvent, SafeModes, ThreatEvent,
+    Threats, TowerControl, TowerEvent, TowerOrder,
 };
-use rustedscreep_core::intents::{ActLog, Outcome, error_name};
+use rustedscreep_core::intents::{ActLog, IntentBuffer, Outcome, error_name};
+use rustedscreep_core::movement::Movement;
 use rustedscreep_core::scheduler::{
     Clock, Fault, FaultRecord, Job, JobState, Scheduler, TickCpu, Tier,
 };
 use rustedscreep_core::snapshot::Snapshot;
+use rustedscreep_core::spawning::Spawner;
 use screeps::{RoomName, StructureType};
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
@@ -84,6 +94,18 @@ const SAFE_MODE_JOB: Job = Job {
     tier: Tier::Critical,
 };
 
+/// The defenders' plan (P7.5): defense, Critical.
+const DEFENDER_JOB: Job = Job {
+    name: "defenders",
+    tier: Tier::Critical,
+};
+
+/// The defenders' shots and moves (P7.5): defense, Critical.
+const DEFENDER_WORK_JOB: Job = Job {
+    name: "defender work",
+    tier: Tier::Critical,
+};
+
 /// The job name the act step's tower faults are logged under.
 const TOWER_CALLS: &str = "tower calls";
 
@@ -98,6 +120,9 @@ pub struct DefenseGlue {
     tower_job: JobState,
     safe: SafeModes,
     safe_job: JobState,
+    defenders: Defenders,
+    defender_job: JobState,
+    defender_work_job: JobState,
     /// Tower calls the game refused since the global started, and the tick the last was logged.
     refused: u32,
     refused_logged: Option<u32>,
@@ -113,7 +138,8 @@ impl DefenseGlue {
         } else {
             self.core.clear();
         }
-        // Only rooms with a tower: nothing heals elsewhere.
+        // Only rooms with a tower: nothing heals elsewhere, and no tower's sim counts a defender
+        // there (P7.5 counts one at its whole body).
         let towered = |room: RoomName| {
             let st = &snapshot.structures;
             snapshot.towers.rows().iter().any(|&r| {
@@ -139,8 +165,12 @@ impl DefenseGlue {
             tower_job,
             safe,
             safe_job,
+            defenders,
             ..
         } = self;
+        // P7.5: the defenders first, whom the towers' sim counts.
+        defenders.begin(snapshot, core);
+        towers.set_allies(defenders.allies());
         towers.begin(snapshot, core, cfg);
         let count = towers.unit_count();
         if count > 0 {
@@ -158,6 +188,53 @@ impl DefenseGlue {
             });
         }
         safe.finish(snapshot.tick.time, core);
+    }
+
+    /// The Critical `defenders` job (one unit per owned room with a dangerous hostile), then the
+    /// Critical `defender work` job (one unit per defender), P7.5 (module docs). Call after
+    /// [`Self::plan_towers`], before the spawn plan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_defenders<C: Clock>(
+        &mut self,
+        tick: &mut TickCpu<'_, C>,
+        snapshot: &Snapshot,
+        movement: &mut Movement,
+        spawner: &mut Spawner,
+        buffer: &mut IntentBuffer,
+        cfg: &DefenseConfig,
+        mcfg: &MovementConfig,
+    ) {
+        let Self {
+            core,
+            towers,
+            defenders,
+            defender_job,
+            defender_work_job,
+            ..
+        } = self;
+        let rooms = defenders.unit_count();
+        if rooms > 0 {
+            tick.run_units(&DEFENDER_JOB, defender_job, rooms, |unit, commit| {
+                defenders.plan_room(
+                    unit, snapshot, core, towers, movement, spawner, cfg, mcfg, commit,
+                )
+            });
+        }
+        let members = defenders.member_count();
+        if members > 0 && defenders.idle(core) {
+            // Nothing to fight and nobody away: each holds and gives way, with no clock reading.
+            defenders.hold_all(snapshot, movement);
+        } else if members > 0 {
+            tick.run_units(
+                &DEFENDER_WORK_JOB,
+                defender_work_job,
+                members,
+                |unit, commit| {
+                    defenders.work(unit, snapshot, core, towers, movement, buffer, mcfg, commit)
+                },
+            );
+        }
+        defenders.finish(core);
     }
 
     /// Calls `activateSafeMode` for this tick's safe-mode orders (at most one per room per threat)
@@ -380,6 +457,58 @@ impl DefenseGlue {
         }
         if !log::log_enabled!(log::Level::Warn) {
             return;
+        }
+        let at_row = |row: u32| {
+            snapshot
+                .creeps
+                .positions()
+                .get(usize::try_from(row).unwrap_or(usize::MAX))
+                .map(|p| format!("({}, {})", p.x().u8(), p.y().u8()))
+                .unwrap_or_else(|| String::from("(?)"))
+        };
+        for event in self.defenders.events() {
+            match *event {
+                DefenderEvent::Need {
+                    room,
+                    target,
+                    parts,
+                    defenders,
+                    per_body,
+                    cost,
+                    ticks,
+                    have,
+                } => {
+                    let asked = if cfg.defenders {
+                        ""
+                    } else {
+                        "; none are requested (defense.defenders is off)"
+                    };
+                    log::warn!(
+                        "rustedscreep defense: {room} needs {defenders} defender(s) of {per_body} \
+                         RANGED_ATTACK and {per_body} MOVE ({cost} energy each): the towers alone do \
+                         not kill the hostile at {} of {} within {} ticks; with {parts} \
+                         RANGED_ATTACK part(s) they do in {ticks} tick(s) by the sim ({have} \
+                         alive){asked}",
+                        at_row(target),
+                        owner_of(js, usize::try_from(target).unwrap_or(usize::MAX)),
+                        cfg.max_kill_ticks
+                    );
+                }
+                DefenderEvent::Outmatched {
+                    room,
+                    target,
+                    defenders,
+                    per_body,
+                } => {
+                    log::warn!(
+                        "rustedscreep defense: {room} defenders cannot win: the hostile at {} of {} \
+                         survives the towers and {defenders} defender(s) of {per_body} \
+                         RANGED_ATTACK by the sim; none are requested for it",
+                        at_row(target),
+                        owner_of(js, usize::try_from(target).unwrap_or(usize::MAX))
+                    );
+                }
+            }
         }
         for event in self.towers.events() {
             match *event {

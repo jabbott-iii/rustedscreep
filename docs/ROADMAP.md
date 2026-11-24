@@ -178,7 +178,7 @@ Modules:
 - [x] Tower focus fire and heal priority, driven by the combat sim.
 - [x] Rampart upkeep (with home road repair, ADR-032: the line placed and held at 1% of its level's hits by the workers; its amendment sizes the workers for the repairs; ADR-033 closes the line with walls but for its gates).
 - [x] Safe-mode triggers (when to activate safe mode, which for a limited time stops every creep but the owner's in the room from using any method that affects the owner's creeps or objects; what it blocks is VERIFICATION_LOG V325 to V334; ADR-035: when a spawn, tower, storage, or terminal would fall before the towers kill the hostiles in reach, or a CLAIM creep would reach the controller first, whoever owns them).
-- [ ] Scaled defenders.
+- [x] Scaled defenders (ADR-036: ranged defenders, spawned only when the towers cannot win a fight within `defense.max_kill_ticks`, as many full bodies as the combat sim says kill it with the towers, up to `defense.max_defenders`, at a spawn priority above every economy role but the zero-creep recovery worker; they shoot from inside the rampart line).
 - [ ] Remote evacuation.
 
 **Gate:**

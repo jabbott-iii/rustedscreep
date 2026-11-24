@@ -70,6 +70,12 @@ extern "C" {
     #[wasm_bindgen(method, catch, js_name = rangedHeal)]
     fn ranged_heal(this: &Actor, target: &JsValue) -> Result<f64, JsValue>;
 
+    /// `rangedAttack(target)` (P7.5): OK, or ERR_NOT_OWNER, ERR_BUSY, ERR_NO_BODYPART,
+    /// ERR_INVALID_TARGET, ERR_NOT_IN_RANGE (V339); bound here, not through the crate's method,
+    /// which unwraps the return code (V111, V341).
+    #[wasm_bindgen(method, catch, js_name = rangedAttack)]
+    fn ranged_attack(this: &Actor, target: &JsValue) -> Result<f64, JsValue>;
+
     #[wasm_bindgen(method, catch, js_name = repair)]
     fn repair(this: &Actor, target: &JsValue) -> Result<f64, JsValue>;
 
@@ -283,6 +289,7 @@ fn call(actor: &Actor, issue: &Issue, js: &JsWorld) -> Option<Result<f64, JsValu
         CreepIntent::Pickup { .. } => actor.pickup(target()?),
         CreepIntent::Heal { .. } => actor.heal(target()?),
         CreepIntent::RangedHeal { .. } => actor.ranged_heal(target()?),
+        CreepIntent::RangedAttack { .. } => actor.ranged_attack(target()?),
         CreepIntent::Repair { .. } | CreepIntent::RepairObject { .. } => actor.repair(target()?),
         CreepIntent::UpgradeController { .. } => actor.upgrade_controller(target()?),
         CreepIntent::Pull { .. } => actor.pull(target()?),
@@ -310,6 +317,7 @@ const fn threw(intent: &CreepIntent) -> &'static str {
         CreepIntent::Pickup { .. } => "the pickup call threw",
         CreepIntent::Heal { .. } => "the heal call threw",
         CreepIntent::RangedHeal { .. } => "the rangedHeal call threw",
+        CreepIntent::RangedAttack { .. } => "the rangedAttack call threw",
         CreepIntent::Repair { .. } | CreepIntent::RepairObject { .. } => "the repair call threw",
         CreepIntent::UpgradeController { .. } => "the upgradeController call threw",
         CreepIntent::Pull { .. } => "the pull call threw",

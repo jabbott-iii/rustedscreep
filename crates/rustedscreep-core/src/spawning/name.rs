@@ -53,11 +53,14 @@ pub enum Role {
     /// The controller signer (ADR-030): one MOVE part, or TOUGH and MOVE parts for a towered room;
     /// it signs every controller it can reach with `signing::SIGN_TEXT`. At most one for the bot.
     Signer,
+    /// A defender (P7.5, ADR-036): MOVE and RANGED_ATTACK parts; spawned only while the towers
+    /// cannot win a fight in its home, it shoots hostiles from inside the rampart line.
+    Defender,
 }
 
 impl Role {
     /// Every role, in a fixed order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Worker,
         Self::Miner,
         Self::Hauler,
@@ -67,6 +70,7 @@ impl Role {
         Self::RemoteMiner,
         Self::RemoteHauler,
         Self::Signer,
+        Self::Defender,
     ];
 
     /// The first byte of the role's creep names. Never change or reuse one (see the module docs).
@@ -81,6 +85,7 @@ impl Role {
             Self::RemoteMiner => b'n',
             Self::RemoteHauler => b'c',
             Self::Signer => b'g',
+            Self::Defender => b'd',
         }
     }
 
@@ -107,6 +112,7 @@ impl Role {
             Self::RemoteMiner => "remote miner",
             Self::RemoteHauler => "remote hauler",
             Self::Signer => "signer",
+            Self::Defender => "defender",
         }
     }
 
@@ -472,7 +478,7 @@ mod tests {
         // The codes creeps alive today carry (a persisted format, module docs).
         assert_eq!(
             Role::ALL.map(Role::code),
-            [b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c', b'g'],
+            [b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c', b'g', b'd'],
             "never change or reuse a code"
         );
     }

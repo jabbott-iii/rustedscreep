@@ -113,8 +113,8 @@ pub enum TargetRow {
 
 /// One creep intent with its arguments. The variants are the creep methods whose targets this
 /// build's snapshot can name; harvest, build, pickup and withdraw from a room object came with the
-/// room-object table (P2.4), and attacks come with the ally check every attack intent needs (P7,
-/// P10).
+/// room-object table (P2.4), and `rangedAttack` with P7.5's defenders (ADR-036). The other attacks,
+/// and the ally check every attack intent needs (`.claude/rules/combat.md`), come with P10.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CreepIntent {
     /// `drop(resource, amount)`; `None` drops all of it.
@@ -157,6 +157,12 @@ pub enum CreepIntent {
         target: CreepHandle,
     },
     RangedHeal {
+        target: CreepHandle,
+    },
+    /// `rangedAttack(creep)` on another player's creep (P7.5, ADR-036). The game accepts an own
+    /// creep as its target and the processor damages it (V339, V340), so [`IntentBuffer::push`]
+    /// refuses one ([`Rejected::WrongTarget`]).
+    RangedAttack {
         target: CreepHandle,
     },
     /// `move(direction)`. The game API refuses it while the creep is fatigued or has no active MOVE
@@ -216,6 +222,7 @@ impl CreepIntent {
             Self::Pickup { .. } => CreepAction::Pickup,
             Self::Heal { .. } => CreepAction::Heal,
             Self::RangedHeal { .. } => CreepAction::RangedHeal,
+            Self::RangedAttack { .. } => CreepAction::RangedAttack,
             Self::Move { .. } | Self::MoveToward { .. } => CreepAction::Move,
             Self::Repair { .. } | Self::RepairObject { .. } => CreepAction::Repair,
             Self::Say { .. } => CreepAction::Say,
@@ -246,6 +253,7 @@ impl CreepIntent {
             | Self::UpgradeController { target } => Some(Target::Structure(target)),
             Self::Heal { target }
             | Self::RangedHeal { target }
+            | Self::RangedAttack { target }
             | Self::Pull { target }
             | Self::MoveToward { target } => Some(Target::Creep(target)),
             Self::WithdrawObject { target, .. }
@@ -274,6 +282,7 @@ impl CreepIntent {
             | Self::ReserveController { .. }
             | Self::SignController { .. } => Some(1),
             Self::RangedHeal { .. }
+            | Self::RangedAttack { .. }
             | Self::Repair { .. }
             | Self::RepairObject { .. }
             | Self::UpgradeController { .. }
@@ -312,7 +321,8 @@ pub enum Rejected {
     /// `CONSTRUCTION_COST` (billed, skipped); for `upgradeController` anything but a controller
     /// (V108, V109, V113). Among room objects (P2.4): `harvest` only a source, `build` only a site,
     /// `pickup` only a pile, `withdraw` only a tombstone, ruin or container, and `transfer` and
-    /// `repair` only a container.
+    /// `repair` only a container. For `rangedAttack` an own creep: the game would damage it (V339,
+    /// V340), which the bot never wants.
     WrongTarget,
     /// The target is farther than the method's range or in another room (`ERR_NOT_IN_RANGE`, V108,
     /// V113).
@@ -525,6 +535,12 @@ impl IntentBuffer {
                         | CreepIntent::Transfer { .. }
                 );
                 if to_self && t == row {
+                    return Err(Rejected::WrongTarget);
+                }
+                // No friendly fire: an own creep, the actor included, is never attacked (V339).
+                if matches!(intent, CreepIntent::RangedAttack { .. })
+                    && creeps.my().get(t).copied().unwrap_or(true)
+                {
                     return Err(Rejected::WrongTarget);
                 }
                 if creeps.spawning().get(t).copied().unwrap_or(true) {
@@ -1517,13 +1533,14 @@ mod tests {
         let (at, range) = match *intent {
             CreepIntent::Heal { target }
             | CreepIntent::RangedHeal { target }
+            | CreepIntent::RangedAttack { target }
             | CreepIntent::Pull { target }
             | CreepIntent::MoveToward { target }
             | CreepIntent::Transfer {
                 target: Target::Creep(target),
                 ..
             } => {
-                let Some(&(_, at, _, sp)) = creeps.iter().find(|c| c.0 == target) else {
+                let Some(&(_, at, target_mine, sp)) = creeps.iter().find(|c| c.0 == target) else {
                     return Err(Rejected::GoneTarget);
                 };
                 let self_target = !matches!(
@@ -1533,12 +1550,19 @@ mod tests {
                 if self_target && target == actor {
                     return Err(Rejected::WrongTarget);
                 }
+                // No friendly fire (V339): an own creep is never a ranged attack's target.
+                if matches!(intent, CreepIntent::RangedAttack { .. }) && target_mine {
+                    return Err(Rejected::WrongTarget);
+                }
                 if sp {
                     return Err(Rejected::SpawningTarget);
                 }
                 (
                     Some(at),
-                    if matches!(intent, CreepIntent::RangedHeal { .. }) {
+                    if matches!(
+                        intent,
+                        CreepIntent::RangedHeal { .. } | CreepIntent::RangedAttack { .. }
+                    ) {
                         3
                     } else {
                         1
@@ -1658,7 +1682,8 @@ mod tests {
             let o = things[rng.next(things.len())];
             let amount = [None, Some(0), Some(7)][rng.next(3)];
             let d = [Direction::Top, Direction::Left, Direction::BottomRight][rng.next(3)];
-            match rng.next(18) {
+            match rng.next(19) {
+                18 => CreepIntent::RangedAttack { target: c },
                 17 => CreepIntent::RepairObject { target: o },
                 12 => CreepIntent::Harvest { target: o },
                 13 => CreepIntent::Build { target: o },

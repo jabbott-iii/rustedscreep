@@ -34,6 +34,18 @@
 //   ATTACK_POWER); the controller then reports its safe mode (`gameTime + SAFE_MODE_DURATION`, V326), and the next loop
 //   logs one "is in safe mode" line with the ticks left;
 // - with none left: no call, and one "needs safe mode but cannot activate it (no activation left)" line on that loop;
+// - with no tower, the raider also needs defenders (P7.5): one "needs N defender(s)" line on its first loop, after
+//   the start line (the spawn's `spawnCreep` accepts each order; the ordered creeps never appear in this run);
+// - no fault, error or trap line, and no halt.
+// Then the defenders (P7.5, ADR-036), in one more run of the smoke world with no tower: a melee raider (2 ATTACK, 2
+// MOVE) stands at range 5 of the spawn, out of the safe-mode triggers' reach. It checks:
+// - one "needs 1 defender(s)" line on the raider's first loop, after its start line, whose figures come from the
+//   constants (BODYPART_COST, RANGED_ATTACK_POWER, the raider's hits: the fewest RANGED_ATTACK parts that kill it within
+//   50 ticks, and the ticks they take; no tower, so the towers alone never do);
+// - one `spawnCreep` call, on that loop, with the body [move, ranged_attack] (the most pairs the room's 300 capacity
+//   pays for) and a name of the defender role (`dW1N1-`); none while that creep spawns or lives;
+// - the creep's `body` read once, on its first loop out of the spawn, and a `rangedAttack` on the raider on every loop
+//   it stands within range 3 of it (its post: already at range 3, out of the raider's melee reach, so no `move`);
 // - no fault, error or trap line, and no halt.
 // npm run check runs it (row 25); standalone: node js/tools/defense-sim.mjs [dir].
 import { join } from 'node:path';
@@ -316,7 +328,7 @@ export function defenseSim(dir = join(ROOT, 'dist')) {
   }
   if (!eq(calls, wantCalls)) problems.push(`tower calls ${JSON.stringify(calls)}, expected ${JSON.stringify(wantCalls)}`);
 
-  problems.push(...safeModeRun(dir, 1), ...safeModeRun(dir, 0));
+  problems.push(...safeModeRun(dir, 1), ...safeModeRun(dir, 0), ...defenderRun(dir));
   if (problems.length) throw new Error(`defense-sim:\n  ${problems.slice(0, 20).join('\n  ')}`);
   return { ticks: world.ticksRun, lines: lines.length, start: lines[0] };
 }
@@ -359,6 +371,8 @@ function safeModeRun(dir, available) {
         return 0;
       };
       Object.defineProperty(spawn, 'hits', { get() { count(reads, 'spawn', `hits@${offset}`); return C.SPAWN_HITS; } });
+      // The defenders' orders (P7.5) are accepted; this run does not model the creeps.
+      spawn.spawnCreep = () => 0;
       const room = scene.rooms[ROOM];
       const base = room.find;
       const raider = { ...SM_RAIDER, x: SPAWN_AT.x + smRange(offset), y: SPAWN_AT.y };
@@ -394,9 +408,120 @@ function safeModeRun(dir, available) {
   const want = [
     `${prefix}threatened by 1 dangerous hostile creep(s) of Raider (1 in the room, 0 boosted): melee ${melee}, ranged 0, heal 0, `
       + `dismantle 0 a tick, 0 CLAIM; hits ${hits}, effective ${hits}`,
+    needLine(SPAWN_AT.x + smRange(SM_FROM), SPAWN_AT.y, hits),
     ...(available > 0
       ? [`${prefix}safe mode activation accepted at tick ${T0 + fire}: ${why}`, `${prefix}is in safe mode for ${C.SAFE_MODE_DURATION - 1} more ticks`]
       : [`${prefix}needs safe mode but cannot activate it (no activation left): ${why}`]),
+  ];
+  const lines = world.logs.filter((l) => l.startsWith('rustedscreep defense:'));
+  if (!eq(lines, want)) problems.push(`${tag} lines:\n    ${lines.join('\n    ') || 'none'}\n  expected:\n    ${want.join('\n    ')}`);
+  return problems;
+}
+
+/** The defender run's raider (2 ATTACK, 2 MOVE), at range 5 of the spawn from DF_FROM on. */
+const DF_RAIDER = {
+  id: id(70), name: 'Raider70', owner: 'Raider', x: 25, y: 30,
+  body: [['attack'], ['attack'], ['move'], ['move']],
+};
+const DF_FROM = 3;
+/** The defender spawns for CREEP_SPAWN_TIME a part, then stands at DF_POST, range 3 of the raider. */
+const DF_PATTERN = ['move', 'ranged_attack'];
+const DF_POST = { x: 25, y: 27 };
+const DF_ID = id(71);
+const DF_TICKS = DF_FROM + DF_PATTERN.length * 3 + 5;
+
+/** The fewest RANGED_ATTACK parts (up to `most`) that kill an unboosted creep of `hits` with no heal and no tower within
+ * 50 ticks, and the ticks they take (the towers' sim with V287's order). */
+function fewestParts(hits, most) {
+  for (let p = 1; p <= most; p++) {
+    const ticks = Math.ceil(hits / (p * C.RANGED_ATTACK_POWER));
+    if (ticks <= 50) return { parts: p, ticks };
+  }
+  return null;
+}
+
+/** The "needs N defender(s)" line for an unboosted raider of Raider at (x, y) with `hits`, in the smoke world (no tower,
+ * the room's capacity SPAWN_ENERGY_CAPACITY, `defense.max_defenders` 3). */
+function needLine(x, y, hits) {
+  const pair = DF_PATTERN.reduce((n, part) => n + C.BODYPART_COST[part], 0);
+  const pairs = Math.floor(C.SPAWN_ENERGY_CAPACITY / pair);
+  const need = fewestParts(hits, pairs * 3);
+  return `rustedscreep defense: ${ROOM} needs ${Math.ceil(need.parts / pairs)} defender(s) of ${pairs} RANGED_ATTACK and ${pairs} MOVE `
+    + `(${pair * pairs} energy each): the towers alone do not kill the hostile at (${x}, ${y}) of Raider within 50 ticks; `
+    + `with ${need.parts} RANGED_ATTACK part(s) they do in ${need.ticks} tick(s) by the sim (0 alive)`;
+}
+
+/** One run: the raider stands still; the spawn records its orders, and the ordered creep spawns, then stands out. */
+function defenderRun(dir) {
+  const reads = {};
+  const spawnCalls = [];
+  const attacks = [];
+  const moves = [];
+  const state = { name: null, at: null };
+  const spawnTime = DF_PATTERN.length * C.CREEP_SPAWN_TIME;
+  const world = simulate(dir, {
+    ticks: DF_TICKS,
+    scene: (offset) => {
+      const scene = sceneAt(offset);
+      const spawn = scene.structures[IDS.spawn];
+      spawn.spawnCreep = (body, name) => {
+        spawnCalls.push([offset, body, name]);
+        state.name = name;
+        state.at = offset;
+        return 0;
+      };
+      // V101: the ordered creep is in Game.creeps from the next tick, spawning for its spawn time.
+      if (state.name !== null && offset > state.at) {
+        const spawning = offset <= state.at + spawnTime;
+        const at = spawning ? SPAWN_AT : DF_POST;
+        const parts = DF_PATTERN.map((type) => ({ type, hits: PART_HITS }));
+        const creep = Object.defineProperties({
+          id: DF_ID, name: state.name, my: true, spawning, owner: { username: 'bot' }, fatigue: 0,
+          ticksToLive: spawning ? undefined : C.CREEP_LIFE_TIME, hitsMax: PART_HITS * parts.length, hits: PART_HITS * parts.length,
+          pos: { x: at.x, y: at.y, roomName: ROOM, __packedPos: packPos(ROOM, at.x, at.y) },
+          store: makeStore({}, { capacity: 0 }),
+          rangedAttack(target) { attacks.push([offset, target?.id]); return 0; },
+          move(direction) { moves.push([offset, direction]); return 0; },
+        }, {
+          body: { get() { count(reads, DF_ID, `body@${offset}`); return parts; }, enumerable: true },
+        });
+        scene.creeps[state.name] = creep;
+        if (spawning) spawn.spawning = { name: state.name, needTime: spawnTime, remainingTime: state.at + spawnTime + 1 - offset };
+      }
+      const room = scene.rooms[ROOM];
+      const base = room.find;
+      const hostiles = offset >= DF_FROM ? [hostileObject(DF_RAIDER, ROOM, offset, reads)] : [];
+      room.find = (type, opts) => (type === FIND_HOSTILE_CREEPS ? findFiltered(hostiles, opts) : base(type, opts));
+      return scene;
+    },
+  });
+  const tag = 'defenders';
+  const problems = [];
+  const bad = world.logs.filter((l) => l.includes('fault') || l.includes('[error]') || l.includes('trapped') || l.includes('incident'));
+  problems.push(...bad.map((l) => `${tag} log: ${l}`));
+  if (world.halts) problems.push(`${tag}: ${world.halts} halt(s)`);
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const pair = DF_PATTERN.reduce((n, part) => n + C.BODYPART_COST[part], 0);
+  const pairs = Math.floor(C.SPAWN_ENERGY_CAPACITY / pair);
+  if (pairs !== 1) problems.push(`${tag}: the room's capacity pays for ${pairs} pairs; the run expects 1`);
+  if (spawnCalls.length !== 1) problems.push(`${tag}: spawnCreep calls ${JSON.stringify(spawnCalls)}, expected one`);
+  const [order] = spawnCalls;
+  if (order && (order[0] !== DF_FROM || !eq(order[1], DF_PATTERN) || !String(order[2]).startsWith(`d${ROOM}-`))) {
+    problems.push(`${tag}: spawnCreep ${JSON.stringify(order)}, expected offset ${DF_FROM}, body ${JSON.stringify(DF_PATTERN)}, a d${ROOM}- name`);
+  }
+  const out = state.at === null ? [] : Array.from({ length: DF_TICKS }, (_, o) => o).filter((o) => o > state.at + spawnTime);
+  const bodyReads = Object.keys(reads[DF_ID] ?? {}).map((k) => Number(k.split('@')[1]));
+  if (!eq(bodyReads, out.slice(0, 1))) problems.push(`${tag}: the defender's body read at ${JSON.stringify(bodyReads)}, expected ${JSON.stringify(out.slice(0, 1))}`);
+  const wantAttacks = out.map((o) => [o, DF_RAIDER.id]);
+  if (!eq(attacks, wantAttacks)) problems.push(`${tag}: rangedAttack calls ${JSON.stringify(attacks)}, expected ${JSON.stringify(wantAttacks)}`);
+  if (moves.length) problems.push(`${tag}: move calls ${JSON.stringify(moves)}, expected none (at its post)`);
+  const hits = PART_HITS * DF_RAIDER.body.length;
+  const melee = 2 * C.ATTACK_POWER;
+  const prefix = `rustedscreep defense: ${ROOM} `;
+  const want = [
+    `${prefix}threatened by 1 dangerous hostile creep(s) of Raider (1 in the room, 0 boosted): melee ${melee}, ranged 0, heal 0, `
+      + `dismantle 0 a tick, 0 CLAIM; hits ${hits}, effective ${hits}`,
+    needLine(DF_RAIDER.x, DF_RAIDER.y, hits),
   ];
   const lines = world.logs.filter((l) => l.startsWith('rustedscreep defense:'));
   if (!eq(lines, want)) problems.push(`${tag} lines:\n    ${lines.join('\n    ') || 'none'}\n  expected:\n    ${want.join('\n    ')}`);

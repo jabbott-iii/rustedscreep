@@ -2050,7 +2050,12 @@ impl Remotes {
                     let _ = buffer.push(snap, m.handle, intent, commit);
                 }
             }
-            Role::Worker | Role::Miner | Role::Hauler | Role::Upgrader | Role::Signer => {}
+            Role::Worker
+            | Role::Miner
+            | Role::Hauler
+            | Role::Upgrader
+            | Role::Signer
+            | Role::Defender => {}
         }
         Ok(())
     }

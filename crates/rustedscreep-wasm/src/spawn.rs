@@ -108,7 +108,8 @@ fn console_role(role: Role) -> bool {
         | Role::Reserver
         | Role::RemoteMiner
         | Role::RemoteHauler
-        | Role::Signer => false,
+        | Role::Signer
+        | Role::Defender => false,
     }
 }
 
@@ -174,7 +175,8 @@ impl SpawnGlue {
                 | Role::Reserver
                 | Role::RemoteMiner
                 | Role::RemoteHauler
-                | Role::Signer => return None,
+                | Role::Signer
+                | Role::Defender => return None,
             };
             self.spawner.request(SpawnRequest {
                 home: c.home,

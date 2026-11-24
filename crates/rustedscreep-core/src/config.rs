@@ -869,6 +869,13 @@ pub struct DefenseConfig {
     /// that the game accepted but that did not take effect (V326, V338), may be made again up to
     /// this many in all. Unit: calls.
     pub safe_mode_calls: u32,
+    /// Lets an owned room spawn defenders when ADR-036 says the towers cannot win (P7.5,
+    /// `defense::defenders`). Off, no defender is requested; living ones still fight.
+    pub defenders: bool,
+    /// The most defenders one home keeps alive (P7.5): the team the combat sim sizes, at full
+    /// capacity, is at most this many, and a hostile that needs more is not answered with
+    /// defenders. Unit: creeps.
+    pub max_defenders: u32,
 }
 
 /// Defense values for the official MMO.
@@ -881,6 +888,8 @@ pub const DEFENSE_MMO: DefenseConfig = DefenseConfig {
     safe_mode: true,
     safe_mode_lead: 1,
     safe_mode_calls: 3,
+    defenders: true,
+    max_defenders: 3,
 };
 
 /// Upkeep (ROADMAP P7.3, ADR-032): the opening's workers repair the roads and own ramparts of their
@@ -1146,7 +1155,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 143;
+pub const FIELD_COUNT: usize = 145;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1556,6 +1565,8 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     flag!(defense, "DefenseConfig", safe_mode, true),
     number!(defense, "DefenseConfig", safe_mode_lead, 1, 10, true),
     number!(defense, "DefenseConfig", safe_mode_calls, 1, 10, true),
+    flag!(defense, "DefenseConfig", defenders, true),
+    number!(defense, "DefenseConfig", max_defenders, 1, 10, true),
     flag!(upkeep, "UpkeepConfig", enabled, true),
     number!(
         upkeep,
@@ -1942,6 +1953,8 @@ mod tests {
             safe_mode: _,
             safe_mode_lead: _,
             safe_mode_calls: _,
+            defenders: _,
+            max_defenders: _,
         } = DEFENSE_MMO;
         let UpkeepConfig {
             enabled: _,
@@ -2155,6 +2168,8 @@ mod tests {
                     "safe_mode",
                     "safe_mode_lead",
                     "safe_mode_calls",
+                    "defenders",
+                    "max_defenders",
                 ],
             ),
             (
