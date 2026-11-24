@@ -146,7 +146,14 @@ pub fn game_loop() {
                 } = &mut *state;
                 let mut probe = profiler::Probe::start();
                 let cfg = *runtime.get();
-                snapshot::take(snapshot, js, &cfg.cache, &cfg.remote, &cfg.upkeep);
+                snapshot::take(
+                    snapshot,
+                    js,
+                    &cfg.cache,
+                    &cfg.remote,
+                    &cfg.upkeep,
+                    &cfg.defense,
+                );
                 // Movement's tick starts with the snapshot (no JS call); its room reads are jobs.
                 movement.begin(snapshot, &cfg.movement, &cfg.cache, &cfg.sign);
                 snapshot::log_skips(skip_log, snapshot, cfg.log.skip_window_ticks);
@@ -178,7 +185,8 @@ pub fn game_loop() {
                 // Critical: the rooms movement needs before anything in them can move, first.
                 movement.read_first(&mut tick, snapshot, js, &cfg.movement);
                 // Critical: the towers' plan (P7.2), only in a room with a tower and a hostile or a
-                // damaged own creep.
+                // damaged own creep; then the safe-mode triggers (P7.4), only in a room with a
+                // dangerous hostile.
                 defense.plan_towers(&mut tick, snapshot, &cfg.defense);
                 // Critical: remote mining's rooms and spawn requests (P6.2; the requests only while the
                 // Standard tier runs), before the spawn job, and its energy for the upgraders' budget,
@@ -316,7 +324,16 @@ pub fn game_loop() {
                     &cfg.scheduler,
                     &cfg.spawn,
                 );
-                // Then the towers' attacks and heals (P7.2): defense before the rest.
+                // Then the safe-mode calls (P7.4, ADR-035) and the towers' attacks and heals
+                // (P7.2): defense before the rest.
+                defense.issue_safe_mode(
+                    snapshot,
+                    js,
+                    act.log_mut(),
+                    sched,
+                    &cfg.scheduler,
+                    &cfg.defense,
+                );
                 defense.issue_towers(
                     snapshot,
                     js,

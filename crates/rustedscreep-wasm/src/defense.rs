@@ -11,12 +11,18 @@
 //! - `towers` (Critical; P7.2, `defense::TowerControl`): one unit per owned room with a tower that
 //!   holds energy for a shot and a hostile or a damaged own creep in it; none, and no clock sample,
 //!   on a tick without. It runs right after movement's first reads, before the other Critical jobs.
-//! - The towers' calls go out in the act step, right after the spawn orders: `attack(creep)` or
-//!   `heal(creep)` per order, one JS call each, billed when OK (V297, V298).
+//! - `safe mode` (Critical; P7.4, ADR-035, `defense::SafeModes`): one unit per owned room with a
+//!   dangerous hostile this tick, right after the towers' plan (it reads their kill times); none,
+//!   and no clock sample, on a tick without. With `defense.safe_mode` off, no unit.
+//! - The calls go out in the act step, right after the spawn orders: first `activateSafeMode()` on
+//!   a room's controller (at most once per room per threat; billed when OK, a refusal is free, V325),
+//!   then the towers' `attack(creep)` or `heal(creep)` per order, one JS call each, billed when OK
+//!   (V297, V298).
 //! - The log lines report each threat's start and changes (warn) and its end (info), the towers'
 //!   new target, a hold of fire with a dangerous hostile in the room, and a target the shot check
-//!   gives up on (warn): the live
-//!   record of the event and the bot's response that the P7 gate asks for.
+//!   gives up on (warn), a safe-mode call's outcome with its reason and a trigger the room cannot
+//!   meet (warn), and a threat in a room already in its safe mode (info): the live record of the
+//!   event and the bot's response that the P7 gate asks for.
 //!
 //! JS calls of its own: the towers' calls; and on a tick a threat starts or changes, or the towers
 //! take a new target, each named hostile's `owner` and its `username` (4 JS calls a creep in the
@@ -26,14 +32,15 @@
 
 use rustedscreep_core::config::{DefenseConfig, SchedulerConfig};
 use rustedscreep_core::defense::{
-    RoomThreat, ThreatEvent, Threats, TowerControl, TowerEvent, TowerOrder,
+    Blocked, Reason, RoomThreat, SafeModeEvent, SafeModes, ThreatEvent, Threats, TowerControl,
+    TowerEvent, TowerOrder,
 };
 use rustedscreep_core::intents::{ActLog, Outcome, error_name};
 use rustedscreep_core::scheduler::{
     Clock, Fault, FaultRecord, Job, JobState, Scheduler, TickCpu, Tier,
 };
 use rustedscreep_core::snapshot::Snapshot;
-use screeps::RoomName;
+use screeps::{RoomName, StructureType};
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
 
@@ -54,6 +61,15 @@ extern "C" {
     /// `heal(target)`, the same codes.
     #[wasm_bindgen(method, catch, js_name = heal)]
     fn heal(this: &TowerActor, target: &JsValue) -> Result<f64, JsValue>;
+
+    /// An own controller, for `activateSafeMode` (V325). Bound here: the crate's method unwraps an
+    /// unexpected return code (V336).
+    type SafeModeActor;
+
+    /// `activateSafeMode()`: OK, or ERR_NOT_OWNER, ERR_BUSY, ERR_NOT_ENOUGH_RESOURCES, ERR_TIRED
+    /// (V325); only an OK call is billed.
+    #[wasm_bindgen(method, catch, js_name = activateSafeMode)]
+    fn activate_safe_mode(this: &SafeModeActor) -> Result<f64, JsValue>;
 }
 
 /// The towers' plan: defense, Critical.
@@ -62,8 +78,17 @@ const TOWER_JOB: Job = Job {
     tier: Tier::Critical,
 };
 
+/// The safe-mode triggers (P7.4): defense, Critical.
+const SAFE_MODE_JOB: Job = Job {
+    name: "safe mode",
+    tier: Tier::Critical,
+};
+
 /// The job name the act step's tower faults are logged under.
 const TOWER_CALLS: &str = "tower calls";
+
+/// The job name the act step's safe-mode faults are logged under.
+const SAFE_MODE_CALLS: &str = "safe mode calls";
 
 /// Defense's glue state for one global.
 #[derive(Default)]
@@ -71,6 +96,8 @@ pub struct DefenseGlue {
     core: Threats,
     towers: TowerControl,
     tower_job: JobState,
+    safe: SafeModes,
+    safe_job: JobState,
     /// Tower calls the game refused since the global started, and the tick the last was logged.
     refused: u32,
     refused_logged: Option<u32>,
@@ -110,6 +137,8 @@ impl DefenseGlue {
             core,
             towers,
             tower_job,
+            safe,
+            safe_job,
             ..
         } = self;
         towers.begin(snapshot, core, cfg);
@@ -120,6 +149,86 @@ impl DefenseGlue {
             });
         }
         towers.finish(snapshot.tick.time, core);
+        // P7.4: the safe-mode triggers, after the towers' plan (their kill times and shot check).
+        safe.begin(snapshot, core, cfg);
+        let count = safe.unit_count();
+        if count > 0 {
+            tick.run_units(&SAFE_MODE_JOB, safe_job, count, |unit, _| {
+                safe.plan_room(unit, snapshot, core, towers, cfg)
+            });
+        }
+        safe.finish(snapshot.tick.time, core);
+    }
+
+    /// Calls `activateSafeMode` for this tick's safe-mode orders (at most one per room per threat)
+    /// and logs each outcome with its reason at warn. Call in the act step, right after the spawn
+    /// orders. A call that throws, or an order with no JS object, is a fault under
+    /// `safe mode calls`.
+    pub fn issue_safe_mode(
+        &mut self,
+        snapshot: &Snapshot,
+        js: &JsWorld,
+        log: &mut ActLog,
+        sched: &mut Scheduler,
+        cfg: &SchedulerConfig,
+        dcfg: &DefenseConfig,
+    ) {
+        let now = snapshot.tick.time;
+        for index in 0..self.safe.orders().len() {
+            // Copied out, so `not_accepted` may update the room's state below.
+            let Some(&order) = self.safe.orders().get(index) else {
+                continue;
+            };
+            let Some(c) = js.structures.get(order.controller as usize) else {
+                fault(
+                    sched,
+                    cfg,
+                    snapshot,
+                    SAFE_MODE_CALLS,
+                    "no JS object for a safe-mode order",
+                    index,
+                );
+                log.missing();
+                self.safe.not_accepted(order.room, true, dcfg);
+                continue;
+            };
+            let outcome = match c.unchecked_ref::<SafeModeActor>().activate_safe_mode() {
+                Ok(value) => Outcome::from_return(value),
+                Err(_) => {
+                    fault(
+                        sched,
+                        cfg,
+                        snapshot,
+                        SAFE_MODE_CALLS,
+                        "an activateSafeMode call threw",
+                        index,
+                    );
+                    Outcome::Threw
+                }
+            };
+            log.record_structure(outcome);
+            if outcome != Outcome::Ok {
+                // A refusal's reasons last; a call that threw may be made again.
+                let retry = matches!(outcome, Outcome::Threw | Outcome::Unknown);
+                self.safe.not_accepted(order.room, retry, dcfg);
+            }
+            if !log::log_enabled!(log::Level::Warn) {
+                continue;
+            }
+            let room = order.room;
+            let why = reason_text(&order.reason, js, dcfg);
+            if outcome == Outcome::Ok {
+                // Accepted; the next read confirms it (the "is in safe mode" line) or not (V338).
+                log::warn!(
+                    "rustedscreep defense: {room} safe mode activation accepted at tick {now}: {why}"
+                );
+            } else {
+                log::warn!(
+                    "rustedscreep defense: {room} safe mode refused at tick {now}: {} ({why})",
+                    outcome_name(outcome)
+                );
+            }
+        }
     }
 
     /// Calls `attack` or `heal` for this tick's tower orders and records each outcome. Call in the
@@ -144,10 +253,11 @@ impl DefenseGlue {
                 js.structures.get(tower as usize),
                 js.creeps.get(target as usize),
             ) else {
-                tower_fault(
+                fault(
                     sched,
                     cfg,
                     snapshot,
+                    TOWER_CALLS,
                     "no JS object for a tower order",
                     index,
                 );
@@ -163,7 +273,14 @@ impl DefenseGlue {
             let outcome = match call {
                 Ok(value) => Outcome::from_return(value),
                 Err(_) => {
-                    tower_fault(sched, cfg, snapshot, "a tower call threw", index);
+                    fault(
+                        sched,
+                        cfg,
+                        snapshot,
+                        TOWER_CALLS,
+                        "a tower call threw",
+                        index,
+                    );
                     Outcome::Threw
                 }
             };
@@ -178,12 +295,7 @@ impl DefenseGlue {
                 .is_none_or(|t| now.saturating_sub(t) >= dcfg.threat_log_ticks);
             if due {
                 self.refused_logged = Some(now);
-                let what = match outcome {
-                    Outcome::Failed(code) => error_name(code),
-                    Outcome::Unknown => "unknown return",
-                    Outcome::Threw => "threw",
-                    Outcome::Ok => "ok",
-                };
+                let what = outcome_name(outcome);
                 log::info!(
                     "rustedscreep defense: a tower's {} was refused at tick {now}: {what} ({} refused \
                      since the global started)",
@@ -227,6 +339,42 @@ impl DefenseGlue {
                         "rustedscreep defense: {room} threat over: no dangerous hostile seen since \
                          tick {last} (it started at tick {since})"
                     );
+                }
+            }
+        }
+        for event in self.safe.events() {
+            match *event {
+                SafeModeEvent::Protected { room, ticks } => {
+                    log::info!(
+                        "rustedscreep defense: {room} is in safe mode for {ticks} more ticks"
+                    );
+                }
+                SafeModeEvent::NotApplied { room, again } => {
+                    if log::log_enabled!(log::Level::Warn) {
+                        log::warn!(
+                            "rustedscreep defense: {room} safe mode did not take effect (no \
+                             activation spent){}",
+                            if again {
+                                "; calling again"
+                            } else {
+                                "; no call left in this threat"
+                            }
+                        );
+                    }
+                }
+                SafeModeEvent::Unavailable {
+                    room,
+                    reason,
+                    blocked,
+                } => {
+                    if log::log_enabled!(log::Level::Warn) {
+                        log::warn!(
+                            "rustedscreep defense: {room} needs safe mode but cannot activate it \
+                             ({}): {}",
+                            blocked_text(&blocked),
+                            reason_text(&reason, js, cfg)
+                        );
+                    }
                 }
             }
         }
@@ -340,16 +488,95 @@ fn owner_of(js: &JsWorld, row: usize) -> String {
         .unwrap_or_else(|| String::from("unknown"))
 }
 
-fn tower_fault(
+/// An outcome's name for a log line.
+fn outcome_name(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Failed(code) => error_name(code),
+        Outcome::Unknown => "unknown return",
+        Outcome::Threw => "threw",
+        Outcome::Ok => "ok",
+    }
+}
+
+/// A structure type's name for a log line (the core's four, P7.4).
+fn kind_name(kind: StructureType) -> &'static str {
+    match kind {
+        StructureType::Spawn => "spawn",
+        StructureType::Tower => "tower",
+        StructureType::Storage => "storage",
+        StructureType::Terminal => "terminal",
+        _ => "structure",
+    }
+}
+
+/// What fired a safe-mode trigger, for a log line (ADR-035).
+fn reason_text(reason: &Reason, js: &JsWorld, cfg: &DefenseConfig) -> String {
+    let towers_say = |towers: u32, kill: Option<u32>, them: &str| match kill {
+        Some(k) => format!("the towers kill {them} in {k} tick(s) by the sim"),
+        None if towers == 0 && them == "it" => String::from("no tower fires at it this tick"),
+        None if towers == 0 => String::from("no tower can fire"),
+        None => format!(
+            "the towers cannot kill {them} within {} ticks",
+            cfg.max_kill_ticks
+        ),
+    };
+    match *reason {
+        Reason::Core {
+            kind,
+            at,
+            hits,
+            hostiles,
+            damage,
+            towers,
+            kill,
+        } => format!(
+            "the {} at ({}, {}) has {hits} hits and {hostiles} hostile(s) in reach deal up to \
+             {damage} a tick; {}",
+            kind_name(kind),
+            at.x().u8(),
+            at.y().u8(),
+            towers_say(towers, kill, "them")
+        ),
+        Reason::Claim {
+            row,
+            claim,
+            range,
+            towers,
+            kill,
+        } => format!(
+            "a hostile of {} with {claim} CLAIM part(s) is {range} tile(s) from the controller; {}",
+            owner_of(js, usize::try_from(row).unwrap_or(usize::MAX)),
+            towers_say(towers, kill, "it")
+        ),
+    }
+}
+
+/// A reason safe mode cannot be activated, for a log line (V325's checks).
+fn blocked_text(blocked: &Blocked) -> String {
+    match *blocked {
+        Blocked::NotRead => String::from("its state was not read"),
+        Blocked::NoCharges => String::from("no activation left"),
+        Blocked::Cooldown { ticks } => format!("cooling down for {ticks} more ticks"),
+        Blocked::UpgradeBlocked => String::from("the controller was attacked (upgrade blocked)"),
+        Blocked::Downgrade { ticks, least } => {
+            format!("the downgrade timer is {ticks} ticks, below {least}")
+        }
+        Blocked::Active { ticks } => format!("already in safe mode for {ticks} more ticks"),
+        Blocked::OtherRoom { room } => format!("{room} is in safe mode"),
+    }
+}
+
+fn fault(
     sched: &mut Scheduler,
     cfg: &SchedulerConfig,
     snapshot: &Snapshot,
+    job: &'static str,
     what: &'static str,
     index: usize,
 ) {
     let record = FaultRecord {
         time: snapshot.tick.time,
-        job: TOWER_CALLS,
+        job,
         fault: Fault::new(what, u32::try_from(index).unwrap_or(u32::MAX)),
     };
     sched.faults_mut().record(record, cfg);

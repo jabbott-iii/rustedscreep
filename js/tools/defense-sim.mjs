@@ -25,6 +25,16 @@
 //   `heal` a loop on the smoke world's Harvester, damaged here (its hits read only while the threat is open, from the
 //   loop after it opened), up to the threat's end;
 // - no fault, error or trap line, and no halt.
+// Then the safe-mode triggers (P7.4, ADR-035), in two more runs of the smoke world with no tower: a melee raider walks
+// from range 4 of the spawn to range 1, a tile a loop. It checks:
+// - the controller's `safeMode`, `safeModeAvailable` and `safeModeCooldown` are read once on each loop the raider
+//   stands in W1N1, and on no other loop; the spawn's `hits` likewise, but not once the room is in its safe mode;
+// - with an activation left: one `activateSafeMode` call, on the loop the raider is at range 2 (melee reach 1 plus
+//   `defense.safe_mode_lead` 1), with its "safe mode activation accepted" line, whose figures come from the constants (SPAWN_HITS,
+//   ATTACK_POWER); the controller then reports its safe mode (`gameTime + SAFE_MODE_DURATION`, V326), and the next loop
+//   logs one "is in safe mode" line with the ticks left;
+// - with none left: no call, and one "needs safe mode but cannot activate it (no activation left)" line on that loop;
+// - no fault, error or trap line, and no halt.
 // npm run check runs it (row 25); standalone: node js/tools/defense-sim.mjs [dir].
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
@@ -306,8 +316,91 @@ export function defenseSim(dir = join(ROOT, 'dist')) {
   }
   if (!eq(calls, wantCalls)) problems.push(`tower calls ${JSON.stringify(calls)}, expected ${JSON.stringify(wantCalls)}`);
 
+  problems.push(...safeModeRun(dir, 1), ...safeModeRun(dir, 0));
   if (problems.length) throw new Error(`defense-sim:\n  ${problems.slice(0, 20).join('\n  ')}`);
   return { ticks: world.ticksRun, lines: lines.length, start: lines[0] };
+}
+
+/** The safe-mode run's raider (3 ATTACK, 3 MOVE) and its walk to the spawn, by loop offset. */
+const SM_RAIDER = {
+  id: id(60), name: 'Breacher', owner: 'Raider', x: 0, y: 0,
+  body: [['attack'], ['attack'], ['attack'], ['move'], ['move'], ['move']],
+};
+const SM_FROM = 5;
+const SM_TICKS = SM_FROM + 6;
+/** The smoke world's spawn (js/tools/lib/world.mjs). */
+const SPAWN_AT = { x: 25, y: 25 };
+/** Range 4 at SM_FROM, then a tile a loop down to range 1. */
+const smRange = (offset) => Math.max(1, 4 - (offset - SM_FROM));
+const smHere = (offset) => offset >= SM_FROM;
+
+/** One run: the controller starts with `available` activations, and its getters follow V326's writes once called. */
+function safeModeRun(dir, available) {
+  const reads = {};
+  const calls = [];
+  const state = { at: null };
+  const world = simulate(dir, {
+    ticks: SM_TICKS,
+    scene: (offset) => {
+      const scene = sceneAt(offset);
+      const time = T0 + offset;
+      const controller = scene.structures[IDS.controller];
+      const spawn = scene.structures[IDS.spawn];
+      const on = state.at !== null;
+      Object.defineProperties(controller, {
+        safeMode: { get() { count(reads, 'controller', `safeMode@${offset}`); return on ? state.at + C.SAFE_MODE_DURATION - time : undefined; } },
+        safeModeAvailable: { get() { count(reads, 'controller', `safeModeAvailable@${offset}`); return available - (on ? 1 : 0); } },
+        safeModeCooldown: { get() { count(reads, 'controller', `safeModeCooldown@${offset}`); return on ? state.at + C.SAFE_MODE_COOLDOWN - time : undefined; } },
+      });
+      controller.activateSafeMode = () => {
+        calls.push(offset);
+        if (available <= 0) return C.ERR_NOT_ENOUGH_RESOURCES;
+        state.at = time;
+        return 0;
+      };
+      Object.defineProperty(spawn, 'hits', { get() { count(reads, 'spawn', `hits@${offset}`); return C.SPAWN_HITS; } });
+      const room = scene.rooms[ROOM];
+      const base = room.find;
+      const raider = { ...SM_RAIDER, x: SPAWN_AT.x + smRange(offset), y: SPAWN_AT.y };
+      const hostiles = smHere(offset) ? [hostileObject(raider, ROOM, offset, reads)] : [];
+      room.find = (type, opts) => (type === FIND_HOSTILE_CREEPS ? findFiltered(hostiles, opts) : base(type, opts));
+      return scene;
+    },
+  });
+  const tag = `safe mode (${available} left)`;
+  const problems = [];
+  const bad = world.logs.filter((l) => l.includes('fault') || l.includes('[error]') || l.includes('trapped') || l.includes('incident'));
+  problems.push(...bad.map((l) => `${tag} log: ${l}`));
+  if (world.halts) problems.push(`${tag}: ${world.halts} halt(s)`);
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const loops = Array.from({ length: SM_TICKS }, (_, o) => o).filter((o) => o >= 1 && smHere(o));
+  const at = (who, what) => Object.keys(reads[who] ?? {}).filter((k) => k.startsWith(`${what}@`)).map((k) => Number(k.split('@')[1]));
+  for (const what of ['safeMode', 'safeModeAvailable', 'safeModeCooldown']) {
+    if (!eq(at('controller', what), loops)) problems.push(`${tag}: ${what} read at ${JSON.stringify(at('controller', what))}, expected ${JSON.stringify(loops)}`);
+  }
+  const multi = Object.entries({ ...reads.controller, ...reads.spawn }).filter(([, n]) => n !== 1);
+  if (multi.length) problems.push(`${tag}: reads not once a loop: ${JSON.stringify(multi)}`);
+  // The raider is at range 2 (melee reach 1 plus the lead of 1) two loops after it came.
+  const fire = SM_FROM + 2;
+  // The spawn's hits: not on the loops the room is in its safe mode (after an accepted call).
+  const hitLoops = available > 0 ? loops.filter((o) => o <= fire) : loops;
+  if (!eq(at('spawn', 'hits'), hitLoops)) problems.push(`${tag}: the spawn's hits read at ${JSON.stringify(at('spawn', 'hits'))}, expected ${JSON.stringify(hitLoops)}`);
+  const wantCalls = available > 0 ? [fire] : [];
+  if (!eq(calls, wantCalls)) problems.push(`${tag}: activateSafeMode at ${JSON.stringify(calls)}, expected ${JSON.stringify(wantCalls)}`);
+  const melee = 3 * C.ATTACK_POWER;
+  const hits = PART_HITS * SM_RAIDER.body.length;
+  const prefix = `rustedscreep defense: ${ROOM} `;
+  const why = `the spawn at (${SPAWN_AT.x}, ${SPAWN_AT.y}) has ${C.SPAWN_HITS} hits and 1 hostile(s) in reach deal up to ${melee} a tick; no tower can fire`;
+  const want = [
+    `${prefix}threatened by 1 dangerous hostile creep(s) of Raider (1 in the room, 0 boosted): melee ${melee}, ranged 0, heal 0, `
+      + `dismantle 0 a tick, 0 CLAIM; hits ${hits}, effective ${hits}`,
+    ...(available > 0
+      ? [`${prefix}safe mode activation accepted at tick ${T0 + fire}: ${why}`, `${prefix}is in safe mode for ${C.SAFE_MODE_DURATION - 1} more ticks`]
+      : [`${prefix}needs safe mode but cannot activate it (no activation left): ${why}`]),
+  ];
+  const lines = world.logs.filter((l) => l.startsWith('rustedscreep defense:'));
+  if (!eq(lines, want)) problems.push(`${tag} lines:\n    ${lines.join('\n    ') || 'none'}\n  expected:\n    ${want.join('\n    ')}`);
+  return problems;
 }
 
 if (isMain(import.meta.url)) {

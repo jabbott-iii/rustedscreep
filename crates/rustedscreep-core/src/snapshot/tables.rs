@@ -117,6 +117,20 @@ pub struct ControllerState {
     pub downgrade_ticks: u32,
     /// `upgradeBlocked` is set: `upgradeController` is refused until it ends.
     pub upgrade_blocked: bool,
+    /// The controller's safe-mode state (P7.4), read only on a tick a hostile creep stands in the
+    /// room; `None` on other ticks.
+    pub safe_mode: Option<SafeModeState>,
+}
+
+/// An owned controller's safe-mode getters (P7.4, V327): undefined values read as 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SafeModeState {
+    /// `safeMode`: the ticks the room's safe mode has left, 0 when none is active. Unit: ticks.
+    pub ticks: u32,
+    /// `safeModeAvailable`: activations left. Unit: activations.
+    pub available: u32,
+    /// `safeModeCooldown`: the ticks before the room may activate again, 0 when none. Unit: ticks.
+    pub cooldown: u32,
 }
 
 /// Who holds a controller's reservation (`controller.reservation`, V263, V264), read in remote
@@ -1003,17 +1017,18 @@ impl Structures {
         Ok(handle)
     }
 
-    /// Sets the hits read for the structure at `row` (P7.3: an own rampart); nothing for a row that
-    /// does not exist.
+    /// Sets the hits read for the structure at `row` (P7.3: an own rampart; P7.4: a core
+    /// structure); nothing for a row that does not exist.
     pub fn set_hits(&mut self, row: usize, hits: u32) {
         if let Some(h) = self.hits.get_mut(row) {
             *h = hits;
         }
     }
 
-    /// Hits per structure (P7.3), read only for own ramparts: on a room's upkeep read, when first
-    /// seen, and for the one a worker is about to repair; 0 when not read this tick (a standing
-    /// structure always has at least 1).
+    /// Hits per structure, read only for own ramparts (P7.3: on a room's upkeep read, when first
+    /// seen, and for the one a worker is about to repair) and for spawns, towers, storage, and
+    /// terminals on a tick a hostile creep stands in their room (P7.4, the safe-mode triggers); 0
+    /// when not read this tick (a standing structure always has at least 1).
     pub fn hits(&self) -> &[u32] {
         &self.hits
     }

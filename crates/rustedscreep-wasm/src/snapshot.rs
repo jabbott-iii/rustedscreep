@@ -24,7 +24,8 @@
 //!   the towers' heals);
 //! - room: 8 with a controller (`get`, `name`, the name copy, `controller`, `my`, `level`, `find`,
 //!   `length`), 6 without, plus `energyAvailable` and `energyCapacityAvailable` when the bot owns
-//!   it (P2.3, V175), and for an owned room its controller's 3 progress and timer getters and its
+//!   it (P2.3, V175), and for an owned room its controller's 3 progress and timer getters (3 more
+//!   for its safe-mode state on a tick a hostile creep stands there, P7.4, V327) and its
 //!   room objects (P2.4, `push_objects`: 6 `find` calls and their `length`s, then per object `get`,
 //!   `id`, the id copy, its amount, a container's `hits` (P3.5), and on the tick it is first seen
 //!   its position and type);
@@ -59,7 +60,9 @@
 //!   `getUsedCapacity` and `getFreeCapacity` for energy on a tick its room is full, has an
 //!   assessed hostile, or had an open threat (P7.2, V196; `tower_wanted`). An own rampart adds
 //!   `hits` on an upkeep read tick, on the tick it is first seen, and while a worker repairing it
-//!   stands within one step of reach (P7.3, V307);
+//!   stands within one step of reach (P7.3, V307). A spawn, tower, storage, or terminal adds `hits`
+//!   on a tick a hostile creep stands in its room, while `defense.safe_mode` is on and the room is
+//!   not in its safe mode (P7.4, the safe-mode triggers);
 //! - upkeep (P7.3, ADR-032): in each owned room, on ticks divisible by `upkeep.read_ticks`, the
 //!   roads as a remote room's (`push_roads`); between reads each road a worker repairing it stands
 //!   within one step of reach of, by id (`Game.getObjectById`, V308), then `id`, the copy, `hits`,
@@ -79,13 +82,14 @@
 use std::fmt::Write as _;
 
 use js_sys::{Array, Object, Reflect};
-use rustedscreep_core::config::{CacheConfig, RemoteConfig, UpkeepConfig};
+use rustedscreep_core::config::{CacheConfig, DefenseConfig, RemoteConfig, UpkeepConfig};
+use rustedscreep_core::defense::safe_mode::is_core;
 use rustedscreep_core::signing::SIGN_TEXT;
 use rustedscreep_core::snapshot::{
     BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepRow, CreepStore, ObjectKey,
-    ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation, RoomEnergy, SignRead, SignSeen,
-    SkipCounts, SkipLog, SkipReason, SkipReport, Snapshot, StructureHandle, StructureStatic,
-    TickContext, known_structure_type, parse_room_name, position_from_packed,
+    ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation, RoomEnergy, SafeModeState,
+    SignRead, SignSeen, SkipCounts, SkipLog, SkipReason, SkipReport, Snapshot, StructureHandle,
+    StructureStatic, TickContext, known_structure_type, parse_room_name, position_from_packed,
 };
 use rustedscreep_core::spawning::{CreepName, Identity, Role};
 use screeps::{
@@ -232,6 +236,11 @@ pub struct JsWorld {
     /// (ADR-033) to read by id, and the own ramparts whose `hits` to read, by handle slot.
     upkeep_roads: Vec<ObjectKey>,
     upkeep_ramparts: Vec<StructureHandle>,
+    /// Scratch: the owned rooms with a hostile creep this tick, sorted (P7.1, P7.4).
+    hostile_rooms: Vec<RoomName>,
+    /// Scratch: the owned rooms whose core structures' `hits` this tick reads, sorted (P7.4): a
+    /// hostile creep there, `defense.safe_mode` on, and the room not in its safe mode.
+    core_rooms: Vec<RoomName>,
 }
 
 impl JsWorld {
@@ -311,8 +320,11 @@ pub fn take(
     cache: &CacheConfig,
     remote: &RemoteConfig,
     upkeep: &UpkeepConfig,
+    defense: &DefenseConfig,
 ) {
     js.clear();
+    js.hostile_rooms.clear();
+    js.core_rooms.clear();
     snapshot.structures.set_static_cache(cache.structure_static);
     snapshot.begin(TickContext::from_raw(
         game::time(),
@@ -355,7 +367,14 @@ pub fn take(
     // P7.3: every road and own rampart of the owned rooms on an upkeep read tick.
     let upkeep_tick = upkeep.enabled && snapshot.tick.time.is_multiple_of(upkeep.read_ticks.max(1));
     for room in game::rooms().values() {
-        push_room(snapshot, js, room, road_tick, upkeep_tick);
+        push_room(
+            snapshot,
+            js,
+            room,
+            road_tick,
+            upkeep_tick,
+            defense.safe_mode,
+        );
     }
     if upkeep.enabled && !upkeep_tick {
         push_asked_roads(snapshot, js);
@@ -400,6 +419,7 @@ fn push_room(
     room: Room,
     road_tick: bool,
     upkeep_tick: bool,
+    safe_mode: bool,
 ) {
     // `parse_room_name` has `RoomName::from_str`'s semantics without its str slicing, which links
     // about 8 KB of Unicode and Debug tables into the release wasm (V114). Anything that parses a
@@ -443,7 +463,8 @@ fn push_room(
             .crew_rooms
             .binary_search_by_key(&name.packed_repr(), |n| n.packed_repr())
             .is_ok();
-    for index in 0..hostiles.length() {
+    let hostile_count = hostiles.length();
+    for index in 0..hostile_count {
         let before = snapshot.creeps.len();
         push_creep(snapshot, js, hostiles.get(index).unchecked_into(), false);
         if snapshot.creeps.len() <= before {
@@ -481,9 +502,17 @@ fn push_room(
     let mut controller_pushed = false;
     if matches!(controller, Controller::Mine { .. }) {
         if let (Some(c), Controller::Mine { level }) = (controller_object.as_ref(), controller) {
-            snapshot
-                .rooms
-                .set_controller_state(row, controller_state(c, level));
+            // P7.4: the safe-mode getters only on a tick a hostile creep stands in the room, and
+            // the core structures' hits then too while safe mode may be activated there.
+            let hostile_here = hostile_count > 0;
+            let state = controller_state(c, level, hostile_here);
+            if hostile_here {
+                insert_sorted(&mut js.hostile_rooms, name);
+                if safe_mode && state.safe_mode.is_some_and(|s| s.ticks == 0) {
+                    insert_sorted(&mut js.core_rooms, name);
+                }
+            }
+            snapshot.rooms.set_controller_state(row, state);
         }
         push_objects(snapshot, js, room.unchecked_ref::<Findable>());
         if upkeep_tick {
@@ -710,9 +739,15 @@ fn insert_sorted(list: &mut Vec<RoomName>, room: RoomName) {
 /// getters (an undefined `upgradeBlocked` is `None`, V189). `ticksToDowngrade` is undefined until
 /// the processor first sets the timer (a controller just claimed, V189): that reads as the full
 /// timer the processor sets, `CONTROLLER_DOWNGRADE[level] + 1`, so the downgrade guard does not
-/// fire on it.
-fn controller_state(c: &StructureController, level: u8) -> ControllerState {
+/// fire on it. With `safe_mode` (a hostile creep in the room, P7.4), 3 more: `safeMode`,
+/// `safeModeAvailable`, and `safeModeCooldown` (V327, V336), an undefined one read as 0.
+fn controller_state(c: &StructureController, level: u8, safe_mode: bool) -> ControllerState {
     ControllerState {
+        safe_mode: safe_mode.then(|| SafeModeState {
+            ticks: c.safe_mode().unwrap_or(0),
+            available: c.safe_mode_available(),
+            cooldown: c.safe_mode_cooldown().unwrap_or(0),
+        }),
         progress: c.progress().unwrap_or(0),
         downgrade_ticks: c.ticks_to_downgrade().unwrap_or_else(|| {
             screeps::constants::controller_downgrade(level)
@@ -980,6 +1015,17 @@ fn push_structure(
             {
                 snapshot.structures.set_hits(row, structure.hits());
             }
+            // P7.4: a core structure's `hits` on a tick a hostile creep stands in its room (the
+            // safe-mode triggers; the rooms are read before the structures).
+            if kind.is_some_and(is_core)
+                && snapshot
+                    .structures
+                    .positions()
+                    .get(row)
+                    .is_some_and(|p| listed(&js.core_rooms, p.room_name()))
+            {
+                snapshot.structures.set_hits(row, structure.hits());
+            }
             if matches!(kind, Some(StructureType::Spawn | StructureType::Extension)) {
                 read_free_energy(snapshot, &structure, row);
             }
@@ -1038,26 +1084,24 @@ fn push_structure(
 }
 
 /// Whether a tower in `room` is read this tick (P7.2): its room is full (the fills may take it), a
-/// hostile creep was assessed there this tick (the rooms are read before the structures), or it had
-/// an open threat last tick (its towers may heal).
+/// hostile creep stands there this tick (the rooms are read before the structures), or it had an
+/// open threat last tick (its towers may heal).
 fn tower_wanted(snapshot: &Snapshot, js: &JsWorld, room: RoomName) -> bool {
     let rooms = &snapshot.rooms;
     let full = rooms
         .row_of(room)
         .and_then(|r| rooms.energy().get(r))
         .is_some_and(|e| e.available >= e.capacity);
-    let creeps = &snapshot.creeps;
-    let hostile = creeps.assessed().iter().any(|&r| {
-        usize::try_from(r)
-            .ok()
-            .and_then(|i| creeps.positions().get(i))
-            .is_some_and(|p| p.room_name() == room)
-    });
-    let threat = js
-        .threat_rooms
-        .binary_search_by_key(&room.packed_repr(), |n| n.packed_repr())
-        .is_ok();
+    let hostile = listed(&js.hostile_rooms, room);
+    let threat = listed(&js.threat_rooms, room);
     full || hostile || threat
+}
+
+/// Whether `room` is in the sorted `list` (the rooms are read before the structures, so this
+/// tick's room lists are complete there).
+fn listed(list: &[RoomName], room: RoomName) -> bool {
+    list.binary_search_by_key(&room.packed_repr(), |n| n.packed_repr())
+        .is_ok()
 }
 
 /// A spawn's or extension's room for energy (P2.4), only while its room is not full: `store` and

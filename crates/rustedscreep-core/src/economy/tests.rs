@@ -1208,6 +1208,7 @@ fn observation(time: u32, alive: u32, working: u32) -> Observation {
             progress: 0,
             downgrade_ticks: 9000,
             upgrade_blocked: false,
+            safe_mode: None,
         },
         energy: 0,
         capacity: 550,
@@ -1939,6 +1940,7 @@ impl World {
                 progress: self.progress,
                 downgrade_ticks: self.downgrade_at.saturating_sub(time),
                 upgrade_blocked: false,
+                safe_mode: None,
             },
         );
         self.struct_rows.clear();

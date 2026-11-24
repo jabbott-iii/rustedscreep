@@ -27,7 +27,9 @@
 //! creep dies once its hits reach 0. The sim takes the positions as they are this tick; a creep that
 //! moves changes the ranges, and the sim runs again on the next tick. The heal is the healers' power
 //! as their parts stand this tick: a healer that loses HEAL parts heals less later (the bot's
-//! error is on the safe side), and one healed back regains them (it is not).
+//! error is on the safe side), and one healed back regains them (it is not). In a room in the bot's
+//! own safe mode no hostile can heal (V300, V330), so the sim counts no heal there
+//! ([`super::safe_mode::protected`]).
 //!
 //! # Focus fire
 //!
@@ -111,7 +113,7 @@ pub fn tower_amount(power: u32, range: u32) -> u32 {
 
 /// Chebyshev range between two tiles of one room (every caller passes a tower and a creep of the
 /// room it plans); `u32::MAX` for tiles of two rooms, which [`heal_on`] reads as out of reach.
-fn range(a: Position, b: Position) -> u32 {
+pub(super) fn range(a: Position, b: Position) -> u32 {
     if a.room_name() != b.room_name() {
         return u32::MAX;
     }
@@ -539,8 +541,11 @@ impl TowerControl {
                 .copied()
         };
         self.healers.clear();
+        // In the bot's own safe mode no hostile heals (module docs).
+        let heals = !super::safe_mode::protected(snap, room);
         for h in hostiles {
-            if h.power.heal > 0
+            if heals
+                && h.power.heal > 0
                 && let Some(pos) = position(h.row)
             {
                 self.healers.push((pos, h.power));
@@ -839,6 +844,33 @@ impl TowerControl {
     /// The towers in owned rooms this tick. Unit: towers.
     pub fn tower_count(&self) -> usize {
         self.towers.len()
+    }
+
+    /// The towers of `room` that hold energy for a shot this tick, as their position and energy
+    /// (P7.4's kill times). Empty before [`Self::begin`] lists them, and on a tick it lists none.
+    pub fn armed_in(&self, room: RoomName) -> impl Iterator<Item = (Position, u32)> + '_ {
+        self.towers
+            .iter()
+            .filter(move |&&(r, t)| r == room && t.energy >= TOWER_ENERGY_COST)
+            .map(|&(_, t)| (t.pos, t.energy))
+    }
+
+    /// The towers this tick's plan orders to attack the creep at row `target` of this tick's
+    /// `Creeps`, as their position and energy (P7.4's claim trigger). Empty before the plan.
+    pub fn firing_at(&self, target: u32) -> impl Iterator<Item = (Position, u32)> + '_ {
+        self.orders
+            .iter()
+            .filter_map(move |o| match *o {
+                TowerOrder::Attack { tower, target: t } if t == target => Some(tower),
+                _ => None,
+            })
+            .filter_map(|row| self.towers.iter().find(|(_, t)| t.row == row))
+            .map(|&(_, t)| (t.pos, t.energy))
+    }
+
+    /// Whether the towers of `room` no longer fire at `creep` (the shot check, module docs).
+    pub fn distrusts(&self, room: RoomName, creep: CreepHandle) -> bool {
+        self.distrust.contains(&(room, creep))
     }
 }
 

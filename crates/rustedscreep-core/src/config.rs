@@ -857,6 +857,18 @@ pub struct DefenseConfig {
     /// The towers stop firing at a creep whose hits came out above the sim's on this many ticks in
     /// a row (P7.2: a rampart on its tile, a power effect, an inactive tower). Unit: ticks.
     pub miss_ticks: u32,
+    /// Lets the bot activate safe mode in an owned room when ADR-035's triggers say so (P7.4,
+    /// `defense::safe_mode`). Off, it never calls `activateSafeMode`, and the towers still count no
+    /// hostile heal in a room already in its safe mode.
+    pub safe_mode: bool,
+    /// The safe-mode triggers count a hostile this many tiles beyond its reach of a core structure
+    /// or the controller: an activation protects only from the next tick on (V328), and a creep
+    /// moves at most one tile a tick. Unit: tiles.
+    pub safe_mode_lead: u32,
+    /// The most `activateSafeMode` calls in one room in one threat (P7.4): a call that threw, or
+    /// that the game accepted but that did not take effect (V326, V338), may be made again up to
+    /// this many in all. Unit: calls.
+    pub safe_mode_calls: u32,
 }
 
 /// Defense values for the official MMO.
@@ -866,6 +878,9 @@ pub const DEFENSE_MMO: DefenseConfig = DefenseConfig {
     max_kill_ticks: 50,
     heal_reserve: TOWER_CAPACITY / 2,
     miss_ticks: 3,
+    safe_mode: true,
+    safe_mode_lead: 1,
+    safe_mode_calls: 3,
 };
 
 /// Upkeep (ROADMAP P7.3, ADR-032): the opening's workers repair the roads and own ramparts of their
@@ -1131,7 +1146,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 140;
+pub const FIELD_COUNT: usize = 143;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1538,6 +1553,9 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         true
     ),
     number!(defense, "DefenseConfig", miss_ticks, 1, 100, true),
+    flag!(defense, "DefenseConfig", safe_mode, true),
+    number!(defense, "DefenseConfig", safe_mode_lead, 1, 10, true),
+    number!(defense, "DefenseConfig", safe_mode_calls, 1, 10, true),
     flag!(upkeep, "UpkeepConfig", enabled, true),
     number!(
         upkeep,
@@ -1921,6 +1939,9 @@ mod tests {
             max_kill_ticks: _,
             heal_reserve: _,
             miss_ticks: _,
+            safe_mode: _,
+            safe_mode_lead: _,
+            safe_mode_calls: _,
         } = DEFENSE_MMO;
         let UpkeepConfig {
             enabled: _,
@@ -2131,6 +2152,9 @@ mod tests {
                     "max_kill_ticks",
                     "heal_reserve",
                     "miss_ticks",
+                    "safe_mode",
+                    "safe_mode_lead",
+                    "safe_mode_calls",
                 ],
             ),
             (

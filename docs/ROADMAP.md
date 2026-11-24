@@ -177,7 +177,7 @@ Modules:
 - [x] Threat assessment from hostile bodies and boosts (mineral compounds that labs apply to body parts to strengthen them).
 - [x] Tower focus fire and heal priority, driven by the combat sim.
 - [x] Rampart upkeep (with home road repair, ADR-032: the line placed and held at 1% of its level's hits by the workers; its amendment sizes the workers for the repairs; ADR-033 closes the line with walls but for its gates).
-- [ ] Safe-mode triggers (when to activate safe mode, which for a limited time stops every creep but the owner's in the room from using any method that affects the owner's creeps or objects; exactly what it blocks is VERIFICATION_LOG R25, still unverified).
+- [x] Safe-mode triggers (when to activate safe mode, which for a limited time stops every creep but the owner's in the room from using any method that affects the owner's creeps or objects; what it blocks is VERIFICATION_LOG V325 to V334; ADR-035: when a spawn, tower, storage, or terminal would fall before the towers kill the hostiles in reach, or a CLAIM creep would reach the controller first, whoever owns them).
 - [ ] Scaled defenders.
 - [ ] Remote evacuation.
 
