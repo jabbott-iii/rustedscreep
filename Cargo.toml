@@ -40,6 +40,10 @@ edition = "2024"
 rust-version = "1.100"
 license = "MIT"
 repository = "https://github.com/jabbott-iii/rustedscreep"
+# crates.io's search terms and categories. Each crate names its own README (`readme`): inherited, the path would
+# resolve from this root.
+keywords = ["screeps", "bot", "game-ai", "wasm", "mmo"]
+categories = ["games", "game-development"]
 # The release workflow publishes every crate to crates.io, and only there (docs/RELEASE.md, ADR-034).
 publish = ["crates-io"]
 

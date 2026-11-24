@@ -1,5 +1,22 @@
-//! WASM boundary: snapshot (JS → Rust), act (Rust → intents), persistence (RawMemory), the profiler
-//! and the exported `loop`. The only crate that uses `wasm-bindgen`, `js-sys` or game-object APIs.
+//! The WebAssembly (wasm) module of rustedscreep, a bot for Screeps: World: the bot's boundary with
+//! the game. It is the only crate that uses `wasm-bindgen`, `js-sys`, or game-object APIs.
+//!
+//! The game calls the exported `loop` once per tick (one game turn), through the repository's
+//! TypeScript loader, and the tick runs snapshot → decide → act:
+//!
+//! 1. the snapshot (JS → Rust, module `snapshot`) reads each game object once into
+//!    `rustedscreep_core`'s tables, since every JS call costs CPU;
+//! 2. `rustedscreep_core` decides, in the CPU tiers its scheduler allows by the bucket (the CPU the
+//!    game banks from earlier ticks);
+//! 3. the act layer (Rust → intents, module `act`) drops intents that would change nothing, checks
+//!    the rest against the engine's table of which intents block which, and issues them in one batch.
+//!
+//! Around that it keeps what must survive a global reset (the game discarding the JS environment and
+//! loading the code again) in RawMemory segments (`persist`), applies the runtime config (`config`),
+//! runs the constants self-check (`consts_check`), and, in a `profiler` build, measures CPU per
+//! subsystem (`profiler`). The other exports, such as `schedulerSummary`, back the console commands
+//! that the loader installs as `rustedscreep.*`. The crate's README lists them, with the segments it
+//! uses and its features.
 
 // No-panic rule for non-test code (.claude/rules/wasm-bot.md; lint names: VERIFICATION_LOG V83).
 #![cfg_attr(

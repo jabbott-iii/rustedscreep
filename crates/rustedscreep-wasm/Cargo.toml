@@ -1,11 +1,14 @@
 [package]
 name = "rustedscreep-wasm"
-description = "WASM boundary for the bot: snapshot, act, persistence, profiler and the exported loop."
+description = "The WebAssembly module of rustedscreep, a Screeps: World bot: it snapshots the game each tick, issues the bot's intents, persists its state, and exports the loop."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories = ["games", "wasm"]
 publish.workspace = true
 
 [lib]

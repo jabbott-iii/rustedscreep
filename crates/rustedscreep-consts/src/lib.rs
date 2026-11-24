@@ -1,5 +1,14 @@
-//! Constants facade (ADR-005). Besides `rustedscreep-wasm`, this is the only crate that may name the
-//! `screeps` crate, and only for constants and pure local types.
+//! The game constants and pure game types of rustedscreep, a bot for Screeps: World, in one crate
+//! that builds and tests natively: the constants facade of ADR-005 (the decision to reach
+//! `screeps-game-api`, the Rust bindings to the game's API, through one crate that re-exports its
+//! plain values and hides what carries JS objects). Besides `rustedscreep-wasm`, this is the only
+//! crate that may name the `screeps` crate, and only for constants and pure local types.
+//! `rustedscreep-core`, the bot's logic, reaches the game's numbers and types only through it.
+//!
+//! Where each value was checked is in
+//! [`docs/VERIFICATION_LOG.md`](https://github.com/jabbott-iii/rustedscreep/blob/main/docs/VERIFICATION_LOG.md).
+//!
+//! # Contents
 //!
 //! - The items `screeps::constants` exports (numbers, extra limits, enums such as `Part`,
 //!   `StructureType` and `ResourceType`, and the grouped modules such as `creep` and `tower`) are
@@ -16,6 +25,8 @@
 //!   out by policy: core works with interned `u32` handles, and the wasm crate names it directly.
 //! - Values the API does not export live in [`extra`], which is never glob-re-exported, so they
 //!   cannot shadow an API constant. The API's own `screeps::constants::extra` items are at the root.
+//!
+//! # Rules for callers
 //!
 //! Rules for callers in `rustedscreep-core` (VERIFICATION_LOG V86, V89):
 //! - Never call JS-backed APIs; they make JS calls on wasm and panic natively. That covers
@@ -93,6 +104,11 @@ pub use screeps::local::{
     RoomCoordinate, RoomName, RoomNameParseError, RoomOffset, RoomXY,
     WorldPositionOutOfBoundsError, XMajor, YMajor, xy_to_linear_index, xy_to_terrain_index,
 };
+
+// The README's examples are compiled as doc tests too.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 #[cfg(test)]
 mod tests {
