@@ -322,7 +322,10 @@ jobs:
           config="$HOME/Steam/config/config.vdf"
           trap 'rm -f "$config"' EXIT
           mkdir -p "$(dirname "$config")"
-          (umask 077 && printf '%s' "$STEAM_CONFIG_VDF" | base64 -d > "$config")
+          if ! (set -o pipefail; umask 077; printf '%s' "$STEAM_CONFIG_VDF" | base64 -d | gzip -d > "$config"); then
+            echo "::error::STEAM_CONFIG_VDF must be a base64-encoded gzip-compressed config.vdf."
+            exit 1
+          fi
           content="$PWD/workshop/content"
           item="$PWD/workshop/item.vdf"
           url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
