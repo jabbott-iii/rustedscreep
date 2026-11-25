@@ -9664,3 +9664,36 @@ mod plan_path {
         }
     }
 }
+
+/// The capacity a room's workers are sized at (P5.1, P8.3): its own with no helper, the smaller of
+/// its own and the helper's, and the helper's when its own pays for no worker (a claimed room
+/// before its first spawn: the pioneers of ADR-042). From the constants: RCL4's capacity and the
+/// smallest worker's cost.
+#[test]
+fn a_claimed_room_sizes_its_pioneers_at_the_helpers_capacity() {
+    let least = smallest_worker().map(|b| b.cost()).unwrap_or(0);
+    let rcl4 = capacity_at(4);
+    assert!(least > 0 && rcl4 > least);
+    assert_eq!(worker_capacity(rcl4, None), rcl4, "no helper: its own");
+    assert_eq!(
+        worker_capacity(0, None),
+        0,
+        "no helper and no energy: nothing"
+    );
+    assert_eq!(
+        worker_capacity(0, Some(rcl4)),
+        rcl4,
+        "a fresh claim: the helper's"
+    );
+    assert_eq!(
+        worker_capacity(least - 1, Some(rcl4)),
+        rcl4,
+        "too little for a worker: the helper's"
+    );
+    assert_eq!(
+        worker_capacity(least, Some(rcl4)),
+        least,
+        "a lost spawn with extensions: the smaller"
+    );
+    assert_eq!(worker_capacity(rcl4, Some(least)), least);
+}

@@ -6,7 +6,8 @@
 //! canonical form (`W`/`E` and `N`/`S` uppercase, no leading zeros), `-`, then the serial in base 36
 //! with lowercase digits and no leading zeros. For example `wW1N1-5vosf7k` for a worker of W1N1 ordered first on tick 50000000.
 //! A remote role ([`Role::is_remote`]: the scout, the reserver, the remote miner and the remote
-//! hauler, P6.2, ADR-029, and the remote defender, P7.6, ADR-037) puts the remote room it works, in
+//! hauler, P6.2, ADR-029, the remote defender, P7.6, ADR-037, and the claimer, P8.3, ADR-042, whose
+//! remote room is the room it claims) puts the remote room it works, in
 //! the same canonical form, right after the home: `rE7N57E8N57-9wv2p6o` for a reserver of E7N57 that holds E8N57. Each room name starts with
 //! `W` or `E`, so the two never run together; every other role has no remote room, so the names
 //! creeps alive before P6.2 carry parse as they did (an additive change).
@@ -63,11 +64,15 @@ pub enum Role {
     /// intel is missing or stale, so the atlas (`expansion::Atlas`) reads them. At most one for
     /// the bot.
     Explorer,
+    /// A claimer (P8.3, ADR-042): one CLAIM part and MOVE parts; it walks to the claim scoring's
+    /// best room (`expansion::Claims::best`), whose name its own carries, and claims the
+    /// controller. At most one for the bot.
+    Claimer,
 }
 
 impl Role {
     /// Every role, in a fixed order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Worker,
         Self::Miner,
         Self::Hauler,
@@ -80,6 +85,7 @@ impl Role {
         Self::Defender,
         Self::RemoteDefender,
         Self::Explorer,
+        Self::Claimer,
     ];
 
     /// The first byte of the role's creep names. Never change or reuse one (see the module docs).
@@ -97,6 +103,7 @@ impl Role {
             Self::Defender => b'd',
             Self::RemoteDefender => b'p',
             Self::Explorer => b'x',
+            Self::Claimer => b'k',
         }
     }
 
@@ -109,6 +116,7 @@ impl Role {
                 | Self::RemoteMiner
                 | Self::RemoteHauler
                 | Self::RemoteDefender
+                | Self::Claimer
         )
     }
 
@@ -130,6 +138,7 @@ impl Role {
             Self::Defender => "defender",
             Self::RemoteDefender => "remote defender",
             Self::Explorer => "explorer",
+            Self::Claimer => "claimer",
         }
     }
 
@@ -470,9 +479,20 @@ mod tests {
                         | Role::RemoteMiner
                         | Role::RemoteHauler
                         | Role::RemoteDefender
+                        | Role::Claimer
                 )
             );
         }
+        // A claimer's name carries the room it claims (P8.3) and round-trips.
+        let id = Identity {
+            role: Role::Claimer,
+            home: room("E7N57"),
+            remote: Some(room("E8N57")),
+            serial: 9,
+        };
+        let name = CreepName::encode(&id);
+        assert_eq!(name.as_str(), "kE7N57E8N57-9");
+        assert_eq!(CreepName::parse(name.as_bytes()), Some(id));
         // A remote defender's name carries its remote room (P7.6) and round-trips.
         let id = Identity {
             role: Role::RemoteDefender,
@@ -510,7 +530,7 @@ mod tests {
         assert_eq!(
             Role::ALL.map(Role::code),
             [
-                b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c', b'g', b'd', b'p', b'x'
+                b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c', b'g', b'd', b'p', b'x', b'k'
             ],
             "never change or reuse a code"
         );

@@ -58,7 +58,7 @@ pub use remotes::{
 
 pub use opening::{
     Fix, Opening, PRIORITY_LOW, PRIORITY_NORMAL, PRIORITY_RECOVERY, Plan, RoomStats, SourcePlan,
-    Task, below_pct, below_share, needs_repair, rampart_goal,
+    Task, below_pct, below_share, needs_repair, rampart_goal, worker_capacity,
 };
 pub use upgrading::{
     Crew, PRIORITY_UPGRADER, UpgradePlan, UpgradeStats, UpgradeTask, UpgradeView, Upgrading, Ways,

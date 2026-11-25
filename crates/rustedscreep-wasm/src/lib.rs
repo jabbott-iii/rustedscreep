@@ -178,7 +178,11 @@ pub fn game_loop() {
                 remote.begin(snapshot);
                 sign.begin(snapshot, &cfg.sign);
                 scout.begin(snapshot, &cfg.scout);
-                claim.begin();
+                claim.begin(snapshot, &cfg.claim);
+                // A claim the game refused (P8.3): the claimed room's atlas entry is read again.
+                for &room in claim.expired() {
+                    scout.expire(room, &cfg.scout);
+                }
                 // Critical: the threat assessment of the hostiles in owned rooms (P7.1), every tick
                 // one stands there or a threat is open; bounded, so outside the scheduler's jobs.
                 defense.begin(snapshot, js, &cfg.defense);
@@ -283,6 +287,9 @@ pub fn game_loop() {
                 // Critical: the explorer's request (ADR-039; only on a tick that runs the Optional
                 // tier), before the spawn plan.
                 scout.plan(&mut tick, spawn.spawner_mut(), &cfg.scout);
+                // Critical: the claimer's request (P8.3, ADR-042; only on a tick that runs the
+                // Optional tier, with the GCL read when due), before the spawn plan.
+                claim.plan(&mut tick, spawn.spawner_mut(), &cfg.claim, &cfg.spawn);
                 spawn.plan(&mut tick, snapshot);
                 // Standard: the persistence loads, then the opening's repairing, building and
                 // upgrading, then the haulers' transfers into the controller container (P3.3), then
@@ -308,6 +315,17 @@ pub fn game_loop() {
                     &mut movement.core,
                     &mut act.buffer,
                     &cfg.remote,
+                    &cfg.movement,
+                );
+                // Standard: the claimer's walk and claim (P8.3).
+                claim.work_claimer(
+                    &mut tick,
+                    snapshot,
+                    scout.core(),
+                    &mut movement.core,
+                    &mut act.buffer,
+                    &cfg.claim,
+                    &cfg.scout,
                     &cfg.movement,
                 );
                 // Standard: the periodic room rescans, then the console's move order.
@@ -368,7 +386,8 @@ pub fn game_loop() {
                 if scout.take_save(&cfg.scout) {
                     persist.atlas_changed();
                 }
-                // Optional: the claim ranking and its plan checks (ADR-041).
+                // Optional: the claim ranking and its plan checks (ADR-041), with the claimed rooms'
+                // plans and first spawn sites first (P8.3).
                 claim.work(
                     &mut tick,
                     scout.core(),
@@ -389,7 +408,7 @@ pub fn game_loop() {
                 remote.log_events(snapshot, js);
                 sign.log_events(&cfg.sign);
                 scout.log_events(&cfg.scout);
-                claim.log_events();
+                claim.log_events(&cfg.claim);
                 defense.log_events(snapshot, js, &cfg.defense);
                 probe.decide();
                 // After the decide step: the scheduler reads the CPU clock no more (scheduler docs); the
@@ -436,6 +455,7 @@ pub fn game_loop() {
                 opening.issue_destroys(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
                 opening.issue_sites(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
                 remote.issue_sites(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
+                claim.issue_sites(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
                 opening.issue_links(
                     snapshot,
                     js,

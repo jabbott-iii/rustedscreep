@@ -82,6 +82,19 @@ const NEAR: u8 = 1;
 /// waits next to it could not be shoved off without leaving its goal.
 const WAIT_RANGE: u8 = 2;
 
+/// The capacity a room's workers are sized at, from its own and, for an owned room without a spawn,
+/// the capacity of the spawn room that would serve it (`helper`, P5.1): its own with no helper; the
+/// smaller of the two, so the worker fits there and the plan stays put while the helper's does; and
+/// the helper's when the room's own pays for no worker ([`smallest_worker`]): a claimed room before
+/// its first spawn holds no energy, and its pioneers are sized at the room that spawns them (P8.3,
+/// ADR-042). Unit: energy.
+///
+/// Uses: [`smallest_worker`].
+pub fn worker_capacity(own: u32, helper: Option<u32>) -> u32 {
+    let least = smallest_worker().map_or(u32::MAX, |b| b.cost());
+    helper.map_or(own, |h| if own < least { h } else { own.min(h) })
+}
+
 /// What a worker repairs (P3.5, P7.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fix {
@@ -706,10 +719,12 @@ impl Opening {
         self.gather_upkeep(ri, snap, row, ucfg);
         // The capacity the room's workers are sized at: its own; for an owned room without a spawn
         // (one that lost it), at most that of the nearest spawn room that would serve it (P5.1), so
-        // its worker fits there and its plan stays put while the nearest room does.
+        // its worker fits there and its plan stays put while the nearest room does. A room whose own
+        // capacity pays for no worker (a claimed room before its first spawn, which holds no
+        // energy: its pioneers, P8.3, ADR-042) is sized at the serving room's.
         let own = snap.rooms.energy().get(row).copied().unwrap_or_default();
         let helper = spawner.spawn_side(name).filter(|side| side.room != name);
-        let capacity = helper.map_or(own.capacity, |side| own.capacity.min(side.energy.capacity));
+        let capacity = worker_capacity(own.capacity, helper.map(|side| side.energy.capacity));
         self.ensure_plan(
             ri, snap, row, capacity, movement, cfg, mcfg, upgrade, commit,
         );

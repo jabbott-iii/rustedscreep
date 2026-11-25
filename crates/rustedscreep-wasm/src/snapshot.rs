@@ -23,7 +23,7 @@
 //!   with a tower and an open threat last tick `hits`, with `hitsMax` once in its life (P7.2, for
 //!   the towers' heals); a defender (P7.5) or a remote defender (P7.6) skips the store and has its
 //!   `body` read once in its life (3N + 2), and a remote defender its `hits` every tick (`hitsMax`
-//!   once) for its own heals;
+//!   once) for its own heals; the claimer (P8.3, no CARRY part) skips the store too;
 //! - room: 8 with a controller (`get`, `name`, the name copy, `controller`, `my`, `level`, `find`,
 //!   `length`), 6 without, plus `energyAvailable` and `energyCapacityAvailable` when the bot owns
 //!   it (P2.3, V175), and for an owned room its controller's 3 progress and timer getters (3 more
@@ -49,6 +49,10 @@
 //!   `hits` and `hitsMax`, and its position and type (the handle is released between reads). The
 //!   rooms an own scout stands in are read the same way (its tour, ADR-029). The bot's username:
 //!   an own creep's `owner` and `username`, once a global;
+//! - claimer room (P8.3, ADR-042: a visible room the bot does not own that an own claimer stands
+//!   in and claims, its name's room): its controller as an object (`id`, the copy, its position and type when first seen),
+//!   unless the remote read pushed it. The claimer's own room (its name's) gets no remote read, so
+//!   remote mining learns nothing of the room being claimed;
 //! - signer room (ADR-030, `push_sign`: a visible room an own signer stands in, owned or not): its
 //!   controller as an object (unless the remote read pushed it), the controller's `sign` and, for
 //!   one, its `username` and `text` (V275), and `FIND_HOSTILE_STRUCTURES` through the tower filter,
@@ -260,6 +264,9 @@ pub struct JsWorld {
     /// Scratch: the remote rooms named by own creeps other than scouts (the rooms the bot mines),
     /// sorted: only their hostiles' combat parts are read (P6.3).
     crew_rooms: Vec<RoomName>,
+    /// Scratch: the rooms an own claimer stands in this tick, sorted: their controller is pushed as
+    /// an object for its `claimController` (P8.3).
+    claim_rooms: Vec<RoomName>,
     /// Scratch: the rooms an own signer stands in this tick, sorted: their controller's sign and
     /// the towers of other users are read (ADR-030).
     sign_rooms: Vec<RoomName>,
@@ -422,6 +429,7 @@ pub fn take(
     js.remote_names.clear();
     js.hauler_rooms.clear();
     js.crew_rooms.clear();
+    js.claim_rooms.clear();
     js.sign_rooms.clear();
     let creeps = &snapshot.creeps;
     for (id, pos) in creeps.identities().iter().zip(creeps.positions()) {
@@ -429,7 +437,12 @@ pub fn take(
             continue;
         };
         let here = pos.room_name();
-        if let Some(r) = id.remote {
+        // The claimer's name carries its room too (P8.3), but that room gets no remote read: remote
+        // mining would take it as intel and mine the room being claimed. Only its controller is
+        // pushed, while the claimer stands there.
+        if let Some(r) = id.remote
+            && id.role != Role::Claimer
+        {
             insert_sorted(&mut js.remote_names, r);
             if id.role != Role::Scout {
                 insert_sorted(&mut js.crew_rooms, r);
@@ -437,6 +450,8 @@ pub fn take(
         }
         match id.role {
             Role::Scout => insert_sorted(&mut js.remote_names, here),
+            // Only in the room it claims: its controller is of no use elsewhere.
+            Role::Claimer if id.remote == Some(here) => insert_sorted(&mut js.claim_rooms, here),
             Role::RemoteHauler => insert_sorted(&mut js.hauler_rooms, here),
             Role::Signer => insert_sorted(&mut js.sign_rooms, here),
             _ => {}
@@ -637,6 +652,24 @@ fn push_room(
         let read = push_remote(snapshot, js, &room, controller_object.as_ref(), roads);
         snapshot.rooms.set_remote(row, read);
         controller_pushed = controller_object.is_some();
+    }
+    // P8.3: a room an own claimer stands in, not owned: its controller as an object.
+    if !controller_pushed
+        && !matches!(controller, Controller::Mine { .. })
+        && js
+            .claim_rooms
+            .binary_search_by_key(&name.packed_repr(), |n| n.packed_repr())
+            .is_ok()
+        && let Some(c) = controller_object.as_ref()
+    {
+        push_object(
+            snapshot,
+            js,
+            c.clone().unchecked_into(),
+            |_| Ok(ObjectKind::Controller),
+            ObjectRow::default(),
+        );
+        controller_pushed = true;
     }
     if js
         .sign_rooms
@@ -1145,8 +1178,8 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
                 .push_named(key, row, || identity_of(&creep))?;
             if !spawning {
                 let row = snapshot.creeps.len().saturating_sub(1);
-                // P7.5 and P7.6: a defender or a remote defender (no CARRY part, nothing reads its
-                // store).
+                // P7.5 and P7.6: a defender or a remote defender, and P8.3's claimer (no CARRY part,
+                // nothing reads its store).
                 let role = snapshot
                     .creeps
                     .identities()
@@ -1156,9 +1189,10 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
                     .map(|id| id.role);
                 let remote_defender = role == Some(Role::RemoteDefender);
                 let defender = role == Some(Role::Defender) || remote_defender;
+                let no_store = defender || role == Some(Role::Claimer);
                 // P2.4: `store`, `getUsedCapacity` and `getCapacity` for energy; a creep with no
                 // active CARRY part has a capacity of null, read as 0 (V196, V197).
-                if !defender {
+                if !no_store {
                     let store = creep.store();
                     let energy = ResourceType::Energy;
                     snapshot.creeps.set_store(

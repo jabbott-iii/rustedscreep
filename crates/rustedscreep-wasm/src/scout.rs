@@ -85,6 +85,11 @@ impl ScoutGlue {
         &self.core
     }
 
+    /// Marks `room`'s atlas entry due now (P8.3: a claim the game refused).
+    pub fn expire(&mut self, room: screeps::RoomName, cfg: &ScoutConfig) {
+        self.core.expire(room, cfg);
+    }
+
     /// Starts the tick: the homes, the explorers, and this tick's reads (no JS call).
     pub fn begin(&mut self, snapshot: &Snapshot, cfg: &ScoutConfig) {
         self.core.begin(snapshot, cfg);

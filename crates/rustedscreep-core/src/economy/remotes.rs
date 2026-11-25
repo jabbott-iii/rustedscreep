@@ -871,10 +871,11 @@ impl Remotes {
         self.members.clear();
         let creeps = &snap.creeps;
         for (row, identity) in creeps.identities().iter().enumerate() {
-            // The remote defenders (P7.6) carry their remote room too, but defense drives them.
-            let Some(id) =
-                identity.filter(|id| id.role.is_remote() && id.role != Role::RemoteDefender)
-            else {
+            // The remote defenders (P7.6) and the claimer (P8.3) carry their remote room too, but
+            // defense and expansion drive them.
+            let Some(id) = identity.filter(|id| {
+                id.role.is_remote() && !matches!(id.role, Role::RemoteDefender | Role::Claimer)
+            }) else {
                 continue;
             };
             let Some(remote) = id.remote else {
@@ -2069,7 +2070,8 @@ impl Remotes {
             | Role::Signer
             | Role::Defender
             | Role::RemoteDefender
-            | Role::Explorer => {}
+            | Role::Explorer
+            | Role::Claimer => {}
         }
         Ok(())
     }

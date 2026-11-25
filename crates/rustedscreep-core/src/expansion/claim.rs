@@ -312,6 +312,9 @@ pub struct Claims {
     params: Option<Params>,
     /// The plans' outcomes, sorted by room.
     outcomes: Vec<Outcome>,
+    /// Owned rooms waiting for their first spawn site (P8.3, [`Self::set_sites`]), with the facts
+    /// their plan is made from: planned before any candidate.
+    sites: Vec<(RoomName, Key)>,
     active: Option<Box<Active>>,
     scratch: Option<Box<Scratch>>,
     /// The best planned candidate last reported.
@@ -361,6 +364,24 @@ impl Claims {
     /// Starts the tick: no events yet.
     pub fn begin(&mut self) {
         self.events.clear();
+    }
+
+    /// Sets the owned rooms waiting for their first spawn site (P8.3, ADR-042): each is planned,
+    /// before any candidate, from what the atlas last saw of it (a claimed room stays in the atlas,
+    /// which reads no owned room), so [`Self::spawn_tile`] can give its plan's level-1 spawn. A
+    /// room the atlas holds no controller tile for is left out.
+    pub fn set_sites(&mut self, rooms: impl Iterator<Item = RoomName>, atlas: &Atlas) {
+        self.sites.clear();
+        self.sites.extend(
+            rooms.filter_map(|room| atlas.get(room).and_then(Key::of).map(|key| (room, key))),
+        );
+    }
+
+    /// The level-1 spawn tile of a room [`Self::set_sites`] named: `Some(Ok)` once its plan fits,
+    /// `Some(Err)` with the planner's reason when none does, `None` while it is not planned yet.
+    pub fn spawn_tile(&self, room: RoomName) -> Option<Result<Tile, &'static str>> {
+        let &(_, key) = self.sites.iter().find(|s| s.0 == room)?;
+        self.outcome(room, key).map(|fit| fit.map(|f| f.spawn))
     }
 
     /// Whether the ranking is due to be rebuilt at `now`, with the atlas at `revision`, `owned` the
@@ -463,7 +484,8 @@ impl Claims {
         // The outcomes of rooms no longer in the atlas are dropped.
         self.outcomes.retain(|o| atlas.get(o.room).is_some());
         let keep = self.active.as_ref().is_some_and(|a| {
-            self.candidates.iter().any(|c| c.room == a.room)
+            (self.candidates.iter().any(|c| c.room == a.room)
+                || self.sites.iter().any(|s| s.0 == a.room))
                 && atlas.get(a.room).and_then(Key::of) == Some(a.key)
         });
         if !keep {
@@ -477,6 +499,13 @@ impl Claims {
     pub fn wanted(&self, cfg: &ClaimConfig) -> Option<RoomName> {
         if self.active.is_some() {
             return None;
+        }
+        if let Some(&(room, _)) = self
+            .sites
+            .iter()
+            .find(|&&(room, key)| self.outcome(room, key).is_none())
+        {
+            return Some(room);
         }
         let mut planned = 0u32;
         for c in &self.candidates {
@@ -592,6 +621,27 @@ impl Claims {
     fn release(&mut self, cfg: &ClaimConfig) {
         if self.wanted(cfg).is_none() {
             self.scratch = None;
+        }
+    }
+
+    /// Tests: sets the ranking as given (best first).
+    #[cfg(test)]
+    pub(crate) fn rank_for_test(&mut self, candidates: Vec<Candidate>) {
+        self.candidates = candidates;
+        self.rank();
+    }
+
+    /// Tests: names `room` a site room with `fit` as its plan's outcome, on the atlas's facts.
+    #[cfg(test)]
+    pub(crate) fn site_for_test(
+        &mut self,
+        room: RoomName,
+        atlas: &Atlas,
+        fit: Result<Fit, &'static str>,
+    ) {
+        self.set_sites(core::iter::once(room), atlas);
+        if let Some(key) = atlas.get(room).and_then(Key::of) {
+            self.finish(room, key, fit);
         }
     }
 

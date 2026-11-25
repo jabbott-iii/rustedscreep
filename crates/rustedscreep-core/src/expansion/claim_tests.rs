@@ -666,3 +666,56 @@ fn every_side_of_a_plain_room_is_open_and_a_walled_one_none() {
     let walls = TerrainGrid::from_row_major(&vec![1u8; ROOM_AREA]).expect("terrain");
     assert_eq!(open_sides(&walls), [false; 4]);
 }
+
+// ---- The first spawn of a claimed room (P8.3, ADR-042) ----
+
+/// Plans every step of the running plan.
+fn finish_plan(c: &mut Claims, a: &Atlas, owned: &[RoomName], cfg: &ClaimConfig) {
+    let mut steps = 0;
+    while c.step(Params::default(), a, owned, cfg) == Step::More {
+        steps += 1;
+        assert!(steps < 100, "the plan never ends");
+    }
+}
+
+/// A room the bot claimed is planned before any candidate, and after a global reset its plan gives
+/// the same level-1 spawn tile it was ranked with (the planner is deterministic in its facts).
+#[test]
+fn a_claimed_room_is_planned_first_and_gives_the_spawn_tile_it_was_ranked_with() {
+    let plain = TerrainGrid::from_row_major(&vec![0u8; ROOM_AREA]).expect("terrain");
+    let a = atlas(vec![neutral("E6N5", 2), neutral("E4N5", 2)]);
+    let c = cfg();
+    // Ranked: E6N5 is planned as a candidate.
+    let mut ranked = scored(&a, &c);
+    let first = ranked.wanted(&c).expect("a plan is wanted");
+    ranked.feed_terrain(first, Some(plain.clone()), &a);
+    finish_plan(&mut ranked, &a, &owned(), &c);
+    let spawn = get(&ranked, &first.to_string())
+        .and_then(|x| x.plan)
+        .map(|f| f.spawn)
+        .expect("a fit");
+    // Claimed, after a reset: it is owned, so no candidate, and the first plan wanted.
+    let mut owned_now = owned();
+    owned_now.push(first);
+    owned_now.sort_unstable_by_key(|r| r.packed_repr());
+    let mut fresh = Claims::default();
+    fresh.score(&a, 0, &homes(), &owned_now, NOW, REMOTES, &c);
+    assert!(
+        get(&fresh, &first.to_string()).is_none(),
+        "owned: no candidate"
+    );
+    assert!(fresh.spawn_tile(first).is_none(), "not a site room yet");
+    fresh.set_sites(core::iter::once(first), &a);
+    assert_eq!(fresh.spawn_tile(first), None, "not planned yet");
+    assert_eq!(fresh.wanted(&c), Some(first), "before the other candidate");
+    fresh.feed_terrain(first, Some(plain), &a);
+    // A score while it is planned keeps the plan.
+    fresh.score(&a, 0, &homes(), &owned_now, NOW, REMOTES, &c);
+    assert_eq!(fresh.planning().map(|p| p.0), Some(first));
+    finish_plan(&mut fresh, &a, &owned_now, &c);
+    assert_eq!(fresh.spawn_tile(first), Some(Ok(spawn)));
+    // A room the atlas holds no controller tile for is no site room.
+    let mut none = Claims::default();
+    none.set_sites(core::iter::once(room("E9N9")), &a);
+    assert_eq!(none.wanted(&c), None);
+}

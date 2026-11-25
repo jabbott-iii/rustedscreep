@@ -389,6 +389,21 @@ impl Atlas {
         }
     }
 
+    /// Makes `room`'s entry due at `now` with `refresh` (`scout.refresh_ticks`): its read is
+    /// kept, and it was seen `refresh` ticks ago at the latest. Returns whether there is an entry.
+    /// Before tick `refresh` the entry cannot be made due this way and stays as it is.
+    pub fn expire(&mut self, room: RoomName, now: u32, refresh: u32) -> bool {
+        let Ok(i) = self.find(room) else {
+            return false;
+        };
+        if let Some(e) = self.entries.get_mut(i)
+            && let Some(old) = now.checked_sub(refresh)
+        {
+            e.seen = e.seen.min(old);
+        }
+        true
+    }
+
     /// Keeps only the entries `keep` says to. Returns how many it dropped.
     pub fn retain(&mut self, keep: impl Fn(&RoomIntel) -> bool) -> usize {
         let before = self.entries.len();

@@ -1,5 +1,7 @@
 //! Expansion (ROADMAP P8, SPEC §3.7). P8.1 (ADR-039) is scouting: the atlas of the rooms near the
-//! homes, the explorer that walks into them, and the observers that look at them.
+//! homes, the explorer that walks into them, and the observers that look at them. P8.2 (ADR-041,
+//! [`claim`]) ranks the rooms to claim, and P8.3 (ADR-042, [`claimer`]) sends the claimer and places
+//! a claimed room's first spawn site.
 //!
 //! # The atlas
 //!
@@ -47,6 +49,9 @@
 
 mod atlas;
 pub mod claim;
+pub mod claimer;
+#[cfg(test)]
+mod claimer_tests;
 #[cfg(test)]
 mod tests;
 
@@ -54,6 +59,10 @@ pub use atlas::{
     Atlas, Deposit, MAX_SOURCES, Mineral, RecordError, Reserved, RoomIntel, SCHEMA, entry_len,
 };
 pub use claim::{Candidate, ClaimEvent, ClaimHome, ClaimStats, Claims, Fit, Skip, Terms};
+pub use claimer::{
+    CLAIMER_MOVES, ClaimerEvent, ClaimerState, ClaimerStats, Claiming, Failure, PRIORITY_CLAIMER,
+    REREAD_WAIT, SitePick, claimer_body,
+};
 
 use rustedscreep_consts::{
     CREEP_LIFE_TIME, INTENT_CPU_COST, OBSERVER_RANGE, Part, Position, RoomName, StructureType,
@@ -778,6 +787,18 @@ impl Scouting {
         if !self.skip.contains(&room) {
             self.skip.push(room);
         }
+    }
+
+    /// Marks `room`'s entry due now, so the next tick that sees the room reads it (P8.3: a claim the
+    /// game refused shows the entry is stale). Returns whether the atlas held it. On a server
+    /// younger than `scout.refresh_ticks` the entry stays as it is.
+    pub fn expire(&mut self, room: RoomName, cfg: &ScoutConfig) -> bool {
+        let held = self.atlas.expire(room, self.time, cfg.refresh_ticks);
+        if held {
+            self.changed();
+            self.idle_until = None;
+        }
+        held
     }
 
     fn unreachable(&mut self, room: RoomName) {

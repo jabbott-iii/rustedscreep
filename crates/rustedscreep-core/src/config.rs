@@ -919,19 +919,31 @@ pub struct ClaimConfig {
     pub plan_count: u32,
     /// The ranking is rebuilt from the atlas this often. Unit: ticks.
     pub score_ticks: u32,
+    /// Sends a claimer to the best candidate while the global control level (GCL) allows another
+    /// room (P8.3, ADR-042, `expansion::Claiming`), and places the first spawn's site in a claimed
+    /// room. Off, no claimer is ordered, a live one ends, and no spawn site is placed. Unit: flag.
+    pub claimers: bool,
+    /// The lowest controller level of the home a claimer is ordered from. Unit: RCL.
+    pub min_home_level: u32,
+    /// A room whose claim failed (no route, a claimer lost on the way, a refused call) is not
+    /// claimed again for this long. Unit: ticks.
+    pub retry_ticks: u32,
 }
 
 /// Claim scoring values for the official MMO.
 pub const CLAIM_MMO: ClaimConfig = ClaimConfig {
     enabled: true,
     min_sources: 1,
-    max_distance: 5,
+    max_distance: 3,
     remote_pct: 30,
     distance_cost: 1_000,
     threat_range: 2,
     foreign_cost: 4_000,
     plan_count: 3,
     score_ticks: 1_000,
+    claimers: true,
+    min_home_level: 4,
+    retry_ticks: 5_000,
 };
 
 /// Defense (ROADMAP P7, `defense::Threats`). `docs/TUNING.md` gives each one's rationale and safe
@@ -1270,7 +1282,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 169;
+pub const FIELD_COUNT: usize = 172;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1686,6 +1698,9 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(claim, "ClaimConfig", foreign_cost, 0, 100_000, true),
     number!(claim, "ClaimConfig", plan_count, 1, 10, true),
     number!(claim, "ClaimConfig", score_ticks, 10, 100_000, true),
+    flag!(claim, "ClaimConfig", claimers, true),
+    number!(claim, "ClaimConfig", min_home_level, 1, 8, true),
+    number!(claim, "ClaimConfig", retry_ticks, 100, 100_000, true),
     number!(
         defense,
         "DefenseConfig",
@@ -2148,6 +2163,9 @@ mod tests {
             foreign_cost: _,
             plan_count: _,
             score_ticks: _,
+            claimers: _,
+            min_home_level: _,
+            retry_ticks: _,
         } = CLAIM_MMO;
         let DefenseConfig {
             threat_end_ticks: _,
@@ -2394,6 +2412,9 @@ mod tests {
                     "foreign_cost",
                     "plan_count",
                     "score_ticks",
+                    "claimers",
+                    "min_home_level",
+                    "retry_ticks",
                 ],
             ),
             (

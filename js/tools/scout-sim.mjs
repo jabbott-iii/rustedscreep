@@ -116,6 +116,10 @@
 //    rules (the read lines the only scout lines), with the observer's calls the only structure calls.
 // And in run C (claim scoring, ROADMAP P8.2, ADR-041: run B's world with claim scoring on), checks 12 to 15 at
 // `claimsRun`: W2N1's one terrain read, its best line with terms from the constants, and `rustedscreep.claims()`.
+// And in run D (claimers, ROADMAP P8.3, ADR-042: run C's world at GCL 2 with W1N1's capacity at RCL4's), checks 16 to 21
+// at `claimerRun`: the GCL read, the claimer's order, walk, claim and end, the first spawn site at the plan's tile, and
+// a pioneer's order. For it the harness also plays `Game.gcl` (V379), `claimController` (V374's checks; the claimed
+// room is the bot's at level 1 from the next tick, V377), and W1N1 refilled to its capacity after each loop.
 // npm run check runs it (row 26); standalone: node js/tools/scout-sim.mjs [dir].
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
@@ -188,6 +192,27 @@ const B_MAX = 200;
 const C_SETTLE = 5;
 const C_MAX = 300;
 const CLAIMS = 'rustedscreep.claims()';
+/** Run D (P8.3, ADR-042): GCL 2, and W1N1's capacity as at RCL4 (a spawn and CONTROLLER_STRUCTURES.extension[4] full
+ * extensions), enough for the claimer (850) as `claim.min_home_level` (4) means; loops after the pioneer's first order
+ * before the summary, and the run's limit. */
+const D_GCL = 2;
+const D_CAPACITY = C.SPAWN_ENERGY_CAPACITY + C.CONTROLLER_STRUCTURES.extension[4] * C.EXTENSION_ENERGY_CAPACITY[4];
+const D_SETTLE = 5;
+const D_MAX = 400;
+/** The claimer's body (expansion::claimer_body): one CLAIM part and the MOVE parts that take a swamp tile's fatigue
+ * for it within a tick (10 a part that makes fatigue, 2 removed a MOVE part, V54, V55, as `applyMoves` models). */
+const CLAIMER_BODY = ['claim', ...Array(Math.ceil(10 / 2)).fill('move')];
+const CLAIMER_COST = CLAIMER_BODY.reduce((sum, p) => sum + C.BODYPART_COST[p], 0);
+const CLAIMER_NAME = new RegExp(`^k${HOME}${WEST}-[0-9a-z]+$`);
+const PIONEER_NAME = new RegExp(`^w${WEST}-[0-9a-z]+$`);
+/** ClaimConfig's MMO default `retry_ticks` (crates/rustedscreep-core/src/config.rs CLAIM_MMO). */
+const RETRY_TICKS = 5000;
+/** The claimer's log lines (crates/rustedscreep-wasm/src/claim.rs `log_events`). */
+const SENT_LINE = `rustedscreep claims: a claimer from ${HOME} goes to claim ${WEST}`;
+const CLAIMED_LINE = `rustedscreep claims: claimed ${WEST}; its pioneers come from the nearest spawn room, and its first spawn `
+  + 'site follows from its plan';
+const SITE_LINE = new RegExp(`^rustedscreep claims: ${WEST}'s first spawn site placed at \\((\\d+), (\\d+)\\)$`);
+const NO_BEST_LINE = 'rustedscreep claims: no planned candidate';
 /** ClaimConfig's MMO default `distance_cost` (crates/rustedscreep-core/src/config.rs CLAIM_MMO). Unit: me/t a room. */
 const DISTANCE_COST = 1000;
 /** Claim scoring's best line (crates/rustedscreep-wasm/src/claim.rs `log_events` and `describe`). */
@@ -379,10 +404,17 @@ function makePathFinder(state, RoomPosition) {
 }
 
 /** A run's world: `level` is W1N1's RCL, `energy` the spawn's at the start, `observer` whether one stands in W1N1. */
-function makeWorld({ level, energy, observer }) {
+function makeWorld({ level, energy, observer, gcl = 1, capacity = C.SPAWN_ENERGY_CAPACITY }) {
   return {
     level,
     observer,
+    /** Game.gcl.level (V379), and its reads; W1N1's energyCapacityAvailable; whether the spawns and extensions are
+     * refilled to it at once after each loop (run D: `refill`); the rooms the bot claimed (run D). */
+    gcl,
+    gclReads: [],
+    capacity,
+    refill: false,
+    claimed: new Set(),
     /** Own creeps: { id, name, room, x, y, body, fatigue, spawning, death (the Game.time it is gone), rooms }. */
     creeps: [],
     /** The spawn's accepted order this tick ({ name, body }), and its busy state ({ name, needTime, until }). */
@@ -422,8 +454,9 @@ function makeWorld({ level, energy, observer }) {
 function refuses(state, room, x, y, type) {
   if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0 || x > 49 || y > 49) return C.ERR_INVALID_ARGS;
   if (!C.CONSTRUCTION_COST[type]) return C.ERR_INVALID_ARGS;
-  // Only W1N1's controller is the bot's; a neutral one has no level, so only level-0 counts are allowed there.
-  const level = room === HOME ? state.level : 0;
+  // W1N1's controller is the bot's, and a room it claimed (run D) is at level 1 (V377); a neutral one has no level,
+  // so only level-0 counts are allowed there.
+  const level = room === HOME ? state.level : state.claimed.has(room) ? 1 : 0;
   const here = (o) => o.room === room && o.x === x && o.y === y;
   const structures = room === HOME
     ? [{ ...SPAWN, type: 'spawn', room }, ...(state.observer ? [{ ...OBSERVER_AT, type: 'observer', room }] : [])]
@@ -458,7 +491,7 @@ function sceneFor(state, offset) {
   state.observedNext = null;
   // A room is visible while an own creep stands in it, spawning or not, the owned one always (V101), and on the tick
   // after an observer's look (V362).
-  const visible = new Set([HOME, ...state.creeps.map((c) => c.room), ...(observed ? [observed] : [])]);
+  const visible = new Set([HOME, ...state.claimed, ...state.creeps.map((c) => c.room), ...(observed ? [observed] : [])]);
   const explorer = state.creeps.find((c) => c.name.startsWith('x'));
   const r = {
     offset, snapshots: 0, structurePasses: 0, visible: ROOMS.filter((n) => visible.has(n)), observed,
@@ -484,12 +517,13 @@ function sceneFor(state, offset) {
   const controllers = {};
   for (const room of ROOMS.filter((n) => visible.has(n))) {
     const c = CONTROLLER[room];
-    const owned = room === HOME;
+    const owned = room === HOME || state.claimed.has(room);
+    const level = room === HOME ? state.level : owned ? 1 : 0;
     controllers[room] = {
-      id: id(1 + ROOMS.indexOf(room)), structureType: 'controller', pos: pos(room, c.x, c.y), level: owned ? state.level : 0,
+      id: id(1 + ROOMS.indexOf(room)), structureType: 'controller', pos: pos(room, c.x, c.y), level,
       ...(owned ? {
-        my: true, owner: { username: USER }, progress: 0, progressTotal: C.CONTROLLER_LEVELS[state.level],
-        ticksToDowngrade: C.CONTROLLER_DOWNGRADE[state.level],
+        my: true, owner: { username: USER }, progress: 0, progressTotal: C.CONTROLLER_LEVELS[level],
+        ticksToDowngrade: C.CONTROLLER_DOWNGRADE[level],
       } : {}),
       get reservation() {
         note(room, 'reservation');
@@ -510,7 +544,7 @@ function sceneFor(state, offset) {
   const taken = new Set();
   const spawn = {
     id: id(10), name: 'Spawn1', structureType: 'spawn', my: true, owner: { username: USER }, pos: pos(HOME, SPAWN.x, SPAWN.y),
-    store: makeStore({ energy: state.energy }, { resourceCapacity: { energy: C.SPAWN_ENERGY_CAPACITY } }),
+    store: makeStore({ energy: Math.min(state.energy, C.SPAWN_ENERGY_CAPACITY) }, { resourceCapacity: { energy: C.SPAWN_ENERGY_CAPACITY } }),
     spawning: state.spawning ? { name: state.spawning.name, needTime: state.spawning.needTime, remainingTime: state.spawning.until - offset + 1 } : null,
     // The runtime's checks in V171's order and its `Memory.creeps[name]` write on OK (V181).
     spawnCreep(...args) {
@@ -545,6 +579,8 @@ function sceneFor(state, offset) {
   spawn.destroy = (...args) => recordStructure(spawn, 'destroy', args, C.OK);
   if (controllers[HOME]) controllers[HOME].destroy = (...args) => recordStructure(controllers[HOME], 'destroy', args, C.OK);
   const owned = [spawn, ...(controllers[HOME] ? [controllers[HOME]] : [])];
+  // A claimed room's controller is an own structure too (run D).
+  const claimedControllers = [...state.claimed].map((n) => controllers[n]).filter(Boolean);
   if (state.observer) {
     const observer = {
       id: id(11), structureType: 'observer', my: true, owner: { username: USER }, pos: pos(HOME, OBSERVER_AT.x, OBSERVER_AT.y),
@@ -594,6 +630,25 @@ function sceneFor(state, offset) {
       if (result === C.OK) intentsOf(c.id).suicide = true;
       return record(c, 'suicide', args, result).result;
     };
+    // V374's checks in order (the creep is the bot's; no novice area, shard access, or safe mode in this world): the
+    // GCL against the owned rooms and this tick's claims (GCL N allows N rooms, V378), the target, a CLAIM part, range 1,
+    // a controller at level 0 with no other user's reservation; then the intent (V376, V377 in `advance`).
+    self.claimController = (...args) => {
+      const [target] = args;
+      const owned = 1 + state.claimed.size + [...state.intents.values()].filter((i) => i.claim).length;
+      const near = target?.pos && target.pos.roomName === c.room && Math.max(Math.abs(target.pos.x - c.x), Math.abs(target.pos.y - c.y)) <= 1;
+      const reservation = target?.structureType === 'controller' ? target.reservation : undefined;
+      const result = c.spawning ? C.ERR_BUSY
+        : owned >= state.gcl ? C.ERR_GCL_NOT_ENOUGH
+          : !target?.structureType ? C.ERR_INVALID_TARGET
+            : !count(c.body, 'claim') ? C.ERR_NO_BODYPART
+              : !near ? C.ERR_NOT_IN_RANGE
+                : target.structureType !== 'controller' || target.level > 0 ? C.ERR_INVALID_TARGET
+                  : reservation && reservation.username !== USER ? C.ERR_INVALID_TARGET
+                    : C.OK;
+      if (result === C.OK) intentsOf(c.id).claim = target.pos.roomName;
+      return record(c, 'claimController', args, result).result;
+    };
     return self;
   });
 
@@ -628,8 +683,9 @@ function sceneFor(state, offset) {
       get level() { note(name, 'level'); return core.level; },
     }] : [];
     const structures = name === HOME ? owned : [controllers[name], ...hostileStructures];
+    const mineOwned = name === HOME ? owned : state.claimed.has(name) ? [controllers[name]] : [];
     const lists = {
-      [C.FIND_STRUCTURES]: structures, [C.FIND_MY_STRUCTURES]: name === HOME ? owned : [], [C.FIND_MY_SPAWNS]: name === HOME ? [spawn] : [],
+      [C.FIND_STRUCTURES]: structures, [C.FIND_MY_STRUCTURES]: mineOwned, [C.FIND_MY_SPAWNS]: name === HOME ? [spawn] : [],
       [C.FIND_HOSTILE_STRUCTURES]: hostileStructures, [C.FIND_SOURCES]: sources, [C.FIND_SOURCES_ACTIVE]: sources,
       [C.FIND_MINERALS]: minerals, [C.FIND_CONSTRUCTION_SITES]: sites, [C.FIND_MY_CONSTRUCTION_SITES]: sites,
       [C.FIND_CREEPS]: mine, [C.FIND_MY_CREEPS]: mine, [C.FIND_TOMBSTONES]: tombstones.filter(inRoom),
@@ -638,7 +694,7 @@ function sceneFor(state, offset) {
       name,
       controller: controllers[name],
       energyAvailable: name === HOME ? state.energy : 0,
-      energyCapacityAvailable: name === HOME ? C.SPAWN_ENERGY_CAPACITY : 0,
+      energyCapacityAvailable: name === HOME ? state.capacity : 0,
       find(type, opts) {
         const filter = opts?.filter;
         const key = filter ? `${type}:${filter.structureType ?? 'other'}` : `${type}`;
@@ -666,7 +722,7 @@ function sceneFor(state, offset) {
       return Reflect.ownKeys(target);
     },
   });
-  const structuresSeen = new Proxy(Object.fromEntries(owned.map((s) => [s.id, s])), {
+  const structuresSeen = new Proxy(Object.fromEntries([...owned, ...claimedControllers].map((s) => [s.id, s])), {
     ownKeys(target) {
       r.structurePasses += 1;
       state.phase = 'after';
@@ -677,6 +733,11 @@ function sceneFor(state, offset) {
     creeps: Object.fromEntries(creeps.map((c) => [c.name, c])),
     rooms: roomsSeen,
     structures: structuresSeen,
+    gcl: {
+      get level() { state.gclReads.push(offset); return state.gcl; },
+      progress: 0,
+      progressTotal: C.GCL_MULTIPLY,
+    },
     map: {
       getRoomStatus(name) {
         state.statusCalls.push({ offset, room: name, phase: state.phase });
@@ -765,7 +826,7 @@ function advance(state, offset) {
   if (state.order) {
     const { name, body } = state.order;
     const cost = body.reduce((s, p) => s + C.BODYPART_COST[p], 0);
-    if (name.startsWith('x') && !state.spawning && state.energy >= cost) {
+    if ((name.startsWith('x') || name.startsWith('k')) && !state.spawning && state.energy >= cost) {
       state.energy -= cost;
       const needTime = C.CREEP_SPAWN_TIME * body.length;
       state.spawning = { name, needTime, until: offset + needTime };
@@ -774,6 +835,8 @@ function advance(state, offset) {
       state.dropped.push({ offset, name });
     }
   }
+  // A claim (V376, V377): the room is the bot's at level 1 from the next tick.
+  for (const i of state.intents.values()) if (i.claim) state.claimed.add(i.claim);
   for (const c of state.creeps.filter((x) => state.intents.get(x.id)?.suicide)) {
     state.creeps = state.creeps.filter((x) => x !== c);
     state.tombstones.push({
@@ -797,7 +860,8 @@ function advance(state, offset) {
     }
   }
   state.creeps = state.creeps.filter((c) => c.spawning || c.death > time + 1);
-  if (state.energy < C.SPAWN_ENERGY_CAPACITY) state.energy += 1;
+  if (state.refill) state.energy = state.capacity;
+  else if (state.energy < C.SPAWN_ENERGY_CAPACITY) state.energy += 1;
   state.tombstones = state.tombstones.filter((t) => time < t.decayTime - 1);
   for (const s of state.siteOrders) state.sites.push({ id: id(state.nextId++), ...s, since: offset });
   state.observedNext = state.observeIntent;
@@ -943,11 +1007,12 @@ function checkReads(problems, loops, readAt) {
 }
 
 /** The log and call rules both runs share. */
-function checkLog(problems, world, state, allowed, terrainOk = false) {
+function checkLog(problems, world, state, allowed, terrainOk = false, more = {}) {
   const bad = world.logs.filter((l) => /^rustedscreep (fault|incident)/.test(l) || l.startsWith('rustedscreep persist:')
     || (l.startsWith('rustedscreep scout: ') && !allowed(l)));
   problems.push(...bad.slice(0, 10).map((l) => `log: ${l}`));
   for (const c of state.calls) {
+    if (more.creep?.(c)) continue;
     if ((c.method !== 'move' && c.method !== 'suicide') || c.result !== C.OK || !c.actor.startsWith('x')) {
       problems.push(`offset ${c.offset}: ${c.actor} called ${c.method}(${c.args.join(', ')}) from ${c.from.room} ${at(c.from)}: ${c.result}`);
     }
@@ -956,6 +1021,7 @@ function checkLog(problems, world, state, allowed, terrainOk = false) {
     if (c.method !== 'observeRoom') problems.push(`offset ${c.offset}: ${c.structure} ${c.method}(${c.args.join(', ')}): ${c.result}`);
   }
   for (const c of state.siteCalls) {
+    if (more.site?.(c)) continue;
     if (c.room !== HOME || c.result !== C.OK || c.args !== 3 || !c.sameRoom) problems.push(`offset ${c.offset}: ${c.room} createConstructionSite(${c.x}, ${c.y}, ${c.type}) with ${c.args} arguments: ${c.result}`);
   }
   if (state.terrainCalls.length && !terrainOk) problems.push(`Game.map.getRoomTerrain calls ${JSON.stringify(state.terrainCalls.slice(0, 4))}`);
@@ -1339,12 +1405,145 @@ export function claimsRun(dir) {
   const shown = (best[0] ?? '').replace('rustedscreep claims: best ', '');
   const head = `rustedscreep claims: 1 candidates (1 planned); left out: reserved 1, sources 1; best ${WEST} at ${value} e/t; `
     + 'scores 3, plans 1 (1 fit), steps ';
-  const tail = `, terrain reads 1 (0 failed) | 1. ${shown}`;
+  // The claimer's part (P8.3): W1N1 is at RCL8, so the GCL is read once, and level 1 allows no second room.
+  const tail = `, terrain reads 1 (0 failed); GCL 1 for 1 owned; no claimer; claimers 0, claims 0, failed 0, spawn sites 0 `
+    + `(0 refused), route searches 0, GCL reads 1 | 1. ${shown}`;
   const steps = summary?.startsWith(head) && summary.endsWith(tail) ? Number(summary.slice(head.length, summary.length - tail.length)) : NaN;
   if (!(steps > 0)) problems.push(`the claims summary ${JSON.stringify(summary)}, expected ${JSON.stringify(`${head}K${tail}`)} with K above 0`);
+  if (state.gclReads.length !== 1) problems.push(`Game.gcl.level read at ${JSON.stringify(state.gclReads)}, expected once`);
 
   if (problems.length) throw new Error(`scout-sim (run C, claims):\n  ${problems.slice(0, 25).join('\n  ')}`);
   return { ticks: world.ticksRun, terrainAt: state.terrainCalls[0]?.[0], bestAt: bestAt[0], steps, summary };
+}
+
+/**
+ * Run D (the claimer and the first spawn site, P8.3, ADR-042): run C's world with Game.gcl.level D_GCL and W1N1's
+ * capacity at D_CAPACITY. The spawn starts empty and regains 1 a tick until the best line (so no explorer is paid for
+ * before the observer has read every room, as in run B); from then on W1N1 is full after every loop. It checks:
+ * 16. one `Game.gcl.level` read, on the loop of the claimer's order, which is the run's first spawnCreep call: two
+ *     arguments, a name matching CLAIMER_NAME, the body CLAIMER_BODY (CLAIMER_COST energy), OK; the line SENT_LINE on
+ *     a loop its creep exists; no other claimer order in the run;
+ * 17. one `claimController` call, by the claimer, with one argument (W2N1's controller), from W2N1 within one tile of
+ *     it, OK; on the next loop the line CLAIMED_LINE and the claimer's `suicide` (no argument, OK), and the claimer is
+ *     gone on the loop after; it never stood in W1N2; NO_BEST_LINE once, after the claim;
+ * 18. one `createConstructionSite` call in W2N1, on or after the claimed line's loop: (X, Y, 'spawn') with three
+ *     arguments, OK, (X, Y) the best line's first spawn; SITE_LINE with (X, Y) on that loop; the site stands from the
+ *     next loop and no other site call in W2N1;
+ * 19. after the claim, a spawnCreep call for a pioneer (a name matching PIONEER_NAME, two arguments, OK) from W1N1's
+ *     spawn, its body WORK, CARRY and MOVE parts costing at most D_CAPACITY (the processor drops it: nothing builds);
+ * 20. `rustedscreep.claims()` D_SETTLE loops after it ends with `; GCL 2 for 2 owned; no claimer; claimers 1, claims 1,
+ *     failed 0, spawn sites 1 (0 refused), route searches 1, GCL reads 1`;
+ * 21. check 11's rules, with the claimer's move, claimController and suicide calls and the one W2N1 site allowed, the
+ *     claimer's and pioneers' orders the only spawnCreep calls, and the claim lines above the only other lines.
+ */
+export function claimerRun(dir) {
+  const state = makeWorld({ level: 8, energy: 0, observer: true, gcl: D_GCL, capacity: D_CAPACITY });
+  state.configLines = C_CONFIG_LINES;
+  const marks = {};
+  const world = runWorld(state, dir, D_MAX, (offset, lines, w) => {
+    if (marks.best === undefined && w.logs.some((l) => BEST_LINE.test(l))) {
+      marks.best = offset;
+      state.refill = true;
+      state.energy = state.capacity;
+    }
+    if (marks.pioneer === undefined && state.spawnCalls.some((c) => PIONEER_NAME.test(c.name ?? ''))) marks.pioneer = offset;
+    if (marks.pioneer !== undefined && offset >= marks.pioneer + D_SETTLE) {
+      marks.final = offset;
+      return { finish: true, cmd: CLAIMS };
+    }
+    if (offset >= D_MAX - 1) return 'finish';
+    return null;
+  });
+
+  const problems = [...state.errors.slice(0, 10)];
+  const linesOf = (o) => world.logs.slice(state.logMarks[o - 1] ?? 0, state.logMarks[o] ?? world.logs.length);
+  const linesAt = (test) => state.logMarks.map((_, o) => o).filter((o) => linesOf(o).some(test));
+  if (marks.final === undefined) problems.push(`not finished in ${world.ticksRun} ticks (marks ${JSON.stringify(marks)})`);
+  if (world.halts !== 0 || world.globals !== 1) problems.push(`halts ${world.halts}, globals ${world.globals}: expected 0 and 1`);
+  const best = BEST_LINE.exec(world.logs.find((l) => BEST_LINE.test(l)) ?? '');
+  const spawnAt = best ? { x: Number(best[8]), y: Number(best[9]) } : null;
+
+  // 21. The log and the calls.
+  const claimer = (c) => CLAIMER_NAME.test(c.actor) && ['move', 'claimController', 'suicide'].includes(c.method) && c.result === C.OK;
+  const westSite = (c) => c.room === WEST && c.type === 'spawn';
+  checkLog(problems, world, state, (l) => READ_LINE.test(l), true, { creep: claimer, site: westSite });
+  const allowedClaims = (l) => BEST_LINE.test(l) || SITE_LINE.test(l) || [SENT_LINE, CLAIMED_LINE, NO_BEST_LINE].includes(l)
+    || /^rustedscreep claims: \d+ candidates /.test(l);
+  const otherClaims = world.logs.filter((l) => l.startsWith('rustedscreep claims: ') && !allowedClaims(l));
+  if (otherClaims.length) problems.push(`other claims lines ${JSON.stringify(otherClaims.slice(0, 4))}`);
+  const orders = state.spawnCalls.filter((c) => !PIONEER_NAME.test(c.name ?? ''));
+
+  // 16. The GCL read and the claimer's order.
+  const [order] = orders;
+  if (orders.length !== 1 || !order || order.args !== 2 || !CLAIMER_NAME.test(order.name) || JSON.stringify(order.body) !== JSON.stringify(CLAIMER_BODY)
+    || order.result !== C.OK) {
+    problems.push(`spawnCreep calls but the pioneers' ${JSON.stringify(orders.map((c) => [c.offset, c.name, c.body, c.result]))}, expected one `
+      + `for the claimer (${JSON.stringify(CLAIMER_BODY)}, ${CLAIMER_COST} energy) and OK`);
+  }
+  if (order && state.spawnCalls[0] !== order) problems.push('the claimer\'s order is not the first spawnCreep call');
+  if (JSON.stringify(state.gclReads) !== JSON.stringify(order ? [order.offset] : [])) {
+    problems.push(`Game.gcl.level read at ${JSON.stringify(state.gclReads)}, expected once, at the claimer's order (${order?.offset})`);
+  }
+  const sentAt = linesAt((l) => l === SENT_LINE);
+  if (sentAt.length !== 1 || !(sentAt[0] > (order?.offset ?? Infinity))) problems.push(`the sent line at ${JSON.stringify(sentAt)}, expected once after the order at ${order?.offset}`);
+
+  // 17. The claim and the claimer's end.
+  const claims = state.calls.filter((c) => c.method === 'claimController');
+  const [claim] = claims;
+  const ctrl = CONTROLLER[WEST];
+  // The call record names an object argument by its structure type.
+  if (claims.length !== 1 || claim.argCount !== 1 || claim.args[0] !== 'controller' || claim.from.room !== WEST
+    || Math.max(Math.abs(claim.from.x - ctrl.x), Math.abs(claim.from.y - ctrl.y)) > 1 || claim.result !== C.OK) {
+    problems.push(`claimController calls ${JSON.stringify(claims.map((c) => [c.offset, c.args, c.from, c.result]))}, expected one at ${WEST}'s `
+      + `controller from within one tile, OK`);
+  }
+  const claimedAt = linesAt((l) => l === CLAIMED_LINE);
+  if (!claim || JSON.stringify(claimedAt) !== JSON.stringify([claim.offset + 1])) problems.push(`the claimed line at ${JSON.stringify(claimedAt)}, expected once at ${claim ? claim.offset + 1 : '?'}`);
+  const suicides = state.calls.filter((c) => CLAIMER_NAME.test(c.actor) && c.method === 'suicide');
+  if (suicides.length !== 1 || suicides[0].offset !== claimedAt[0] || suicides[0].argCount !== 0) {
+    problems.push(`the claimer's suicide calls ${JSON.stringify(suicides.map((c) => [c.offset, c.argCount]))}, expected one with no argument at ${claimedAt[0]}`);
+  }
+  const lastCall = Math.max(...state.calls.filter((c) => CLAIMER_NAME.test(c.actor)).map((c) => c.offset));
+  if (suicides[0] && lastCall !== suicides[0].offset) problems.push(`the claimer called at ${lastCall}, after its suicide`);
+  if (state.creeps.some((c) => CLAIMER_NAME.test(c.name))) problems.push('the claimer still lives at the end');
+  const noBest = linesAt((l) => l === NO_BEST_LINE);
+  if (noBest.length !== 1 || !(noBest[0] > (claim?.offset ?? Infinity))) problems.push(`the no-best line at ${JSON.stringify(noBest)}, expected once after the claim`);
+
+  // 18. The first spawn site.
+  const sites = state.siteCalls.filter((c) => c.room === WEST);
+  const [site] = sites;
+  if (sites.length !== 1 || site.type !== 'spawn' || site.args !== 3 || !site.sameRoom || site.result !== C.OK || !spawnAt
+    || site.x !== spawnAt.x || site.y !== spawnAt.y || !(site.offset >= (claimedAt[0] ?? Infinity))) {
+    problems.push(`${WEST} site calls ${JSON.stringify(sites.map((c) => [c.offset, c.x, c.y, c.type, c.args, c.result]))}, expected one spawn `
+      + `site at the best line's first spawn ${spawnAt ? at(spawnAt) : '?'} on or after ${claimedAt[0]}`);
+  }
+  const siteLines = linesAt((l) => SITE_LINE.test(l));
+  const siteText = world.logs.find((l) => SITE_LINE.test(l));
+  if (!site || JSON.stringify(siteLines) !== JSON.stringify([site.offset]) || !spawnAt || siteText !== `rustedscreep claims: ${WEST}'s first spawn site placed at ${at(spawnAt)}`) {
+    problems.push(`the site line ${JSON.stringify(siteText)} at ${JSON.stringify(siteLines)}, expected once at ${site?.offset}`);
+  }
+  if (!state.sites.some((x) => x.room === WEST && x.type === 'spawn')) problems.push(`no spawn site stands in ${WEST}`);
+
+  // 19. A pioneer's order.
+  const pioneers = state.spawnCalls.filter((c) => PIONEER_NAME.test(c.name ?? ''));
+  const [pioneer] = pioneers;
+  const cost = pioneer && Array.isArray(pioneer.body) ? pioneer.body.reduce((sum, p) => sum + C.BODYPART_COST[p], 0) : Infinity;
+  if (!pioneer || pioneer.args !== 2 || pioneer.result !== C.OK || !(pioneer.offset > (claim?.offset ?? Infinity)) || cost > D_CAPACITY
+    || !['work', 'carry', 'move'].every((p) => pioneer.body.includes(p))) {
+    problems.push(`the first pioneer order ${JSON.stringify(pioneer && [pioneer.offset, pioneer.name, pioneer.body, pioneer.result])}, expected `
+      + `one after the claim with WORK, CARRY and MOVE parts at most ${D_CAPACITY} energy, OK`);
+  }
+
+  // 20. The console summary.
+  const [summary] = commandResults(world, CLAIMS);
+  const tail = `; GCL ${D_GCL} for 2 owned; no claimer; claimers 1, claims 1, failed 0, spawn sites 1 (0 refused), route searches 1, GCL reads 1`;
+  if (!summary?.endsWith(tail)) problems.push(`the claims summary ${JSON.stringify(summary)}, expected it to end ${JSON.stringify(tail)}`);
+
+  if (problems.length) throw new Error(`scout-sim (run D, claimer):\n  ${problems.slice(0, 25).join('\n  ')}`);
+  return {
+    ticks: world.ticksRun, bestAt: marks.best, orderAt: order?.offset, claimAt: claim?.offset, siteAt: site?.offset,
+    site: spawnAt ? at(spawnAt) : '?', pioneerAt: pioneer?.offset, pioneerCost: cost, summary,
+  };
 }
 
 if (isMain(import.meta.url)) {
@@ -1353,6 +1552,7 @@ if (isMain(import.meta.url)) {
     const a = explorerRun(dir);
     const b = observerRun(dir);
     const c = claimsRun(dir);
+    const d = claimerRun(dir);
     console.log(`scout-sim ok: run A ${a.ticks} ticks, 2 globals; explorer ordered at offset ${a.orderAt}, out at ${a.outAt}; `
       + `${NORTH} unreachable at ${a.unreachableAt}; read ${a.reads}; ended in ${a.end}; ${a.searches} PathFinder search(es); `
       + `segment ${ATLAS_SEGMENT} written at offsets ${a.writes}; after the halt: ${a.loaded} | ${a.final}`);
@@ -1360,6 +1560,8 @@ if (isMain(import.meta.url)) {
       + `${b.writes}; spawn energy ${b.energy} at the end, no spawn | ${b.during} | ${b.final}`);
     console.log(`scout-sim ok: run C ${c.ticks} ticks; ${WEST}'s terrain read at offset ${c.terrainAt}, best line at ${c.bestAt} `
       + `after ${c.steps} plan steps | ${c.summary}`);
+    console.log(`scout-sim ok: run D ${d.ticks} ticks; best at ${d.bestAt}, claimer ordered at ${d.orderAt}, claim at ${d.claimAt}, `
+      + `spawn site at ${d.site} on ${d.siteAt}, first pioneer order at ${d.pioneerAt} (${d.pioneerCost} energy) | ${d.summary}`);
   } catch (e) {
     fail(e.message);
   }

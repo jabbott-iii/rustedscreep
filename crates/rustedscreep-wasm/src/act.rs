@@ -101,6 +101,10 @@ extern "C" {
     #[wasm_bindgen(method, catch, js_name = reserveController)]
     fn reserve_controller(this: &Actor, target: &JsValue) -> Result<f64, JsValue>;
 
+    /// `claimController(controller)` (P8.3, V374).
+    #[wasm_bindgen(method, catch, js_name = claimController)]
+    fn claim_controller(this: &Actor, target: &JsValue) -> Result<f64, JsValue>;
+
     /// `suicide()` (P6.2, V108).
     #[wasm_bindgen(method, catch, js_name = suicide)]
     fn suicide(this: &Actor) -> Result<f64, JsValue>;
@@ -294,6 +298,7 @@ fn call(actor: &Actor, issue: &Issue, js: &JsWorld) -> Option<Result<f64, JsValu
         CreepIntent::UpgradeController { .. } => actor.upgrade_controller(target()?),
         CreepIntent::Pull { .. } => actor.pull(target()?),
         CreepIntent::ReserveController { .. } => actor.reserve_controller(target()?),
+        CreepIntent::ClaimController { .. } => actor.claim_controller(target()?),
         CreepIntent::Suicide => actor.suicide(),
         CreepIntent::SignController { .. } => {
             actor.sign_controller(target()?, rustedscreep_core::signing::SIGN_TEXT)
@@ -322,6 +327,7 @@ const fn threw(intent: &CreepIntent) -> &'static str {
         CreepIntent::UpgradeController { .. } => "the upgradeController call threw",
         CreepIntent::Pull { .. } => "the pull call threw",
         CreepIntent::ReserveController { .. } => "the reserveController call threw",
+        CreepIntent::ClaimController { .. } => "the claimController call threw",
         CreepIntent::Suicide => "the suicide call threw",
         CreepIntent::SignController { .. } => "the signController call threw",
     }
