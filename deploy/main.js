@@ -754,6 +754,10 @@ function __wbg_get_imports() {
         __wbg__wbg_cb_unref_09736879a3f67559: function(arg0) {
             arg0._wbg_cb_unref();
         },
+        __wbg_activateSafeMode_2d8b0f97393c8960: function() { return handleError(function (arg0) {
+            const ret = arg0.activateSafeMode();
+            return ret;
+        }, arguments); },
         __wbg_amount_e891929ae63d07d1: function(arg0) {
             const ret = arg0.amount;
             return ret;
@@ -1092,6 +1096,10 @@ function __wbg_get_imports() {
             const ret = arg0.push(arg1);
             return ret;
         },
+        __wbg_rangedAttack_78f9ab4b94be98d7: function() { return handleError(function (arg0, arg1) {
+            const ret = arg0.rangedAttack(arg1);
+            return ret;
+        }, arguments); },
         __wbg_rangedHeal_eb3a00962fb020cc: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.rangedHeal(arg1);
             return ret;
@@ -1118,6 +1126,18 @@ function __wbg_get_imports() {
         __wbg_rooms_fb611d081330a50f: function() {
             const ret = Game.rooms;
             return ret;
+        },
+        __wbg_safe_mode_a82767e48895b6f5: function(arg0) {
+            const ret = arg0.safeMode;
+            return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
+        },
+        __wbg_safe_mode_available_c283e3c924488aa7: function(arg0) {
+            const ret = arg0.safeModeAvailable;
+            return ret;
+        },
+        __wbg_safe_mode_cooldown_82a6cf4e3f36756c: function(arg0) {
+            const ret = arg0.safeModeCooldown;
+            return isLikeNone(ret) ? Number.MAX_SAFE_INTEGER : (ret) >>> 0;
         },
         __wbg_say_576bba1bc1eefbc2: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg0.say(getStringFromWasm0(arg1, arg2), arg3 !== 0);
@@ -2304,7 +2324,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"f24faa96f537-dirty-8ea89287","wasmCrc32":"8ea89287","features":[],"wasmParts":[860544,860540]});
+const BUILD = ({"id":"d8db073590e8-7ba99bbd","wasmCrc32":"7ba99bbd","features":[],"wasmParts":[622444,622444,622440]});
 const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;
