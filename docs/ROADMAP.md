@@ -179,7 +179,7 @@ Modules:
 - [x] Rampart upkeep (with home road repair, ADR-032: the line placed and held at 1% of its level's hits by the workers; its amendment sizes the workers for the repairs; ADR-033 closes the line with walls but for its gates).
 - [x] Safe-mode triggers (when to activate safe mode, which for a limited time stops every creep but the owner's in the room from using any method that affects the owner's creeps or objects; what it blocks is VERIFICATION_LOG V325 to V334; ADR-035: when a spawn, tower, storage, or terminal would fall before the towers kill the hostiles in reach, or a CLAIM creep would reach the controller first, whoever owns them).
 - [x] Scaled defenders (ADR-036: ranged defenders, spawned only when the towers cannot win a fight within `defense.max_kill_ticks`, as many full bodies as the combat sim says kill it with the towers, up to `defense.max_defenders`, at a spawn priority above every economy role but the zero-creep recovery worker; they shoot from inside the rampart line).
-- [ ] Remote evacuation.
+- [x] Remote evacuation (ADR-037: P6.3's evacuation stands, and a home sends remote defenders of RANGED_ATTACK, HEAL and MOVE parts when a two-sided combat sim says the cheapest team, up to `defense.max_remote_defenders`, wins and costs less than the wait would lose; they go in together, and the wait ends once one sees the room with no armed hostile).
 
 **Gate:**
 - [ ] `/combat-verify` reports no high-severity findings.

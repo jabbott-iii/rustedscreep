@@ -21,6 +21,15 @@
 //!   clock sample is taken, on a tick with no hostile in an owned room and every defender home;
 //!   each defender then only gives way. The defenders' list goes to the towers' plan first, whose
 //!   sim counts them.
+//! - `remote defense` (Critical; P7.6, ADR-037, `defense::RemoteDefense`): one unit per remote room
+//!   with an open threat (`economy::Remotes::threats`), after the remote manager's plan and before
+//!   the spawn plan: it ends the room's wait when a creep sees it with no armed hostile, sizes the
+//!   team the two-sided sim says wins, decides whether the room's ready defenders go in together, and
+//!   requests the team's bodies while the Standard tier runs. `remote defender work` (Critical, as
+//!   the home defenders'): one unit per remote defender, right after it: its `heal` on itself, its
+//!   `rangedAttack`, and its move or a give-way. Neither runs, and no clock sample is taken, with no
+//!   threatened room and every remote defender waiting off the edge, whole, with no armed hostile
+//!   where it waits; each then only gives way.
 //! - The calls go out in the act step, right after the spawn orders: first `activateSafeMode()` on
 //!   a room's controller (at most once per room per threat; billed when OK, a refusal is free, V325),
 //!   then the towers' `attack(creep)` or `heal(creep)` per order, one JS call each, billed when OK
@@ -28,9 +37,10 @@
 //! - The log lines report each threat's start and changes (warn) and its end (info), the towers'
 //!   new target, a hold of fire with a dangerous hostile in the room, and a target the shot check
 //!   gives up on (warn), a safe-mode call's outcome with its reason and a trigger the room cannot
-//!   meet (warn), a threat in a room already in its safe mode (info), and the defenders a room
-//!   needs and a hostile beyond them (warn): the live record of the event and the bot's response
-//!   that the P7 gate asks for.
+//!   meet (warn), a threat in a room already in its safe mode (info), the defenders a room needs
+//!   and a hostile beyond them (warn), and a remote room's team, a raid not worth or beyond one
+//!   (warn), its living defenders holding it, and its wait's end (info): the live record of the
+//!   event and the bot's response that the P7 gate asks for.
 //!
 //! JS calls of its own: the towers' calls; and on a tick a threat starts or changes, or the towers
 //! take a new target, each named hostile's `owner` and its `username` (4 JS calls a creep in the
@@ -40,9 +50,10 @@
 
 use rustedscreep_core::config::{DefenseConfig, MovementConfig, SchedulerConfig};
 use rustedscreep_core::defense::{
-    Blocked, DefenderEvent, Defenders, Reason, RoomThreat, SafeModeEvent, SafeModes, ThreatEvent,
-    Threats, TowerControl, TowerEvent, TowerOrder,
+    Blocked, DefenderEvent, Defenders, Reason, RemoteDefense, RemoteDefenseEvent, RoomThreat,
+    SafeModeEvent, SafeModes, ThreatEvent, Threats, TowerControl, TowerEvent, TowerOrder,
 };
+use rustedscreep_core::economy::Remotes;
 use rustedscreep_core::intents::{ActLog, IntentBuffer, Outcome, error_name};
 use rustedscreep_core::movement::Movement;
 use rustedscreep_core::scheduler::{
@@ -106,6 +117,20 @@ const DEFENDER_WORK_JOB: Job = Job {
     tier: Tier::Critical,
 };
 
+/// The remote defenders' plan and requests (P7.6): before the spawn plan, Critical (a request must
+/// come before the spawn job, P2.3); its requests wait for the Standard tier, as remote mining's.
+const REMOTE_JOB: Job = Job {
+    name: "remote defense",
+    tier: Tier::Critical,
+};
+
+/// The remote defenders' shots, heals and moves (P7.6): defense, Critical, as the home defenders'
+/// (a defender in a fight must heal and shoot every tick, as the sim has it).
+const REMOTE_WORK_JOB: Job = Job {
+    name: "remote defender work",
+    tier: Tier::Critical,
+};
+
 /// The job name the act step's tower faults are logged under.
 const TOWER_CALLS: &str = "tower calls";
 
@@ -123,6 +148,9 @@ pub struct DefenseGlue {
     defenders: Defenders,
     defender_job: JobState,
     defender_work_job: JobState,
+    remote: RemoteDefense,
+    remote_job: JobState,
+    remote_work_job: JobState,
     /// Tower calls the game refused since the global started, and the tick the last was logged.
     refused: u32,
     refused_logged: Option<u32>,
@@ -235,6 +263,62 @@ impl DefenseGlue {
             );
         }
         defenders.finish(core);
+    }
+
+    /// The Critical `remote defense` job (one unit per threatened remote room), P7.6 (module
+    /// docs): ends a room's wait when a creep sees it with no armed hostile, sizes its team, and
+    /// requests the bodies it lacks while the Standard tier runs. Call after the remote manager's
+    /// plan (its threats are this tick's), before the spawn plan.
+    pub fn plan_remote<C: Clock>(
+        &mut self,
+        tick: &mut TickCpu<'_, C>,
+        snapshot: &Snapshot,
+        remotes: &mut Remotes,
+        spawner: &mut Spawner,
+        cfg: &DefenseConfig,
+    ) {
+        let Self {
+            remote, remote_job, ..
+        } = self;
+        remote.begin(snapshot, remotes, cfg);
+        let rooms = remote.unit_count();
+        if rooms > 0 {
+            let spare = tick.allows(Tier::Standard);
+            tick.run_units(&REMOTE_JOB, remote_job, rooms, |unit, commit| {
+                remote.plan_room(unit, snapshot, remotes, spawner, cfg, spare, commit)
+            });
+        }
+    }
+
+    /// The Critical `remote defender work` job (one unit per remote defender), P7.6 (module docs).
+    /// With no threatened room and every remote defender waiting off the edge, whole, with no armed
+    /// hostile where it waits, each only gives way, with no job and no clock reading. Call after
+    /// [`Self::plan_remote`].
+    pub fn work_remote<C: Clock>(
+        &mut self,
+        tick: &mut TickCpu<'_, C>,
+        snapshot: &Snapshot,
+        movement: &mut Movement,
+        buffer: &mut IntentBuffer,
+        mcfg: &MovementConfig,
+    ) {
+        let Self {
+            remote,
+            remote_work_job,
+            ..
+        } = self;
+        let members = remote.member_count();
+        if members > 0 && remote.idle(snapshot) {
+            remote.hold_all(snapshot, movement);
+        } else if members > 0 {
+            tick.run_units(
+                &REMOTE_WORK_JOB,
+                remote_work_job,
+                members,
+                |unit, commit| remote.work(unit, snapshot, movement, buffer, mcfg, commit),
+            );
+        }
+        remote.finish();
     }
 
     /// Calls `activateSafeMode` for this tick's safe-mode orders (at most one per room per threat)
@@ -506,6 +590,77 @@ impl DefenseGlue {
                          RANGED_ATTACK by the sim; none are requested for it",
                         at_row(target),
                         owner_of(js, usize::try_from(target).unwrap_or(usize::MAX))
+                    );
+                }
+            }
+        }
+        for event in self.remote.events() {
+            match *event {
+                RemoteDefenseEvent::Need {
+                    home,
+                    room,
+                    shape,
+                    count,
+                    cost,
+                    ticks,
+                    have,
+                    foes,
+                } => {
+                    let asked = if cfg.remote_defenders {
+                        ""
+                    } else {
+                        "; none are requested (defense.remote_defenders is off)"
+                    };
+                    log::warn!(
+                        "rustedscreep defense: {room} (of {home}) needs {count} remote defender(s) \
+                         of {} RANGED_ATTACK, {} HEAL and {} MOVE ({cost} energy each): with the \
+                         {have} alive they kill its {foes} armed hostile(s) in {ticks} tick(s) by \
+                         the sim{asked}",
+                        shape.ranged,
+                        shape.heal,
+                        shape.moves()
+                    );
+                }
+                RemoteDefenseEvent::Held {
+                    home,
+                    room,
+                    ticks,
+                    have,
+                } => {
+                    log::info!(
+                        "rustedscreep defense: {room} (of {home}) is held by its {have} remote \
+                         defender(s): they kill its armed hostiles in {ticks} tick(s) by the sim; \
+                         none are requested"
+                    );
+                }
+                RemoteDefenseEvent::NotWorth {
+                    home,
+                    room,
+                    cost,
+                    lost,
+                } => {
+                    log::warn!(
+                        "rustedscreep defense: {room} (of {home}) is not defended: the cheapest \
+                         winning team costs {cost} energy, the wait loses about {lost}; its creeps \
+                         wait"
+                    );
+                }
+                RemoteDefenseEvent::Outmatched {
+                    home,
+                    room,
+                    foes,
+                    cap,
+                } => {
+                    log::warn!(
+                        "rustedscreep defense: {room} (of {home}) is not defended: no team of up \
+                         to {cap} remote defender(s) beats its {foes} armed hostile(s) by the sim; \
+                         its creeps wait"
+                    );
+                }
+                RemoteDefenseEvent::Cleared { home, room, since } => {
+                    log::info!(
+                        "rustedscreep defense: {room} (of {home}) is clear of armed hostiles: its \
+                         wait (since tick {since}) ends and its creeps go back"
                     );
                 }
             }

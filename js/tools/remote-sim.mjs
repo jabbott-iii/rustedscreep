@@ -1,7 +1,8 @@
 // Remote mining's glue end to end in the Screeps-like sandbox (js/tools/smoke.mjs), with the plain build in dist/
 // (crates/rustedscreep-wasm/src/remote.rs, snapshot.rs `push_remote` and `own_username`, and act.rs, over
 // rustedscreep-core `economy::remotes`; P6.2, ADR-029: remote mining before P8's scouting, with each remote creep's
-// remote room in its name; P6.3: the threats that send a remote room's creeps home). Two rooms:
+// remote room in its name; P6.3: the threats that send a remote room's creeps home; P7.6, ADR-037: the remote defenders,
+// defense.rs and `defense::remote`). Two rooms:
 // - W1N1, owned at RCL5: a spawn at (25, 25), the controller, and CONTROLLER_STRUCTURES.extension[5] (30) full
 //   extensions, so energyCapacityAvailable is SPAWN_ENERGY_CAPACITY + 30 × EXTENSION_ENERGY_CAPACITY[5] (1800). It has
 //   no source, so the miners and the haulers stay inert and the home has no hauling plan: the remote manager asks for no
@@ -38,14 +39,16 @@
 // - `PathFinder.search` is route-sim.mjs's model of the native search and `Game.map.getRoomStatus` says 'normal'; both
 //   are recorded, and before the threat every remote creep's goal is in its own room, so neither may run then;
 //   `spawnCreep` makes the runtime's checks and its `Memory.creeps` write, and the processor drops the order (V171,
-//   V181, V173, as in planner-sim.mjs): no call may order other than a worker.
+//   V181, V173, as in planner-sim.mjs): no call may order other than a worker, but for check 7's remote defenders.
 // It runs the bot until the reserver reserves, lets the reservation grow for GROW loops, holds ticksToEnd at PINNED
 // (CONTROLLER_RESERVE_MAX - CLAIM × CONTROLLER_RESERVE + 1, 4999) for PIN loops, lets it run for RELEASE loops (it then
 // alternates between PINNED - 1 and PINNED) and halts once (a global reset). In the second global, once the reserver
 // reserves again (within AFTER ticks) it reserves RESUMED times; then remote.evacuate_ticks is set to EVACUATE_TICKS
 // through the runtime config and an unarmed hostile (two MOVE parts) stands in W2N1 for UNARMED loops, with another in
 // W1N1; then an armed one (a dead ATTACK part, then ATTACK, RANGED_ATTACK and two MOVE parts) stands beside it for ARMED
-// loops, and all leave. The run ends RETURN_RESERVES reserves after the wait is over. It checks:
+// loops, and all leave. RETURN_RESERVES reserves after the wait is over, a remote defender `pW1N1W2N1-…` (GUARD_BODY:
+// 10 MOVE, 8 RANGED_ATTACK and 2 HEAL parts) stands in W2N1 and a second armed hostile like the first stands GUARD_RANGE
+// (3) from it for GUARD_ARMED loops, then is gone; the run ends once the reserver reserves again. It checks:
 // 1. the snapshot's reads of W2N1, a remote room (a room it does not own that an own creep's name gives): on every loop
 //    exactly one `reservation` read (undefined until the first reserve, then the bot's username and a positive
 //    ticksToEnd), one FIND_HOSTILE_STRUCTURES find, one container-filtered FIND_STRUCTURES find (push_objects reads it
@@ -74,8 +77,19 @@
 //    each way; `rustedscreep.remote()` then shows ` threatened (1 armed) until T`, T being EVACUATE_TICKS after the last
 //    loop W2N1 showed the armed hostile; on T one info line says the wait is over, and the reserver goes back and
 //    reserves again by check 4's rule; no room is abandoned (one threat);
-// and no fault line, no incident, no site refusal line, no remote spawn order, no route search before the threat and
-// none incomplete, every creep call OK, one halt, two globals. It prints the snapshot's W2N1 calls per loop. npm run
+// 7. the remote defense (P7.6): on every loop W2N1 shows an armed hostile, one `hits` read of each hostile there, and
+//    one `body` read of each in all (none while only the unarmed one stands there); on the first armed loop one warn line
+//    with the cheapest team that wins by the reference fight (remoteFight, from the constants and DefenseConfig) against
+//    the hostile whole (the sizing assumes its healers refill it), and on
+//    each loop W2N1 shows the armed hostile that many `spawnCreep(body, "pW1N1W2N1-…")` calls with the team's body,
+//    MOVE parts first, HEAL last (the sandbox drops each order, so each loop asks again); once W2N1 is unseen, one warn
+//    line that the team costs more than the wait left would lose, and no order after; nothing ends that wait early (no
+//    defender stands in W2N1). With the guard there, the second threat's line, one info line that the guard holds the
+//    room alone (its kill time by the reference fight) and no order; on each guarded loop the guard's `heal` on itself and
+//    `rangedAttack` on the hostile, and nothing after; on the loop after the hostile is gone, one info line that the wait
+//    ends, and the reserver reserves again within RETURN_MAX loops;
+// and no fault line, no incident, no site refusal line, no other remote spawn order, no route search before the threat
+// and none incomplete, every creep call OK, one halt, two globals. It prints the snapshot's W2N1 calls per loop. npm run
 // check runs it (row 23); standalone: node js/tools/remote-sim.mjs [dir].
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
@@ -131,8 +145,9 @@ const RESUMED = 3;
 const UNARMED = 5;
 const ARMED = 3;
 /** remote.evacuate_ticks for the run (REMOTE_MMO: 1500), set through the runtime config before the hostiles come: long
- * enough for the reserver's walk home (about 60 ticks here) and a wait there. */
-const EVACUATE_TICKS = 90;
+ * enough for the reserver's walk home (about 60 ticks here) and a wait there, and for the remote defense (check 7) to
+ * find a team worth its cost on the first sight (its spawn and kill time taken out of the wait). */
+const EVACUATE_TICKS = 200;
 const EVACUATE_CMD = `rustedscreep.configSet("remote.evacuate_ticks", "${EVACUATE_TICKS}")`;
 /** economy::remotes EVACUATE_RANGE: an evacuated creep waits within this range of the home's first spawn. */
 const EVACUATE_RANGE = 5;
@@ -150,6 +165,20 @@ const HOSTILES = {
   home: { id: id(72), name: 'Invader72', room: HOME, x: 45, y: 5, body: [['move', 100]] },
 };
 const ARMED_PARTS = { attack: 1, ranged_attack: 1 };
+/** P7.6 (ADR-037): `DefenseConfig` of the mmo profile: `max_remote_defenders`, `remote_loss_pct`, `max_kill_ticks`. */
+const DEFENSE_CFG = { maxRemote: 2, lossPct: 40, killTicks: 50 };
+/** The second threat (P7.6): a remote defender of W1N1 for W2N1 guards the room, MOVE parts first, then RANGED_ATTACK,
+ * HEAL last; an armed hostile like the first stands GUARD_RANGE from it for GUARD_ARMED loops, then is gone. */
+const GUARD_BODY = [...Array(10).fill('move'), ...Array(8).fill('ranged_attack'), ...Array(2).fill('heal')];
+const GUARD_AT = { x: 24, y: 41 };
+const GUARD_HOSTILE = { ...HOSTILES.armed, id: id(73), name: 'Invader73' };
+const GUARD_RANGE = 3;
+const GUARD_ARMED = 3;
+/** The remote defense's log lines (crates/rustedscreep-wasm/src/defense.rs `log_events`). */
+const NEED_LINE = `rustedscreep defense: ${REMOTE} (of ${HOME}) needs `;
+const NOT_WORTH_LINE = `rustedscreep defense: ${REMOTE} (of ${HOME}) is not defended: the cheapest winning team costs `;
+const HELD_LINE = `rustedscreep defense: ${REMOTE} (of ${HOME}) is held by its `;
+const CLEARED_LINE = `rustedscreep defense: ${REMOTE} (of ${HOME}) is clear of armed hostiles: its wait (since tick `;
 /** The threat's log lines (crates/rustedscreep-wasm/src/remote.rs `log_events`). */
 const THREAT_LINE = `rustedscreep remote: ${REMOTE} (of ${HOME}) threatened by `;
 const RESUMED_LINE = `rustedscreep remote: ${REMOTE} (of ${HOME}): the wait is over, its creeps go back`;
@@ -164,10 +193,58 @@ const RESERVER = botName('r', T0 - 100, 0);
  * no container or pile at a mining tile it only walks there and waits. */
 const HAULER = botName('c', T0 - 50, 0);
 const HAULER_AT = { x: 40, y: 40 };
+/** The remote defender of the second threat (P7.6), added to the world when that threat starts. */
+const GUARD = botName('p', T0 + 100, 0);
 const HAULER_BODY = ['carry', 'move'];
 const count = (body, part) => body.filter((p) => p === part).length;
 const range = (a, b) => Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y));
 const at = (p) => `(${p.x}, ${p.y})`;
+
+/** The remote defense's fight against one foe with no TOUGH and no heal (defense/remote.rs `duel`, V287's order), from the
+ * constants: `count` bodies of `ranged` RANGED_ATTACK and `heal` HEAL parts behind as many MOVE parts hit it for
+ * RANGED_ATTACK_POWER a part; the foe hits one body for `damage` a tick, which heals itself HEAL_POWER a part; the body
+ * is lost at or below its floor (remote_loss_pct of its hits, at most its MOVE parts' hits). The ticks to kill, or null. */
+function remoteFight(foe, ranged, heal, count) {
+  const max = (ranged + heal) * 2 * 100;
+  const floor = max - Math.min(Math.floor((max * DEFENSE_CFG.lossPct) / 100), (ranged + heal) * 100);
+  let hp = foe.hits;
+  let mine = max;
+  for (let t = 1; t <= DEFENSE_CFG.killTicks; t++) {
+    hp -= count * ranged * C.RANGED_ATTACK_POWER;
+    mine = Math.min(max, mine - foe.damage + heal * C.HEAL_POWER);
+    if (mine <= floor) return null;
+    if (hp <= 0) return t;
+  }
+  return null;
+}
+
+/** The cheapest team that wins (least energy in all, then fewest bodies, then fewest parts), each body within CAPACITY. */
+function remoteTeam(foe) {
+  let best = null;
+  for (let count = 1; count <= DEFENSE_CFG.maxRemote; count++) {
+    for (let heal = 0; heal < 25; heal++) {
+      for (let ranged = 1; ranged + heal <= 25; ranged++) {
+        const cost = ranged * C.BODYPART_COST.ranged_attack + heal * C.BODYPART_COST.heal + (ranged + heal) * C.BODYPART_COST.move;
+        if (cost > CAPACITY) continue;
+        const ticks = remoteFight(foe, ranged, heal, count);
+        if (ticks === null) continue;
+        const key = [count * cost, count, 2 * (ranged + heal)];
+        const less = (a, b) => a[0] !== b[0] ? a[0] < b[0] : a[1] !== b[1] ? a[1] < b[1] : a[2] < b[2];
+        if (!best || less(key, best.key)) best = { key, ranged, heal, count, cost, ticks };
+      }
+    }
+  }
+  return best;
+}
+
+/** A remote defender's body, the MOVE parts first, then RANGED_ATTACK, HEAL last. */
+const teamBody = (t) => [...Array(t.ranged + t.heal).fill('move'), ...Array(t.ranged).fill('ranged_attack'), ...Array(t.heal).fill('heal')];
+/** A hostile whole, as the remote defense sizes it (its healers would refill it): 100 hits a part, and every ATTACK and
+ * RANGED_ATTACK part's damage a tick. */
+function foeWhole(h) {
+  const parts = h.body.map(([t]) => t);
+  return { hits: 100 * parts.length, damage: count(parts, 'attack') * C.ATTACK_POWER + count(parts, 'ranged_attack') * C.RANGED_ATTACK_POWER };
+}
 
 /** Room coordinates as the engine counts them: W<n> is -n - 1, E<n> is n; N<n> is -n - 1, S<n> is n (V103). */
 function roomXY(name) {
@@ -213,10 +290,11 @@ const isWall = (room, x, y) => (TERRAIN[room][y * 50 + x] & C.TERRAIN_MASK_WALL)
 class EngineCreep {
   getActiveBodyparts(type) {
     this.__counted?.(type);
+    const body = this.__parts ?? this.body;
     let n = 0;
-    for (let i = this.body.length - 1; i >= 0; i--) {
-      if (this.body[i].hits <= 0) break;
-      if (this.body[i].type === type) n += 1;
+    for (let i = body.length - 1; i >= 0; i--) {
+      if (body[i].hits <= 0) break;
+      if (body[i].type === type) n += 1;
     }
     return n;
   }
@@ -430,6 +508,8 @@ function sceneFor(state, offset) {
     hostiles: shown.map((h) => ({ id: h.id, room: h.room })),
     bodyCalls: {},
     hostileOwner: {},
+    hostileBody: {},
+    hostileHits: {},
   };
   state.reads[offset] = r;
   const registered = new Set();
@@ -455,7 +535,7 @@ function sceneFor(state, offset) {
     // order (V173), so no creep appears (as in planner-sim.mjs).
     spawnCreep(...args) {
       const [body, name, opts = {}] = args;
-      const call = { offset, args: args.length, name, result: C.OK };
+      const call = { offset, args: args.length, name, body: Array.isArray(body) ? [...body] : body, result: C.OK };
       state.spawnCalls.push(call);
       if (!name || !Array.isArray(body) || state.spawned.has(name)) call.result = C.ERR_INVALID_ARGS;
       else if (!opts.dryRun) {
@@ -547,9 +627,19 @@ function sceneFor(state, offset) {
   });
 
   // Hostile creeps (V101, V268, V269): `owner` and `getActiveBodyparts` are counted per creep.
+  // P7.6: `hits` and `body` are counted per creep too (the bot's reads; getActiveBodyparts reads `__parts`).
   const hostiles = shown.map((h) => Object.create(EngineCreep.prototype, Object.getOwnPropertyDescriptors({
     id: h.id, name: h.name, my: false, spawning: false, fatigue: 0, pos: pos(h.room, h.x, h.y),
-    body: h.body.map(([type, hits]) => ({ type, hits })), hits: h.body.reduce((n, [, hits]) => n + hits, 0), hitsMax: 100 * h.body.length,
+    __parts: h.body.map(([type, hits]) => ({ type, hits })),
+    get body() {
+      r.hostileBody[h.id] = (r.hostileBody[h.id] ?? 0) + 1;
+      return h.body.map(([type, hits]) => ({ type, hits }));
+    },
+    get hits() {
+      r.hostileHits[h.id] = (r.hostileHits[h.id] ?? 0) + 1;
+      return h.body.reduce((n, [, hits]) => n + hits, 0);
+    },
+    hitsMax: 100 * h.body.length,
     get owner() {
       r.hostileOwner[h.id] = (r.hostileOwner[h.id] ?? 0) + 1;
       return { username: INVADER };
@@ -788,6 +878,17 @@ export function remoteSim(dir = join(ROOT, 'dist')) {
       } else if (phase === 'returning'
         && (state.calls.filter((c) => c.method === 'reserveController' && c.offset > marks.resumed).length >= RETURN_RESERVES
           || offset >= marks.resumed + RETURN_MAX)) {
+        // P7.6: a remote defender guards W2N1, and a second armed hostile stands GUARD_RANGE from it.
+        phase = 'guarded';
+        marks.guardFrom = offset + 1;
+        state.creeps.push({ id: id(104), name: GUARD, room: REMOTE, ...GUARD_AT, body: GUARD_BODY, fatigue: 0, death: T0 + 2000, rooms: [REMOTE] });
+        state.hostiles = [{ ...GUARD_HOSTILE, x: GUARD_AT.x, y: GUARD_AT.y + GUARD_RANGE }];
+      } else if (phase === 'guarded' && offset >= marks.guardFrom + GUARD_ARMED - 1) {
+        phase = 'cleared';
+        marks.guardTo = offset;
+        state.hostiles = [];
+      } else if (phase === 'cleared'
+        && (state.calls.some((c) => c.method === 'reserveController' && c.offset > marks.guardTo) || offset >= marks.guardTo + RETURN_MAX)) {
         finished = true;
       }
       return offset === SEEN_AT ? SUMMARY : cmd;
@@ -798,11 +899,13 @@ export function remoteSim(dir = join(ROOT, 'dist')) {
   const problems = [...state.errors.slice(0, 10)];
   const bad = world.logs.filter((l) => /rustedscreep fault|incident|loader error|\[error\]|trapped|rustedscreep remote: no /.test(l));
   problems.push(...bad.slice(0, 10).map((l) => `log: ${l}`));
-  if (!finished || phase !== 'returning') problems.push(`not finished in ${world.ticksRun} ticks (phase ${phase}; marks ${JSON.stringify(marks)})`);
+  if (!finished || phase !== 'cleared') problems.push(`not finished in ${world.ticksRun} ticks (phase ${phase}; marks ${JSON.stringify(marks)})`);
   if (world.halts !== 1 || world.globals !== 2) problems.push(`halts ${world.halts}, globals ${world.globals}: expected 1 and 2`);
-  // With no hauling plan the remote manager orders no creep; the opening's worker orders are its own.
-  const remoteOrders = state.spawnCalls.filter((c) => !/^w[WE]\d+[NS]\d+-/.test(c.name ?? ''));
-  if (remoteOrders.length) problems.push(`spawnCreep calls for other than a worker: ${JSON.stringify(remoteOrders.slice(0, 4))}`);
+  // With no hauling plan the remote manager orders no creep; the opening's worker orders are its own, and the remote
+  // defenders' (P7.6) come only on the loops W2N1 shows the first armed hostile (checked with the threat, below).
+  const defenderOrders = state.spawnCalls.filter((c) => (c.name ?? '').startsWith(`p${HOME}${REMOTE}-`));
+  const remoteOrders = state.spawnCalls.filter((c) => !/^w[WE]\d+[NS]\d+-/.test(c.name ?? '') && !defenderOrders.includes(c));
+  if (remoteOrders.length) problems.push(`spawnCreep calls for other than a worker or a remote defender: ${JSON.stringify(remoteOrders.slice(0, 4))}`);
   for (const c of state.spawnCalls) if (c.result !== C.OK || c.args !== 2) problems.push(`offset ${c.offset}: spawnCreep(${c.name}) with ${c.args} arguments: ${c.result}`);
   // This loop's log lines, and the threat's start and end.
   const linesOf = (o) => world.logs.slice(state.logMarks[o - 1] ?? 0, state.logMarks[o] ?? world.logs.length);
@@ -818,8 +921,9 @@ export function remoteSim(dir = join(ROOT, 'dist')) {
   const bad1 = state.searches.filter((x) => x.incomplete !== false);
   if (bad1.length) problems.push(`incomplete route searches: ${JSON.stringify(bad1.slice(0, 3))}`);
   const expected = new Set(['move', 'reserveController', 'suicide']);
+  const guardCalls = new Set(['heal', 'rangedAttack']);
   for (const c of state.calls) {
-    if (!expected.has(c.method) || c.result !== C.OK) {
+    if (!(expected.has(c.method) || (c.actor === GUARD && guardCalls.has(c.method))) || c.result !== C.OK) {
       problems.push(`offset ${c.offset}: ${c.actor} called ${c.method}(${c.args.join(', ')}) from ${c.from.room} ${at(c.from)}: ${c.result}`);
     }
   }
@@ -924,8 +1028,9 @@ export function remoteSim(dir = join(ROOT, 'dist')) {
     const after = state.calls.filter((c) => c.offset > haltAt).map((c) => `${c.offset}:${c.method}`);
     problems.push(`no reserve in the ${second.length} loops after the halt (ticksToEnd ${second[0]?.ticksToEnd} to ${second.at(-1)?.ticksToEnd}; creep calls ${JSON.stringify(after)})`);
   } else {
-    // The same rule after the halt, outside the threat (check 6 covers it).
-    for (const r of second.filter((x) => x.offset >= resumed.offset && !threatened(x.offset))) {
+    // The same rule after the halt, outside the two waits (checks 6 and 7 cover them).
+    const guarded = (o) => o >= (marks.guardFrom ?? Infinity) && o <= (marks.guardTo ?? -Infinity);
+    for (const r of second.filter((x) => x.offset >= resumed.offset && !threatened(x.offset) && !guarded(x.offset))) {
       const called = reserves.some((c) => c.offset === r.offset);
       const fits = (r.ticksToEnd ?? 0) + CLAIM * C.CONTROLLER_RESERVE <= C.CONTROLLER_RESERVE_MAX;
       if (adjacent(r) && called !== fits) problems.push(`offset ${r.offset} (after the halt): ticksToEnd ${r.ticksToEnd}, reserve ${called ? 'called' : 'not called'}`);
@@ -953,12 +1058,12 @@ export function remoteSim(dir = join(ROOT, 'dist')) {
   const threatLines = world.logs.filter((l) => l.includes(THREAT_LINE));
   const threatWant = `${THREAT_LINE}1 armed hostile creep(s) of ${INVADER} (${ARMED_PARTS.attack} ATTACK, ${ARMED_PARTS.ranged_attack} RANGED_ATTACK parts); `
     + `its creeps wait in ${HOME} until tick ${T0 + armedFrom + EVACUATE_TICKS}`;
-  if (threatLines.length !== 1 || !threatLines[0].endsWith(threatWant) || threatFrom !== armedFrom) {
-    problems.push(`threat lines ${JSON.stringify(threatLines)} at offsets ${JSON.stringify(threatAt)}, expected one ending ${JSON.stringify(threatWant)} at ${armedFrom}`);
+  if (threatLines.length !== 2 || !threatLines[0].endsWith(threatWant) || threatFrom !== armedFrom || threatAt[1] !== marks.guardFrom) {
+    problems.push(`threat lines ${JSON.stringify(threatLines)} at offsets ${JSON.stringify(threatAt)}, expected one ending ${JSON.stringify(threatWant)} at ${armedFrom} and the guarded one at ${marks.guardFrom}`);
   }
   // `owner` of a hostile: the armed one's, once, on that loop.
   const hostileOwner = loops.flatMap((r) => Object.entries(r.hostileOwner).map(([hid, n]) => [r.offset, hid, n]));
-  const ownerWant = JSON.stringify([[armedFrom, HOSTILES.armed.id, 1]]);
+  const ownerWant = JSON.stringify([[armedFrom, HOSTILES.armed.id, 1], [marks.guardFrom, GUARD_HOSTILE.id, 1]]);
   if (JSON.stringify(hostileOwner) !== ownerWant) problems.push(`hostile owner reads ${JSON.stringify(hostileOwner)}, expected ${ownerWant}`);
   // While threatened the reserver and the hauler only move, and both reach the home's spawn; the wait ends EVACUATE_TICKS
   // after the last sight of the armed hostile, with one info line.
@@ -987,7 +1092,71 @@ export function remoteSim(dir = join(ROOT, 'dist')) {
   if (!waitWant.test(summaries[2] ?? '')) problems.push(`summary while waiting ${JSON.stringify(summaries[2])}, expected to match ${waitWant}`);
   const after = reserves.filter((c) => c.offset >= threatTo);
   if (after.length < RETURN_RESERVES) problems.push(`${after.length} reserves after the wait, expected at least ${RETURN_RESERVES}`);
-  if (world.logs.some((l) => l.includes(' abandoned ('))) problems.push('a room was abandoned after one threat');
+  if (world.logs.some((l) => l.includes(' abandoned ('))) problems.push('a room was abandoned after two threats, one held');
+
+  // 7. The remote defense (P7.6, ADR-037). The snapshot reads `hits` on every loop and `body` once for each hostile W2N1
+  // shows while one of them is armed (never otherwise); the first threat gets the cheapest winning team requested on
+  // the loops W2N1 shows the armed hostile (the sandbox's processor drops every order, so the request stands each loop),
+  // then, unseen with too little of the wait left, one line that it is not worth it; no line ends that wait (no defender
+  // stands in W2N1). The second, with a guard in W2N1 that wins alone, gets one line and no order, the guard's heal on
+  // itself and its ranged attack on the hostile every loop, and once the hostile is gone one line that ends the wait.
+  const bodyReads = {};
+  for (const r of loops) {
+    const shownHere = r.hostiles.filter((h) => h.room === REMOTE);
+    const armedHere = shownHere.some((h) => h.id === HOSTILES.armed.id || h.id === GUARD_HOSTILE.id);
+    for (const h of shownHere) {
+      const hits = r.hostileHits[h.id] ?? 0;
+      if (hits !== (armedHere ? 1 : 0)) problems.push(`offset ${r.offset}: ${hits} hits reads of ${h.id} in ${REMOTE}, expected ${armedHere ? 1 : 0}`);
+      bodyReads[h.id] = (bodyReads[h.id] ?? 0) + (r.hostileBody[h.id] ?? 0);
+    }
+  }
+  const bodyWant = { [HOSTILES.unarmed.id]: 1, [HOSTILES.armed.id]: 1, [GUARD_HOSTILE.id]: 1 };
+  if (JSON.stringify(bodyReads) !== JSON.stringify(bodyWant)) problems.push(`body reads of the ${REMOTE} hostiles ${JSON.stringify(bodyReads)}, expected ${JSON.stringify(bodyWant)}`);
+  const team = remoteTeam(foeWhole(HOSTILES.armed));
+  const linesWith = (text) => world.logs.filter((l) => l.includes(text));
+  if (!team) problems.push('the reference finds no team for the first armed hostile');
+  else {
+    const needWant = `${NEED_LINE}${team.count} remote defender(s) of ${team.ranged} RANGED_ATTACK, ${team.heal} HEAL and ${team.ranged + team.heal} MOVE `
+      + `(${team.cost} energy each): with the 0 alive they kill its 1 armed hostile(s) in ${team.ticks} tick(s) by the sim`;
+    const needAt = linesAt(NEED_LINE);
+    if (linesWith(NEED_LINE).length !== 1 || !linesWith(NEED_LINE)[0].endsWith(needWant) || needAt[0] !== armedFrom) {
+      problems.push(`need lines ${JSON.stringify(linesWith(NEED_LINE))} at ${JSON.stringify(needAt)}, expected one ending ${JSON.stringify(needWant)} at ${armedFrom}`);
+    }
+    const body = JSON.stringify(teamBody(team));
+    const orderLoops = [...new Set(defenderOrders.map((c) => c.offset))];
+    const wantLoops = Array.from({ length: armedTo - armedFrom + 1 }, (_, i) => armedFrom + i);
+    if (JSON.stringify(orderLoops) !== JSON.stringify(wantLoops) || defenderOrders.length !== team.count * wantLoops.length
+      || defenderOrders.some((c) => JSON.stringify(c.body) !== body || c.args !== 2)) {
+      problems.push(`remote defender orders ${JSON.stringify(defenderOrders.map((c) => [c.offset, c.name, c.body?.length]))}, expected ${team.count} a loop on ${JSON.stringify(wantLoops)} of ${body}`);
+    }
+    const notWorth = linesAt(NOT_WORTH_LINE);
+    const unseen = (o) => !state.reads[o]?.visible;
+    if (notWorth.length !== 1 || !threatened(notWorth[0]) || !unseen(notWorth[0]) || !linesWith(NOT_WORTH_LINE)[0].includes(`costs ${team.count * team.cost} energy, the wait loses about `)) {
+      problems.push(`not-worth lines at ${JSON.stringify(notWorth)}: ${JSON.stringify(linesWith(NOT_WORTH_LINE))}, expected one while ${REMOTE} is unseen during the first wait`);
+    }
+  }
+  const guardTicks = remoteFight(foeWhole(GUARD_HOSTILE), count(GUARD_BODY, 'ranged_attack'), count(GUARD_BODY, 'heal'), 1);
+  const heldWant = `${HELD_LINE}1 remote defender(s): they kill its armed hostiles in ${guardTicks} tick(s) by the sim; none are requested`;
+  const heldAt = linesAt(HELD_LINE);
+  if (guardTicks === null || heldAt.length !== 1 || heldAt[0] !== marks.guardFrom || !linesWith(HELD_LINE)[0].endsWith(heldWant)) {
+    problems.push(`held lines ${JSON.stringify(linesWith(HELD_LINE))} at ${JSON.stringify(heldAt)}, expected one ending ${JSON.stringify(heldWant)} at ${marks.guardFrom}`);
+  }
+  for (let o = marks.guardFrom; o <= marks.guardTo; o++) {
+    const mine = state.calls.filter((c) => c.offset === o && c.actor === GUARD && guardCalls.has(c.method));
+    const want = JSON.stringify([['heal', GUARD], ['rangedAttack', GUARD_HOSTILE.name]]);
+    const got = JSON.stringify(mine.map((c) => [c.method, c.args[0]]).sort());
+    if (got !== want) problems.push(`offset ${o}: the guard's calls ${got}, expected ${want}`);
+  }
+  const lateGuard = state.calls.filter((c) => c.actor === GUARD && guardCalls.has(c.method) && c.offset > marks.guardTo);
+  if (lateGuard.length) problems.push(`the guard called ${JSON.stringify(lateGuard.slice(0, 3).map((c) => `${c.offset}:${c.method}`))} after the hostile was gone`);
+  const clearedWant = `${CLEARED_LINE}${T0 + marks.guardFrom}) ends and its creeps go back`;
+  const clearedAt = linesAt(CLEARED_LINE);
+  if (clearedAt.length !== 1 || clearedAt[0] !== marks.guardTo + 1 || !linesWith(CLEARED_LINE)[0].endsWith(clearedWant)) {
+    problems.push(`cleared lines ${JSON.stringify(linesWith(CLEARED_LINE))} at ${JSON.stringify(clearedAt)}, expected one ending ${JSON.stringify(clearedWant)} at ${marks.guardTo + 1}`);
+  }
+  if (!reserves.some((c) => c.offset > (clearedAt[0] ?? Infinity) && c.offset <= (clearedAt[0] ?? 0) + RETURN_MAX)) {
+    problems.push('the reserver did not reserve again after the guarded wait ended');
+  }
 
   // 5. The remote room's sites.
   const containers = remoteCalls.filter((c) => c.type === 'container');

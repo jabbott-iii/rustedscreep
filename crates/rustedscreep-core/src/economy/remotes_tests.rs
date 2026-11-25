@@ -1,6 +1,7 @@
 //! Tests of remote mining's manager and creeps (P6.2, `economy::remotes`). Expected values derive
 //! from the cost profile and the constants; the bodies from the model's own solvers.
 
+use rustedscreep_consts::extra::BODYPART_HITS;
 use rustedscreep_consts::{
     BUILD_POWER, CONTAINER_HITS, CONTROLLER_RESERVE, CONTROLLER_RESERVE_MAX, Part, Position,
     REPAIR_POWER, ROOM_AREA, ROOM_SIZE, RoomCoordinate, RoomName, StructureType, Terrain,
@@ -16,20 +17,20 @@ use crate::intents::{CreepIntent, IntentBuffer};
 use crate::movement::{CostGrid, Footprint, Movement, Side, TerrainGrid, Tile, profile};
 use crate::scheduler::Commit;
 use crate::snapshot::{
-    Combat, Controller, CreepRow, CreepStore, ObjectKey, ObjectKind, ObjectRow, ObjectStatic,
-    RemoteRead, Reservation, RoomEnergy, Snapshot, StructureStatic, TickContext,
+    BodyRead, Combat, Controller, CreepRow, CreepStore, ObjectKey, ObjectKind, ObjectRow,
+    ObjectStatic, RemoteRead, Reservation, RoomEnergy, Snapshot, StructureStatic, TickContext,
 };
 use crate::spawning::{Body, BodySpec, Identity, Role, Spawner};
 
-fn room(name: &str) -> RoomName {
+pub(crate) fn room(name: &str) -> RoomName {
     name.parse().expect("room")
 }
 
-fn tile(x: u8, y: u8) -> Tile {
+pub(crate) fn tile(x: u8, y: u8) -> Tile {
     Tile::new(x, y).expect("tile")
 }
 
-fn pos(r: RoomName, t: Tile) -> Position {
+pub(crate) fn pos(r: RoomName, t: Tile) -> Position {
     Position::new(
         RoomCoordinate::new(t.x()).expect("x"),
         RoomCoordinate::new(t.y()).expect("y"),
@@ -237,25 +238,28 @@ struct Object {
     hits: u32,
 }
 
-struct World {
-    time: u32,
-    home: RoomName,
-    remote: RoomName,
+pub(crate) struct World {
+    pub(crate) time: u32,
+    pub(crate) home: RoomName,
+    pub(crate) remote: RoomName,
     reservation: Reservation,
-    visible: bool,
+    pub(crate) visible: bool,
     hostile_structures: u32,
     creeps: Vec<Creep>,
     /// Hostile creeps (P6.3): key, place and active combat parts; after the own creeps' rows.
-    hostiles: Vec<(u128, Position, Combat)>,
+    pub(crate) hostiles: Vec<(u128, Position, Combat)>,
+    /// Bodies and hits by creep key (P7.6): a hostile's is assessed (`set_assessed`, its body
+    /// read), an own creep's is its body with its hits read (`set_own_hits`).
+    pub(crate) bodies: Vec<(u128, BodyRead, u32)>,
     /// The last own creep id given out.
     next_key: u128,
     objects: Vec<Object>,
-    snap: Snapshot,
-    movement: Movement,
-    spawner: Spawner,
-    buffer: IntentBuffer,
-    remotes: Remotes,
-    cfg: RemoteConfig,
+    pub(crate) snap: Snapshot,
+    pub(crate) movement: Movement,
+    pub(crate) spawner: Spawner,
+    pub(crate) buffer: IntentBuffer,
+    pub(crate) remotes: Remotes,
+    pub(crate) cfg: RemoteConfig,
 }
 
 impl World {
@@ -304,6 +308,7 @@ impl World {
             hostile_structures: 0,
             creeps: vec![worker],
             hostiles: Vec::new(),
+            bodies: Vec::new(),
             next_key: 1000,
             objects,
             snap: Snapshot::default(),
@@ -315,7 +320,20 @@ impl World {
         }
     }
 
-    fn add(&mut self, role: Role, at: Position, energy: u32, capacity: u32) -> u128 {
+    /// A hostile structure in the remote room (an invader core): the room is contested (P7.6's
+    /// tests).
+    pub(crate) fn contest(&mut self) {
+        self.hostile_structures = 1;
+    }
+
+    /// Moves the creep `key` to `at` (P7.6's tests).
+    pub(crate) fn move_creep(&mut self, key: u128, at: Position) {
+        if let Some(c) = self.creeps.iter_mut().find(|c| c.key == key) {
+            c.at = at;
+        }
+    }
+
+    pub(crate) fn add(&mut self, role: Role, at: Position, energy: u32, capacity: u32) -> u128 {
         // A fresh id each time, also after a creep is removed: an id is never reused.
         self.next_key += 1;
         let key = self.next_key;
@@ -358,6 +376,11 @@ impl World {
                 },
             );
             self.snap.creeps.set_death(row, c.death);
+            if let Some(&(_, body, hits)) = self.bodies.iter().find(|b| b.0 == c.key) {
+                self.snap.creeps.set_body(row, body);
+                let max = u32::try_from(body.len()).expect("small") * BODYPART_HITS;
+                self.snap.creeps.set_own_hits(row, hits, max);
+            }
         }
         for &(key, at, combat) in &self.hostiles {
             let r = CreepRow {
@@ -369,6 +392,10 @@ impl World {
             self.snap.creeps.push(ObjectKey(key), r).expect("hostile");
             let row = self.snap.creeps.len() - 1;
             self.snap.creeps.set_combat(row, combat);
+            if let Some(&(_, body, hits)) = self.bodies.iter().find(|b| b.0 == key) {
+                self.snap.creeps.set_assessed(row, hits);
+                self.snap.creeps.set_body(row, body);
+            }
         }
         let row = self
             .snap
@@ -425,7 +452,7 @@ impl World {
 
     /// One tick up to the remote jobs: the snapshot, movement's reads, the buffer, the spawner and
     /// `Remotes::begin`.
-    fn begin(&mut self) {
+    pub(crate) fn begin(&mut self) {
         self.take_snapshot();
         let mcfg = MOVEMENT_MMO;
         self.movement.begin(&self.snap, &mcfg);
@@ -455,7 +482,7 @@ impl World {
         self.remotes.begin(&self.snap);
     }
 
-    fn plan(&mut self, hauled: bool) {
+    pub(crate) fn plan(&mut self, hauled: bool) {
         self.plan_with(hauled, true);
     }
 
@@ -530,7 +557,7 @@ impl World {
         }
     }
 
-    fn requests(&self) -> Vec<(Role, Option<RoomName>, Body, u8)> {
+    pub(crate) fn requests(&self) -> Vec<(Role, Option<RoomName>, Body, u8)> {
         (0..self.spawner.stats().requests)
             .filter_map(|i| self.spawner.request_at(i))
             .map(|r| {
@@ -543,7 +570,7 @@ impl World {
             .collect()
     }
 
-    fn intents(&self) -> Vec<(u128, CreepIntent)> {
+    pub(crate) fn intents(&self) -> Vec<(u128, CreepIntent)> {
         self.buffer
             .planned()
             .filter(|i| !matches!(i.intent, CreepIntent::Move { .. }))
@@ -1002,7 +1029,7 @@ fn a_reset_searches_a_crewed_room_again() {
 
 /// A settled world with every post staffed: a reserver, a miner on each mining tile (empty), and
 /// one hauler a source (empty, next to its mining tile). Returns the miners' and haulers' keys.
-fn staffed() -> (World, Vec<u128>, Vec<u128>) {
+pub(crate) fn staffed() -> (World, Vec<u128>, Vec<u128>) {
     let mut w = World::new();
     w.settle();
     w.begin();
@@ -1026,7 +1053,7 @@ fn staffed() -> (World, Vec<u128>, Vec<u128>) {
     (w, miners, haulers)
 }
 
-fn the_remote(w: &World) -> super::remotes::Remote {
+pub(crate) fn the_remote(w: &World) -> super::remotes::Remote {
     let (_, remotes) = w.remotes.home_states().next().expect("home");
     remotes
         .iter()

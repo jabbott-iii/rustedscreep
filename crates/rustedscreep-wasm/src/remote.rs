@@ -87,6 +87,11 @@ pub struct RemoteGlue {
 }
 
 impl RemoteGlue {
+    /// The manager, for the remote defense's plan (P7.6: it reads the threats and ends a wait).
+    pub fn core_mut(&mut self) -> &mut Remotes {
+        &mut self.core
+    }
+
     /// Starts the tick: the homes, the intel of the remote rooms read this tick, and the creeps.
     pub fn begin(&mut self, snapshot: &Snapshot) {
         self.core.begin(snapshot);

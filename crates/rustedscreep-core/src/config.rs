@@ -876,6 +876,17 @@ pub struct DefenseConfig {
     /// capacity, is at most this many, and a hostile that needs more is not answered with
     /// defenders. Unit: creeps.
     pub max_defenders: u32,
+    /// Lets a home send remote defenders into a remote room it mines when ADR-037 says they win and
+    /// pay (P7.6, `defense::remote`). Off, none is requested; living ones still fight and guard,
+    /// and a room's wait still ends when a creep sees it with no armed hostile.
+    pub remote_defenders: bool,
+    /// The most remote defenders one remote room keeps alive (P7.6): the cheapest team the sim says
+    /// wins has at most this many bodies with the living ones, and a raid that needs more is
+    /// answered by the wait alone. Unit: creeps.
+    pub max_remote_defenders: u32,
+    /// The most of a remote defender's hits the sim lets it lose in a fight (P7.6). At most 50, its
+    /// MOVE parts' share, so in the sim every RANGED_ATTACK and HEAL part stays live. Unit: percent.
+    pub remote_loss_pct: u32,
 }
 
 /// Defense values for the official MMO.
@@ -890,6 +901,9 @@ pub const DEFENSE_MMO: DefenseConfig = DefenseConfig {
     safe_mode_calls: 3,
     defenders: true,
     max_defenders: 3,
+    remote_defenders: true,
+    max_remote_defenders: 2,
+    remote_loss_pct: 40,
 };
 
 /// Upkeep (ROADMAP P7.3, ADR-032): the opening's workers repair the roads and own ramparts of their
@@ -1155,7 +1169,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 145;
+pub const FIELD_COUNT: usize = 148;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1567,6 +1581,9 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(defense, "DefenseConfig", safe_mode_calls, 1, 10, true),
     flag!(defense, "DefenseConfig", defenders, true),
     number!(defense, "DefenseConfig", max_defenders, 1, 10, true),
+    flag!(defense, "DefenseConfig", remote_defenders, true),
+    number!(defense, "DefenseConfig", max_remote_defenders, 1, 5, true),
+    number!(defense, "DefenseConfig", remote_loss_pct, 10, 50, true),
     flag!(upkeep, "UpkeepConfig", enabled, true),
     number!(
         upkeep,
@@ -1955,6 +1972,9 @@ mod tests {
             safe_mode_calls: _,
             defenders: _,
             max_defenders: _,
+            remote_defenders: _,
+            max_remote_defenders: _,
+            remote_loss_pct: _,
         } = DEFENSE_MMO;
         let UpkeepConfig {
             enabled: _,
@@ -2170,6 +2190,9 @@ mod tests {
                     "safe_mode_calls",
                     "defenders",
                     "max_defenders",
+                    "remote_defenders",
+                    "max_remote_defenders",
+                    "remote_loss_pct",
                 ],
             ),
             (

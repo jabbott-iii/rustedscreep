@@ -68,7 +68,8 @@ pub use watchdog::{Event, Observation, Watchdog};
 
 #[cfg(test)]
 mod remote_tests;
+// Its two-room world is also the remote defenders' (P7.6, `defense::remote`).
 #[cfg(test)]
-mod remotes_tests;
+pub(crate) mod remotes_tests;
 #[cfg(test)]
 mod tests;

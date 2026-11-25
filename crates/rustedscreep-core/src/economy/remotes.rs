@@ -70,7 +70,10 @@
 //!   its haulers' loads are delivered there by the home's hauling, and no creep is requested for
 //!   it. When the wait runs out they go back; armed hostiles seen again start a new threat. A
 //!   hostile with no such part (another player's scout or hauler) changes nothing. P7's defense
-//!   can start or end a wait itself ([`Remotes::evacuate`], [`Remotes::clear_threat`]).
+//!   can start or end a wait itself ([`Remotes::evacuate`], [`Remotes::clear_threat`]): since P7.6
+//!   (ADR-037) a home may send remote defenders (`defense::remote`), and the wait ends as soon as a
+//!   creep sees the room with no armed hostile; a threat ended so does not count toward
+//!   `remote.contest_threats`.
 //! - **Contested:** a mined room seen with another player's controller, another user's
 //!   reservation (an invader core's among them, V273), or a hostile structure (V267) is abandoned
 //!   ([`Intel::contested`]). A harvest or a reserve there fails (V182, V263, V271), so its miners
@@ -868,7 +871,10 @@ impl Remotes {
         self.members.clear();
         let creeps = &snap.creeps;
         for (row, identity) in creeps.identities().iter().enumerate() {
-            let Some(id) = identity.filter(|id| id.role.is_remote()) else {
+            // The remote defenders (P7.6) carry their remote room too, but defense drives them.
+            let Some(id) =
+                identity.filter(|id| id.role.is_remote() && id.role != Role::RemoteDefender)
+            else {
                 continue;
             };
             let Some(remote) = id.remote else {
@@ -1003,8 +1009,9 @@ impl Remotes {
         found
     }
 
-    /// Ends `room`'s threat now (P7's hook, once its defenders hold the room): its creeps go back.
-    /// Returns whether it had one.
+    /// Ends `room`'s threat now (P7's hook, once a creep sees the room with no armed hostile,
+    /// `defense::remote`): its creeps go back, and the threat no longer counts toward
+    /// `remote.contest_threats` (the room was held). Returns whether it had one.
     pub fn clear_threat(&mut self, room: RoomName) -> bool {
         let mut cleared = false;
         for r in self
@@ -1013,7 +1020,12 @@ impl Remotes {
             .flat_map(|h| h.remotes.iter_mut())
             .filter(|r| r.room == room)
         {
-            cleared |= r.threat.take().is_some();
+            if let Some(t) = r.threat.take() {
+                cleared = true;
+                if let Some(i) = r.threats_at.iter().rposition(|&at| at == t.since) {
+                    r.threats_at.remove(i);
+                }
+            }
         }
         cleared
     }
@@ -2055,7 +2067,8 @@ impl Remotes {
             | Role::Hauler
             | Role::Upgrader
             | Role::Signer
-            | Role::Defender => {}
+            | Role::Defender
+            | Role::RemoteDefender => {}
         }
         Ok(())
     }

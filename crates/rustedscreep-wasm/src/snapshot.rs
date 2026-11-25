@@ -21,7 +21,9 @@
 //!   `ticksToLive` on each tick until it reads a number, normally once or twice in its life and
 //!   once after a global reset (P5.2, V198; its death tick is kept with its handle), and in a room
 //!   with a tower and an open threat last tick `hits`, with `hitsMax` once in its life (P7.2, for
-//!   the towers' heals);
+//!   the towers' heals); a defender (P7.5) or a remote defender (P7.6) skips the store and has its
+//!   `body` read once in its life (3N + 2), and a remote defender its `hits` every tick (`hitsMax`
+//!   once) for its own heals;
 //! - room: 8 with a controller (`get`, `name`, the name copy, `controller`, `my`, `level`, `find`,
 //!   `length`), 6 without, plus `energyAvailable` and `energyCapacityAvailable` when the bot owns
 //!   it (P2.3, V175), and for an owned room its controller's 3 progress and timer getters (3 more
@@ -31,11 +33,13 @@
 //!   its position and type);
 //!   hostile creep: 5 (`get`, `id`, the id copy, `pos`, `__packedPos`; hostile results never
 //!   include spawning creeps, V101), and in a remote room named by an own creep other than a scout
-//!   2 more, `getActiveBodyparts` for ATTACK and for RANGED_ATTACK (P6.3, V269); in an owned room 1
-//!   more, `hits` (P7.1), and while no body is known for its handle `body`, the array's `length`,
-//!   and per part the element, `type` and `boost` (3N + 2 for N parts, V289): once while the creep
-//!   stays in the snapshot, since a body is forgotten only when the creep is seen in another
-//!   player's room at a level with labs, where it may be boosted (`read_body`, V290, V291);
+//!   2 more, `getActiveBodyparts` for ATTACK and for RANGED_ATTACK (P6.3, V269); in an owned room,
+//!   and in such a remote room on a tick one of its hostiles is armed (P7.6, for the remote
+//!   defenders), 1 more, `hits` (P7.1), and while no body is known for its handle `body`, the
+//!   array's `length`, and per part the element, `type` and `boost` (3N + 2 for N parts, V289):
+//!   once while the creep stays in the snapshot, since a body is forgotten only when the creep is
+//!   seen in another player's room at a level with labs, where it may be boosted (`read_body`,
+//!   V290, V291);
 //! - remote room (P6.2, ADR-029: a visible room the bot does not own that an own creep's name gives
 //!   as its remote room; `push_remote`): an owned room's 6 `find` calls and room objects, then the
 //!   controller as an object (`id`, the copy, its position and type when first seen, `reservation`,
@@ -464,6 +468,9 @@ fn push_room(
             .binary_search_by_key(&name.packed_repr(), |n| n.packed_repr())
             .is_ok();
     let hostile_count = hostiles.length();
+    // P7.6: this room's first hostile row, and whether one is armed (a mined room only).
+    let first_row = snapshot.creeps.len();
+    let mut any_armed = false;
     for index in 0..hostile_count {
         let before = snapshot.creeps.len();
         push_creep(snapshot, js, hostiles.get(index).unchecked_into(), false);
@@ -494,6 +501,23 @@ fn push_room(
                 ranged_attack: u32::from(creep.get_active_bodyparts(Part::RangedAttack)),
             };
             snapshot.creeps.set_combat(before, combat);
+            any_armed |= combat.armed();
+        }
+    }
+    // P7.6: in a mined room that holds an armed hostile, every hostile's hits, and its body while
+    // none is known (a healer's heal counts against the remote defenders), as in an owned room.
+    if mined && any_armed {
+        for row in first_row..snapshot.creeps.len() {
+            let Some(creep) = js.creeps.get(row) else {
+                continue;
+            };
+            snapshot.creeps.set_assessed(row, creep.hits());
+            if !snapshot.creeps.knows_body(row) {
+                let body = read_body(creep);
+                if !body.is_empty() {
+                    snapshot.creeps.set_body(row, body);
+                }
+            }
         }
     }
     let row = snapshot.rooms.push(name, controller);
@@ -917,14 +941,17 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
                 .push_named(key, row, || identity_of(&creep))?;
             if !spawning {
                 let row = snapshot.creeps.len().saturating_sub(1);
-                // P7.5: a defender (no CARRY part, nothing reads its store).
-                let defender = snapshot
+                // P7.5 and P7.6: a defender or a remote defender (no CARRY part, nothing reads its
+                // store).
+                let role = snapshot
                     .creeps
                     .identities()
                     .get(row)
                     .copied()
                     .flatten()
-                    .is_some_and(|id| id.role == Role::Defender);
+                    .map(|id| id.role);
+                let remote_defender = role == Some(Role::RemoteDefender);
+                let defender = role == Some(Role::Defender) || remote_defender;
                 // P2.4: `store`, `getUsedCapacity` and `getCapacity` for energy; a creep with no
                 // active CARRY part has a capacity of null, read as 0 (V196, V197).
                 if !defender {
@@ -953,11 +980,13 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
                     let death = snapshot.tick.time.saturating_add(ttl);
                     snapshot.creeps.set_death(row, death);
                 }
-                // P7.2: `hits` and `hitsMax` in a room with an open threat, for the towers' heals.
-                if js
-                    .threat_rooms
-                    .binary_search_by_key(&pos.room_name().packed_repr(), |n| n.packed_repr())
-                    .is_ok()
+                // P7.2: `hits` and `hitsMax` in a room with an open threat, for the towers' heals;
+                // P7.6: a remote defender's every tick, for its own heals.
+                if remote_defender
+                    || js
+                        .threat_rooms
+                        .binary_search_by_key(&pos.room_name().packed_repr(), |n| n.packed_repr())
+                        .is_ok()
                 {
                     // `hitsMax` once in the creep's life: it never changes.
                     let max = snapshot
@@ -967,7 +996,8 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
                     snapshot.creeps.set_own_hits(row, creep.hits(), max);
                 }
                 // P7.5: a defender's body once in its life (its RANGED_ATTACK parts are its
-                // power; the engine never changes a body but by boosts, which the bot gives none).
+                // power; the engine never changes a body but by boosts, which the bot gives none),
+                // and a remote defender's (its RANGED_ATTACK and HEAL parts, P7.6).
                 if defender && !snapshot.creeps.knows_body(row) {
                     let body = read_body(&creep);
                     if !body.is_empty() {

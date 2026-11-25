@@ -81,7 +81,7 @@ struct State {
     /// The controller signer (ADR-030): its record, its trips and the next signer's plan.
     sign: sign::SignGlue,
     /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1), the towers
-    /// (P7.2), the safe-mode triggers (P7.4) and the defenders (P7.5).
+    /// (P7.2), the safe-mode triggers (P7.4), the defenders (P7.5) and the remote defenders (P7.6).
     defense: defense::DefenseGlue,
     persist: persist::Persist,
     /// The constants self-check, once per global (P1.11).
@@ -217,6 +217,23 @@ pub fn game_loop() {
                         &cfg.movement,
                     );
                 }
+                // Critical: the remote defenders' plan and requests (P7.6), after the remote plan
+                // (this tick's threats) and before the spawn plan; only with a threatened room.
+                defense.plan_remote(
+                    &mut tick,
+                    snapshot,
+                    remote.core_mut(),
+                    spawn.spawner_mut(),
+                    &cfg.defense,
+                );
+                // Critical: the remote defenders' heals, shots and moves (P7.6).
+                defense.work_remote(
+                    &mut tick,
+                    snapshot,
+                    &mut movement.core,
+                    &mut act.buffer,
+                    &cfg.movement,
+                );
                 // Critical: the static miners (P3.1), the haulers (P3.3), the upgraders' plan
                 // (P3.4), the opening's workers and their spawn requests (P2.4), then the spawn
                 // plan, after the Critical jobs that request creeps (P2.3).

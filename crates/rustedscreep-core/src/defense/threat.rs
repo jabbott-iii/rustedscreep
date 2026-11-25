@@ -48,7 +48,8 @@
 //! # Rooms and events
 //!
 //! [`Threats::assess`] groups the tick's assessed hostiles by room, owned rooms only, and keeps one
-//! [`RoomThreat`] per room with a hostile in it. A hostile is dangerous when it can attack, ranged
+//! [`RoomThreat`] per room with a hostile in it (the snapshot also assesses the hostiles of a mined
+//! remote room that holds an armed one, for the remote defenders of P7.6, [`super::remote`]). A hostile is dangerous when it can attack, ranged
 //! attack, dismantle, or attack the controller ([`Power::dangerous`]). A healer, a scout, or a hauler
 //! alone is not. A room with a dangerous hostile is under threat from that tick until none has been
 //! seen there for `defense.threat_end_ticks`. The events ([`ThreatEvent`]) report a threat's start,
@@ -64,7 +65,7 @@ use rustedscreep_consts::{
 };
 
 use crate::config::DefenseConfig;
-use crate::snapshot::{BodyPartRead, BodyRead, Snapshot};
+use crate::snapshot::{BodyPartRead, BodyRead, Controller, Snapshot};
 
 /// A creep's combat power in boosted parts (module docs): each live part of an action's type counts
 /// its boost's multiplier for that action, or 1 unboosted. Unit: boosted parts.
@@ -466,7 +467,21 @@ impl Threats {
             }
         }
         self.found.sort_unstable();
+        // Owned rooms only: a mined remote room's hostiles are assessed too (P7.6), for the remote
+        // defenders, which read them on their own.
+        let mut mine: Option<(RoomName, bool)> = None;
         for &(room, row) in &self.found {
+            let owned = match mine {
+                Some((r, o)) if r == room => o,
+                _ => {
+                    let o = owned(snap, room);
+                    mine = Some((room, o));
+                    o
+                }
+            };
+            if !owned {
+                continue;
+            }
             if self.rooms.last().is_none_or(|r| r.room != room) {
                 self.rooms.push(RoomThreat {
                     room,
@@ -594,4 +609,12 @@ impl Threats {
     pub fn events(&self) -> &[ThreatEvent] {
         &self.events
     }
+}
+
+/// Whether the bot owns `room` by this tick's snapshot.
+fn owned(snap: &Snapshot, room: RoomName) -> bool {
+    snap.rooms
+        .row_of(room)
+        .and_then(|r| snap.rooms.controllers().get(r))
+        .is_some_and(|c| matches!(c, Controller::Mine { .. }))
 }

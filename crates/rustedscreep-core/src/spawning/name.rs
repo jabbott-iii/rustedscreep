@@ -6,8 +6,8 @@
 //! canonical form (`W`/`E` and `N`/`S` uppercase, no leading zeros), `-`, then the serial in base 36
 //! with lowercase digits and no leading zeros. For example `wW1N1-5vosf7k` for a worker of W1N1 ordered first on tick 50000000.
 //! A remote role ([`Role::is_remote`]: the scout, the reserver, the remote miner and the remote
-//! hauler, P6.2, ADR-029) puts the remote room it works, in the same canonical form, right after the
-//! home: `rE7N57E8N57-9wv2p6o` for a reserver of E7N57 that holds E8N57. Each room name starts with
+//! hauler, P6.2, ADR-029, and the remote defender, P7.6, ADR-037) puts the remote room it works, in
+//! the same canonical form, right after the home: `rE7N57E8N57-9wv2p6o` for a reserver of E7N57 that holds E8N57. Each room name starts with
 //! `W` or `E`, so the two never run together; every other role has no remote room, so the names
 //! creeps alive before P6.2 carry parse as they did (an additive change).
 //! At most [`NAME_MAX`] bytes, under the engine's `extra::CREEP_NAME_MAX_LENGTH` (V171).
@@ -56,11 +56,14 @@ pub enum Role {
     /// A defender (P7.5, ADR-036): MOVE and RANGED_ATTACK parts; spawned only while the towers
     /// cannot win a fight in its home, it shoots hostiles from inside the rampart line.
     Defender,
+    /// A remote defender (P7.6, ADR-037): MOVE, RANGED_ATTACK and HEAL parts; sent into a remote
+    /// room its home mines when armed hostiles stand there, it fights them, then guards the room.
+    RemoteDefender,
 }
 
 impl Role {
     /// Every role, in a fixed order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Worker,
         Self::Miner,
         Self::Hauler,
@@ -71,6 +74,7 @@ impl Role {
         Self::RemoteHauler,
         Self::Signer,
         Self::Defender,
+        Self::RemoteDefender,
     ];
 
     /// The first byte of the role's creep names. Never change or reuse one (see the module docs).
@@ -86,6 +90,7 @@ impl Role {
             Self::RemoteHauler => b'c',
             Self::Signer => b'g',
             Self::Defender => b'd',
+            Self::RemoteDefender => b'p',
         }
     }
 
@@ -93,7 +98,11 @@ impl Role {
     pub const fn is_remote(self) -> bool {
         matches!(
             self,
-            Self::Scout | Self::Reserver | Self::RemoteMiner | Self::RemoteHauler
+            Self::Scout
+                | Self::Reserver
+                | Self::RemoteMiner
+                | Self::RemoteHauler
+                | Self::RemoteDefender
         )
     }
 
@@ -113,6 +122,7 @@ impl Role {
             Self::RemoteHauler => "remote hauler",
             Self::Signer => "signer",
             Self::Defender => "defender",
+            Self::RemoteDefender => "remote defender",
         }
     }
 
@@ -448,10 +458,24 @@ mod tests {
                 role.is_remote(),
                 matches!(
                     role,
-                    Role::Scout | Role::Reserver | Role::RemoteMiner | Role::RemoteHauler
+                    Role::Scout
+                        | Role::Reserver
+                        | Role::RemoteMiner
+                        | Role::RemoteHauler
+                        | Role::RemoteDefender
                 )
             );
         }
+        // A remote defender's name carries its remote room (P7.6) and round-trips.
+        let id = Identity {
+            role: Role::RemoteDefender,
+            home: room("E7N57"),
+            remote: Some(room("E8N57")),
+            serial: 9,
+        };
+        let name = CreepName::encode(&id);
+        assert_eq!(name.as_str(), "pE7N57E8N57-9");
+        assert_eq!(CreepName::parse(name.as_bytes()), Some(id));
     }
 
     #[test]
@@ -478,7 +502,9 @@ mod tests {
         // The codes creeps alive today carry (a persisted format, module docs).
         assert_eq!(
             Role::ALL.map(Role::code),
-            [b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c', b'g', b'd'],
+            [
+                b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c', b'g', b'd', b'p'
+            ],
             "never change or reuse a code"
         );
     }

@@ -438,6 +438,12 @@ impl TowerControl {
         let mut misses = 0;
         if let Some((h, expected)) = prev.expect
             && let Some(row) = snap.creeps.row_of(h)
+            // Still in the room: one that stepped into a remote room is assessed there too (P7.6).
+            && snap
+                .creeps
+                .positions()
+                .get(row)
+                .is_some_and(|p| p.room_name() == room)
             && snap
                 .creeps
                 .assessed()
