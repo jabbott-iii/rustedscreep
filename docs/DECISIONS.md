@@ -886,3 +886,25 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
   - A player creep whose weapons sit at the front of its body is disarmed by damage before it dies; the room then reads clear and the wait ends while it lives, and a healer could refit it (invader bodies keep their weapons at the back, V344). The walk into the room is not counted in `pays`.
   - No remote room is mined live today (ADR-031), so no live evidence is possible until one is.
 - Evidence: V342 to V357 (screeps-verifier, engine a90d26f, backend-local master, crate 0.23.5), with V44, V283, V287, V288 and V339; the native tests in TEST_PLAN §1 (Remote defenders) and §7; `node js/tools/remote-sim.mjs`'s check 7.
+
+## ADR-038 The P7 gate's live defense event waits for a hostile to come: Accepted (2026-11-25)
+- Context: the P7 gate (ROADMAP P7, defense) has four items. Three are native and pass (2026-11-24 and 2026-11-25, STATUS's log): `/combat-verify` with no high-severity finding (after ADR-035's amendment 1 fixed the one it found), the combat scenarios against the room's towers and defenders, and the safe-mode trigger tests. The fourth is live: "any live defense event is logged with the bot's response". Scripted attacks are a private-track scenario (PS3), which never blocks the core.
+  - The defense code has run live since P7.1 went live (the push of 1371313, 2026-11-23): threat assessment and the towers, then rampart upkeep (84444895), and P7.4 to P7.6 since Game.time 84473488 (build `d8db073590e8-7ba99bbd`). Its boot and scheduler lines show no fault, and the jobs run every tick a hostile is in an owned or mined room.
+  - No defense event is recorded: no `rustedscreep defense: <room> threatened by ...` line is in STATUS, and the user gave none at the gate. An event needs a dangerous hostile (one that can attack, ranged attack, dismantle, or attack the controller) in E7N57, or in a remote room the bot mines. None of E7N57's neighbors can be mined (ADR-031), so today the event must come to E7N57 itself: another player's creeps, or an NPC invader raid. Raids are made for a room whose harvest has reached its goal, in a sector with an invader core (V342), and an owned room can be raided too (V346); both rows are inferred from the private server's backend, a proxy for the MMO's closed one. None has come to E7N57 since P7.1 went live.
+  - The bot cannot make an event happen on the MMO. Its own creeps are not hostile, and attacking its own room from a second account would break the game's rules on multiple accounts.
+  - By the project's workflow, a phase starts only after the previous phase's gate passes, so P8 (expansion) waits on this item.
+- Options:
+  - (a) Keep the gate as written. P7 stays open until a hostile comes, and P8 waits on an event the bot does not control.
+  - (b) Close P7 on the three native items and the record that the defense code runs live with no fault, and carry the event. Its lines, with the bot's response, are recorded from the first live event (TEST_PLAN §8: threats, towers, safe mode, defenders, and remote defenders). P8's gate gains the item as a backstop: it passes only with an event's lines, or with the user's record that no dangerous hostile entered an owned or mined room during P8's live run (the bot keeps no count of threats, so that record is the user's console reading).
+  - (c) Make the event on a private server (PS3's scripted attacks). The optional track never blocks the core, and none runs yet. Rejected as a gate dependency; it stays PS3's.
+  - (d) Take it from the sandbox (`js/tools/defense-sim.mjs`, `remote-sim.mjs`). They already pass in `/check`, but a model of the game is not a live event. Rejected as a substitute.
+- Decision: (b), the user's decision on 2026-11-25: "Carry it, write ADR".
+- Consequences:
+  - ROADMAP P7's fourth gate item says the event is carried to the first one that comes (this ADR), and P8's gate gains the backstop line. STATUS carries the open item, and TEST_PLAN §8's "The P7 gate's live event" says what to record.
+  - The P7 gate closes on 2026-11-25 with the three native items and this record. P8 becomes the current phase.
+  - No code changes.
+- Risks:
+  - The defense code's responses (tower fire, safe mode, defenders, remote defenders) have run only in the native tests and the sandbox. A live bug in them shows only in a fight, and a fight is when it costs most: a lost spawn, or a safe mode spent for nothing.
+  - ADR-035's amendment 1 (the core trigger waits for the towers' focus) is committed (edf5aa8) but not deployed yet. Until it is, the live trigger has the audit's high finding: a hostile in reach that the towers do not shoot triggers only on the tick its target falls.
+  - The audits' open mediums stay open: no ally list (P10), and the home defenders' sizing does not count fire on the defenders themselves (P7.5).
+- Evidence: STATUS's log for 2026-11-24 and 2026-11-25 (the gate run, the fix, the console lines of the deploy at 84473488), ADR-031, V342, V346.

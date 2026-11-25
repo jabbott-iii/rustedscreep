@@ -181,12 +181,14 @@ Modules:
 - [x] Scaled defenders (ADR-036: ranged defenders, spawned only when the towers cannot win a fight within `defense.max_kill_ticks`, as many full bodies as the combat sim says kill it with the towers, up to `defense.max_defenders`, at a spawn priority above every economy role but the zero-creep recovery worker; they shoot from inside the rampart line).
 - [x] Remote evacuation (ADR-037: P6.3's evacuation stands, and a home sends remote defenders of RANGED_ATTACK, HEAL and MOVE parts when a two-sided combat sim says the cheapest team, up to `defense.max_remote_defenders`, wins and costs less than the wait would lose; they go in together, and the wait ends once one sees the room with no armed hostile).
 
-**Gate:**
-- [ ] `/combat-verify` reports no high-severity findings.
-- [ ] Native combat scenario tests (melee, ranged, and a healer duo against the room's tower and defender configuration) pass, with expected
+**Gate:** passed 2026-11-25 (its live event carried by ADR-038).
+- [x] `/combat-verify` reports no high-severity findings.
+- [x] Native combat scenario tests (melee, ranged, and a healer duo against the room's tower and defender configuration) pass, with expected
   outcomes derived from constants.
-- [ ] Safe-mode trigger tests pass.
-- [ ] Any live defense event is logged with the bot's response. Scripted attacks are a private-track scenario (PS3).
+- [x] Safe-mode trigger tests pass.
+- [x] Any live defense event is logged with the bot's response. ADR-038 (the live event waits for a hostile to come) amended this item: no
+  dangerous hostile came to E7N57 while P7's code ran live, and the bot cannot make one come on the MMO, so the first live event's lines, with the
+  bot's response, are recorded when one comes, with P8's gate as the backstop. Scripted attacks are a private-track scenario (PS3).
 
 ## P8 Expansion (SPEC §3.7)
 - [ ] Scouting and observers (structures that give vision of a distant room).
@@ -200,6 +202,8 @@ Modules:
   progress below the threshold in TUNING.
 - [ ] P6's carried reading (ADR-031): net energy per CPU from a live run that mines a remote room is recorded, or the record shows that no home had a remote room it could mine
   during P8's live run.
+- [ ] P7's carried event (ADR-038): a live defense event is logged with the bot's response, or the user's record shows that no dangerous hostile entered an owned or
+  mined room during P8's live run.
 
 ## P9 Late game (SPEC §3.8)
 - [ ] Minerals.
