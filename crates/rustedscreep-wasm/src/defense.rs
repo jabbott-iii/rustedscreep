@@ -813,14 +813,23 @@ fn reason_text(reason: &Reason, js: &JsWorld, cfg: &DefenseConfig) -> String {
             damage,
             towers,
             kill,
-        } => format!(
-            "the {} at ({}, {}) has {hits} hits and {hostiles} hostile(s) in reach deal up to \
-             {damage} a tick; {}",
-            kind_name(kind),
-            at.x().u8(),
-            at.y().u8(),
-            towers_say(towers, kill, "them")
-        ),
+            wait,
+        } => {
+            // The ticks the towers spend first on their focus out of reach (ADR-035's amendment).
+            let first = if wait > 0 && kill.is_some() {
+                format!(", the first {wait} on their focus out of reach")
+            } else {
+                String::new()
+            };
+            format!(
+                "the {} at ({}, {}) has {hits} hits and {hostiles} hostile(s) in reach deal up to \
+                 {damage} a tick; {}{first}",
+                kind_name(kind),
+                at.x().u8(),
+                at.y().u8(),
+                towers_say(towers, kill, "them")
+            )
+        }
         Reason::Claim {
             row,
             claim,

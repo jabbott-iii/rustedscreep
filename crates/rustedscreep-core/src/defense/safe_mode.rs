@@ -38,6 +38,19 @@
 //!   towers distrust it (the shot check), or when no tower can fire. The structure falls first when
 //!   K is never, or when the summed damage a tick times K reaches its `hits`, read this tick
 //!   ([`falls_first`]).
+//!
+//!   The towers keep one focus across the room until it dies (P7.2), so when this tick's focus is
+//!   not one of the hostiles in reach, K first adds the sim's ticks to kill it
+//!   ([`TowerControl::focus_kill`]): the hostiles in reach go unshot while the towers finish it.
+//!   Without the wait, a dismantler the towers would kill in one tick, beside a spawn while they
+//!   finish a healed tank elsewhere, triggered only on the tick the spawn fell, too late (the P7
+//!   gate audit's high finding, 2026-11-24; ADR-035's amendment). Every hostile in reach but the
+//!   focus is killed after it, so the focus's heal on them is not counted, whether the focus is in
+//!   reach or not: a healer the towers shoot first (P7.2's attacker and healer pair) would otherwise
+//!   count twice, as the wait and as heal, and a dangerous healer in reach would keep its partner's
+//!   kill long or never. There is no wait when a tower fires at a hostile in reach this tick: the focus, or a spare
+//!   tower's one-tick kill when the focus dies in one tick. Each tick's re-check covers the focus
+//!   that comes after this one.
 //! - **A CLAIM creep near the controller.** A hostile with a live CLAIM part at range r of at most
 //!   `1 + defense.safe_mode_lead` from the controller triggers when the sim's kill time k is never or
 //!   at least `max(r, 2)` ([`claim_wins`]). Its first hit can come r - 1 ticks from now, a hit in the
@@ -211,7 +224,8 @@ pub fn protected(snap: &Snapshot, room: RoomName) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     /// A core structure falls first: its type, tile, and hits; the hostiles in reach, their damage a
-    /// tick, the towers that can fire, and their time to kill them (`None` for never).
+    /// tick, the towers that can fire, and their time to kill them (`None` for never), of which the
+    /// first `wait` ticks go to the towers' focus out of reach (module docs).
     Core {
         kind: StructureType,
         at: Position,
@@ -220,6 +234,7 @@ pub enum Reason {
         damage: u32,
         towers: u32,
         kill: Option<u32>,
+        wait: u32,
     },
     /// A CLAIM creep near the controller: its row in this tick's `Creeps`, its live CLAIM parts, its
     /// range, the towers that can fire, and their time to kill it (`None` for never).
@@ -306,6 +321,11 @@ pub struct SafeModes {
     armed: Vec<(Position, u32)>,
     shots: Vec<Shot>,
     kills: Vec<Option<Option<u32>>>,
+    /// Scratch: the healers but the towers' focus, each hostile's kill time with the focus dead
+    /// (module docs), and the indexes of the hostiles in reach of one structure.
+    others: Vec<(Position, Power)>,
+    kills_after: Vec<Option<Option<u32>>>,
+    reach: Vec<usize>,
 }
 
 impl SafeModes {
@@ -517,6 +537,22 @@ impl SafeModes {
         }
         self.kills.clear();
         self.kills.resize(hostiles.len(), None);
+        self.kills_after.clear();
+        self.kills_after.resize(hostiles.len(), None);
+        // The towers' focus this tick, as its row and the sim's ticks to kill it, and the healers
+        // left once it is dead (module docs).
+        let focus = towers
+            .focus_kill(room, snap.tick.time)
+            .and_then(|(handle, ticks)| Some((u32::try_from(creeps.row_of(handle)?).ok()?, ticks)));
+        let focus_at = focus.and_then(|(row, _)| position(row));
+        self.others.clear();
+        self.others.extend(
+            self.healers
+                .iter()
+                .copied()
+                .filter(|&(p, _)| Some(p) != focus_at),
+        );
+        let focus_heals = self.others.len() < self.healers.len();
         // The core falls first.
         for (i, &kind) in st.kinds().iter().enumerate() {
             if !is_core(kind) {
@@ -531,8 +567,11 @@ impl SafeModes {
                 continue;
             }
             let mut damage = 0u32;
-            let mut kill = Some(0u32);
             let mut count = 0u32;
+            // Whether a tower fires at a hostile in reach this tick: the focus, or a spare tower's
+            // one-tick kill (P7.2's `split`).
+            let mut shot = false;
+            self.reach.clear();
             for (index, h) in hostiles.iter().enumerate() {
                 if !h.power.dangerous() {
                     continue;
@@ -544,10 +583,26 @@ impl SafeModes {
                 if d == 0 {
                     continue;
                 }
-                let k = self.kill_cached(index, snap, room, h, towers, cfg);
                 damage = damage.saturating_add(d);
-                kill = kill.zip(k).map(|(a, b)| a.saturating_add(b));
                 count = count.saturating_add(1);
+                shot |= towers.firing_at(h.row).next().is_some();
+                self.reach.push(index);
+            }
+            // A focus out of reach is killed first: the hostiles in reach wait for it.
+            let wait = match focus {
+                Some((_, ticks)) if count > 0 && !shot => ticks,
+                _ => 0,
+            };
+            let mut kill = Some(wait);
+            for j in 0..self.reach.len() {
+                let Some((index, h)) = self.reach.get(j).and_then(|&i| Some((i, hostiles.get(i)?)))
+                else {
+                    continue;
+                };
+                // Every hostile but the focus dies after it, so the focus's heal is gone.
+                let after = focus_heals && focus.is_some_and(|(row, _)| row != h.row);
+                let k = self.kill_cached(index, snap, room, h, towers, cfg, after);
+                kill = kill.zip(k).map(|(a, b)| a.saturating_add(b));
             }
             if falls_first(hits, damage, kill) {
                 return Some((
@@ -560,6 +615,7 @@ impl SafeModes {
                         damage,
                         towers: armed,
                         kill,
+                        wait,
                     },
                 ));
             }
@@ -631,7 +687,9 @@ impl SafeModes {
         )
     }
 
-    /// [`Self::kill_of`] for the hostile at `index` of the room's, computed once a tick.
+    /// [`Self::kill_of`] for the hostile at `index` of the room's, computed once a tick; `after`
+    /// with the towers' focus dead (its heal gone).
+    #[allow(clippy::too_many_arguments)]
     fn kill_cached(
         &mut self,
         index: usize,
@@ -640,12 +698,23 @@ impl SafeModes {
         h: &HostileThreat,
         towers: &TowerControl,
         cfg: &DefenseConfig,
+        after: bool,
     ) -> Option<u32> {
-        if let Some(&Some(k)) = self.kills.get(index) {
+        let cache = if after {
+            &self.kills_after
+        } else {
+            &self.kills
+        };
+        if let Some(&Some(k)) = cache.get(index) {
             return k;
         }
-        let k = self.kill_of(snap, room, h, towers, cfg);
-        if let Some(slot) = self.kills.get_mut(index) {
+        let k = self.kill_of(snap, room, h, towers, cfg, after);
+        let cache = if after {
+            &mut self.kills_after
+        } else {
+            &mut self.kills
+        };
+        if let Some(slot) = cache.get_mut(index) {
             *slot = Some(k);
         }
         k
@@ -653,7 +722,7 @@ impl SafeModes {
 
     /// The towers' time to kill hostile `h` alone by P7.2's sim (module docs), or `None` for never:
     /// no tower can fire, the towers distrust it, its body is unread, or it outlasts
-    /// `defense.max_kill_ticks`.
+    /// `defense.max_kill_ticks`. With `after`, the towers' focus is dead and does not heal it.
     ///
     /// Uses: rustedscreep_consts::{TOWER_POWER_ATTACK, TOWER_ENERGY_COST} (through the sim).
     fn kill_of(
@@ -663,6 +732,7 @@ impl SafeModes {
         h: &HostileThreat,
         towers: &TowerControl,
         cfg: &DefenseConfig,
+        after: bool,
     ) -> Option<u32> {
         let creeps = &snap.creeps;
         let index = usize::try_from(h.row).ok()?;
@@ -681,7 +751,7 @@ impl SafeModes {
         if self.shots.is_empty() {
             return None;
         }
-        let heal = heal_on(pos, &self.healers);
+        let heal = heal_on(pos, if after { &self.others } else { &self.healers });
         kill_ticks(
             body.parts(),
             h.hits,

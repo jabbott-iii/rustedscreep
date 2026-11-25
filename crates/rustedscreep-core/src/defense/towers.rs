@@ -235,6 +235,8 @@ struct RoomState {
     room: RoomName,
     /// Last tick's target.
     focus: Option<CreepHandle>,
+    /// The sim's ticks to kill `focus` when it was chosen, the defenders in range counted.
+    focus_ticks: u32,
     /// Whether last tick held fire with a dangerous hostile in the room.
     holding: bool,
     /// The tick of the last plan; a room is dropped once it neither plans nor has an open threat.
@@ -408,6 +410,7 @@ impl TowerControl {
                 self.rooms.push(RoomState {
                     room,
                     focus: None,
+                    focus_ticks: 0,
                     holding: false,
                     seen: now,
                     line_at: None,
@@ -467,6 +470,7 @@ impl TowerControl {
         let dangerous = threats.room(room).map_or(0, |r| r.dangerous);
         let mut next = RoomState {
             focus: None,
+            focus_ticks: 0,
             holding: false,
             seen: now,
             expect: None,
@@ -501,6 +505,7 @@ impl TowerControl {
                     });
                 }
                 next.focus = Some(c.handle);
+                next.focus_ticks = c.ticks;
                 // The defenders in range fire at the focus too (module docs).
                 let total = damage.saturating_add(allies);
                 next.expect = self.expected(snap, &c, total).map(|e| (c.handle, e));
@@ -930,6 +935,17 @@ impl TowerControl {
             .iter()
             .find(|r| r.room == room && r.seen == now)
             .and_then(|r| r.focus)
+    }
+
+    /// The creep the towers of `room` fire at this tick and the sim's ticks to kill it (the
+    /// defenders in range counted), if their plan ran there at tick `now` and chose one. P7.4's
+    /// core trigger reads it: the towers keep this focus until it dies (module docs), so a hostile
+    /// they do not fire at waits that long.
+    pub fn focus_kill(&self, room: RoomName, now: u32) -> Option<(CreepHandle, u32)> {
+        self.rooms
+            .iter()
+            .find(|r| r.room == room && r.seen == now)
+            .and_then(|r| Some((r.focus?, r.focus_ticks)))
     }
 }
 

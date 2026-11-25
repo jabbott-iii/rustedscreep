@@ -7,10 +7,10 @@
 
 use rustedscreep_consts::extra::BODYPART_HITS;
 use rustedscreep_consts::{
-    ATTACK_POWER, Boost, CONTROLLER_DOWNGRADE_SAFEMODE_THRESHOLD, DISMANTLE_POWER, Part, Position,
-    RANGED_ATTACK_POWER, ResourceType, RoomCoordinate, RoomName, SAFE_MODE_DURATION, SPAWN_HITS,
-    StructureType, TOWER_CAPACITY, TOWER_FALLOFF, TOWER_FALLOFF_RANGE, TOWER_HITS,
-    TOWER_OPTIMAL_RANGE, TOWER_POWER_ATTACK, controller_downgrade,
+    ATTACK_POWER, Boost, CONTROLLER_DOWNGRADE_SAFEMODE_THRESHOLD, DISMANTLE_POWER, HEAL_POWER,
+    Part, Position, RANGED_ATTACK_POWER, ResourceType, RoomCoordinate, RoomName,
+    SAFE_MODE_DURATION, SPAWN_HITS, STORAGE_HITS, StructureType, TOWER_CAPACITY, TOWER_FALLOFF,
+    TOWER_FALLOFF_RANGE, TOWER_HITS, TOWER_OPTIMAL_RANGE, TOWER_POWER_ATTACK, controller_downgrade,
 };
 
 use super::safe_mode::{
@@ -416,6 +416,7 @@ fn scenario_no_tower_and_a_melee_hostile_near_the_spawn() {
             damage: 5 * ATTACK_POWER,
             towers: 0,
             kill: None,
+            wait: 0,
         }]
     );
     // One step farther, nothing is in reach.
@@ -466,6 +467,7 @@ fn scenario_the_towers_win_or_lose_the_race() {
             damage,
             towers: 1,
             kill: Some(k),
+            wait: 0,
         }]
     );
 }
@@ -899,6 +901,7 @@ fn scenario_two_attackers_sum_their_damage_and_kills() {
             damage: 2 * d,
             towers: 1,
             kill: Some(2 * k),
+            wait: 0,
         }]
     );
     sites[1].hits = bound + 1;
@@ -935,4 +938,250 @@ fn scenario_a_distrusted_attacker() {
             ..
         }]
     ));
+}
+
+/// The engine's order on one creep with no TOUGH part (V287): `damage` lands, then `heal`, capped at
+/// `hits_max`; it dies once its hits come to 0 or less. The ticks until it dies from `hits`, or
+/// `None` within `limit`.
+fn kill_by_hand(hits: u32, hits_max: u32, damage: u32, heal: u32, limit: u32) -> Option<u32> {
+    let mut h = i64::from(hits);
+    for tick in 1..=limit {
+        h = h - i64::from(damage) + i64::from(heal);
+        if h <= 0 {
+            return Some(tick);
+        }
+        h = h.min(i64::from(hits_max));
+    }
+    None
+}
+
+/// The P7 gate audit's high finding: the towers keep a dangerous focus they kill within
+/// `defense.max_kill_ticks` (P7.2), so a dismantler beside the spawn that one tower would kill in
+/// one tick is not shot while they finish a healed tank out of the spawn's reach. The spawn falls
+/// before the tank dies, so the trigger waits for the tank: its kill time by the towers' plan comes
+/// first in K. A quick tank does not make it fire.
+#[test]
+fn scenario_core_falls_while_the_towers_keep_another_focus() {
+    let mut sites = base();
+    sites.push(site(902, StructureType::Tower, 10, 14, TOWER_HITS));
+    // The tank: one RANGED_ATTACK part, last so that damage (which takes the front parts first,
+    // V283) leaves it armed, makes it dangerous; at range 5 of the tower (full power) and 5 of the
+    // spawn it is out of reach of both (3 plus the lead).
+    let tank_parts = body(&[(Part::Move, 8), (Part::Heal, 40), (Part::RangedAttack, 1)]);
+    let tank_at = (15u8, 14u8);
+    let heal = 40 * HEAL_POWER;
+    let shot = falloff(5);
+    let hits_max = full(&tank_parts);
+    assert!(shot > heal, "the premise: the tower beats the tank's heal");
+    // The dismantler beside the spawn, at range 4 of the tower: one shot kills it.
+    let dismantler = body(&[(Part::Work, 3), (Part::Move, 3)]);
+    let d = 3 * DISMANTLE_POWER;
+    assert!(full(&dismantler) <= falloff(4), "the premise: one shot");
+    assert!(
+        d < SPAWN_HITS,
+        "the premise: the old bound (a one-tick kill) never fired"
+    );
+    // Tick 1: the tank alone becomes the towers' focus. Tick 2: its hits as the sim expected (no
+    // miss for the shot check), and the dismantler arrives.
+    let mut tank = foe(1, tank_at.0, tank_at.1, tank_parts);
+    let mut w = World::new();
+    w.tick(100, &sites, std::slice::from_ref(&tank));
+    assert!(
+        w.safe.orders().is_empty(),
+        "the tank reaches no core structure"
+    );
+    tank.hits = hits_max - shot + heal;
+    let limit = w.cfg.max_kill_ticks;
+    let wait = kill_by_hand(tank.hits, hits_max, shot, heal, limit).expect("the premise: killable");
+    assert!(
+        SPAWN_HITS.div_ceil(d) < wait,
+        "the premise: the spawn falls before the tank dies"
+    );
+    w.tick(
+        101,
+        &sites,
+        &[tank.clone(), foe(2, 11, 10, dismantler.clone())],
+    );
+    // The towers' plan: one tower on the tank, none on the dismantler.
+    assert_eq!(w.towers.firing_at(0).count(), 1, "the tank is shot");
+    assert_eq!(w.towers.firing_at(1).count(), 0, "the dismantler is not");
+    assert_eq!(
+        w.reasons(),
+        [Reason::Core {
+            kind: StructureType::Spawn,
+            at: at(10, 10),
+            hits: SPAWN_HITS,
+            hostiles: 1,
+            damage: d,
+            towers: 1,
+            // The tank's kill first, then the dismantler's one shot.
+            kill: Some(wait + 1),
+            wait,
+        }]
+    );
+    // A tank with no heal dies in a few ticks: the spawn holds, and nothing fires.
+    let quick_parts = body(&[(Part::Move, 8), (Part::RangedAttack, 1)]);
+    let quick_max = full(&quick_parts);
+    let mut quick = foe(1, tank_at.0, tank_at.1, quick_parts);
+    let mut w = World::new();
+    w.tick(100, &sites, std::slice::from_ref(&quick));
+    quick.hits = quick_max - shot;
+    let wait = kill_by_hand(quick.hits, quick_max, shot, 0, limit).expect("killable");
+    assert!(d * (wait + 1) < SPAWN_HITS, "the premise");
+    w.tick(101, &sites, &[quick, foe(2, 11, 10, dismantler)]);
+    assert!(w.safe.orders().is_empty(), "{:?}", w.reasons());
+}
+
+/// The audit of the fix (a new medium): when the towers shoot a healer first (P7.2's attacker and
+/// healer pair), the hostiles in reach are killed after it, without its heal. Counting that heal as
+/// well as the wait spent a safe mode on a storage that holds. Hits of exactly the towers' order
+/// (the healer, then the dismantler without its heal) still fall first.
+#[test]
+fn scenario_a_healer_shot_first_counts_once() {
+    let mut sites = base();
+    sites.push(site(902, StructureType::Tower, 10, 14, TOWER_HITS));
+    sites.push(site(903, StructureType::Storage, 13, 14, STORAGE_HITS));
+    // A dismantler beside the storage, at range 4 of the tower, and a healer of XLHO2-boosted HEAL
+    // parts beside it at range 5: both in the tower's full power.
+    let dismantler = body(&[(Part::Work, 11), (Part::Move, 9)]);
+    let Some(Boost::Heal(m)) = ResourceType::CatalyzedLemergiumAlkalide.boost() else {
+        panic!("XLHO2 boosts heal");
+    };
+    let healer: Vec<BodyPartRead> = (0..10)
+        .map(|_| BodyPartRead {
+            part: Part::Heal,
+            boost: Some(ResourceType::CatalyzedLemergiumAlkalide),
+        })
+        .chain(body(&[(Part::Move, 3)]))
+        .collect();
+    let heal = 10 * m * HEAL_POWER;
+    let (d_max, h_max) = (full(&dismantler), full(&healer));
+    let limit = DEFENSE_MMO.max_kill_ticks;
+    let first = kill_by_hand(h_max, h_max, falloff(5), heal, limit).expect("killable");
+    let after = d_max.div_ceil(falloff(4));
+    let through = kill_by_hand(d_max, d_max, falloff(4), heal, limit).expect("killable");
+    assert!(
+        first + after < through,
+        "the premise: the towers shoot the healer first"
+    );
+    let d = 11 * DISMANTLE_POWER;
+    assert!(
+        d * (first + after) < STORAGE_HITS,
+        "the premise: the storage holds"
+    );
+    assert!(
+        d * (first + through) >= STORAGE_HITS,
+        "the premise: counting the heal twice would fire"
+    );
+    let foes = [foe(1, 14, 14, dismantler), foe(2, 15, 14, healer)];
+    let mut w = World::new();
+    w.tick(100, &sites, &foes);
+    assert_eq!(w.towers.firing_at(1).count(), 1, "the healer is shot");
+    assert_eq!(w.towers.firing_at(0).count(), 0, "the dismantler is not");
+    assert!(w.safe.orders().is_empty(), "{:?}", w.reasons());
+    let hits = d * (first + after);
+    if let Some(s) = sites.iter_mut().find(|s| s.kind == StructureType::Storage) {
+        s.hits = hits;
+    }
+    let mut w = World::new();
+    w.tick(100, &sites, &foes);
+    assert_eq!(
+        w.reasons(),
+        [Reason::Core {
+            kind: StructureType::Storage,
+            at: at(13, 14),
+            hits,
+            hostiles: 1,
+            damage: d,
+            towers: 1,
+            kill: Some(first + after),
+            wait: first,
+        }]
+    );
+}
+
+/// The audit of the fix (a low): when the focus dies in one tick, a spare tower may kill a hostile
+/// in reach in the same tick (P7.2's `split`), so it does not wait. A spawn with one tick of its
+/// damage and one hit more holds.
+#[test]
+fn scenario_a_spare_tower_kills_in_reach_this_tick() {
+    let mut sites = base();
+    sites.push(site(902, StructureType::Tower, 10, 14, TOWER_HITS));
+    sites.push(site(903, StructureType::Tower, 12, 15, TOWER_HITS));
+    // The focus: a ranged scout one shot kills, out of reach (more than 3 plus the lead) of the
+    // spawn and both towers, with the lower id. The dismantler beside the spawn: one shot each.
+    let scout = body(&[(Part::RangedAttack, 1), (Part::Move, 1)]);
+    let dismantler = body(&[(Part::Work, 3), (Part::Move, 3)]);
+    assert!(
+        full(&scout) <= falloff(6),
+        "the premise: one shot from either tower"
+    );
+    assert!(full(&dismantler) <= falloff(4), "the premise: one shot");
+    let d = 3 * DISMANTLE_POWER;
+    let hits = d + 1;
+    sites[1].hits = hits;
+    assert!(2 * d >= hits, "the premise: a wait of one tick would fire");
+    let mut w = World::new();
+    w.tick(
+        100,
+        &sites,
+        &[foe(1, 16, 10, scout), foe(2, 11, 10, dismantler)],
+    );
+    assert_eq!(w.towers.firing_at(0).count(), 1, "the scout");
+    assert_eq!(
+        w.towers.firing_at(1).count(),
+        1,
+        "the dismantler, by the spare tower"
+    );
+    assert!(w.safe.orders().is_empty(), "{:?}", w.reasons());
+}
+
+/// The third audit of the fix (a medium from P7.4): a dangerous healer the towers focus in reach
+/// dies first, so its partner's kill leaves out its heal. Two ranged healers side by side beside a
+/// storage: K is the focus's kill through both heals plus the partner's through its own.
+#[test]
+fn scenario_a_dangerous_healer_focus_in_reach_counts_once() {
+    let mut sites = base();
+    sites.push(site(902, StructureType::Tower, 10, 14, TOWER_HITS));
+    // At range 5 of the tower (full power) and 2 of the storage; 5 from the spawn and the tower,
+    // out of their reach.
+    sites.push(site(903, StructureType::Storage, 13, 14, STORAGE_HITS));
+    let pair = body(&[(Part::Move, 5), (Part::Heal, 10), (Part::RangedAttack, 5)]);
+    let own = 10 * HEAL_POWER;
+    let hp = full(&pair);
+    let limit = DEFENSE_MMO.max_kill_ticks;
+    let shot = falloff(5);
+    // The first (lower id) is the focus: both heal it at range 1 or on itself.
+    let k_first = kill_by_hand(hp, hp, shot, 2 * own, limit).expect("killable");
+    let k_then = kill_by_hand(hp, hp, shot, own, limit).expect("killable");
+    let k_through = kill_by_hand(hp, hp, shot, 2 * own, limit).expect("killable");
+    assert!(k_then < k_through, "the premise: the focus's heal matters");
+    let d = 2 * 5 * RANGED_ATTACK_POWER;
+    let foes = [foe(1, 15, 14, pair.clone()), foe(2, 15, 15, pair)];
+    let bound = d * (k_first + k_then);
+    for (hits, fires) in [(bound + 1, false), (bound, true)] {
+        if let Some(s) = sites.iter_mut().find(|s| s.kind == StructureType::Storage) {
+            s.hits = hits;
+        }
+        let mut w = World::new();
+        w.tick(100, &sites, &foes);
+        assert_eq!(w.towers.firing_at(0).count(), 1, "the focus");
+        if fires {
+            assert_eq!(
+                w.reasons(),
+                [Reason::Core {
+                    kind: StructureType::Storage,
+                    at: at(13, 14),
+                    hits,
+                    hostiles: 2,
+                    damage: d,
+                    towers: 1,
+                    kill: Some(k_first + k_then),
+                    wait: 0,
+                }]
+            );
+        } else {
+            assert!(w.safe.orders().is_empty(), "{:?}", w.reasons());
+        }
+    }
 }
