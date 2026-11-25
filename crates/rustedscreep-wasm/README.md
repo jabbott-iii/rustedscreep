@@ -89,9 +89,11 @@ The repository's `npm run build` builds it. Building the crate alone gives the w
 3. `wasm-opt -O4` from binaryen version_133;
 4. the TypeScript loader, bundled by Rollup into `dist/main.js`, and a smoke test in a model of the game's runtime.
 
-`npm run stage` runs that build and writes `deploy/`: `main.js`, and the wasm as base64 text in modules of at most 905709 bytes
-each (`rustedscreep_wasm.js`, `rustedscreep_wasm_1.js`, and so on). The game's GitHub sync delivers each file as a text
-module, so binary files do not survive it, and 905709 bytes is the largest module it has been seen to deliver intact.
+`npm run stage` runs that build and writes `deploy/`: `main.js`, and the wasm compressed with DEFLATE and written as base64
+text, in modules of at most 905709 bytes each (`rustedscreep_wasm.js`, then `rustedscreep_wasm_1.js` and so on when one
+is not enough). The game's GitHub sync delivers each file as a text module, so binary files do not survive it, and
+905709 bytes is the largest module it has been seen to deliver intact. The compression keeps the upload under the
+MMO's 2 MB code limit, and the loader inflates the wasm before it checks the CRC-32 and compiles.
 
 ## Features
 

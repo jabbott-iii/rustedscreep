@@ -550,7 +550,8 @@ export function smoke(dir = join(ROOT, 'dist'), { features = [], wasmForm = 'bin
   // split (ADR-028), or a binary module's bytes.
   const parts = Object.keys(partFiles(dir)).length;
   const form = wasmForm === 'binary' ? / \| wasm Uint8Array \d+ B crc32 /
-    : parts > 1 ? new RegExp(` \\| wasm String\\(base64, \\d+ chars in ${parts} parts\\) \\d+ B crc32 `) : / \| wasm String\(base64, \d+ chars\) \d+ B crc32 /;
+    : parts > 1 ? new RegExp(` \\| wasm String\\(base64, \\d+ chars in ${parts} parts, deflate \\d+ B\\) \\d+ B crc32 `)
+      : / \| wasm String\(base64, \d+ chars, deflate \d+ B\) \d+ B crc32 /;
   if (!form.test(boot)) throw new Error(`the boot log does not show the ${wasmForm} wasm module${wasmForm === 'base64' ? ` in ${parts} part(s)` : ''}: ${boot}`);
   if (!boot.includes(', atob undefined, Buffer undefined')) throw new Error(`the boot log does not report atob and Buffer: ${boot}`);
   const booted = world.logs.findIndex((l) => l.startsWith('rustedscreep booted in'));

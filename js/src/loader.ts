@@ -3,6 +3,7 @@
 // wires it to the real runtime. No game logic lives here.
 import { decodeBase64, decodeBase64Into, decodedLength } from './base64.js';
 import { crc32Hex } from './crc32.js';
+import { inflateRaw } from './inflate.js';
 
 /** Loader thresholds, injected at build time from rustedscreep-core's config.rs (LOADER_MMO). */
 export interface LoaderConfig {
@@ -29,6 +30,12 @@ export interface BuildInfo {
    * `rustedscreep_wasm_1`, `rustedscreep_wasm_2`, … A text part of any other length is a load incident.
    */
   wasmParts: number[];
+  /**
+   * The wasm's length once inflated, when the text parts hold the base64 of a raw DEFLATE stream of it (ADR-040: the
+   * upload must fit the MMO's 2 MB code cap, V76, V370); absent or 0 when they hold the wasm itself (ADR-015's form).
+   * A binary module under `rustedscreep_wasm` is the wasm itself either way.
+   */
+  inflatedBytes?: number;
 }
 
 /** The wasm-bindgen glue, as the loader uses it. */
@@ -210,9 +217,15 @@ export function partModuleName(k: number): string {
  * its recorded length, only the last may end in '=', and the parts are decoded into one buffer, so a missing,
  * empty, cut or misplaced part throws a TypeError that names it before anything is decoded or compiled (an empty
  * part 0 with toBytes's text, `returned Object, not bytes`, since a non-string part 0 is read as a binary module).
- * A part of the recorded length with other content decodes, and the CRC-32 check reports it (ADR-015).
+ * A part of the recorded length with other content decodes, and the CRC-32 check reports it (ADR-015). With
+ * `inflatedBytes` above 0 the decoded text is a raw DEFLATE stream (ADR-040), inflated to exactly that many bytes; a
+ * stream that does not inflate throws a TypeError, and the boot line's tag adds the stream's length.
  */
-export function loadWasm(requireModule: (name: string) => unknown, wasmParts: readonly number[]): { bytes: Uint8Array; tag: string } {
+export function loadWasm(
+  requireModule: (name: string) => unknown,
+  wasmParts: readonly number[],
+  inflatedBytes = 0,
+): { bytes: Uint8Array; tag: string } {
   // A part that is missing, or cut short (a SyntaxError that does not name its module), is named, part 0 too.
   let first: unknown;
   try {
@@ -262,7 +275,15 @@ export function loadWasm(requireModule: (name: string) => unknown, wasmParts: re
       throw notBase64(k, e);
     }
   }
-  return { bytes, tag: `String(base64, ${chars} chars${count > 1 ? ` in ${count} parts` : ''})` };
+  const parts = `${chars} chars${count > 1 ? ` in ${count} parts` : ''}`;
+  if (!(inflatedBytes > 0)) return { bytes, tag: `String(base64, ${parts})` };
+  let wasm: Uint8Array;
+  try {
+    wasm = inflateRaw(bytes, inflatedBytes);
+  } catch (e) {
+    throw new TypeError(`the wasm text modules' ${bytes.length}-byte DEFLATE stream does not inflate to ${inflatedBytes} bytes (${message(e)})`);
+  }
+  return { bytes: wasm, tag: `String(base64, ${parts}, deflate ${bytes.length} B)` };
 }
 
 function message(e: unknown): string {
@@ -361,8 +382,9 @@ export class Loader {
     let bytes: Uint8Array;
     let tag: string;
     try {
-      // The boot line shows which delivery ran: a binary module's type, or the text modules' base64 (ADR-015, ADR-028).
-      ({ bytes, tag } = loadWasm((name) => this.env.requireModule(name), this.build.wasmParts));
+      // The boot line shows which delivery ran: a binary module's type, or the text modules' base64 (ADR-015, ADR-028)
+      // and, for a DEFLATE stream, its length (ADR-040; the inflate falls in `load+crc`).
+      ({ bytes, tag } = loadWasm((name) => this.env.requireModule(name), this.build.wasmParts, this.build.inflatedBytes));
     } catch (e) {
       this.incident('load', message(e));
       return false;

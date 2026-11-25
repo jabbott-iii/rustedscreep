@@ -2,10 +2,12 @@
 // exact Cargo.lock version (--target web), then the pinned wasm-opt -O4, then tsc and Rollup, then a
 // smoke run in a Screeps-like sandbox, with the wasm as a binary module and as the base64 text module the
 // GitHub link delivers (ADR-015). Output: dist/main.js, dist/rustedscreep_wasm.wasm, dist/rustedscreep_wasm.js (the
-// .wasm as base64; with dist/rustedscreep_wasm_1.js, … when one module would pass the largest size the link has
-// delivered intact, ADR-028) and dist/build-info.json. Usage: npm run build [-- --features trap-test,profiler].
+// base64 of the .wasm's raw DEFLATE stream, ADR-040, so the upload fits the MMO's 2 MB cap; with
+// dist/rustedscreep_wasm_1.js, … when one module would pass the largest size the link has delivered intact, ADR-028)
+// and dist/build-info.json. Usage: npm run build [-- --features trap-test,profiler].
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import {
   BINARYEN_VERSION, ROOT, WASM_MODULE, fail, isMain, isWasmOptVersion, lockVersion, parseWasmBindgenVersion,
   readJson, run, sha256, wasmOptPath,
@@ -136,15 +138,19 @@ export function build({ features = [], dist = DIST, loaderOverrides = {}, partMa
   mustRun('wasm-opt', tools.wasmOpt, [join(PKG, `${WASM_MODULE}_bg.wasm`), '-O4', '-o', distWasm]);
   const wasmBytes = readFileSync(distWasm);
   const wasmCrc = crc32Hex(wasmBytes);
-  // The text modules the GitHub link can carry (ADR-015, ADR-028), checked to decode to the exact .wasm.
-  const maxChars = typeof partMaxChars === 'function' ? partMaxChars(Math.ceil(wasmBytes.length / 3) * 4) : partMaxChars;
-  const wasmTexts = wasmModuleTexts(wasmBytes, maxChars);
-  if (!wasmPartsBytes(wasmTexts).equals(wasmBytes)) fail('the wasm text modules do not decode to the .wasm');
+  // The .wasm's raw DEFLATE stream (ADR-040), which the loader inflates (js/src/inflate.ts); the smoke test below boots
+  // it through the loader and checks the CRC-32 of what it inflated.
+  const deflated = deflateRawSync(wasmBytes, { level: 9 });
+  if (!inflateRawSync(deflated).equals(wasmBytes)) fail('the DEFLATE stream does not inflate to the .wasm');
+  // The text modules the GitHub link can carry (ADR-015, ADR-028), checked to decode to the exact stream.
+  const maxChars = typeof partMaxChars === 'function' ? partMaxChars(Math.ceil(deflated.length / 3) * 4) : partMaxChars;
+  const wasmTexts = wasmModuleTexts(deflated, maxChars);
+  if (!wasmPartsBytes(wasmTexts).equals(deflated)) fail('the wasm text modules do not decode to the DEFLATE stream');
   wasmTexts.forEach((text, k) => writeFileSync(join(dist, partFileName(k)), text));
   const wasmParts = wasmTexts.map((text) => textModuleBase64(text).length);
   const overrideTag = Object.keys(loaderOverrides).length ? `+override(${Object.entries(loaderOverrides).map(([k, v]) => `${k}=${v}`).join(',')})` : '';
   const buildId = `${gitDescription()}-${wasmCrc}${features.map((f) => `+${f}`).join('')}${overrideTag}`;
-  const buildValue = { id: buildId, wasmCrc32: wasmCrc, features, wasmParts };
+  const buildValue = { id: buildId, wasmCrc32: wasmCrc, features, wasmParts, inflatedBytes: wasmBytes.length };
 
   step('tsc (ES2022)');
   mustRun('tsc', join(BIN, 'tsc'), ['-p', join(ROOT, 'js')]);
@@ -187,6 +193,7 @@ export function build({ features = [], dist = DIST, loaderOverrides = {}, partMa
       main: { file: 'main.js', bytes: mainBytes.length, sha256: sha256(mainBytes) },
       [WASM_MODULE]: {
         file: `${WASM_MODULE}.wasm`, bytes: wasmBytes.length, sha256: sha256(wasmBytes), crc32: wasmCrc,
+        deflate: { bytes: deflated.length, sha256: sha256(deflated) },
         text: wasmTexts.map((text, k) => ({
           file: partFileName(k), chars: wasmParts[k], bytes: Buffer.byteLength(text), sha256: sha256(Buffer.from(text)),
         })),
@@ -199,8 +206,9 @@ export function build({ features = [], dist = DIST, loaderOverrides = {}, partMa
   console.log(`build ${buildId}`);
   console.log(`  main.js             ${mainBytes.length} bytes`);
   console.log(`  ${WASM_MODULE}.wasm  ${wasmBytes.length} bytes, crc32 ${wasmCrc}, sha256 ${info.modules[WASM_MODULE].sha256}`);
+  console.log(`  DEFLATE stream          ${deflated.length} bytes (ADR-040)`);
   for (const part of info.modules[WASM_MODULE].text) {
-    console.log(`  ${part.file.padEnd(22)}  ${part.bytes} bytes (${part.chars} characters of the .wasm as base64, ADR-015, ADR-028)`);
+    console.log(`  ${part.file.padEnd(22)}  ${part.bytes} bytes (${part.chars} characters of the stream as base64, ADR-015, ADR-028)`);
   }
   return info;
 }

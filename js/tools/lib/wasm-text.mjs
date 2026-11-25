@@ -1,6 +1,8 @@
 // The wasm as CommonJS text modules (ADR-015, ADR-028): the GitHub link uploads every file as text, so a .wasm arrives
 // mangled under its file name (VERIFICATION_LOG V137); a .js module that exports the bytes as base64 arrives intact
-// as module `rustedscreep_wasm`, and the loader decodes it (js/src/base64.ts). A module larger than the link
+// as module `rustedscreep_wasm`, and the loader decodes it (js/src/base64.ts). The bytes are the .wasm's raw DEFLATE
+// stream since ADR-040 (the upload must fit the MMO's 2 MB cap), which the loader inflates (js/src/inflate.ts); these
+// helpers carry any bytes. A module larger than the link
 // delivers arrived empty (V257), so the base64 is split across `rustedscreep_wasm`, `rustedscreep_wasm_1`, … whenever
 // one module would pass MODULE_MAX_BYTES. This is the only definition of the text form: build.mjs writes it, stage.mjs
 // checks it, size.mjs measures it, and smoke.mjs serves it. No game logic.

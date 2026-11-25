@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { deflateRawSync } from 'node:zlib';
 import { WASM_MODULE } from './lib/common.mjs';
 import { MODULE_MAX_BYTES, PART_MAX_CHARS, partFileName, wasmModuleText, wasmModuleTexts } from './lib/wasm-text.mjs';
 import { UPLOAD_BUDGET, measure } from './size.mjs';
@@ -43,7 +44,7 @@ test('a small build is within budget and its sizes are reported', () => {
 
 // The text module (ADR-015) wraps the same base64 in `module.exports = "...";\n` instead of {"binary":"..."}: 13
 // characters more, whatever the size.
-test('the text-module upload is 13 characters larger than the binary one, and the larger one is checked', () => {
+test('with the wasm itself as text, the text-module upload is 13 characters larger than the binary one, and it is the one checked', () => {
   for (const n of [0, 1000, 230513]) {
     const dir = fakeBuild(n);
     try {
@@ -54,6 +55,24 @@ test('the text-module upload is 13 characters larger than the binary one, and th
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+});
+
+// ADR-040: the text parts hold the .wasm's DEFLATE stream, so the text upload is what the budget checks, even when the
+// .wasm as a binary module would be over it.
+test('a build whose text parts hold a DEFLATE stream is checked on the text upload, not the binary one', () => {
+  const n = Math.ceil((UPLOAD_BUDGET * 3) / 4);
+  const dir = fakeBuild(n);
+  try {
+    const stream = deflateRawSync(Buffer.alloc(n), { level: 9 });
+    writeFileSync(join(dir, partFileName(0)), wasmModuleText(stream));
+    const m = measure(dir);
+    assert.ok(m.uploadBinaryChars > UPLOAD_BUDGET);
+    assert.equal(m.uploadChars, m.uploadTextChars);
+    assert.ok(m.uploadChars < UPLOAD_BUDGET);
+    assert.equal(m.withinBudget, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

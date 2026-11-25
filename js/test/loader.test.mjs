@@ -2,6 +2,7 @@
 // the harness builds a new Loader (fresh module state) on the same Memory record, as the next tick would.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { deflateRawSync } from 'node:zlib';
 import { crc32Hex } from '../build-test/crc32.js';
 import { Loader, loadWasm, partModuleName, sanitizeLoaderMemory, toBytes } from '../build-test/loader.js';
 
@@ -21,12 +22,13 @@ const WASM = Uint8Array.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x
 /**
  * `wasm` is the build's bytes (its CRC goes into the build info); `moduleValue` is what require('rustedscreep_wasm')
  * returns, the bytes by default (a binary module) or, for the GitHub link's text module, a base64 string (ADR-015).
- * `wasmParts` is the build's record of its text parts (one part of the build's base64 by default, ADR-028), and
- * `modules` answers require for any other name: a value, or a function that throws.
+ * `wasmParts` is the build's record of its text parts (one part of the build's base64 by default, ADR-028),
+ * `inflatedBytes` its record of a DEFLATE stream's inflated length (ADR-040; none by default), and `modules` answers
+ * require for any other name: a value, or a function that throws.
  */
 function harness({
   config = {}, glue = {}, bucket = 10000, wasm = WASM, moduleValue = wasm, compileThrows = false,
-  wasmParts = [Buffer.from(wasm).toString('base64').length], modules = {},
+  wasmParts = [Buffer.from(wasm).toString('base64').length], modules = {}, inflatedBytes = undefined,
 } = {}) {
   const h = {
     time: 1000, bucket, cpu: 0, halts: 0, notifies: [], logs: [], memoryReads: 0, mem: null,
@@ -70,7 +72,7 @@ function harness({
     },
     ...glue,
   };
-  const build = { id: 'abc-dirty-00000000', wasmCrc32: crc32Hex(wasm), features: [], wasmParts };
+  const build = { id: 'abc-dirty-00000000', wasmCrc32: crc32Hex(wasm), features: [], wasmParts, inflatedBytes };
   h.newGlobal = () => new Loader(env, g, { ...CONFIG, ...config }, build);
   h.loader = h.newGlobal();
   /** One tick; a halt replaces the loader, like a global reset. */
@@ -484,6 +486,49 @@ test('parts of the recorded lengths with other content decode and boot with a CR
   const boot = h.logs.find((l) => l.startsWith('rustedscreep boot:'));
   assert.match(boot, /in 3 parts\) 40 B crc32 [0-9a-f]{8} \(stage [0-9a-f]{8}: MISMATCH\)/);
   assert.equal(h.notifies.filter((n) => /does not match the build's/.test(n)).length, 1);
+});
+
+test('a DEFLATE text module inflates to the wasm and boots, its boot line naming the stream (ADR-040)', () => {
+  const stream = deflateRawSync(BIG_WASM, { level: 9 });
+  const text = stream.toString('base64');
+  const h = harness({ wasm: BIG_WASM, moduleValue: text, wasmParts: [text.length], inflatedBytes: BIG_WASM.length });
+  h.tick();
+  assert.equal(h.loader.phase, 'compiled');
+  assert.deepEqual(h.compiledBytes, Array.from(BIG_WASM));
+  const boot = h.logs.find((l) => l.startsWith('rustedscreep boot:'));
+  const want = new RegExp(`\\| wasm String\\(base64, ${text.length} chars, deflate ${stream.length} B\\) ${BIG_WASM.length} B crc32 [0-9a-f]{8} \\(stage [0-9a-f]{8}: match\\) \\|`);
+  assert.match(boot, want);
+  h.tick();
+  assert.equal(h.loops, 1);
+  // Split across parts (ADR-028), the stream inflates the same.
+  const parts = [text.slice(0, 8), text.slice(8)];
+  const s = harness({ wasm: BIG_WASM, moduleValue: parts[0], wasmParts: parts.map((p) => p.length), inflatedBytes: BIG_WASM.length, modules: { rustedscreep_wasm_1: parts[1] } });
+  s.tick();
+  assert.deepEqual(s.compiledBytes, Array.from(BIG_WASM));
+  assert.match(s.logs.find((l) => l.startsWith('rustedscreep boot:')), /in 2 parts, deflate \d+ B\) 40 B crc32/);
+  // A binary module is the wasm itself: it is not inflated.
+  const bin = harness({ wasm: BIG_WASM, inflatedBytes: BIG_WASM.length });
+  bin.tick();
+  assert.deepEqual(bin.compiledBytes, Array.from(BIG_WASM));
+});
+
+test('a DEFLATE text module that does not inflate to the recorded length is a load incident, never compiled', () => {
+  const stream = deflateRawSync(BIG_WASM, { level: 9 });
+  const text = stream.toString('base64');
+  // The base64 of the raw wasm where a stream is recorded, a stream recorded with another length, and a cut stream.
+  const raw = Buffer.from(BIG_WASM).toString('base64');
+  const cut = Buffer.from(stream.subarray(0, stream.length - 3)).toString('base64');
+  const cases = [
+    [raw, BIG_WASM.length, /DEFLATE stream does not inflate to 40 bytes/],
+    [text, BIG_WASM.length + 1, /does not inflate to 41 bytes \(TypeError: not a raw DEFLATE stream: it inflates to 40 bytes, not 41\)/],
+    [cut, BIG_WASM.length, /DEFLATE stream does not inflate to 40 bytes/],
+  ];
+  for (const [moduleValue, inflatedBytes, want] of cases) {
+    const h = harness({ wasm: BIG_WASM, moduleValue, wasmParts: [moduleValue.length], inflatedBytes });
+    h.tick(2);
+    assert.equal(h.compiles, 0, String(want));
+    assert.ok(h.logs.some((l) => /incident: load/.test(l) && want.test(l)), `${want}: ${h.logs.join(' / ')}`);
+  }
 });
 
 test('loadWasm refuses a text module when the build records no parts', () => {

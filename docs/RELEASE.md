@@ -10,8 +10,8 @@ it ships `deploy/` exactly as committed at the tag.
   the workspace's version. crates.io keeps every version it takes. A broken one can be yanked (hidden from new
   dependency resolution) but never deleted or replaced.
 - **A GitHub release:** the files in `deploy/` and nothing else. These are `main.js` and the wasm's base64 text modules
-  (`rustedscreep_wasm.js`, `rustedscreep_wasm_1.js`, and so on; ADR-028 splits the wasm across modules of at most 905709
-  bytes each). The release notes give the build ID from `main.js` and each file's SHA-256 sum.
+  (`rustedscreep_wasm.js`, then `rustedscreep_wasm_1.js` and so on when needed; the wasm is compressed with DEFLATE
+  before the base64, ADR-040, and ADR-028 splits the text across modules of at most 905709 bytes each). The release notes give the build ID from `main.js` and each file's SHA-256 sum.
 - **The Steam Workshop of Screeps: World** (app 464350): the same files, as one Workshop item. That Workshop is "Server
   Mods & Bots": it holds bots and mods for private, self-hosted servers, not code for the MMO (V318).
 

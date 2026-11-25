@@ -1,6 +1,6 @@
 // End-to-end test of the wasm split across text modules (ADR-028) in the Screeps-like sandbox (js/tools/smoke.mjs):
-// a plain build into target/split-sim whose base64 is cut into three parts (build.mjs's `partMaxChars`, which only
-// tests lower; the real cap gives two today). The build's own smoke test boots it in both forms, with `in 3 parts` in
+// a plain build into target/split-sim whose base64 (of the .wasm's DEFLATE stream, ADR-040) is cut into three parts
+// (build.mjs's `partMaxChars`, which only tests lower; the real cap gives one since ADR-040). The build's own smoke test boots it in both forms, with `in 3 parts` in
 // its boot line. Then, in the text form, the script checks that:
 // - the three parts boot on the first tick with a matching CRC-32, and a stale part beyond them (an earlier, larger
 //   build's rustedscreep_wasm_3, which throws if evaluated) is never required;
@@ -42,7 +42,7 @@ export function splitSim() {
   const ok = run({ ...files, [partModuleName(PARTS)]: 'throw new Error("a stale part was required");' }, 3);
   const boot = ok.logs.find((l) => l.startsWith('rustedscreep boot:')) ?? '';
   const total = chars.reduce((a, b) => a + b, 0);
-  if (!boot.includes(`wasm String(base64, ${total} chars in ${PARTS} parts)`) || !boot.includes(': match)')) {
+  if (!new RegExp(`wasm String\\(base64, ${total} chars in ${PARTS} parts, deflate \\d+ B\\) `).test(boot) || !boot.includes(': match)')) {
     problems.push(`intact: boot line ${JSON.stringify(boot)}`);
   }
   if (!ok.logs.some((l) => l.startsWith('rustedscreep booted in 1 ticks'))) problems.push('intact: did not boot in 1 tick');

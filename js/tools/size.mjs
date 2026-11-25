@@ -1,8 +1,9 @@
 // Reports the bundle and wasm sizes in dist/ and checks the upload budget and the size of each module. Usage: npm run
 // size. The budget is the safe default from VERIFICATION_LOG V76: keep JSON.stringify(modules) under 2 MiB until the
-// real MMO limit is measured. Both upload shapes are counted and the larger is checked: the wasm as base64 inside
-// { binary } (an API upload, V19) and as the text modules the GitHub link delivers (ADR-015, ADR-028). Each file the
-// link delivers must also be at most MODULE_MAX_BYTES, the largest module seen arrive intact (V257, ADR-028).
+// real MMO limit is measured (V370). The budget checks the upload the MMO gets: the text modules the GitHub link
+// delivers (ADR-012, ADR-015, ADR-028), which hold the .wasm's DEFLATE stream since ADR-040. The .wasm as base64 inside
+// { binary } (an API upload, V19, which no tool makes since ADR-021) is reported but not checked. Each file the link
+// delivers must also be at most MODULE_MAX_BYTES, the largest module seen arrive intact (V257, ADR-028).
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { ROOT, WASM_MODULE, fail, isMain, readJson } from './lib/common.mjs';
@@ -22,7 +23,7 @@ export function measure(dir = join(ROOT, 'dist')) {
   const parts = texts.map((t, k) => ({ file: partFileName(k), bytes: Buffer.byteLength(t, 'utf8') }));
   const uploadBinaryChars = JSON.stringify({ main, [WASM_MODULE]: { binary: wasm.toString('base64') } }).length;
   const uploadTextChars = JSON.stringify({ main, ...Object.fromEntries(texts.map((t, k) => [partModuleName(k), t])) }).length;
-  const upload = Math.max(uploadBinaryChars, uploadTextChars);
+  const upload = uploadTextChars;
   const mainBytes = Buffer.byteLength(main, 'utf8');
   const largestModule = [{ file: 'main.js', bytes: mainBytes }, ...parts].reduce((a, b) => (b.bytes > a.bytes ? b : a));
   return {
@@ -47,8 +48,8 @@ export function report(m) {
   console.log(`build ${m.buildId}`);
   console.log(`  main.js                 ${m.mainBytes} bytes`);
   console.log(`  ${WASM_MODULE}.wasm  ${m.wasmBytes} bytes`);
-  for (const p of m.parts) console.log(`  ${p.file.padEnd(22)}  ${p.bytes} bytes (the .wasm as base64, part of ${m.parts.length}, ADR-015, ADR-028)`);
-  console.log(`  upload estimate         ${m.uploadChars} of ${m.budget} characters (${pct}%; binary ${m.uploadBinaryChars}, text ${m.uploadTextChars})`);
+  for (const p of m.parts) console.log(`  ${p.file.padEnd(22)}  ${p.bytes} bytes (the .wasm's DEFLATE stream as base64, part of ${m.parts.length}, ADR-015, ADR-028, ADR-040)`);
+  console.log(`  upload estimate         ${m.uploadChars} of ${m.budget} characters (${pct}%, the text modules; as a binary module ${m.uploadBinaryChars}, not checked)`);
   console.log(`  largest module          ${m.largestModule.file} ${m.largestModule.bytes} of ${m.moduleCap} bytes (V257, ADR-028)`);
 }
 

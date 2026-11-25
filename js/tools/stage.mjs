@@ -12,6 +12,7 @@
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { inflateRawSync } from 'node:zlib';
 import { build, parseFeatures } from './build.mjs';
 import { ROOT, WASM_MODULE, canonicalPath, fail, isInside, sha256 } from './lib/common.mjs';
 import { crc32Hex } from './lib/crc32.mjs';
@@ -82,8 +83,9 @@ const check = (dir, f) => {
   if (sha256(readFileSync(join(dir, f))) !== wantSha[f]) fail(`${join(dir, f)} is not the file this build produced`);
 };
 for (const f of FILES) check(STAGE_DIST, f);
-const staged = wasmPartsBytes(parts.map((p) => readFileSync(join(STAGE_DIST, p.file), 'utf8')));
-if (sha256(staged) !== info.modules[WASM_MODULE].sha256) fail("the wasm text modules do not decode to the build's .wasm");
+// The parts hold the .wasm's raw DEFLATE stream (ADR-040).
+const staged = inflateRawSync(wasmPartsBytes(parts.map((p) => readFileSync(join(STAGE_DIST, p.file), 'utf8'))));
+if (sha256(staged) !== info.modules[WASM_MODULE].sha256) fail("the wasm text modules do not inflate to the build's .wasm");
 
 mkdirSync(target, { recursive: true });
 for (const f of FILES) copyFileSync(join(STAGE_DIST, f), join(target, f));
@@ -96,7 +98,7 @@ const held = readdirSync(target).sort();
 if (held.join(',') !== [...FILES].sort().join(',')) fail(`the staged folder holds ${held.join(', ')}, expected ${FILES.join(', ')}`);
 
 console.log(`\n== staged into ${target}`);
-console.log(`modules: main (main.js), ${parts.map((p) => `${p.file.replace(/\.js$/, '')} (${p.file})`).join(', ')}: the .wasm as base64 in ${parts.length} part(s), ADR-015, ADR-028`);
+console.log(`modules: main (main.js), ${parts.map((p) => `${p.file.replace(/\.js$/, '')} (${p.file})`).join(', ')}: the .wasm's DEFLATE stream as base64 in ${parts.length} part(s), ADR-015, ADR-028, ADR-040`);
 for (const f of retired) console.log(`removed ${f} (${f.endsWith('.wasm') ? 'the GitHub link mangles a .wasm, V137' : 'a wasm part this build does not have'})`);
 console.log(`features: ${info.features.length ? info.features.join(', ') : 'none'}`);
 report(size);
