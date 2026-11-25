@@ -53,6 +53,11 @@
 //!   controller as an object (unless the remote read pushed it), the controller's `sign` and, for
 //!   one, its `username` and `text` (V275), and `FIND_HOSTILE_STRUCTURES` through the tower filter,
 //!   each tower's `pos` and `__packedPos`;
+//! - atlas room (ADR-039, `push_intel`: a visible room the bot does not own whose record is
+//!   missing or stale, at most `scout.max_reads` a tick, once the atlas has loaded): its status,
+//!   its controller's position, reservation and (another owner's) safe mode, its sources'
+//!   positions, its mineral's position, type and density, and its hostile towers, spawns, lairs
+//!   and invader core through four filtered `find` calls, about 25 calls;
 //! - structure: 3 (`get`, `id`, the id copy), plus on the tick it is first seen `structureType`,
 //!   and `pos` and `__packedPos` when the type is known (again every tick while that read fails).
 //!   With `cache.structure_static` off (the naive baseline, P1.10) those three are read every tick.
@@ -86,14 +91,18 @@
 use std::fmt::Write as _;
 
 use js_sys::{Array, Object, Reflect};
-use rustedscreep_core::config::{CacheConfig, DefenseConfig, RemoteConfig, UpkeepConfig};
+use rustedscreep_core::config::{
+    CacheConfig, DefenseConfig, RemoteConfig, ScoutConfig, UpkeepConfig,
+};
 use rustedscreep_core::defense::safe_mode::is_core;
+use rustedscreep_core::expansion::Scouting;
 use rustedscreep_core::signing::SIGN_TEXT;
 use rustedscreep_core::snapshot::{
-    BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepRow, CreepStore, ObjectKey,
-    ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation, RoomEnergy, SafeModeState,
-    SignRead, SignSeen, SkipCounts, SkipLog, SkipReason, SkipReport, Snapshot, StructureHandle,
-    StructureStatic, TickContext, known_structure_type, parse_room_name, position_from_packed,
+    BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepRow, CreepStore, IntelRead,
+    MineralRead, ObjectKey, ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation,
+    RoomEnergy, RoomStatus, SafeModeState, SignRead, SignSeen, SkipCounts, SkipLog, SkipReason,
+    SkipReport, Snapshot, StructureHandle, StructureStatic, TickContext, known_structure_type,
+    parse_room_name, position_from_packed,
 };
 use rustedscreep_core::spawning::{CreepName, Identity, Role};
 use screeps::{
@@ -197,6 +206,22 @@ extern "C" {
 
     #[wasm_bindgen(method, getter = hitsMax)]
     fn hits_max_value(this: &WithHitsMax) -> JsValue;
+
+    /// A mineral, for `mineralType` and `density` as plain values (ADR-039, V364): the crate's
+    /// getters convert to wasm-bindgen enums, which throw on a value they do not know.
+    type MineralInfo;
+
+    #[wasm_bindgen(method, getter = mineralType)]
+    fn mineral_type_value(this: &MineralInfo) -> JsValue;
+
+    #[wasm_bindgen(method, getter = density)]
+    fn density_value(this: &MineralInfo) -> JsValue;
+
+    /// An invader core, for `level` as a plain value (ADR-039, V365).
+    type CoreInfo;
+
+    #[wasm_bindgen(method, getter = level)]
+    fn level_value(this: &CoreInfo) -> JsValue;
 }
 
 /// This tick's JS objects, index-aligned with the snapshot's rows. They are stale after this tick
@@ -218,6 +243,11 @@ pub struct JsWorld {
     tower_filter: Option<JsValue>,
     /// `{filter: {structureType: "constructedWall"}}`, likewise (ADR-033).
     wall_filter: Option<JsValue>,
+    /// `{filter: {structureType: ...}}` for spawns, keepers' lairs and invader cores, likewise
+    /// (ADR-039, the atlas's reads).
+    spawn_filter: Option<JsValue>,
+    lair_filter: Option<JsValue>,
+    core_filter: Option<JsValue>,
     /// The bot's username, read once per global from an own creep's `owner` (P6.2): a remote
     /// room's reservation is the bot's when it names it.
     username: Option<String>,
@@ -304,6 +334,53 @@ impl JsWorld {
         self.wall_filter
             .get_or_insert_with(|| type_filter("constructedWall"))
     }
+
+    /// The spawn filter, built on first use like the container filter (ADR-039).
+    fn spawn_filter(&mut self) -> &JsValue {
+        self.spawn_filter
+            .get_or_insert_with(|| type_filter("spawn"))
+    }
+
+    /// The keeper's lair filter, likewise (ADR-039).
+    fn lair_filter(&mut self) -> &JsValue {
+        self.lair_filter
+            .get_or_insert_with(|| type_filter("keeperLair"))
+    }
+
+    /// The invader core filter, likewise (ADR-039).
+    fn core_filter(&mut self) -> &JsValue {
+        self.core_filter
+            .get_or_insert_with(|| type_filter("invaderCore"))
+    }
+}
+
+/// Which visible rooms this tick's snapshot reads for the atlas (ADR-039): a room the bot does not
+/// own that [`Scouting::wants_read`] says is due, at most `scout.max_reads` a tick, and none unless
+/// the last tick ran the Optional tier (scouting is Optional work; the snapshot runs before this
+/// tick's budget, so last tick's stands in, and a global's first tick reads none).
+pub struct IntelPass<'a> {
+    pub scouting: &'a Scouting,
+    pub cfg: &'a ScoutConfig,
+    left: u32,
+}
+
+impl<'a> IntelPass<'a> {
+    pub fn new(scouting: &'a Scouting, cfg: &'a ScoutConfig, optional: bool) -> Self {
+        Self {
+            scouting,
+            cfg,
+            left: if optional { cfg.max_reads } else { 0 },
+        }
+    }
+
+    /// Whether `room` is read now; a read counts against this tick's reads.
+    fn take(&mut self, room: RoomName, now: u32) -> bool {
+        let wanted = self.left > 0 && self.scouting.wants_read(room, now, self.cfg);
+        if wanted {
+            self.left -= 1;
+        }
+        wanted
+    }
 }
 
 /// `{filter: {structureType: kind}}`. A fresh plain object never refuses a property; a failure
@@ -325,6 +402,7 @@ pub fn take(
     remote: &RemoteConfig,
     upkeep: &UpkeepConfig,
     defense: &DefenseConfig,
+    mut intel: IntelPass<'_>,
 ) {
     js.clear();
     js.hostile_rooms.clear();
@@ -378,6 +456,7 @@ pub fn take(
             road_tick,
             upkeep_tick,
             defense.safe_mode,
+            &mut intel,
         );
     }
     if upkeep.enabled && !upkeep_tick {
@@ -424,6 +503,7 @@ fn push_room(
     road_tick: bool,
     upkeep_tick: bool,
     safe_mode: bool,
+    intel: &mut IntelPass<'_>,
 ) {
     // `parse_room_name` has `RoomName::from_str`'s semantics without its str slicing, which links
     // about 8 KB of Unicode and Debug tables into the release wasm (V114). Anything that parses a
@@ -572,7 +652,147 @@ fn push_room(
         );
         snapshot.rooms.set_sign(row, read);
     }
+    // ADR-039: a due room the bot does not own, for the atlas.
+    if !owned && intel.take(name, snapshot.tick.time) {
+        let read = push_intel(
+            snapshot,
+            js,
+            &room,
+            name,
+            controller_object.as_ref(),
+            controller,
+            hostile_count,
+        );
+        snapshot.rooms.set_intel(row, read);
+    }
     js.rooms.push(room);
+}
+
+/// A due room for the atlas (ADR-039): its status (`Game.map.getRoomStatus`, V168, and the
+/// `status` read: 4), the controller's `pos` and `__packedPos` and its `reservation` (and for one
+/// its `username` and `ticksToEnd`), another owner's `safeMode` (V337), `FIND_SOURCES` and its
+/// `length` and per source `get`, `pos` and `__packedPos`, `FIND_MINERALS` and its `length` and
+/// for the first `get`, `pos`, `__packedPos`, `mineralType` and `density` (V364),
+/// `FIND_HOSTILE_STRUCTURES` through the tower, spawn, lair and core filters with each `length`
+/// (V267), and an invader core's `get` and `level` (V365): about 25 calls. The hostile creeps are
+/// the room's count, already read.
+fn push_intel(
+    snapshot: &Snapshot,
+    js: &mut JsWorld,
+    room: &Room,
+    name: RoomName,
+    controller: Option<&StructureController>,
+    kind: Controller,
+    hostiles: u32,
+) -> IntelRead {
+    let mut read = IntelRead {
+        read: true,
+        hostiles: u8::try_from(hostiles).unwrap_or(u8::MAX),
+        ..IntelRead::default()
+    };
+    // A status this build does not know, or one it could not read, is the safe reading: closed.
+    read.status = match crate::route::read_status(name) {
+        Some(crate::route::Status::Normal) => RoomStatus::Normal,
+        Some(crate::route::Status::Novice) => RoomStatus::Novice,
+        Some(crate::route::Status::Respawn) => RoomStatus::Respawn,
+        Some(crate::route::Status::Closed | crate::route::Status::Other) | None => {
+            RoomStatus::Closed
+        }
+    };
+    if let Some(c) = controller {
+        read.controller_at = position_of(c.unchecked_ref::<RoomObject>()).ok();
+        read.reservation = reservation_of(snapshot, js, c).1;
+        if matches!(kind, Controller::Foreign { .. }) {
+            read.safe_mode = c.safe_mode().unwrap_or(0);
+        }
+    }
+    let finder = room.unchecked_ref::<Findable>();
+    let sources = finder.find_array(find::SOURCES.find_code());
+    for i in 0..sources.length() {
+        let object: RoomObject = sources.get(i).unchecked_into();
+        if let Ok(at) = position_of(&object) {
+            read.add_source(at);
+        }
+    }
+    let minerals = finder.find_array(find::MINERALS.find_code());
+    if minerals.length() > 0 {
+        let object: RoomObject = minerals.get(0).unchecked_into();
+        if let Ok(at) = position_of(&object) {
+            let info = object.unchecked_ref::<MineralInfo>();
+            let density = info
+                .density_value()
+                .as_f64()
+                .filter(|d| d.is_finite() && *d >= 0.0 && *d <= f64::from(u8::MAX))
+                .map_or(0, |d| d as u8);
+            read.mineral = Some(MineralRead {
+                kind: info
+                    .mineral_type_value()
+                    .as_string()
+                    .and_then(|t| mineral_kind(&t)),
+                at,
+                density,
+            });
+        }
+    }
+    let hostile = find::HOSTILE_STRUCTURES.find_code();
+    let count = |list: Array| u8::try_from(list.length()).unwrap_or(u8::MAX);
+    read.towers = count(finder.find_filtered(hostile, js.tower_filter()));
+    read.spawns = count(finder.find_filtered(hostile, js.spawn_filter()));
+    read.lairs = count(finder.find_filtered(hostile, js.lair_filter()));
+    let cores = finder.find_filtered(hostile, js.core_filter());
+    if cores.length() > 0 {
+        let core: JsValue = cores.get(0);
+        read.core = Some(
+            core.unchecked_ref::<CoreInfo>()
+                .level_value()
+                .as_f64()
+                .filter(|l| l.is_finite() && *l >= 0.0 && *l < f64::from(u8::MAX))
+                .map_or(0, |l| l as u8),
+        );
+    }
+    read
+}
+
+/// A mineral's type from its `mineralType` text (V364): the seven a room can hold, `None` for any
+/// other.
+fn mineral_kind(text: &str) -> Option<ResourceType> {
+    Some(match text {
+        "H" => ResourceType::Hydrogen,
+        "O" => ResourceType::Oxygen,
+        "U" => ResourceType::Utrium,
+        "L" => ResourceType::Lemergium,
+        "K" => ResourceType::Keanium,
+        "Z" => ResourceType::Zynthium,
+        "X" => ResourceType::Catalyst,
+        _ => return None,
+    })
+}
+
+/// A controller's reservation (P6.2, V263): `reservation`, and for one its `username` and
+/// `ticksToEnd` (the bot's username read once a global). Returns the ticks to its end (0 for none)
+/// and who holds it.
+fn reservation_of(
+    snapshot: &Snapshot,
+    js: &mut JsWorld,
+    c: &StructureController,
+) -> (u32, Reservation) {
+    let value = c.unchecked_ref::<Reserving>().reservation_value();
+    if !value.is_object() {
+        return (0, Reservation::None);
+    }
+    let r = value.unchecked_ref::<UserRecord>();
+    let ticks = r
+        .ticks_to_end_value()
+        .as_f64()
+        .filter(|t| t.is_finite() && *t >= 0.0)
+        .map_or(0, |t| t as u32);
+    let user = r.username_value().as_string();
+    ensure_username(snapshot, js);
+    let holder = match (user, js.username.as_deref()) {
+        (Some(u), Some(me)) if u == me => Reservation::Mine { ticks },
+        _ => Reservation::Other { ticks },
+    };
+    (ticks, holder)
 }
 
 /// A remote room (P6.2, ADR-029): a visible room the bot does not own that an own creep's name
@@ -595,24 +815,8 @@ fn push_remote(
         ..RemoteRead::default()
     };
     if let Some(c) = controller {
-        let value = c.unchecked_ref::<Reserving>().reservation_value();
-        let ticks = if value.is_object() {
-            let r = value.unchecked_ref::<UserRecord>();
-            let ticks = r
-                .ticks_to_end_value()
-                .as_f64()
-                .filter(|t| t.is_finite() && *t >= 0.0)
-                .map_or(0, |t| t as u32);
-            let user = r.username_value().as_string();
-            ensure_username(snapshot, js);
-            read.reservation = match (user, js.username.as_deref()) {
-                (Some(u), Some(me)) if u == me => Reservation::Mine { ticks },
-                _ => Reservation::Other { ticks },
-            };
-            ticks
-        } else {
-            0
-        };
+        let (ticks, holder) = reservation_of(snapshot, js, c);
+        read.reservation = holder;
         let row = ObjectRow {
             amount: ticks,
             total: 0,

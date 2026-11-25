@@ -47,6 +47,7 @@ mod profiler;
 mod remote;
 mod route;
 mod scheduler;
+mod scout;
 mod sign;
 mod snapshot;
 mod spawn;
@@ -80,6 +81,8 @@ struct State {
     remote: remote::RemoteGlue,
     /// The controller signer (ADR-030): its record, its trips and the next signer's plan.
     sign: sign::SignGlue,
+    /// Scouting for expansion (P8.1, ADR-039): the atlas, the explorer and the observers.
+    scout: scout::ScoutGlue,
     /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1), the towers
     /// (P7.2), the safe-mode triggers (P7.4), the defenders (P7.5) and the remote defenders (P7.6).
     defense: defense::DefenseGlue,
@@ -137,6 +140,7 @@ pub fn game_loop() {
                     planner,
                     remote,
                     sign,
+                    scout,
                     defense,
                     persist,
                     consts,
@@ -146,6 +150,11 @@ pub fn game_loop() {
                 } = &mut *state;
                 let mut probe = profiler::Probe::start();
                 let cfg = *runtime.get();
+                // Scouting's room reads (ADR-039) are Optional work; the snapshot comes before this
+                // tick's budget, so they follow last tick's.
+                let optional_last = sched
+                    .last_tick()
+                    .is_some_and(|r| r.budget.allows(Tier::Optional));
                 snapshot::take(
                     snapshot,
                     js,
@@ -153,6 +162,7 @@ pub fn game_loop() {
                     &cfg.remote,
                     &cfg.upkeep,
                     &cfg.defense,
+                    snapshot::IntelPass::new(scout.core(), &cfg.scout, optional_last),
                 );
                 // Movement's tick starts with the snapshot (no JS call); its room reads are jobs.
                 movement.begin(snapshot, &cfg.movement, &cfg.cache, &cfg.sign);
@@ -163,6 +173,7 @@ pub fn game_loop() {
                 opening.begin(snapshot, &mut movement.core);
                 remote.begin(snapshot);
                 sign.begin(snapshot, &cfg.sign);
+                scout.begin(snapshot, &cfg.scout);
                 // Critical: the threat assessment of the hostiles in owned rooms (P7.1), every tick
                 // one stands there or a threat is open; bounded, so outside the scheduler's jobs.
                 defense.begin(snapshot, js, &cfg.defense);
@@ -174,6 +185,14 @@ pub fn game_loop() {
                         persist.request_sign_load();
                     } else {
                         sign.no_record();
+                    }
+                }
+                // The atlas (ADR-039) the same way, once a home is scouted.
+                if runtime.overrides_loaded() && scout.wants_record(&cfg.scout) {
+                    if persist.has_atlas_segment() {
+                        persist.request_atlas_load();
+                    } else {
+                        scout.no_record();
                     }
                 }
                 // With no segment for the planner's record (ADR-027), plan from what stands at once.
@@ -256,11 +275,14 @@ pub fn game_loop() {
                 // Critical: the planned signer's request (ADR-030; only on a tick that runs the
                 // Optional tier), before the spawn plan.
                 sign.plan(&mut tick, spawn.spawner_mut(), &cfg.sign);
+                // Critical: the explorer's request (ADR-039; only on a tick that runs the Optional
+                // tier), before the spawn plan.
+                scout.plan(&mut tick, spawn.spawner_mut(), &cfg.scout);
                 spawn.plan(&mut tick, snapshot);
                 // Standard: the persistence loads, then the opening's repairing, building and
                 // upgrading, then the haulers' transfers into the controller container (P3.3), then
                 // the upgraders' withdraws and upgrades (P3.4).
-                persist.load(&mut tick, snapshot.tick.time, runtime, planner, sign);
+                persist.load(&mut tick, snapshot.tick.time, runtime, planner, sign, scout);
                 opening.work(
                     &mut tick,
                     snapshot,
@@ -329,6 +351,18 @@ pub fn game_loop() {
                 if sign.take_save(&cfg.sign) {
                     persist.sign_changed();
                 }
+                // Optional: the explorer's trips, then the observers' looks (ADR-039).
+                scout.work(
+                    &mut tick,
+                    snapshot,
+                    &mut movement.core,
+                    &mut act.buffer,
+                    &cfg.scout,
+                    &cfg.movement,
+                );
+                if scout.take_save(&cfg.scout) {
+                    persist.atlas_changed();
+                }
                 act.queue_console_say(snapshot, tick.commit());
                 #[cfg(feature = "act-test")]
                 act_test.queue(&mut act.buffer, snapshot, tick.commit());
@@ -338,6 +372,7 @@ pub fn game_loop() {
                 opening.log_events();
                 remote.log_events(snapshot, js);
                 sign.log_events(&cfg.sign);
+                scout.log_events(&cfg.scout);
                 defense.log_events(snapshot, js, &cfg.defense);
                 probe.decide();
                 // After the decide step: the scheduler reads the CPU clock no more (scheduler docs); the
@@ -370,6 +405,15 @@ pub fn game_loop() {
                     &cfg.scheduler,
                     &cfg.defense,
                 );
+                // Then the observers' looks (ADR-039).
+                scout.issue_looks(
+                    snapshot,
+                    js,
+                    act.log_mut(),
+                    sched,
+                    &cfg.scheduler,
+                    &cfg.scout,
+                );
                 // Then the plan's destroys (ADR-026), the sites the placement picked (ADR-020,
                 // ADR-023, ADR-024, P4.3), the link sends (P3.2), then the creep intents.
                 opening.issue_destroys(snapshot, js, act.log_mut(), sched, &cfg.scheduler);
@@ -394,7 +438,7 @@ pub fn game_loop() {
                 let standard = sched
                     .last_tick()
                     .is_some_and(|r| r.budget.allows(Tier::Standard));
-                persist.flush(snapshot.tick.time, standard, runtime, planner, sign);
+                persist.flush(snapshot.tick.time, standard, runtime, planner, sign, scout);
                 scheduler::log_faults(sched);
                 if prof.finish(probe, &snapshot.tick, act.issues(), &cfg.scheduler) {
                     persist.keys_short();
@@ -553,6 +597,21 @@ pub fn sign_summary() -> String {
             Err(_) => String::from("rustedscreep sign: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep sign: state unavailable"))
+}
+
+/// Exported to JS as `scoutSummary`, for the `rustedscreep.scout()` console command: one line with
+/// the atlas, the rooms due, the explorer and its trip, this tick's observer looks and the counts
+/// since the global started (P8.1, ADR-039).
+#[wasm_bindgen(js_name = "scoutSummary")]
+pub fn scout_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state
+                .scout
+                .summary(&state.snapshot, &state.config.get().scout),
+            Err(_) => String::from("rustedscreep scout: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep scout: state unavailable"))
 }
 
 /// Exported to JS as `remoteSummary`, for the `rustedscreep.remote()` console command: one line with

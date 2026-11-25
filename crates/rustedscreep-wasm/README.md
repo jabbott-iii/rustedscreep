@@ -42,6 +42,7 @@ only when it changed:
 
 | Segment | What it holds |
 | :- | :- |
+| 94 | The atlas: what the bot last saw of each room near its homes, for expansion |
 | 95 | The controller signer's record: the rooms it signed or gave up on, and when each is due again |
 | 96 | The base planner's record: each room's plan anchor and the structures it adopted |
 | 97 | The runtime config overrides set from the console |
@@ -71,6 +72,7 @@ game's console, for example `rustedscreep.scheduler()` for `schedulerSummary`:
 | `plannerSummary` | `rustedscreep.planner()` | Each room's plan, its placement, and the CPU per planner step |
 | `remoteSummary` | `rustedscreep.remote()` | The remote rooms, their figures, their creeps, and the sites placed |
 | `signSummary` | `rustedscreep.sign()` | The signer's record, its trip, and the next signer's plan |
+| `scoutSummary` | `rustedscreep.scout()` | The atlas of rooms near the homes, the explorer and its trip, and the observers' looks |
 | `persistSummary`, `persistTest` | `rustedscreep.persist()`, `rustedscreep.persistTest(bytes)` | The segments in use; a write and read-back test |
 | `configSummary`, `configSet`, `configUnset`, `configReset` | `rustedscreep.config()` and the same names | The config in force; set, remove, or clear overrides |
 | `constsSummary` | `rustedscreep.consts()` | The constants self-check: this build's constants against the server's |

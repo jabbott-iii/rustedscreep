@@ -208,6 +208,78 @@ impl SignRead {
     }
 }
 
+/// A room's status as `Game.map.getRoomStatus` gives it (V168), read for the atlas (ADR-039).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RoomStatus {
+    /// Open to everyone (`normal`), or a room not read for it.
+    #[default]
+    Normal,
+    /// Closed, out of the world's borders, or a status this build does not know (the safe reading:
+    /// no creep goes there).
+    Closed,
+    /// A novice area, walled off from the rest of the world until its timer ends.
+    Novice,
+    /// A respawn area, walled off the same way.
+    Respawn,
+}
+
+/// The most source tiles [`IntelRead`] and the atlas keep. A room has at most three (a keeper's
+/// room or a sector's center room), so one more is spare. Unit: sources.
+pub const INTEL_SOURCES: usize = 4;
+
+/// A room's mineral as an intel read gives it (V364).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MineralRead {
+    /// Its `mineralType`; `None` for a type this build does not list.
+    pub kind: Option<ResourceType>,
+    pub at: Position,
+    /// `density`: 1 (low) to 4 (ultra). Unit: density level.
+    pub density: u8,
+}
+
+/// What the snapshot reads in a visible room for the atlas (ADR-039): a room the bot does not own
+/// whose record is missing or stale. Default (not read) for every other room.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IntelRead {
+    /// The room was read for the atlas this tick.
+    pub read: bool,
+    pub status: RoomStatus,
+    /// The controller's position, for a room that has one.
+    pub controller_at: Option<Position>,
+    /// Who reserves the controller, and for how long (V263, V264).
+    pub reservation: Reservation,
+    /// Another owner's safe mode: the ticks it has left, 0 when none (V337). Unit: ticks.
+    pub safe_mode: u32,
+    /// The sources' positions, the first [`INTEL_SOURCES`].
+    pub source_at: [Option<Position>; INTEL_SOURCES],
+    /// The room's mineral (the first one, for a room that shows more).
+    pub mineral: Option<MineralRead>,
+    /// Structures of other users by type (`FIND_HOSTILE_STRUCTURES`, V267), each capped at 255.
+    /// Unit: structures.
+    pub towers: u8,
+    pub spawns: u8,
+    /// Source keepers' lairs.
+    pub lairs: u8,
+    /// An invader core's `level`, when one stands there (V365).
+    pub core: Option<u8>,
+    /// Hostile creeps in the room this tick, capped at 255. Unit: creeps.
+    pub hostiles: u8,
+}
+
+impl IntelRead {
+    /// The sources' positions read.
+    pub fn source_positions(&self) -> impl Iterator<Item = Position> + '_ {
+        self.source_at.iter().flatten().copied()
+    }
+
+    /// Adds a source: kept while fewer than [`INTEL_SOURCES`] are.
+    pub fn add_source(&mut self, at: Position) {
+        if let Some(slot) = self.source_at.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(at);
+        }
+    }
+}
+
 /// Visible rooms (`Game.rooms`). Rooms are keyed by name, so they need no handles.
 #[derive(Default)]
 pub struct Rooms {
@@ -217,6 +289,7 @@ pub struct Rooms {
     state: Vec<ControllerState>,
     remote: Vec<RemoteRead>,
     sign: Vec<SignRead>,
+    intel: Vec<IntelRead>,
     /// Whether every road's and own rampart's hits were read in the room this tick (P7.3,
     /// `upkeep.read_ticks`).
     upkeep: Vec<bool>,
@@ -230,6 +303,7 @@ impl Rooms {
         self.state.clear();
         self.remote.clear();
         self.sign.clear();
+        self.intel.clear();
         self.upkeep.clear();
     }
 
@@ -244,6 +318,7 @@ impl Rooms {
         self.state.push(ControllerState::default());
         self.remote.push(RemoteRead::default());
         self.sign.push(SignRead::default());
+        self.intel.push(IntelRead::default());
         self.upkeep.push(false);
         row
     }
@@ -272,6 +347,18 @@ impl Rooms {
 
     pub fn sign_reads(&self) -> &[SignRead] {
         &self.sign
+    }
+
+    /// Sets what was read for the atlas in the room at `row` (ADR-039); nothing for a row that does
+    /// not exist.
+    pub fn set_intel(&mut self, row: usize, read: IntelRead) {
+        if let Some(r) = self.intel.get_mut(row) {
+            *r = read;
+        }
+    }
+
+    pub fn intel_reads(&self) -> &[IntelRead] {
+        &self.intel
     }
 
     /// Sets what was read in the remote room at `row` (P6.2); nothing for a row that does not exist.

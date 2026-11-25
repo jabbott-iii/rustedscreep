@@ -298,6 +298,8 @@ export const CONFIG_SEGMENT = 97;
 export const PLANNER_SEGMENT = 96;
 /** PERSIST_MMO.sign_segment (crates/rustedscreep-core/src/config.rs): the controller signer's record (ADR-030). */
 export const SIGN_SEGMENT = 95;
+/** PERSIST_MMO.atlas_segment (crates/rustedscreep-core/src/config.rs): scouting's atlas (ADR-039). */
+export const ATLAS_SEGMENT = 94;
 
 /**
  * A runtime config record for segment CONFIG_SEGMENT, so a sim can start a global with overrides in force from its

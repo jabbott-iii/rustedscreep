@@ -2068,7 +2068,8 @@ impl Remotes {
             | Role::Upgrader
             | Role::Signer
             | Role::Defender
-            | Role::RemoteDefender => {}
+            | Role::RemoteDefender
+            | Role::Explorer => {}
         }
         Ok(())
     }

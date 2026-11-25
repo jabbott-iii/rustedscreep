@@ -94,6 +94,7 @@ const ROWS = [
   ['23 Remote mining (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'remote-sim.mjs')], true],
   ['24 Controller signer (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'sign-sim.mjs')], true],
   ['25 Threat assessment (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'defense-sim.mjs')], true],
+  ['26 Scouting (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'scout-sim.mjs')], true],
 ];
 
 function main() {

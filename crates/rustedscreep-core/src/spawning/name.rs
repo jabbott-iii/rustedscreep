@@ -59,11 +59,15 @@ pub enum Role {
     /// A remote defender (P7.6, ADR-037): MOVE, RANGED_ATTACK and HEAL parts; sent into a remote
     /// room its home mines when armed hostiles stand there, it fights them, then guards the room.
     RemoteDefender,
+    /// The explorer (P8.1, ADR-039): one MOVE part; it walks into the rooms near the homes whose
+    /// intel is missing or stale, so the atlas (`expansion::Atlas`) reads them. At most one for
+    /// the bot.
+    Explorer,
 }
 
 impl Role {
     /// Every role, in a fixed order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Worker,
         Self::Miner,
         Self::Hauler,
@@ -75,6 +79,7 @@ impl Role {
         Self::Signer,
         Self::Defender,
         Self::RemoteDefender,
+        Self::Explorer,
     ];
 
     /// The first byte of the role's creep names. Never change or reuse one (see the module docs).
@@ -91,6 +96,7 @@ impl Role {
             Self::Signer => b'g',
             Self::Defender => b'd',
             Self::RemoteDefender => b'p',
+            Self::Explorer => b'x',
         }
     }
 
@@ -123,6 +129,7 @@ impl Role {
             Self::Signer => "signer",
             Self::Defender => "defender",
             Self::RemoteDefender => "remote defender",
+            Self::Explorer => "explorer",
         }
     }
 
@@ -416,7 +423,7 @@ mod tests {
             "w",
             "wW1N1",
             "wW1N1-",
-            "xW1N1-1",
+            "qW1N1-1",
             "WW1N1-1",
             "ww1n1-1",
             "wW01N1-1",
@@ -503,7 +510,7 @@ mod tests {
         assert_eq!(
             Role::ALL.map(Role::code),
             [
-                b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c', b'g', b'd', b'p'
+                b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c', b'g', b'd', b'p', b'x'
             ],
             "never change or reuse a code"
         );

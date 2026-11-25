@@ -57,6 +57,7 @@ pub struct Gates {
     pub towers: bool,
     pub ramparts: bool,
     pub late: bool,
+    pub observer: bool,
 }
 
 impl Gates {
@@ -66,6 +67,7 @@ impl Gates {
             towers: cfg.towers,
             ramparts: cfg.ramparts,
             late: cfg.late,
+            observer: cfg.observer,
         }
     }
 
@@ -77,6 +79,7 @@ impl Gates {
             Gate::Towers => self.towers,
             Gate::Ramparts => self.ramparts,
             Gate::Late => self.late,
+            Gate::Observer => self.observer,
         }
     }
 
@@ -1005,6 +1008,7 @@ mod tests {
                 towers: true,
                 ramparts: true,
                 late: true,
+                observer: true,
             },
         ] {
             a.gates = gates;
@@ -1211,18 +1215,19 @@ mod tests {
         earliest_level(kind, 0).expect("allowed at some level")
     }
 
-    /// Gates from four bits: storage, towers, ramparts, late.
+    /// Gates from five bits: storage, towers, ramparts, late, observer.
     fn gates(bits: u8) -> Gates {
         Gates {
             storage: bits & 1 != 0,
             towers: bits & 2 != 0,
             ramparts: bits & 4 != 0,
             late: bits & 8 != 0,
+            observer: bits & 16 != 0,
         }
     }
 
     /// Every gate on.
-    const ALL_ON: u8 = 0b1111;
+    const ALL_ON: u8 = 0b1_1111;
 
     /// The bit of `kind` in [`Ask::full`].
     fn full_bit(kind: StructureType) -> u32 {
@@ -1427,11 +1432,11 @@ mod tests {
     }
 
     /// C14: under the MMO profile's gates no storage or late structure (terminal, extractor and
-    /// mineral container, lab, factory, power spawn, nuker, observer) is due at any level, so none
-    /// is counted or offered; the tower, the rampart and the wall are due from the first level that
-    /// allows each (P7.2 turned the towers' gate on, P7.3 the ramparts' and with it the walls',
-    /// ADR-026, ADR-032), and the one of them first in the planner's kind order is offered; with
-    /// every gate on, each is due at the top level.
+    /// mineral container, lab, factory, power spawn, nuker) is due at any level, so none is counted
+    /// or offered; the tower, the rampart, the wall and the observer are due from the first level
+    /// that allows each (P7.2 turned the towers' gate on, P7.3 the ramparts' and with it the
+    /// walls', ADR-026, ADR-032, and P8.1 the observer's, ADR-039), and the one of them first in
+    /// the planner's kind order is offered; with every gate on, each is due at the top level.
     ///
     /// Uses: `PLANNER_MMO` (its gates), `CONTROLLER_STRUCTURES` (through `earliest_level`: each
     /// at the first level that allows it), `MAX_LEVEL`.
@@ -1481,6 +1486,7 @@ mod tests {
                 StructureType::Tower,
                 StructureType::Rampart,
                 StructureType::Wall,
+                StructureType::Observer,
             ]
             .into_iter()
             .filter(|&k| level >= first(k))

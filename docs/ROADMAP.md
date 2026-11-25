@@ -191,7 +191,7 @@ Modules:
   bot's response, are recorded when one comes, with P8's gate as the backstop. Scripted attacks are a private-track scenario (PS3).
 
 ## P8 Expansion (SPEC §3.7)
-- [ ] Scouting and observers (structures that give vision of a distant room).
+- [x] Scouting and observers (structures that give vision of a distant room; ADR-039: one explorer creep, the atlas of rooms within 10 of a home in segment 94, the observers at RCL8 with their own planner gate).
 - [ ] Claim scoring.
 - [ ] Claimers and pioneers (creeps sent to build up a newly claimed room).
 - [ ] GCL (global control level, which caps how many rooms the bot may own) and CPU limits respected.

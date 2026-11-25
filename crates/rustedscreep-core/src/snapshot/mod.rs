@@ -26,10 +26,11 @@ pub use intern::{Handle, Interner, ObjectKey};
 pub use room_name::parse_room_name;
 pub use tables::{
     BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepClass, CreepHandle, CreepRow,
-    CreepStore, Creeps, Links, ObjectClass, ObjectHandle, ObjectKind, ObjectRow, ObjectStatic,
-    RemoteRead, Reservation, RoomEnergy, RoomObjects, Rooms, SIGN_TOWERS, SafeModeState, SignRead,
-    SignSeen, Spawns, StructureClass, StructureHandle, StructureStatic, Structures, Towers,
-    known_structure_type, position_from_packed,
+    CreepStore, Creeps, INTEL_SOURCES, IntelRead, Links, MineralRead, ObjectClass, ObjectHandle,
+    ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation, RoomEnergy, RoomObjects,
+    RoomStatus, Rooms, SIGN_TOWERS, SafeModeState, SignRead, SignSeen, Spawns, StructureClass,
+    StructureHandle, StructureStatic, Structures, Towers, known_structure_type,
+    position_from_packed,
 };
 pub use tick::TickContext;
 

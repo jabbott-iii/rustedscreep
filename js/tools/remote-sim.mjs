@@ -812,9 +812,10 @@ export function remoteSim(dir = join(ROOT, 'dist')) {
   const world = simulate(dir, {
     ticks: RUN,
     setup: (context, w) => {
-      // The controller signer (ADR-030) is off for this run: its spawn requests and route searches are not remote
-      // mining's, and sign-sim.mjs covers them. The record is in segment CONFIG_SEGMENT before the first global.
-      w.segments[CONFIG_SEGMENT] ??= configRecord(['sign.enabled=false']);
+      // The controller signer (ADR-030) and scouting (ADR-039) are off for this run: their spawn requests, room reads
+      // and route searches are not remote mining's, and sign-sim.mjs and scout-sim.mjs cover them. The record is in
+      // segment CONFIG_SEGMENT before the first global.
+      w.segments[CONFIG_SEGMENT] ??= configRecord(['sign.enabled=false', 'scout.enabled=false']);
       state.context = context;
       context.Creep = EngineCreep;
       context.PathFinder = makePathFinder(state, definePositions(context));

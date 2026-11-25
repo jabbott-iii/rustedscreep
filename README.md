@@ -102,6 +102,7 @@ the console to see the build, the loader's phase, and any incidents.
 | `rustedscreep.planner()` | Each room's base plan and its placement |
 | `rustedscreep.remote()` | The rooms it mines remotely, with their figures and creeps |
 | `rustedscreep.sign()` | The controller signer's record and its current trip |
+| `rustedscreep.scout()` | What the bot knows of the rooms near its homes, the explorer, and the observers' looks |
 | `rustedscreep.movement()` | Movement's rooms, grids, flow fields, and traffic |
 | `rustedscreep.consts()` | The constants self-check: this build's game constants against the server's |
 | `rustedscreep.persist()` | The RawMemory segments it uses |
@@ -126,7 +127,8 @@ change it and build the bot yourself.
 ## What it uses in your account
 
 - **A whole code branch.** The GitHub link deletes any module that is not in `deploy/`.
-- **RawMemory segments 95 to 99** (the game's numbered strings that survive between ticks): the signer's record (95),
+- **RawMemory segments 94 to 99** (the game's numbered strings that survive between ticks): the atlas of rooms near
+  its homes (94), the signer's record (95),
   the base planner's record (96), the settings (97), a self-test (98), and the profiler's statistics (99, in a
   profiler build only).
 - **Almost none of `Memory`.** The bot never reads `Memory` (the game's JSON store, which costs CPU to parse) for its

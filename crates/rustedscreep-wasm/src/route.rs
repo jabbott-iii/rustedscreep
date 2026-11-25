@@ -60,7 +60,7 @@ extern "C" {
 
 /// A room's status as `Game.map.getRoomStatus` gives it (V168); `None` when it could not be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Status {
+pub(crate) enum Status {
     Normal,
     Closed,
     Novice,
@@ -68,7 +68,7 @@ enum Status {
     Other,
 }
 
-fn read_status(room: RoomName) -> Option<Status> {
+pub(crate) fn read_status(room: RoomName) -> Option<Status> {
     let name = JsString::from(room);
     let result = get_room_status(&name).ok()?;
     let status = Reflect::get(&result, &JsValue::from_str("status")).ok()?;

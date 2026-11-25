@@ -1178,13 +1178,13 @@ enum Reach {
 
 /// The Chebyshev distance between two positions in world tiles: no path between them is shorter
 /// (a step moves one tile on each axis at most). Unit: tiles.
-fn world_range(a: Position, b: Position) -> u32 {
+pub(crate) fn world_range(a: Position, b: Position) -> u32 {
     let (a, b) = (a.world_coords(), b.world_coords());
     let d = (a.0 - b.0).abs().max((a.1 - b.1).abs());
     u32::try_from(d).unwrap_or(u32::MAX)
 }
 
-fn at(room: RoomName, t: Tile) -> Option<Position> {
+pub(crate) fn at(room: RoomName, t: Tile) -> Option<Position> {
     Some(Position::new(
         RoomCoordinate::new(t.x()).ok()?,
         RoomCoordinate::new(t.y()).ok()?,

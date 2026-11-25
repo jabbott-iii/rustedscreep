@@ -27,6 +27,8 @@
 //! - [`planner`]: the base planner: the room's layout, its checks, and site placement.
 //! - [`defense`]: the threat assessment of hostile creeps and the towers' fire and heals.
 //! - [`signing`]: the controller signer.
+//! - [`expansion`]: scouting for expansion: the atlas of the rooms near the homes, the explorer,
+//!   and the observers.
 //! - [`persist`]: the binary formats and the manager of the RawMemory segments (strings the game
 //!   keeps between ticks) that survive a global reset.
 //! - [`config`]: every threshold, the server profiles, and the runtime overrides.
@@ -51,6 +53,7 @@ pub mod config;
 pub mod consts_check;
 pub mod defense;
 pub mod economy;
+pub mod expansion;
 pub mod intents;
 pub mod movement;
 pub mod persist;

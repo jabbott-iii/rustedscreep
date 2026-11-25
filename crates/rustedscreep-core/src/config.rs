@@ -22,8 +22,8 @@ use core::fmt;
 
 use rustedscreep_consts::{
     CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, LINK_CAPACITY, MAX_CONSTRUCTION_SITES,
-    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, RAMPART_DECAY_AMOUNT,
-    RAMPART_DECAY_TIME, RAMPART_HITS_MAX_RCL2, ROOM_SIZE, TOWER_CAPACITY,
+    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, OBSERVER_RANGE,
+    RAMPART_DECAY_AMOUNT, RAMPART_DECAY_TIME, RAMPART_HITS_MAX_RCL2, ROOM_SIZE, TOWER_CAPACITY,
 };
 
 /// How the loader recovers after a trap or an aborted tick (ADR-003).
@@ -199,6 +199,9 @@ pub struct PersistConfig {
     /// sign it showed, when it was seen, its controller's tile, the seen towers, and the signers
     /// lost there (`signing::Book`, ADR-030; 0 to 99). Unit: segment id.
     pub sign_segment: u8,
+    /// The segment that keeps the atlas across global resets: per room near a home what the bot
+    /// last saw of it (`expansion::Atlas`, ADR-039; 0 to 99). Unit: segment id.
+    pub atlas_segment: u8,
 }
 
 /// Segment manager values for the official MMO.
@@ -210,6 +213,7 @@ pub const PERSIST_MMO: PersistConfig = PersistConfig {
     config_segment: 97,
     planner_segment: 96,
     sign_segment: 95,
+    atlas_segment: 94,
 };
 
 /// How much the bot logs, least verbose first. rustedscreep-wasm maps it to `log::LevelFilter`
@@ -678,8 +682,11 @@ pub struct PlannerConfig {
     /// workers keep them at [`UpkeepConfig::rampart_permille`] of their level's hits).
     pub ramparts: bool,
     /// Places the terminal, the extractor and its container, the labs, the factory, the power spawn,
-    /// the nuker and the observer (nothing uses them before P9).
+    /// and the nuker (nothing uses them before P9).
     pub late: bool,
+    /// Places the observer (at RCL8, the only level that allows one), which the atlas's observer
+    /// loop uses (P8.1, ADR-039). Split from [`Self::late`].
+    pub observer: bool,
     /// The most own construction sites a room may hold before the placement waits: one site a
     /// tick goes out, first the economy's containers and links on the plan's tiles (ADR-023 to
     /// ADR-025's timing), then the plan's items by type (spawns, extensions, ... roads). Unit:
@@ -707,6 +714,7 @@ pub const PLANNER_MMO: PlannerConfig = PlannerConfig {
     towers: true,
     ramparts: true,
     late: false,
+    observer: true,
     max_sites: 10,
     verify_ticks: 500,
     hub_clearance: 3,
@@ -831,6 +839,52 @@ pub const SIGN_MMO: SignConfig = SignConfig {
     max_deaths: 2,
     max_overwrites: 2,
     damage_margin_pct: 25,
+    life_margin_ticks: 50,
+    route_max_ops: 10_000,
+    route_max_rooms: 64,
+    save_ticks: 100,
+};
+
+/// Scouting (ROADMAP P8.1, ADR-039, `expansion::Scouting`): the atlas's reads, the explorer, and
+/// the observers. `docs/TUNING.md` gives each one's rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScoutConfig {
+    /// Runs scouting: the atlas's reads, the explorer, and the observers. Off, nothing is read, no
+    /// explorer is requested (one alive stands where it is until it dies), and no observer looks.
+    pub enabled: bool,
+    /// Runs the observer loop (each own observer looks at the stalest due room in range). Off, the
+    /// reads and the explorer go on.
+    pub observers: bool,
+    /// The least controller level a home has before its rooms are scouted (remote mining and the
+    /// signer start at the same level). Unit: RCL.
+    pub min_level: u32,
+    /// The farthest a scouted room lies from a home, by the larger of the two room-coordinate
+    /// differences. The default is `OBSERVER_RANGE`, so the explorer and an observer cover one
+    /// square (the user's choice). Unit: rooms.
+    pub max_distance: u32,
+    /// A room's record is due again this long after it was read (or marked unreachable). Unit:
+    /// ticks.
+    pub refresh_ticks: u32,
+    /// The most visible rooms the snapshot reads for the atlas in one tick. Unit: rooms.
+    pub max_reads: u32,
+    /// Ticks of life a trip must leave spare by the walk's estimate. Unit: ticks.
+    pub life_margin_ticks: u32,
+    /// PathFinder's `maxOps` for a trip's route search (V163). Unit: ops.
+    pub route_max_ops: u32,
+    /// PathFinder's `maxRooms` for a trip's route search (at most 64, V163). Unit: rooms.
+    pub route_max_rooms: u32,
+    /// The record is written at most once per this many ticks while it has changes. Unit: ticks.
+    pub save_ticks: u32,
+}
+
+/// Scouting values for the official MMO.
+pub const SCOUT_MMO: ScoutConfig = ScoutConfig {
+    enabled: true,
+    observers: true,
+    min_level: 3,
+    max_distance: OBSERVER_RANGE,
+    refresh_ticks: 50_000,
+    max_reads: 4,
     life_margin_ticks: 50,
     route_max_ops: 10_000,
     route_max_rooms: 64,
@@ -975,6 +1029,7 @@ pub struct Config {
     pub planner: PlannerConfig,
     pub remote: RemoteConfig,
     pub sign: SignConfig,
+    pub scout: ScoutConfig,
     pub defense: DefenseConfig,
     pub upkeep: UpkeepConfig,
 }
@@ -1007,6 +1062,7 @@ pub const MMO: Profile = Profile {
         planner: PLANNER_MMO,
         remote: REMOTE_MMO,
         sign: SIGN_MMO,
+        scout: SCOUT_MMO,
         defense: DEFENSE_MMO,
         upkeep: UPKEEP_MMO,
     },
@@ -1169,7 +1225,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 148;
+pub const FIELD_COUNT: usize = 160;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1299,6 +1355,7 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(persist, "PersistConfig", config_segment, 0, 99, false),
     number!(persist, "PersistConfig", planner_segment, 0, 99, false),
     number!(persist, "PersistConfig", sign_segment, 0, 99, false),
+    number!(persist, "PersistConfig", atlas_segment, 0, 99, false),
     Field {
         key: "log.level",
         tuning: "LogConfig::level",
@@ -1449,6 +1506,7 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     flag!(planner, "PlannerConfig", towers, true),
     flag!(planner, "PlannerConfig", ramparts, true),
     flag!(planner, "PlannerConfig", late, true),
+    flag!(planner, "PlannerConfig", observer, true),
     number!(
         planner,
         "PlannerConfig",
@@ -1550,6 +1608,30 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(sign, "SignConfig", route_max_ops, 1000, 100_000, true),
     number!(sign, "SignConfig", route_max_rooms, 1, 64, true),
     number!(sign, "SignConfig", save_ticks, 1, 10_000, true),
+    flag!(scout, "ScoutConfig", enabled, true),
+    flag!(scout, "ScoutConfig", observers, true),
+    number!(scout, "ScoutConfig", min_level, 1, 8, true),
+    number!(scout, "ScoutConfig", max_distance, 1, 20, true),
+    number!(
+        scout,
+        "ScoutConfig",
+        refresh_ticks,
+        CREEP_LIFE_TIME,
+        10_000_000,
+        true
+    ),
+    number!(scout, "ScoutConfig", max_reads, 1, 20, true),
+    number!(
+        scout,
+        "ScoutConfig",
+        life_margin_ticks,
+        0,
+        CREEP_LIFE_TIME / 2,
+        true
+    ),
+    number!(scout, "ScoutConfig", route_max_ops, 1000, 100_000, true),
+    number!(scout, "ScoutConfig", route_max_rooms, 1, 64, true),
+    number!(scout, "ScoutConfig", save_ticks, 1, 10_000, true),
     number!(
         defense,
         "DefenseConfig",
@@ -1638,7 +1720,7 @@ pub struct Rule {
 /// `CPU_TICK_LIMIT_MAX`: Standard switches on from the bucket at the start of the tick, and one tick
 /// is billed about tickLimit at most (the scheduler stops every tier at the ceiling and the reserve
 /// covers the rest), so a Standard tick leaves the bucket at or above the boot gate (TUNING.md).
-pub static RULES: [Rule; 18] = [
+pub static RULES: [Rule; 23] = [
     Rule {
         keys: ["loader.backoff_base_ticks", "loader.backoff_max_ticks"],
         text: "loader.backoff_base_ticks must be at most loader.backoff_max_ticks",
@@ -1719,6 +1801,31 @@ pub static RULES: [Rule; 18] = [
         keys: ["persist.sign_segment", "persist.planner_segment"],
         text: "persist.sign_segment and persist.planner_segment must differ",
         holds: |c| c.persist.sign_segment != c.persist.planner_segment,
+    },
+    Rule {
+        keys: ["persist.atlas_segment", "profiler.stats_segment"],
+        text: "persist.atlas_segment and profiler.stats_segment must differ",
+        holds: |c| c.persist.atlas_segment != c.profiler.stats_segment,
+    },
+    Rule {
+        keys: ["persist.atlas_segment", "persist.self_test_segment"],
+        text: "persist.atlas_segment and persist.self_test_segment must differ",
+        holds: |c| c.persist.atlas_segment != c.persist.self_test_segment,
+    },
+    Rule {
+        keys: ["persist.atlas_segment", "persist.config_segment"],
+        text: "persist.atlas_segment and persist.config_segment must differ",
+        holds: |c| c.persist.atlas_segment != c.persist.config_segment,
+    },
+    Rule {
+        keys: ["persist.atlas_segment", "persist.planner_segment"],
+        text: "persist.atlas_segment and persist.planner_segment must differ",
+        holds: |c| c.persist.atlas_segment != c.persist.planner_segment,
+    },
+    Rule {
+        keys: ["persist.atlas_segment", "persist.sign_segment"],
+        text: "persist.atlas_segment and persist.sign_segment must differ",
+        holds: |c| c.persist.atlas_segment != c.persist.sign_segment,
     },
     Rule {
         keys: ["repair.walk_pct", "repair.start_pct"],
@@ -1815,6 +1922,7 @@ mod tests {
             config_segment: _,
             planner_segment: _,
             sign_segment: _,
+            atlas_segment: _,
         } = PERSIST_MMO;
         let LogConfig {
             level: _,
@@ -1866,6 +1974,7 @@ mod tests {
             planner: _,
             remote: _,
             sign: _,
+            scout: _,
             defense: _,
             upkeep: _,
         } = MMO.config;
@@ -1925,6 +2034,7 @@ mod tests {
             towers: _,
             ramparts: _,
             late: _,
+            observer: _,
             max_sites: _,
             verify_ticks: _,
             hub_clearance: _,
@@ -1961,6 +2071,18 @@ mod tests {
             route_max_rooms: _,
             save_ticks: _,
         } = SIGN_MMO;
+        let ScoutConfig {
+            enabled: _,
+            observers: _,
+            min_level: _,
+            max_distance: _,
+            refresh_ticks: _,
+            max_reads: _,
+            life_margin_ticks: _,
+            route_max_ops: _,
+            route_max_rooms: _,
+            save_ticks: _,
+        } = SCOUT_MMO;
         let DefenseConfig {
             threat_end_ticks: _,
             threat_log_ticks: _,
@@ -1986,7 +2108,7 @@ mod tests {
             rampart_floor: _,
             rampart_refill: _,
         } = UPKEEP_MMO;
-        let expected: [(&str, &[&str]); 19] = [
+        let expected: [(&str, &[&str]); 20] = [
             (
                 "loader",
                 &[
@@ -2030,6 +2152,7 @@ mod tests {
                     "config_segment",
                     "planner_segment",
                     "sign_segment",
+                    "atlas_segment",
                 ],
             ),
             ("log", &["level", "skip_window_ticks", "consts_findings"]),
@@ -2134,6 +2257,7 @@ mod tests {
                     "towers",
                     "ramparts",
                     "late",
+                    "observer",
                     "max_sites",
                     "verify_ticks",
                     "hub_clearance",
@@ -2171,6 +2295,21 @@ mod tests {
                     "max_deaths",
                     "max_overwrites",
                     "damage_margin_pct",
+                    "life_margin_ticks",
+                    "route_max_ops",
+                    "route_max_rooms",
+                    "save_ticks",
+                ],
+            ),
+            (
+                "scout",
+                &[
+                    "enabled",
+                    "observers",
+                    "min_level",
+                    "max_distance",
+                    "refresh_ticks",
+                    "max_reads",
                     "life_margin_ticks",
                     "route_max_ops",
                     "route_max_rooms",

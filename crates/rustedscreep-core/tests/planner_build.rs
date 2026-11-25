@@ -32,6 +32,7 @@ const ALL: Gates = Gates {
     towers: true,
     ramparts: true,
     late: true,
+    observer: true,
 };
 
 /// The ground from a list of what stands (the plan's first spawn among it).
@@ -894,12 +895,13 @@ fn needed(gates: &Gates, from: &[u8; GATES], level: u8) -> bool {
 #[test]
 fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
     let mmo = Gates::from_config(&PLANNER_MMO);
-    let combos: Vec<Gates> = (0u8..16)
+    let combos: Vec<Gates> = (0u8..32)
         .map(|b| Gates {
             storage: b & 1 != 0,
             towers: b & 2 != 0,
             ramparts: b & 4 != 0,
             late: b & 8 != 0,
+            observer: b & 16 != 0,
         })
         .collect();
     assert!(combos.contains(&mmo) && combos.contains(&ALL));
@@ -993,6 +995,7 @@ fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
                     Gate::Towers => mmo.towers,
                     Gate::Ramparts => mmo.ramparts,
                     Gate::Late => mmo.late,
+                    Gate::Observer => mmo.observer,
                 };
                 let unneeded = Gate::ALL
                     .iter()
@@ -1023,9 +1026,10 @@ fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
 }
 
 /// The types the MMO's gates never place (`PLANNER_MMO`: the storage and the late structures off;
-/// the towers are on since P7.2, the ramparts and walls since P7.3; the containers and links are
-/// the economy's or a gated one's, the mineral container and the hub link).
-const NOT_UNDER_MMO: [StructureType; 10] = [
+/// the towers are on since P7.2, the ramparts and walls since P7.3, the observer since P8.1; the
+/// containers and links are the economy's or a gated one's, the mineral container and the hub
+/// link).
+const NOT_UNDER_MMO: [StructureType; 9] = [
     StructureType::Storage,
     StructureType::Terminal,
     StructureType::Extractor,
@@ -1033,24 +1037,23 @@ const NOT_UNDER_MMO: [StructureType; 10] = [
     StructureType::Factory,
     StructureType::PowerSpawn,
     StructureType::Nuker,
-    StructureType::Observer,
     StructureType::Container,
     StructureType::Link,
 ];
 
 /// Under the MMO's gates every plan builds up level by level from its first spawn, with the
 /// economy's containers and links standing as `economy::mining` places them, and `build::next`
-/// offers only spawns, extensions, towers (on since P7.2), ramparts and walls (on since P7.3) and
-/// the roads due for them (C14): no
+/// offers only spawns, extensions, towers (on since P7.2), ramparts and walls (on since P7.3), the
+/// observer (on since P8.1) and the roads due for them (C14): no
 /// destroy, no site of a gated type or of the economy's, every item it places built at each level,
 /// and at the top the room holds exactly those, the economy's and the first spawn.
 ///
 /// Uses: `PLANNER_MMO` (the gates, `replace`, `max_sites`), `CONTROLLER_STRUCTURES` (through
 /// `allowed`: each level's count), `MAX_LEVEL`.
 #[test]
-fn the_mmo_gates_place_only_spawns_extensions_towers_ramparts_and_their_roads() {
+fn the_mmo_gates_place_only_spawns_extensions_towers_ramparts_observers_and_their_roads() {
     let gates = Gates::from_config(&PLANNER_MMO);
-    assert!(!gates.storage && gates.towers && gates.ramparts && !gates.late);
+    assert!(!gates.storage && gates.towers && gates.ramparts && !gates.late && gates.observer);
     let mut s = Scratch::default();
     let (mut rooms, mut sites) = (0u32, 0usize);
     harness::each(|room, mode, input| {
@@ -1101,7 +1104,7 @@ fn the_mmo_gates_place_only_spawns_extensions_towers_ramparts_and_their_roads() 
                         assert!(
                             matches!(
                                 Gate::of(kind, tile, roles),
-                                Gate::Base | Gate::Towers | Gate::Ramparts
+                                Gate::Base | Gate::Towers | Gate::Ramparts | Gate::Observer
                             ),
                             "{what}"
                         );

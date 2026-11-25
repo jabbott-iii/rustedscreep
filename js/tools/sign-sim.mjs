@@ -17,7 +17,8 @@
 // The tour this gives: W1N1 first (the nearest home's own room), then the due rooms one room away in packed-name order
 // (signing/mod.rs `nearest_due`): W2N2 (a look through W2N1, which finds the server's sign), W2N1 (signed), and W1N2, whose
 // refused route ends the signer; the next plan's search from the home spawn then marks W1N2 unreachable.
-// The run starts with the overrides `sign.max_distance=1` and `sign.save_ticks=5` in segment 97 (the runtime config's
+// The run starts with the overrides `sign.max_distance=1`, `sign.save_ticks=5` and `scout.enabled=false` (scouting,
+// ADR-039, is scout-sim.mjs's) in segment 97 (the runtime config's
 // record), which the bot loads on its second loop.
 // The harness plays the engine's part as far as the bot can see it:
 // - `spawnCreep(body, name)` makes the runtime's checks in V171's order and its `Memory.creeps[name]` write (V181); the
@@ -108,9 +109,11 @@ const SERVER_SIGN = {
   datetime: Date.UTC(2026, 10, 1),
 };
 const SAVE_TICKS = 5;
-const CONFIG_LINES = ['sign.max_distance=1', `sign.save_ticks=${SAVE_TICKS}`];
+// Scouting (ADR-039) is off: its explorer, room reads and route searches are not the signer's, and scout-sim.mjs covers
+// them.
+const CONFIG_LINES = ['sign.max_distance=1', `sign.save_ticks=${SAVE_TICKS}`, 'scout.enabled=false'];
 /** The runtime config's log line for the record above (crates/rustedscreep-wasm/src/config.rs `loaded`). */
-const CONFIG_LINE = `rustedscreep config: 2 override(s) from segment ${CONFIG_SEGMENT} (written at tick 0): ${CONFIG_LINES.join(' ')}`;
+const CONFIG_LINE = `rustedscreep config: ${CONFIG_LINES.length} override(s) from segment ${CONFIG_SEGMENT} (written at tick 0): ${CONFIG_LINES.join(' ')}`;
 /** The signer's body (signing::plain_signer) and its cost. */
 const SIGNER_BODY = ['move'];
 const SIGNER_COST = SIGNER_BODY.reduce((s, p) => s + C.BODYPART_COST[p], 0);

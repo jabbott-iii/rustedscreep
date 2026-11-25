@@ -7,7 +7,9 @@
 //! the planner's record (`PersistConfig::planner_segment`, ADR-027; requested the same way, and no
 //! room is planned until its load has finished), the controller signer's record
 //! (`PersistConfig::sign_segment`, ADR-030; requested once a home reaches `sign.min_level`, and no
-//! signer is planned until its load has finished) and the self-test
+//! signer is planned until its load has finished), the atlas (`PersistConfig::atlas_segment`,
+//! ADR-039; requested once a home reaches `scout.min_level`, and nothing is read or toured until
+//! its load has finished) and the self-test
 //! (`PersistConfig::self_test_segment`). The manager's limits come from the config in
 //! force (`config::Runtime`), so the overridable ones apply from the tick after a change.
 //!
@@ -44,6 +46,7 @@ use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 
 use crate::config::{PROFILE, Runtime};
 use crate::planner::PlannerGlue;
+use crate::scout::ScoutGlue;
 use crate::sign::SignGlue;
 
 #[wasm_bindgen]
@@ -108,6 +111,11 @@ pub struct Persist {
     sign_id: Option<SegmentId>,
     /// The signer's record was requested this global.
     sign_requested: bool,
+    atlas_id: Option<SegmentId>,
+    /// The atlas was requested this global.
+    atlas_requested: bool,
+    /// Rooms the last atlas write left out (a warning only when it changes).
+    atlas_left_out: usize,
     /// Frame text for writes.
     text: String,
     /// Decoded frame bytes for loads.
@@ -128,6 +136,7 @@ impl Default for Persist {
         let config_id = SegmentId::new(ids.persist.config_segment);
         let planner_id = SegmentId::new(ids.persist.planner_segment);
         let sign_id = SegmentId::new(ids.persist.sign_segment);
+        let atlas_id = SegmentId::new(ids.persist.atlas_segment);
         let mut mgr = Segments::new(reserved);
         // The signer's record is requested only once a home sends signers (`request_sign_load`).
         for id in [config_id, planner_id].into_iter().flatten() {
@@ -142,6 +151,9 @@ impl Default for Persist {
             planner_id,
             sign_id,
             sign_requested: false,
+            atlas_id,
+            atlas_requested: false,
+            atlas_left_out: 0,
             text: String::new(),
             bytes: Vec::new(),
             scratch: Vec::new(),
@@ -216,15 +228,17 @@ impl Persist {
         cfg: &mut Runtime,
         planner: &mut PlannerGlue,
         sign: &mut SignGlue,
+        scout: &mut ScoutGlue,
     ) {
         let due = self.mgr.due(now);
         if !due.is_empty() && tick.allows(LOAD.tier) {
-            self.load_due(tick, due, now, cfg, planner, sign);
+            self.load_due(tick, due, now, cfg, planner, sign, scout);
         }
     }
 
     /// Kept out of the per-tick `loop` function: loads are rare (once per global, or on request).
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn load_due<C: Clock>(
         &mut self,
         tick: &mut TickCpu<'_, C>,
@@ -233,6 +247,7 @@ impl Persist {
         cfg: &mut Runtime,
         planner: &mut PlannerGlue,
         sign: &mut SignGlue,
+        scout: &mut ScoutGlue,
     ) {
         let segs = match read_segments() {
             Ok(s) => s,
@@ -242,7 +257,7 @@ impl Persist {
                 for id in due.iter() {
                     let limits = cfg.get().persist;
                     if let Some(err) = self.mgr.absent(id, &limits) {
-                        self.deliver(id, now, err, None, cfg, planner, sign);
+                        self.deliver(id, now, err, None, cfg, planner, sign, scout);
                     }
                 }
                 return;
@@ -252,7 +267,7 @@ impl Persist {
         let mut job = self.job;
         tick.run_steps(&LOAD, &mut job, |_, _| {
             if let Some(id) = ids.next() {
-                self.load_one(&segs, id, now, cfg, planner, sign);
+                self.load_one(&segs, id, now, cfg, planner, sign, scout);
             }
             Ok(if ids.peek().is_some() {
                 Step::More
@@ -263,6 +278,7 @@ impl Persist {
         self.job = job;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn load_one(
         &mut self,
         segs: &JsValue,
@@ -271,6 +287,7 @@ impl Persist {
         cfg: &mut Runtime,
         planner: &mut PlannerGlue,
         sign: &mut SignGlue,
+        scout: &mut ScoutGlue,
     ) {
         let testing = Some(id) == self.test_id && matches!(self.test.phase(), Phase::Read { .. });
         let t0 = if testing { game::cpu::get_used() } else { 0.0 };
@@ -284,7 +301,7 @@ impl Persist {
         if value.is_undefined() {
             let limits = cfg.get().persist;
             if let Some(err) = self.mgr.absent(id, &limits) {
-                self.deliver(id, now, err, None, cfg, planner, sign);
+                self.deliver(id, now, err, None, cfg, planner, sign, scout);
             }
             return;
         }
@@ -295,8 +312,8 @@ impl Persist {
             None
         };
         let ok = match text {
-            None => self.deliver(id, now, LoadError::NotText, get, cfg, planner, sign),
-            Some(text) => self.deliver_text(id, now, &text, get, cfg, planner, sign),
+            None => self.deliver(id, now, LoadError::NotText, get, cfg, planner, sign, scout),
+            Some(text) => self.deliver_text(id, now, &text, get, cfg, planner, sign, scout),
         };
         self.mgr.loaded(id, ok);
     }
@@ -312,6 +329,7 @@ impl Persist {
         cfg: &mut Runtime,
         planner: &mut PlannerGlue,
         sign: &mut SignGlue,
+        scout: &mut ScoutGlue,
     ) -> bool {
         if Some(id) == self.config_id {
             let mut bytes = std::mem::take(&mut self.bytes);
@@ -331,6 +349,13 @@ impl Persist {
             let mut bytes = std::mem::take(&mut self.bytes);
             let frame = frame::decode(text, &mut bytes).map_err(LoadError::Decode);
             let ok = sign.loaded(id.get(), frame);
+            self.bytes = bytes;
+            return ok;
+        }
+        if Some(id) == self.atlas_id {
+            let mut bytes = std::mem::take(&mut self.bytes);
+            let frame = frame::decode(text, &mut bytes).map_err(LoadError::Decode);
+            let ok = scout.loaded(id.get(), frame);
             self.bytes = bytes;
             return ok;
         }
@@ -369,6 +394,7 @@ impl Persist {
         cfg: &mut Runtime,
         planner: &mut PlannerGlue,
         sign: &mut SignGlue,
+        scout: &mut ScoutGlue,
     ) -> bool {
         if Some(id) == self.config_id {
             return cfg.loaded(id.get(), Err(err));
@@ -378,6 +404,9 @@ impl Persist {
         }
         if Some(id) == self.sign_id {
             return sign.loaded(id.get(), Err(err));
+        }
+        if Some(id) == self.atlas_id {
+            return scout.loaded(id.get(), Err(err));
         }
         if Some(id) == self.test_id
             && let Some(v) = self.test.loaded(now, Err(err), get, &mut self.scratch)
@@ -397,20 +426,28 @@ impl Persist {
         cfg: &mut Runtime,
         planner: &PlannerGlue,
         sign: &SignGlue,
+        scout: &ScoutGlue,
     ) {
         let limits = &cfg.get().persist;
         if standard && (!self.mgr.dirty().is_empty() || self.mgr.plan_active(limits).is_some()) {
-            self.flush_work(now, cfg, planner, sign);
+            self.flush_work(now, cfg, planner, sign, scout);
         }
     }
 
     /// Kept out of the per-tick `loop` function: writes and activations are rare.
     #[inline(never)]
-    fn flush_work(&mut self, now: u32, cfg: &mut Runtime, planner: &PlannerGlue, sign: &SignGlue) {
+    fn flush_work(
+        &mut self,
+        now: u32,
+        cfg: &mut Runtime,
+        planner: &PlannerGlue,
+        sign: &SignGlue,
+        scout: &ScoutGlue,
+    ) {
         let limits = cfg.get().persist;
         if !self.mgr.dirty().is_empty() {
             match read_segments() {
-                Ok(segs) => self.write(&segs, now, cfg, planner, sign),
+                Ok(segs) => self.write(&segs, now, cfg, planner, sign, scout),
                 Err(why) => {
                     self.fail(Op::Segments, now, why);
                     self.abort_test_write(now);
@@ -440,6 +477,7 @@ impl Persist {
         cfg: &mut Runtime,
         planner: &PlannerGlue,
         sign: &SignGlue,
+        scout: &ScoutGlue,
     ) {
         let (count, present) = match present_keys(segs) {
             Ok(k) => k,
@@ -467,6 +505,8 @@ impl Persist {
                 self.write_planner(segs, id, now, planner)
             } else if Some(id) == self.sign_id {
                 self.write_sign(segs, id, now, sign)
+            } else if Some(id) == self.atlas_id {
+                self.write_atlas(segs, id, now, scout)
             } else if Some(id) == self.test_id {
                 self.write_test(segs, id, now)
             } else {
@@ -574,6 +614,69 @@ impl Persist {
                 WriteResult::Failed
             }
         }
+    }
+
+    /// Writes the atlas (ADR-039): as many rooms as fit one segment's payload, the newest first
+    /// (`expansion::Atlas::encode`). A failed JS write stays dirty and is tried again next tick
+    /// (logged once per global).
+    fn write_atlas(
+        &mut self,
+        segs: &JsValue,
+        id: SegmentId,
+        now: u32,
+        scout: &ScoutGlue,
+    ) -> WriteResult {
+        self.scratch.clear();
+        let left_out = scout.payload(&mut self.scratch, rustedscreep_core::persist::MAX_PAYLOAD);
+        if left_out != self.atlas_left_out {
+            self.atlas_left_out = left_out;
+            if left_out > 0 {
+                log::warn!(
+                    "rustedscreep scout: the atlas does not fit a segment; {left_out} rooms seen \
+                     longest ago are left out of the write"
+                );
+            }
+        }
+        let encoded = frame::encode(
+            kind::ATLAS,
+            rustedscreep_core::expansion::SCHEMA,
+            now,
+            &self.scratch,
+            &mut self.text,
+        );
+        if encoded.is_err() {
+            log::warn!("rustedscreep scout: the atlas does not fit a segment; not written");
+            return WriteResult::Rejected;
+        }
+        match set_segment(segs, id, &self.text) {
+            Ok(()) => WriteResult::Written,
+            Err(why) => {
+                self.fail(Op::Set, now, why);
+                WriteResult::Failed
+            }
+        }
+    }
+
+    /// The atlas changed: it is written on the next output step that runs the Standard tier.
+    pub fn atlas_changed(&mut self) {
+        if let Some(id) = self.atlas_id {
+            self.mgr.mark_dirty(id);
+        }
+    }
+
+    /// Requests the atlas, once a global, as the signer's record ([`Self::request_sign_load`]).
+    pub fn request_atlas_load(&mut self) {
+        if !self.atlas_requested
+            && let Some(id) = self.atlas_id
+        {
+            self.atlas_requested = true;
+            self.mgr.request_load(id);
+        }
+    }
+
+    /// Whether a segment keeps the atlas (a valid `PersistConfig::atlas_segment`).
+    pub fn has_atlas_segment(&self) -> bool {
+        self.atlas_id.is_some()
     }
 
     /// The signer's record changed: it is written on the next output step that runs the Standard

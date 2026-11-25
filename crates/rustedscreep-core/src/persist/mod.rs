@@ -34,4 +34,6 @@ pub mod kind {
     pub const PLANNER: u16 = 3;
     /// The controller signer's rooms (`crate::signing::Book`, ADR-030).
     pub const SIGN: u16 = 4;
+    /// The atlas of the rooms near the homes (`crate::expansion::Atlas`, ADR-039).
+    pub const ATLAS: u16 = 5;
 }

@@ -64,12 +64,14 @@ pub enum Gate {
     /// Ramparts and walls.
     Ramparts,
     /// The terminal, the extractor and the mineral container, labs, the factory, the power spawn,
-    /// the nuker and the observer.
+    /// and the nuker.
     Late,
+    /// The observer (P8.1, ADR-039: split from [`Gate::Late`], since the atlas uses it).
+    Observer,
 }
 
 /// How many [`Gate`]s there are.
-pub const GATES: usize = 5;
+pub const GATES: usize = 6;
 
 impl Gate {
     /// Every gate, in index order.
@@ -79,6 +81,7 @@ impl Gate {
         Self::Towers,
         Self::Ramparts,
         Self::Late,
+        Self::Observer,
     ];
 
     /// The gate of the plan's `kind` on `tile` (a container or a link is the economy's but for the
@@ -93,6 +96,7 @@ impl Gate {
             StructureType::Storage => Self::Storage,
             StructureType::Tower => Self::Towers,
             StructureType::Rampart | StructureType::Wall => Self::Ramparts,
+            StructureType::Observer => Self::Observer,
             _ => Self::Late,
         }
     }

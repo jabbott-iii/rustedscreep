@@ -205,8 +205,14 @@ impl PlannerGlue {
         );
         let _ = write!(
             text,
-            " (replace {}, storage {}, towers {}, ramparts {}, late {}, max sites {});",
-            cfg.replace, cfg.storage, cfg.towers, cfg.ramparts, cfg.late, cfg.max_sites
+            " (replace {}, storage {}, towers {}, ramparts {}, late {}, observer {}, max sites {});",
+            cfg.replace,
+            cfg.storage,
+            cfg.towers,
+            cfg.ramparts,
+            cfg.late,
+            cfg.observer,
+            cfg.max_sites
         );
         match self.core.load_state() {
             None => text.push_str(" record: loading, no room planned yet;"),
