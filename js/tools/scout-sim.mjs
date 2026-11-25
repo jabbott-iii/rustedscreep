@@ -19,10 +19,12 @@
 //   it; a neutral controller at (25, 25), no source, no mineral.
 // With `scout.max_distance` 1 these three are the candidates: the other rooms within one of W1N1 are highways (W0x,
 // xN0), which cannot have a controller (economy::is_remote_room).
-// Both runs start with the overrides `sign.enabled=false` (no signer, whose creep would give vision too),
-// `scout.max_distance=1` and `scout.save_ticks=5` in segment 97 (the runtime config's record; scouting stays on), which
-// the bot loads on its second loop; it then requests segment 94 (the atlas), which loads on the loop after. The
-// snapshot reads a due room only once the atlas has loaded and the tick before ran the Optional tier.
+// Runs A and B start with the overrides `sign.enabled=false` (no signer, whose creep would give vision too),
+// `scout.max_distance=1`, `scout.save_ticks=5` and `claim.enabled=false` (claim scoring would read W2N1's terrain;
+// run C checks it) in segment 97 (the runtime config's record; scouting stays on), which the bot loads on its second
+// loop; it then requests segment 94 (the atlas), which loads on the loop after. Run C starts with the same overrides
+// but the last. The snapshot reads a due room only once the atlas has loaded and the tick before ran the Optional
+// tier.
 // Run A (explorer and record): the spawn holds SPAWN_ENERGY_CAPACITY. The explorer's tour this gives (expansion/mod.rs
 // `nearest_due`, by world tiles from where it stands to each room's center, then by packed name): out of the spawn on
 // (25, 24), W1N2's center is 49 tiles away and the other two 50, so W1N2 first, whose route the glue refuses before
@@ -112,6 +114,8 @@
 //    to the three rooms' entries;
 // 11. no spawnCreep call, no PathFinder search, no atlas load line (the segment was empty), and check 7's log and call
 //    rules (the read lines the only scout lines), with the observer's calls the only structure calls.
+// And in run C (claim scoring, ROADMAP P8.2, ADR-041: run B's world with claim scoring on), checks 12 to 15 at
+// `claimsRun`: W2N1's one terrain read, its best line with terms from the constants, and `rustedscreep.claims()`.
 // npm run check runs it (row 26); standalone: node js/tools/scout-sim.mjs [dir].
 import { join } from 'node:path';
 import { ROOT, fail, isMain } from './lib/common.mjs';
@@ -157,7 +161,9 @@ const CANDIDATES = [WEST, NORTH, CORNER];
 const SAVE_TICKS = 5;
 /** ScoutConfig's MMO default (crates/rustedscreep-core/src/config.rs SCOUT_MMO). */
 const REFRESH_TICKS = 50000;
-const CONFIG_LINES = ['sign.enabled=false', 'scout.max_distance=1', `scout.save_ticks=${SAVE_TICKS}`];
+const CONFIG_LINES = ['sign.enabled=false', 'scout.max_distance=1', `scout.save_ticks=${SAVE_TICKS}`, 'claim.enabled=false'];
+/** Run C's overrides: claim scoring stays on. */
+const C_CONFIG_LINES = CONFIG_LINES.filter((l) => !l.startsWith('claim.'));
 /** The runtime config's log line for the record above (crates/rustedscreep-wasm/src/config.rs `loaded`). */
 const CONFIG_LINE = `rustedscreep config: ${CONFIG_LINES.length} override(s) from segment ${CONFIG_SEGMENT} (written at tick 0): ${CONFIG_LINES.join(' ')}`;
 /** The explorer's body (expansion `request`) and its cost. */
@@ -178,6 +184,16 @@ const TOUR_MAX = 500;
 /** Run B: loops after the last read before the final summary, and the run's limit. */
 const B_SETTLE = 20;
 const B_MAX = 200;
+/** Run C: loops after the best line before the summary, and the run's limit. */
+const C_SETTLE = 5;
+const C_MAX = 300;
+const CLAIMS = 'rustedscreep.claims()';
+/** ClaimConfig's MMO default `distance_cost` (crates/rustedscreep-core/src/config.rs CLAIM_MMO). Unit: me/t a room. */
+const DISTANCE_COST = 1000;
+/** Claim scoring's best line (crates/rustedscreep-wasm/src/claim.rs `log_events` and `describe`). */
+const E = '(-?\\d+\\.\\d{3})';
+const BEST_LINE = new RegExp(`^rustedscreep claims: best ${WEST} from ${HOME}, 1 room, 2 sources: ${E} e/t \\(sources ${E}, `
+  + `remotes ${E}, distance ${E}, foreign ${E}, walks ${E}, ramparts ${E}\\), first spawn \\((\\d+), (\\d+)\\), (\\d+) ramparts$`);
 
 const count = (body, part) => body.filter((p) => p === part).length;
 const at = (p) => `(${p.x}, ${p.y})`;
@@ -798,7 +814,7 @@ function runWorld(state, dir, ticks, command) {
     ticks,
     setup: (context, w) => {
       // The overrides in segment CONFIG_SEGMENT before the first global, in the config's field order.
-      w.segments[CONFIG_SEGMENT] ??= configRecord(CONFIG_LINES);
+      w.segments[CONFIG_SEGMENT] ??= configRecord(state.configLines ?? CONFIG_LINES);
       state.context = context;
       context.Creep = EngineCreep;
       context.PathFinder = makePathFinder(state, definePositions(context));
@@ -927,7 +943,7 @@ function checkReads(problems, loops, readAt) {
 }
 
 /** The log and call rules both runs share. */
-function checkLog(problems, world, state, allowed) {
+function checkLog(problems, world, state, allowed, terrainOk = false) {
   const bad = world.logs.filter((l) => /^rustedscreep (fault|incident)/.test(l) || l.startsWith('rustedscreep persist:')
     || (l.startsWith('rustedscreep scout: ') && !allowed(l)));
   problems.push(...bad.slice(0, 10).map((l) => `log: ${l}`));
@@ -942,7 +958,7 @@ function checkLog(problems, world, state, allowed) {
   for (const c of state.siteCalls) {
     if (c.room !== HOME || c.result !== C.OK || c.args !== 3 || !c.sameRoom) problems.push(`offset ${c.offset}: ${c.room} createConstructionSite(${c.x}, ${c.y}, ${c.type}) with ${c.args} arguments: ${c.result}`);
   }
-  if (state.terrainCalls.length) problems.push(`Game.map.getRoomTerrain calls ${JSON.stringify(state.terrainCalls.slice(0, 4))}`);
+  if (state.terrainCalls.length && !terrainOk) problems.push(`Game.map.getRoomTerrain calls ${JSON.stringify(state.terrainCalls.slice(0, 4))}`);
   if (world.segmentErrors.length) problems.push(`segment saves the driver would refuse: ${world.segmentErrors.join(' / ')}`);
 }
 
@@ -1238,16 +1254,112 @@ export function observerRun(dir) {
   };
 }
 
+/** `v` me/t as claim.rs `energy` prints it. */
+const energyText = (v) => `${v < 0 ? '-' : ''}${Math.floor(Math.abs(v) / 1000)}.${String(Math.abs(v) % 1000).padStart(3, '0')}`;
+/** Parses claim.rs `energy`'s text back to me/t. */
+const milli = (text) => Math.round(Number(text) * 1000);
+
+/**
+ * Run C (claim scoring, P8.2, ADR-041): run B's world with claim scoring on. The observer reads W2N2, W2N1 and W1N2;
+ * each read changes the atlas, so the ranking is built again on that loop. W2N2 (reserved by its invader core, V375)
+ * and W1N2 (no source) are left out, and W2N1 is the one candidate, planned with its terrain from one
+ * `Game.map.getRoomTerrain` call (no creep stands there, so movement holds none). It checks:
+ * 12. exactly one `Game.map.getRoomTerrain` call, for W2N1, on the loop of W2N1's read line;
+ * 13. exactly one claims line, `rustedscreep claims: best W2N1 from W1N1, 1 room, 2 sources: V e/t (sources S, remotes
+ *     0.000, distance D, foreign 0.000, walks W, ramparts R), first spawn (X, Y), N ramparts`, after that call: S is two
+ *     sources at SOURCE_ENERGY_CAPACITY / ENERGY_REGEN_TIME, D one room at `claim.distance_cost`, W at most 0, R the
+ *     repair of N ramparts' decay a tick (`RAMPART_DECAY_AMOUNT` every `RAMPART_DECAY_TIME` - 1 ticks, V304, at
+ *     `REPAIR_COST`, over `CREEP_LIFE_TIME`), V their sum, and (X, Y) a tile of W2N1 that is neither a wall nor an edge;
+ * 14. `rustedscreep.claims()` C_SETTLE loops later is exactly `rustedscreep claims: 1 candidates (1 planned); left out:
+ *     reserved 1, sources 1; best W2N1 at V e/t; scores 3, plans 1 (1 fit), steps K, terrain reads 1 (0 failed) | 1.
+ *     <the best line's text after "best ">`, K above 0 (a score on each of the three reads' loops, none before);
+ * 15. check 11's rules, with the claims line the only other line allowed and the terrain call above.
+ */
+export function claimsRun(dir) {
+  const state = makeWorld({ level: 8, energy: 0, observer: true });
+  state.configLines = C_CONFIG_LINES;
+  const marks = {};
+  const world = runWorld(state, dir, C_MAX, (offset, lines, w) => {
+    if (marks.best === undefined && w.logs.some((l) => BEST_LINE.test(l))) marks.best = offset;
+    if (marks.best !== undefined && offset >= marks.best + C_SETTLE) {
+      marks.final = offset;
+      return { finish: true, cmd: CLAIMS };
+    }
+    if (offset >= C_MAX - 1) return 'finish';
+    return null;
+  });
+
+  const problems = [...state.errors.slice(0, 10)];
+  const linesOf = (o) => world.logs.slice(state.logMarks[o - 1] ?? 0, state.logMarks[o] ?? world.logs.length);
+  const linesAt = (test) => state.logMarks.map((_, o) => o).filter((o) => linesOf(o).some(test));
+  if (marks.final === undefined) problems.push(`not finished in ${world.ticksRun} ticks (marks ${JSON.stringify(marks)})`);
+  if (world.halts !== 0 || world.globals !== 1) problems.push(`halts ${world.halts}, globals ${world.globals}: expected 0 and 1`);
+
+  // 15. The log and the calls.
+  // The console's reply is in the log too; it is check 14's.
+  const claimLines = world.logs.filter((l) => l.startsWith('rustedscreep claims: ') && !/^rustedscreep claims: \d+ candidates /.test(l));
+  checkLog(problems, world, state, (l) => READ_LINE.test(l), true);
+  if (state.spawnCalls.length) problems.push(`spawnCreep calls ${JSON.stringify(state.spawnCalls.map((c) => [c.offset, c.name, c.result]))}, expected none`);
+
+  // 12. One terrain read, W2N1's, on the loop of its read.
+  const westRead = linesAt((l) => READ_LINE.exec(l)?.[1] === WEST);
+  if (westRead.length !== 1) problems.push(`${WEST}'s read lines at ${JSON.stringify(westRead)}, expected one`);
+  if (JSON.stringify(state.terrainCalls) !== JSON.stringify([[westRead[0], WEST]])) {
+    problems.push(`Game.map.getRoomTerrain calls ${JSON.stringify(state.terrainCalls)}, expected one for ${WEST} at offset ${westRead[0]}`);
+  }
+
+  // 13. The best line and its terms.
+  const best = claimLines.filter((l) => BEST_LINE.test(l));
+  if (best.length !== 1 || claimLines.length !== 1) problems.push(`claims lines ${JSON.stringify(claimLines)}, expected one best line for ${WEST}`);
+  const bestAt = linesAt((l) => BEST_LINE.test(l));
+  if (!(bestAt[0] >= (state.terrainCalls[0]?.[0] ?? Infinity))) problems.push(`the best line at ${bestAt[0]}, before the terrain call`);
+  const m = BEST_LINE.exec(best[0] ?? '');
+  if (m) {
+    const [, value, sources, remotes, distance, foreign, walks, ramparts, x, y, n] = m;
+    const sourceYield = Math.floor(C.SOURCE_ENERGY_CAPACITY * 1000 / C.ENERGY_REGEN_TIME);
+    const decay = Math.floor(C.CREEP_LIFE_TIME * C.RAMPART_DECAY_AMOUNT / (C.RAMPART_DECAY_TIME - 1));
+    const repair = Math.ceil(decay * Number(n) / Math.round(1 / C.REPAIR_COST));
+    const rampartWant = -Math.floor(repair * 1000 / C.CREEP_LIFE_TIME);
+    const want = { sources: 2 * sourceYield, remotes: 0, distance: -DISTANCE_COST, foreign: 0 };
+    const got = { sources: milli(sources), remotes: milli(remotes), distance: milli(distance), foreign: milli(foreign) };
+    if (JSON.stringify(got) !== JSON.stringify(want)) problems.push(`the best line's terms ${JSON.stringify(got)}, expected ${JSON.stringify(want)}`);
+    if (milli(ramparts) !== rampartWant) problems.push(`ramparts ${ramparts} for ${n} ramparts, expected ${energyText(rampartWant)}`);
+    if (milli(walks) > 0) problems.push(`walks ${walks} above 0`);
+    const sum = got.sources + got.remotes + got.distance + got.foreign + milli(walks) + milli(ramparts);
+    if (milli(value) !== sum) problems.push(`value ${value}, expected the terms' sum ${energyText(sum)}`);
+    const [sx, sy] = [Number(x), Number(y)];
+    if (isWall(WEST, sx, sy) || sx <= 0 || sy <= 0 || sx >= 49 || sy >= 49) problems.push(`the first spawn at (${sx}, ${sy}): a wall or an edge`);
+  } else {
+    problems.push(`no best line matches ${BEST_LINE}`);
+  }
+
+  // 14. The console summary.
+  const [summary] = commandResults(world, CLAIMS);
+  const value = m?.[1];
+  const shown = (best[0] ?? '').replace('rustedscreep claims: best ', '');
+  const head = `rustedscreep claims: 1 candidates (1 planned); left out: reserved 1, sources 1; best ${WEST} at ${value} e/t; `
+    + 'scores 3, plans 1 (1 fit), steps ';
+  const tail = `, terrain reads 1 (0 failed) | 1. ${shown}`;
+  const steps = summary?.startsWith(head) && summary.endsWith(tail) ? Number(summary.slice(head.length, summary.length - tail.length)) : NaN;
+  if (!(steps > 0)) problems.push(`the claims summary ${JSON.stringify(summary)}, expected ${JSON.stringify(`${head}K${tail}`)} with K above 0`);
+
+  if (problems.length) throw new Error(`scout-sim (run C, claims):\n  ${problems.slice(0, 25).join('\n  ')}`);
+  return { ticks: world.ticksRun, terrainAt: state.terrainCalls[0]?.[0], bestAt: bestAt[0], steps, summary };
+}
+
 if (isMain(import.meta.url)) {
   try {
     const dir = process.argv[2] ?? join(ROOT, 'dist');
     const a = explorerRun(dir);
     const b = observerRun(dir);
+    const c = claimsRun(dir);
     console.log(`scout-sim ok: run A ${a.ticks} ticks, 2 globals; explorer ordered at offset ${a.orderAt}, out at ${a.outAt}; `
       + `${NORTH} unreachable at ${a.unreachableAt}; read ${a.reads}; ended in ${a.end}; ${a.searches} PathFinder search(es); `
       + `segment ${ATLAS_SEGMENT} written at offsets ${a.writes}; after the halt: ${a.loaded} | ${a.final}`);
     console.log(`scout-sim ok: run B ${b.ticks} ticks; looks ${b.looks}; read ${b.reads}; segment ${ATLAS_SEGMENT} written at offsets `
       + `${b.writes}; spawn energy ${b.energy} at the end, no spawn | ${b.during} | ${b.final}`);
+    console.log(`scout-sim ok: run C ${c.ticks} ticks; ${WEST}'s terrain read at offset ${c.terrainAt}, best line at ${c.bestAt} `
+      + `after ${c.steps} plan steps | ${c.summary}`);
   } catch (e) {
     fail(e.message);
   }

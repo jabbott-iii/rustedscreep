@@ -357,7 +357,7 @@ impl SignGlue {
 /// `room`'s terrain through `Game.map.getRoomTerrain` (no vision needed), or `None` when a call
 /// throws or the buffer is not `ROOM_AREA` long (checked before the copy, whose length assertion
 /// would panic).
-fn read_terrain(room: RoomName) -> Option<TerrainGrid> {
+pub(crate) fn read_terrain(room: RoomName) -> Option<TerrainGrid> {
     let terrain = get_room_terrain(&JsString::from(room)).ok()?;
     let raw = terrain.raw_buffer().ok()?;
     if usize::try_from(raw.length()).ok() != Some(ROOM_AREA) {

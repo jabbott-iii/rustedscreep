@@ -99,6 +99,8 @@ export interface Glue {
   signSummary?: () => string;
   /** One line about scouting: the atlas, the rooms due, the explorer and its trip, the observers' looks (ADR-039). */
   scoutSummary?: () => string;
+  /** One line about claim scoring: the candidates, why rooms were left out, the plan running, the best (ADR-041). */
+  claimsSummary?: () => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -731,6 +733,11 @@ export class Loader {
     return this.summary('scoutSummary', 'scout summary');
   }
 
+  /** Console command `rustedscreep.claims()`: the wasm's claim-scoring summary (ranking, plans, best; ADR-041). */
+  claims(): string {
+    return this.summary('claimsSummary', 'claims summary');
+  }
+
   /**
    * Console command `rustedscreep.spawn(room, role)`: a spawn of `room` spawns one creep of `role` (worker when
    * omitted) sized to the room's capacity, once the room holds its cost; `rustedscreep.spawn()` cancels. Only
@@ -751,7 +758,7 @@ export class Loader {
     name:
       | 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary' | 'persistSummary' | 'configSummary'
       | 'constsSummary' | 'movementSummary' | 'spawnerSummary' | 'openingSummary' | 'plannerSummary'
-      | 'remoteSummary' | 'signSummary' | 'scoutSummary',
+      | 'remoteSummary' | 'signSummary' | 'scoutSummary' | 'claimsSummary',
     noun: string,
   ): string {
     const call = this.glue[name];

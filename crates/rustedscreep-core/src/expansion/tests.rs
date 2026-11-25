@@ -1071,6 +1071,25 @@ fn wants_read_needs_a_due_room_in_reach() {
 }
 
 #[test]
+fn the_revision_moves_on_a_new_fact_and_not_on_a_refresh() {
+    // Claim scoring (P8.2) ranks again on every revision: a refresh that finds the same facts is
+    // saved (its tick moved) but raises none.
+    let mut w = World::new();
+    w.tick();
+    let start = w.scouting.revision();
+    w.see(room("E1N1"));
+    w.tick();
+    let first = w.scouting.revision();
+    assert_ne!(first, start, "a first read");
+    assert!(w.scouting.take_save(&w.cfg));
+    w.time += w.cfg.refresh_ticks;
+    w.see(room("E1N1"));
+    w.tick();
+    assert_eq!(w.scouting.revision(), first, "the same facts again");
+    assert!(w.scouting.is_dirty(), "the new tick is saved");
+}
+
+#[test]
 fn the_record_is_saved_when_changed_at_most_once_per_window() {
     let mut w = World::new();
     w.tick();

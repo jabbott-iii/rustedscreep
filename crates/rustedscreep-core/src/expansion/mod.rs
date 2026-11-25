@@ -46,12 +46,14 @@
 //! accepts by its name, V358, or a refused call) marks the room unreachable, so it waits too.
 
 mod atlas;
+pub mod claim;
 #[cfg(test)]
 mod tests;
 
 pub use atlas::{
     Atlas, Deposit, MAX_SOURCES, Mineral, RecordError, Reserved, RoomIntel, SCHEMA, entry_len,
 };
+pub use claim::{Candidate, ClaimEvent, ClaimHome, ClaimStats, Claims, Fit, Skip, Terms};
 
 use rustedscreep_consts::{
     CREEP_LIFE_TIME, INTENT_CPU_COST, OBSERVER_RANGE, Part, Position, RoomName, StructureType,
@@ -186,6 +188,9 @@ pub struct Scouting {
     looks: Vec<Look>,
     events: Vec<ScoutEvent>,
     stats: ScoutStats,
+    /// Raised on every change to the atlas's facts (a load, a read that differs in more than its
+    /// tick, a mark, a prune), so claim scoring (P8.2) knows when to rank again.
+    revision: u32,
 }
 
 impl Scouting {
@@ -199,6 +204,21 @@ impl Scouting {
 
     pub fn homes(&self) -> &[Home] {
         &self.homes
+    }
+
+    /// The rooms whose controller the bot owns this tick, sorted (homes or not).
+    pub fn owned(&self) -> &[RoomName] {
+        &self.owned
+    }
+
+    /// A count raised on every change to the atlas's facts this global (it wraps).
+    pub fn revision(&self) -> u32 {
+        self.revision
+    }
+
+    fn changed(&mut self) {
+        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn events(&self) -> &[ScoutEvent] {
@@ -241,6 +261,7 @@ impl Scouting {
             RecordLoad::Payload(bytes) => match Atlas::decode(bytes) {
                 Ok(atlas) => {
                     self.atlas = atlas;
+                    self.revision = self.revision.wrapping_add(1);
                     Ok(())
                 }
                 Err(e) => {
@@ -373,7 +394,7 @@ impl Scouting {
             };
             if snap.rooms.row_of(room).is_none() {
                 self.atlas.mark_unreachable(room, now);
-                self.dirty = true;
+                self.changed();
                 self.events.push(ScoutEvent::Unseen { room });
             }
         }
@@ -531,7 +552,16 @@ impl Scouting {
             let before = self.atlas.put(intel);
             let first = before.is_none_or(|b| !b.known);
             let changed = !first && before.is_some_and(|b| !b.same_holder(&intel));
+            // Every read is saved (its tick moved); claim scoring ranks again only when a fact did.
             self.dirty = true;
+            if before.is_none_or(|b| {
+                RoomIntel {
+                    seen: intel.seen,
+                    ..b
+                } != intel
+            }) {
+                self.revision = self.revision.wrapping_add(1);
+            }
             self.idle_until = None;
             self.stats.reads = self.stats.reads.saturating_add(1);
             self.events.push(ScoutEvent::Read {
@@ -563,7 +593,7 @@ impl Scouting {
                 .any(|&o| room_distance(o, e.room) <= cfg.max_distance)
         });
         if dropped > 0 {
-            self.dirty = true;
+            self.changed();
             self.events.push(ScoutEvent::Pruned { rooms: dropped });
         }
         self.pruned_for = Some((self.owned.clone(), cfg.max_distance));
@@ -752,7 +782,7 @@ impl Scouting {
 
     fn unreachable(&mut self, room: RoomName) {
         self.atlas.mark_unreachable(room, self.time);
-        self.dirty = true;
+        self.changed();
         self.stats.unreachable = self.stats.unreachable.saturating_add(1);
         self.events.push(ScoutEvent::Unreachable { room });
     }

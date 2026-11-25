@@ -35,6 +35,7 @@
 mod act;
 #[cfg(feature = "act-test")]
 mod act_test;
+mod claim;
 mod config;
 mod consts_check;
 mod defense;
@@ -83,6 +84,8 @@ struct State {
     sign: sign::SignGlue,
     /// Scouting for expansion (P8.1, ADR-039): the atlas, the explorer and the observers.
     scout: scout::ScoutGlue,
+    /// Claim scoring (P8.2, ADR-041): the ranking of the rooms to claim and their plan checks.
+    claim: claim::ClaimGlue,
     /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1), the towers
     /// (P7.2), the safe-mode triggers (P7.4), the defenders (P7.5) and the remote defenders (P7.6).
     defense: defense::DefenseGlue,
@@ -141,6 +144,7 @@ pub fn game_loop() {
                     remote,
                     sign,
                     scout,
+                    claim,
                     defense,
                     persist,
                     consts,
@@ -174,6 +178,7 @@ pub fn game_loop() {
                 remote.begin(snapshot);
                 sign.begin(snapshot, &cfg.sign);
                 scout.begin(snapshot, &cfg.scout);
+                claim.begin();
                 // Critical: the threat assessment of the hostiles in owned rooms (P7.1), every tick
                 // one stands there or a threat is open; bounded, so outside the scheduler's jobs.
                 defense.begin(snapshot, js, &cfg.defense);
@@ -363,6 +368,17 @@ pub fn game_loop() {
                 if scout.take_save(&cfg.scout) {
                     persist.atlas_changed();
                 }
+                // Optional: the claim ranking and its plan checks (ADR-041).
+                claim.work(
+                    &mut tick,
+                    scout.core(),
+                    &movement.core,
+                    snapshot.tick.time,
+                    &cfg.claim,
+                    &cfg.scout,
+                    &cfg.remote,
+                    &cfg.planner,
+                );
                 act.queue_console_say(snapshot, tick.commit());
                 #[cfg(feature = "act-test")]
                 act_test.queue(&mut act.buffer, snapshot, tick.commit());
@@ -373,6 +389,7 @@ pub fn game_loop() {
                 remote.log_events(snapshot, js);
                 sign.log_events(&cfg.sign);
                 scout.log_events(&cfg.scout);
+                claim.log_events();
                 defense.log_events(snapshot, js, &cfg.defense);
                 probe.decide();
                 // After the decide step: the scheduler reads the CPU clock no more (scheduler docs); the
@@ -612,6 +629,21 @@ pub fn scout_summary() -> String {
             Err(_) => String::from("rustedscreep scout: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep scout: state unavailable"))
+}
+
+/// Exported to JS as `claimsSummary`, for the `rustedscreep.claims()` console command: one line with
+/// the candidates' counts, why rooms were left out, the plan running, the best room, and the first
+/// candidates with their terms (P8.2, ADR-041).
+#[wasm_bindgen(js_name = "claimsSummary")]
+pub fn claims_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state
+                .claim
+                .summary(&state.config.get().claim, state.scout.core()),
+            Err(_) => String::from("rustedscreep claims: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep claims: state unavailable"))
 }
 
 /// Exported to JS as `remoteSummary`, for the `rustedscreep.remote()` console command: one line with

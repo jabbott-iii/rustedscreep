@@ -891,6 +891,49 @@ pub const SCOUT_MMO: ScoutConfig = ScoutConfig {
     save_ticks: 100,
 };
 
+/// Claim scoring (ROADMAP P8.2, ADR-041, `expansion::Claims`): which room the bot should own
+/// next, ranked from the atlas, the best few checked with the base planner. The weights are in
+/// milli-energy a tick (me/t, a thousandth of an energy unit each tick), the score's unit.
+/// `docs/TUNING.md` gives each one's rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimConfig {
+    /// Runs claim scoring: the ranking and the plan checks, in the Optional tier. Off, nothing is
+    /// scored or planned.
+    pub enabled: bool,
+    /// The fewest sources a candidate has. Unit: sources.
+    pub min_sources: u32,
+    /// The farthest a candidate lies from a home of its status, by the larger of the two
+    /// room-coordinate differences. Unit: rooms.
+    pub max_distance: u32,
+    /// The share of a reserved neighbor's yield the remotes term counts. Unit: percent.
+    pub remote_pct: u32,
+    /// The distance term: this for each room between a candidate and its nearest home. Unit: me/t
+    /// a room.
+    pub distance_cost: u32,
+    /// The farthest another player's room counts in the foreign term. Unit: rooms.
+    pub threat_range: u32,
+    /// The foreign term for a room another player owns at the highest level, one room inside
+    /// `threat_range`'s end. Unit: me/t.
+    pub foreign_cost: u32,
+    /// How many of the top candidates are planned before one is chosen. Unit: rooms.
+    pub plan_count: u32,
+    /// The ranking is rebuilt from the atlas this often. Unit: ticks.
+    pub score_ticks: u32,
+}
+
+/// Claim scoring values for the official MMO.
+pub const CLAIM_MMO: ClaimConfig = ClaimConfig {
+    enabled: true,
+    min_sources: 1,
+    max_distance: 5,
+    remote_pct: 30,
+    distance_cost: 1_000,
+    threat_range: 2,
+    foreign_cost: 4_000,
+    plan_count: 3,
+    score_ticks: 1_000,
+};
+
 /// Defense (ROADMAP P7, `defense::Threats`). `docs/TUNING.md` gives each one's rationale and safe
 /// range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1030,6 +1073,7 @@ pub struct Config {
     pub remote: RemoteConfig,
     pub sign: SignConfig,
     pub scout: ScoutConfig,
+    pub claim: ClaimConfig,
     pub defense: DefenseConfig,
     pub upkeep: UpkeepConfig,
 }
@@ -1063,6 +1107,7 @@ pub const MMO: Profile = Profile {
         remote: REMOTE_MMO,
         sign: SIGN_MMO,
         scout: SCOUT_MMO,
+        claim: CLAIM_MMO,
         defense: DEFENSE_MMO,
         upkeep: UPKEEP_MMO,
     },
@@ -1225,7 +1270,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 160;
+pub const FIELD_COUNT: usize = 169;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1632,6 +1677,15 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     number!(scout, "ScoutConfig", route_max_ops, 1000, 100_000, true),
     number!(scout, "ScoutConfig", route_max_rooms, 1, 64, true),
     number!(scout, "ScoutConfig", save_ticks, 1, 10_000, true),
+    flag!(claim, "ClaimConfig", enabled, true),
+    number!(claim, "ClaimConfig", min_sources, 1, 4, true),
+    number!(claim, "ClaimConfig", max_distance, 1, 20, true),
+    number!(claim, "ClaimConfig", remote_pct, 0, 100, true),
+    number!(claim, "ClaimConfig", distance_cost, 0, 20_000, true),
+    number!(claim, "ClaimConfig", threat_range, 0, 5, true),
+    number!(claim, "ClaimConfig", foreign_cost, 0, 100_000, true),
+    number!(claim, "ClaimConfig", plan_count, 1, 10, true),
+    number!(claim, "ClaimConfig", score_ticks, 10, 100_000, true),
     number!(
         defense,
         "DefenseConfig",
@@ -1975,6 +2029,7 @@ mod tests {
             remote: _,
             sign: _,
             scout: _,
+            claim: _,
             defense: _,
             upkeep: _,
         } = MMO.config;
@@ -2083,6 +2138,17 @@ mod tests {
             route_max_rooms: _,
             save_ticks: _,
         } = SCOUT_MMO;
+        let ClaimConfig {
+            enabled: _,
+            min_sources: _,
+            max_distance: _,
+            remote_pct: _,
+            distance_cost: _,
+            threat_range: _,
+            foreign_cost: _,
+            plan_count: _,
+            score_ticks: _,
+        } = CLAIM_MMO;
         let DefenseConfig {
             threat_end_ticks: _,
             threat_log_ticks: _,
@@ -2108,7 +2174,7 @@ mod tests {
             rampart_floor: _,
             rampart_refill: _,
         } = UPKEEP_MMO;
-        let expected: [(&str, &[&str]); 20] = [
+        let expected: [(&str, &[&str]); 21] = [
             (
                 "loader",
                 &[
@@ -2314,6 +2380,20 @@ mod tests {
                     "route_max_ops",
                     "route_max_rooms",
                     "save_ticks",
+                ],
+            ),
+            (
+                "claim",
+                &[
+                    "enabled",
+                    "min_sources",
+                    "max_distance",
+                    "remote_pct",
+                    "distance_cost",
+                    "threat_range",
+                    "foreign_cost",
+                    "plan_count",
+                    "score_ticks",
                 ],
             ),
             (
