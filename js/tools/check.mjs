@@ -97,6 +97,7 @@ const ROWS = [
   ['26 Scouting (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'scout-sim.mjs')], true],
   ['27 Minerals (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'mineral-sim.mjs')], true],
   ['28 Labs (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'lab-sim.mjs')], true],
+  ['29 Factory (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'factory-sim.mjs')], true],
 ];
 
 function main() {

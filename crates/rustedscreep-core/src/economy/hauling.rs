@@ -31,7 +31,9 @@
 //! hauler takes from (a pile before a container), the nearest, else from the controller container;
 //! a load from the controller container is never stored back there (it waits for the spawns' room). Delivering, it fills the spawns and extensions with room (nearest first, reserved per
 //! tick; last tick's fillers first), else, once they are full, the towers with at least
-//! `hauling.tower_refill_min` room (P7.2), else the controller container while it has room. Its intent
+//! `hauling.tower_refill_min` room (P7.2), else the terminal while the room's factory wants energy
+//! (P9.3, ADR-046's "the haulers fill the terminal": [`Hauling::set_banks`], up to
+//! `factory.energy_keep`), else the controller container while it has room. Its intent
 //! goes out on the tick it starts next to the target; its task is chosen again next tick.
 //!
 //! The opening reads [`Hauling::view`]: the sources whose haulers work this tick (its workers take
@@ -83,7 +85,7 @@ pub enum HaulTask {
     Take(ObjectHandle),
     /// Next to its source's mining tile while too little energy lies there for a whole load.
     Wait(Position),
-    /// `transfer` to a spawn or an extension.
+    /// `transfer` to a spawn or an extension, a tower (P7.2), or the factory's terminal (P9.3).
     Fill(StructureHandle),
     /// `transfer` to the controller container.
     Store(ObjectHandle),
@@ -312,9 +314,13 @@ pub struct Hauling {
     /// place, room left to reserve), each plan source's haulers this tick, and the delivering
     /// haulers (member index, range to the nearest fill, last tick's task).
     fills: Vec<(StructureHandle, Position, u32)>,
-    /// Whether this tick's `fills` are the towers (P7.2: the spawns and extensions are full), which
-    /// the spawn queue's refill (P5.3) does not count.
+    /// Whether this tick's `fills` are the towers (P7.2: the spawns and extensions are full) or
+    /// the factory's terminal (P9.3: the towers are full too), which the spawn queue's refill
+    /// (P5.3) does not count.
     tower_fills: bool,
+    /// The terminals that take the haulers' energy this tick (P9.3, ADR-046, [`Self::set_banks`]):
+    /// room, terminal, its place, and how much more it takes. Sorted by packed room name.
+    banks: Vec<(RoomName, StructureHandle, Position, u32)>,
     sources: Vec<(Position, u32)>,
     loose: Vec<(ObjectHandle, Position, ObjectKind, u32)>,
     container: Option<(ObjectHandle, Position, u32)>,
@@ -452,6 +458,18 @@ impl Hauling {
             .binary_search_by_key(&room.packed_repr(), |r| r.name.packed_repr())
             .ok()
             .and_then(|i| self.rooms.get(i))
+    }
+
+    /// Sets the terminals the haulers deliver energy to this tick once a room's spawns,
+    /// extensions and towers are full (P9.3, ADR-046's "the haulers fill the terminal",
+    /// `economy::Factories::banks`): room, terminal, its place, and how much more energy it takes
+    /// (the transfers carry no amount, so the last load may pass it). Call before the `hauling`
+    /// job; none set, no hauler delivers to a terminal.
+    pub fn set_banks(&mut self, banks: &[(RoomName, StructureHandle, Position, u32)]) {
+        self.banks.clear();
+        self.banks.extend(banks.iter().copied().filter(|b| b.3 > 0));
+        self.banks.sort_unstable_by_key(|b| b.0.packed_repr());
+        self.banks.dedup_by_key(|b| b.0.packed_repr());
     }
 
     /// What the opening reads of `room`'s haulers this tick ([`HaulView`]); nothing before the
@@ -754,6 +772,16 @@ impl Hauling {
         if self.fills.is_empty() {
             push_towers(&mut self.fills, snap, name, tower_refill_min);
             self.tower_fills = !self.fills.is_empty();
+        }
+        // P9.3: the factory's terminal, once the towers are full too.
+        if self.fills.is_empty()
+            && let Ok(i) = self
+                .banks
+                .binary_search_by_key(&name.packed_repr(), |b| b.0.packed_repr())
+            && let Some(&(_, h, pos, want)) = self.banks.get(i)
+        {
+            self.fills.push((h, pos, want));
+            self.tower_fills = true;
         }
         let tile_of =
             |p: Position| mine.is_some_and(|m| m.sources.iter().any(|s| s.tile == Some(p)));

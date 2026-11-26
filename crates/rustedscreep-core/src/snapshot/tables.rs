@@ -446,12 +446,14 @@ pub struct CreepStore {
     /// creep's one pool, shared by every resource it holds (V402). Unit: units.
     pub capacity: u32,
     /// Everything else in the store (`store.getUsedCapacity()` less the energy), read only for
-    /// mineral haulers (P9.1, ADR-044), which carry nothing but their room's mineral, and lab
-    /// haulers (P9.2, ADR-045); 0 for every other creep. Unit: units.
+    /// mineral haulers (P9.1, ADR-044), which carry nothing but their room's mineral, lab
+    /// haulers (P9.2, ADR-045), and factory haulers (P9.3, ADR-046); 0 for every other creep.
+    /// Unit: units.
     pub other: u32,
-    /// The type of [`Self::other`], read only for a lab hauler that holds some (the first key of
-    /// its store other than energy; the hauler never takes a second type): `None` for every other
-    /// creep, or for a type no lab handles ([`LAB_RESOURCES`]).
+    /// The type of [`Self::other`], read only for a lab or factory hauler that holds some (the
+    /// first key of its store other than energy that holds an amount; neither hauler takes a
+    /// second type): `None` for every other creep, or for a type its module does not handle
+    /// ([`LAB_RESOURCES`], [`FACTORY_RESOURCES`]).
     pub other_kind: Option<ResourceType>,
 }
 
@@ -1669,6 +1671,190 @@ impl LabSites {
     }
 
     pub fn rows(&self) -> &[LabRead] {
+        &self.rows
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+/// Every resource the factory handles (P9.3, ADR-046): the 8 minerals a factory compresses
+/// into bars (the 7 base minerals, then ghodium, which the labs make), then their 8 bars in the
+/// same order, so the bar of the mineral at index `i` is at `i + FACTORY_MINERALS` (the
+/// `COMMODITIES` recipes with no level that take one mineral and energy, V131; checked by
+/// `economy::factory::recipes`). A factory read's stocks are kept by index in this list
+/// ([`factory_resource`]).
+pub const FACTORY_RESOURCES: [ResourceType; 2 * FACTORY_MINERALS] = {
+    use ResourceType as R;
+    [
+        R::Hydrogen,
+        R::Oxygen,
+        R::Utrium,
+        R::Lemergium,
+        R::Keanium,
+        R::Zynthium,
+        R::Catalyst,
+        R::Ghodium,
+        R::Reductant,
+        R::Oxidant,
+        R::UtriumBar,
+        R::LemergiumBar,
+        R::KeaniumBar,
+        R::ZynthiumBar,
+        R::Purifier,
+        R::GhodiumMelt,
+    ]
+};
+
+/// How many minerals [`FACTORY_RESOURCES`] lists (and so how many bars).
+pub const FACTORY_MINERALS: usize = 8;
+
+/// A factory read's stock of each of [`FACTORY_RESOURCES`], by index. Unit: units.
+pub type FactoryStock = [u32; 2 * FACTORY_MINERALS];
+
+/// `kind`'s index in [`FACTORY_RESOURCES`]; `None` for a resource the factory module does not
+/// handle (energy, compounds, commodities, ...).
+pub fn factory_resource(kind: ResourceType) -> Option<usize> {
+    FACTORY_RESOURCES.iter().position(|&r| r == kind)
+}
+
+/// An owned room's own terminal, as a factory read gives it (P9.3, ADR-046).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FactoryTerminal {
+    pub handle: StructureHandle,
+    pub at: Position,
+    /// Its free room for anything (`store.getFreeCapacity()`; one pool, V401). Unit: units.
+    pub free: u32,
+    /// Its energy (`store.energy`). Unit: energy.
+    pub energy: u32,
+}
+
+/// An owned room's own factory, as a factory read gives it (P9.3, ADR-046).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FactoryState {
+    pub handle: StructureHandle,
+    /// Its row in this tick's structures (its JS object, for `produce`).
+    pub row: u32,
+    pub at: Position,
+    /// `cooldown` (V423): ticks until it can produce again. Unit: ticks.
+    pub cooldown: u32,
+    /// Its free room for anything (`store.getFreeCapacity()`; one pool of `FACTORY_CAPACITY`,
+    /// V425). Unit: units.
+    pub free: u32,
+    /// Its energy. Unit: energy.
+    pub energy: u32,
+    /// Its stock of each of [`FACTORY_RESOURCES`], by index. Unit: units.
+    pub stock: FactoryStock,
+}
+
+/// One owned room's factory read (P9.3, ADR-046): its own terminal with its stock of every
+/// factory resource, and its own factory. The snapshot reads it only in the rooms the factory
+/// module asks for, and the terminal and factory only while the room's row exists, since own
+/// structures come after the rooms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FactoryRead {
+    pub room: RoomName,
+    pub terminal: Option<FactoryTerminal>,
+    /// The terminal's stock of each of [`FACTORY_RESOURCES`], by index (0 for none or no
+    /// terminal). Unit: units.
+    pub stock: FactoryStock,
+    pub factory: Option<FactoryState>,
+}
+
+/// The owned rooms' factory reads this tick (P9.3), one row a read room in the order the rooms
+/// were read, and the terminal energy of the rooms whose terminal takes energy from the haulers
+/// this tick (the "bank" reads: `store.energy` alone, [`Self::bank`]).
+#[derive(Default)]
+pub struct FactorySites {
+    rows: Vec<FactoryRead>,
+    banks: Vec<(RoomName, u32)>,
+}
+
+impl FactorySites {
+    pub(super) fn begin(&mut self) {
+        self.rows.clear();
+        self.banks.clear();
+    }
+
+    /// Adds `room`'s read, with no terminal and no factory yet ([`Self::set_terminal`],
+    /// [`Self::set_factory`]). A second read of the same room is ignored.
+    pub fn push(&mut self, room: RoomName) {
+        if self.get(room).is_none() {
+            self.rows.push(FactoryRead {
+                room,
+                terminal: None,
+                stock: [0; 2 * FACTORY_MINERALS],
+                factory: None,
+            });
+        }
+    }
+
+    /// Whether `room` has a read row this tick (its structures are read for it).
+    pub fn wants(&self, room: RoomName) -> bool {
+        self.get(room).is_some()
+    }
+
+    /// Records the own terminal of `terminal.at`'s room, if that room has a row. Returns whether
+    /// it was taken.
+    pub fn set_terminal(&mut self, terminal: FactoryTerminal) -> bool {
+        let room = terminal.at.room_name();
+        match self.rows.iter_mut().find(|r| r.room == room) {
+            Some(r) => {
+                r.terminal = Some(terminal);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Records the terminal of `room` holding `amount` of `kind` (ignored for a resource the
+    /// module does not handle, or a room with no row).
+    pub fn set_stock(&mut self, room: RoomName, kind: ResourceType, amount: u32) {
+        if let Some(i) = factory_resource(kind)
+            && let Some(r) = self.rows.iter_mut().find(|r| r.room == room)
+            && let Some(s) = r.stock.get_mut(i)
+        {
+            *s = amount;
+        }
+    }
+
+    /// Records the own factory of `factory.at`'s room, if that room has a row. Returns whether
+    /// it was taken.
+    pub fn set_factory(&mut self, factory: FactoryState) -> bool {
+        let room = factory.at.room_name();
+        match self.rows.iter_mut().find(|r| r.room == room) {
+            Some(r) => {
+                r.factory = Some(factory);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Records `room`'s terminal energy from a bank read (a second one replaces the first).
+    pub fn set_bank(&mut self, room: RoomName, energy: u32) {
+        match self.banks.iter_mut().find(|b| b.0 == room) {
+            Some(b) => b.1 = energy,
+            None => self.banks.push((room, energy)),
+        }
+    }
+
+    /// `room`'s terminal energy from this tick's bank read, if it had one.
+    pub fn bank(&self, room: RoomName) -> Option<u32> {
+        self.banks.iter().find(|b| b.0 == room).map(|b| b.1)
+    }
+
+    /// `room`'s read this tick, if it was read.
+    pub fn get(&self, room: RoomName) -> Option<&FactoryRead> {
+        self.rows.iter().find(|r| r.room == room)
+    }
+
+    pub fn rows(&self) -> &[FactoryRead] {
         &self.rows
     }
 

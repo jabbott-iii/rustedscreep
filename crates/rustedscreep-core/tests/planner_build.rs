@@ -35,6 +35,7 @@ const ALL: Gates = Gates {
     observer: true,
     minerals: true,
     labs: true,
+    factory: true,
 };
 
 /// The ground from a list of what stands (the plan's first spawn among it).
@@ -892,14 +893,17 @@ fn needed(gates: &Gates, from: &[u8; GATES], level: u8) -> bool {
 /// level; with any gates, a road is due at a level exactly when a gate that is on needs it by
 /// then, so one only gates that are off need is never due. The tally's MMO gates are those of a
 /// room that wants no labs (P9.2, ADR-045: every room until a second mineral reaches its
-/// terminal), so the labs' roads count as left out, as before the labs had a gate of their own.
+/// terminal) and no factory (P9.3, ADR-046: every room until its terminal holds a surplus), so
+/// the labs' and the factory's roads count as left out, as before they had gates of their own.
 ///
 /// Uses: `CONTROLLER_STRUCTURES` (through `earliest_level`: the first level that allows a road),
 /// `PLANNER_MMO` (the gates), `MAX_LEVEL`.
 #[test]
 fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
-    let mmo = Gates::from_config(&PLANNER_MMO).with_labs(false);
-    let combos: Vec<Gates> = (0u8..128)
+    let mmo = Gates::from_config(&PLANNER_MMO)
+        .with_labs(false)
+        .with_factory(false);
+    let combos: Vec<Gates> = (0u16..256)
         .map(|b| Gates {
             storage: b & 1 != 0,
             towers: b & 2 != 0,
@@ -908,6 +912,7 @@ fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
             observer: b & 16 != 0,
             minerals: b & 32 != 0,
             labs: b & 64 != 0,
+            factory: b & 128 != 0,
         })
         .collect();
     assert!(combos.contains(&mmo) && combos.contains(&ALL));
@@ -1004,6 +1009,7 @@ fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
                     Gate::Observer => mmo.observer,
                     Gate::Minerals => mmo.minerals,
                     Gate::Labs => mmo.labs,
+                    Gate::Factory => mmo.factory,
                 };
                 let unneeded = Gate::ALL
                     .iter()
@@ -1013,7 +1019,9 @@ fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
                     *off_only += 1;
                     let others = Gate::ALL
                         .iter()
-                        .filter(|&&g| !matches!(g, Gate::Late | Gate::Labs | Gate::Base))
+                        .filter(|&&g| {
+                            !matches!(g, Gate::Late | Gate::Labs | Gate::Factory | Gate::Base)
+                        })
                         .all(|&g| from[g.index()] == u8::MAX);
                     if others {
                         *late_only += 1;
@@ -1026,7 +1034,7 @@ fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
         println!(
             "roads, {name}: {plans} plans, {roads} roads, {due_top} due at RCL{MAX_LEVEL} under \
              the MMO's gates, {off_only} needed by no structure the MMO's gates place ({late_only} \
-             by late or lab ones only)"
+             by late, lab or factory ones only)"
         );
         assert!(plans > 0 && roads > 0, "{name}");
         assert_eq!(due_top + off_only, roads, "{name}");
@@ -1036,7 +1044,8 @@ fn every_road_is_due_from_the_least_level_a_gate_that_is_on_needs_it() {
 /// The types the MMO's gates never place in a room that wants no labs (`PLANNER_MMO`: the storage
 /// and the late structures off; the towers are on since P7.2, the ramparts and walls since P7.3,
 /// the observer since P8.1, the terminal, the extractor and the mineral container since P9.1,
-/// ADR-044; the labs only where wanted since P9.2, ADR-045; the links are the
+/// ADR-044; the labs only where wanted since P9.2, ADR-045, and the factory since P9.3, ADR-046;
+/// the links are the
 /// economy's or the hub link, which the storage gate holds; the containers are the economy's but
 /// for the mineral container, checked on its own).
 const NOT_UNDER_MMO: [StructureType; 6] = [
@@ -1053,7 +1062,7 @@ const NOT_UNDER_MMO: [StructureType; 6] = [
 /// offers only spawns, extensions, towers (on since P7.2), ramparts and walls (on since P7.3), the
 /// observer (on since P8.1), the terminal, the extractor and the mineral container (on since
 /// P9.1, ADR-044) and the roads due for them (C14), in a room that wants no labs (P9.2, ADR-045,
-/// `Gates::with_labs`): no destroy, no site of a gated type or of the economy's, every item it
+/// `Gates::with_labs`) and no factory (P9.3, ADR-046, `Gates::with_factory`): no destroy, no site of a gated type or of the economy's, every item it
 /// places built at each level, and at the top the room holds exactly those, the economy's and the
 /// first spawn.
 ///
@@ -1061,7 +1070,9 @@ const NOT_UNDER_MMO: [StructureType; 6] = [
 /// `allowed`: each level's count), `MAX_LEVEL`.
 #[test]
 fn the_mmo_gates_place_only_spawns_extensions_towers_ramparts_observers_minerals_and_roads() {
-    let gates = Gates::from_config(&PLANNER_MMO).with_labs(false);
+    let gates = Gates::from_config(&PLANNER_MMO)
+        .with_labs(false)
+        .with_factory(false);
     assert!(
         !gates.storage
             && gates.towers
@@ -1070,6 +1081,7 @@ fn the_mmo_gates_place_only_spawns_extensions_towers_ramparts_observers_minerals
             && gates.observer
             && gates.minerals
             && !gates.labs
+            && !gates.factory
     );
     let mut s = Scratch::default();
     let (mut rooms, mut sites) = (0u32, 0usize);

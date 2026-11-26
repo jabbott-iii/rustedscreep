@@ -79,11 +79,15 @@ pub enum Role {
     /// job's reagents from the terminal and takes the products and leftovers back. At most one a
     /// room.
     LabHauler,
+    /// A factory hauler (P9.3, ADR-046): CARRY and MOVE parts; it loads its room's factory with
+    /// a batch's mineral and energy from the terminal and takes the bars and leftovers back. At
+    /// most one a room.
+    FactoryHauler,
 }
 
 impl Role {
     /// Every role, in a fixed order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Worker,
         Self::Miner,
         Self::Hauler,
@@ -100,6 +104,7 @@ impl Role {
         Self::MineralMiner,
         Self::MineralHauler,
         Self::LabHauler,
+        Self::FactoryHauler,
     ];
 
     /// The first byte of the role's creep names. Never change or reuse one (see the module docs).
@@ -121,6 +126,7 @@ impl Role {
             Self::MineralMiner => b'e',
             Self::MineralHauler => b't',
             Self::LabHauler => b'l',
+            Self::FactoryHauler => b'f',
         }
     }
 
@@ -159,6 +165,7 @@ impl Role {
             Self::MineralMiner => "mineral miner",
             Self::MineralHauler => "mineral hauler",
             Self::LabHauler => "lab hauler",
+            Self::FactoryHauler => "factory hauler",
         }
     }
 
@@ -551,7 +558,7 @@ mod tests {
             Role::ALL.map(Role::code),
             [
                 b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c', b'g', b'd', b'p', b'x', b'k', b'e',
-                b't', b'l'
+                b't', b'l', b'f'
             ],
             "never change or reuse a code"
         );

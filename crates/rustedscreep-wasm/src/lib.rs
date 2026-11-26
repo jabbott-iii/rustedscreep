@@ -39,6 +39,7 @@ mod claim;
 mod config;
 mod consts_check;
 mod defense;
+mod factory;
 mod labs;
 mod logging;
 mod minerals;
@@ -92,6 +93,8 @@ struct State {
     minerals: minerals::MineralsGlue,
     /// Lab reactions (P9.2, ADR-045): each room's lab roles, job, reactions and lab hauler.
     labs: labs::LabsGlue,
+    /// The factory (P9.3, ADR-046): each room's job, batches, terminal bank and factory hauler.
+    factory: factory::FactoryGlue,
     /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1), the towers
     /// (P7.2), the safe-mode triggers (P7.4), the defenders (P7.5) and the remote defenders (P7.6).
     defense: defense::DefenseGlue,
@@ -153,6 +156,7 @@ pub fn game_loop() {
                     claim,
                     minerals,
                     labs,
+                    factory,
                     defense,
                     persist,
                     consts,
@@ -186,6 +190,7 @@ pub fn game_loop() {
                 remote.begin(snapshot);
                 minerals.begin(snapshot, &cfg.minerals);
                 labs.begin(snapshot, &cfg.labs);
+                factory.begin(snapshot);
                 sign.begin(snapshot, &cfg.sign);
                 scout.begin(snapshot, &cfg.scout);
                 claim.begin(snapshot, &cfg.claim, sched.last_tick());
@@ -301,6 +306,22 @@ pub fn game_loop() {
                         &cfg.labs,
                     );
                 }
+                // Critical: the factory's jobs and the factory hauler's request (P9.3, ADR-046;
+                // the request and the terminal's bank only while the Standard tier runs), before
+                // the spawn plan, its upkeep for the upgraders' budget, before the upgrading job,
+                // and the banks for the haulers, before the hauling job.
+                {
+                    let (hauling, upgrading) = opening.haul_parts();
+                    factory.plan(
+                        &mut tick,
+                        snapshot,
+                        spawn.spawner_mut(),
+                        hauling,
+                        upgrading,
+                        &cfg.factory,
+                    );
+                }
+                opening.set_banks(factory.banks());
                 // Critical: the static miners (P3.1), the haulers (P3.3), the upgraders' plan
                 // (P3.4), the opening's workers and their spawn requests (P2.4), then the spawn
                 // plan, after the Critical jobs that request creeps (P2.3).
@@ -373,6 +394,15 @@ pub fn game_loop() {
                     &cfg.labs,
                     &cfg.movement,
                 );
+                // Standard: the factory's batches and the factory hauler's work (P9.3).
+                factory.work(
+                    &mut tick,
+                    snapshot,
+                    &mut movement.core,
+                    &mut act.buffer,
+                    &cfg.factory,
+                    &cfg.movement,
+                );
                 // Standard: the claimer's walk and claim (P8.3).
                 claim.work_claimer(
                     &mut tick,
@@ -400,6 +430,8 @@ pub fn game_loop() {
                 }
                 // P9.2 (ADR-045): the plan's labs only in the rooms that want them.
                 opening.set_lab_rooms(labs.wants_labs());
+                // P9.3 (ADR-046): the plan's factory only in the rooms that want one.
+                opening.set_factory_rooms(factory.wants_factory());
                 opening.place(
                     &mut tick,
                     snapshot,
@@ -466,9 +498,13 @@ pub fn game_loop() {
                 js.set_mineral_reads(minerals.reads(&cfg.minerals));
                 // P9.2: the rooms the next snapshot reads for their labs.
                 js.set_lab_reads(labs.reads(&cfg.labs));
+                // P9.3: the rooms the next snapshot reads for their factory, or for their
+                // terminal's energy alone.
+                factory.set_reads(js, &cfg.factory);
                 opening.log_events();
                 minerals.log_events();
                 labs.log_events();
+                factory.log_events(&cfg.factory);
                 remote.log_events(snapshot, js);
                 sign.log_events(&cfg.sign);
                 scout.log_events(&cfg.scout);
@@ -536,6 +572,15 @@ pub fn game_loop() {
                     sched,
                     &cfg.scheduler,
                     &cfg.labs,
+                );
+                // The factory's batches (P9.3, ADR-046).
+                factory.issue(
+                    snapshot,
+                    js,
+                    act.log_mut(),
+                    sched,
+                    &cfg.scheduler,
+                    &cfg.factory,
                 );
                 act::issue(act, snapshot, js, sched, &cfg.scheduler);
                 movement.after_act(snapshot, act.refused_moves(), &cfg.movement);
@@ -767,6 +812,21 @@ pub fn labs_summary() -> String {
             Err(_) => String::from("rustedscreep labs: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep labs: state unavailable"))
+}
+
+/// Exported to JS as `factorySummary`, for the `rustedscreep.factory()` console command: one line
+/// with the settings and the pace, then each room's factory state, its last read, its job, its
+/// hauler and its counters (P9.3, ADR-046).
+#[wasm_bindgen(js_name = "factorySummary")]
+pub fn factory_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state
+                .factory
+                .summary(&state.snapshot, &state.config.get().factory),
+            Err(_) => String::from("rustedscreep factory: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep factory: state unavailable"))
 }
 
 /// Exported to JS as `remoteSummary`, for the `rustedscreep.remote()` console command: one line with

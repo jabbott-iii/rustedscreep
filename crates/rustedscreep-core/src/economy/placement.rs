@@ -261,6 +261,10 @@ pub struct Placement {
     /// The rooms whose labs' gate is on this tick (P9.2, ADR-045: the rooms that want labs,
     /// `economy::labs::Labs::wants_labs`), sorted by packed name ([`Self::set_lab_rooms`]).
     lab_rooms: Vec<RoomName>,
+    /// The rooms whose factory's gate is on this tick (P9.3, ADR-046: the rooms that want a
+    /// factory, `economy::factory::Factories::wants_factory`), sorted by packed name
+    /// ([`Self::set_factory_rooms`]).
+    factory_rooms: Vec<RoomName>,
     field: FlowField,
     dial: Dial,
     occupied: Vec<(Tile, bool)>,
@@ -332,14 +336,28 @@ impl Placement {
         self.lab_rooms.dedup();
     }
 
+    /// Sets the rooms that want a factory this tick (P9.3, ADR-046): in every other room the
+    /// plan's factory, and the roads only it needs, are not placed
+    /// ([`build::Gates::with_factory`]). Call before the job; none set, no room places one.
+    pub fn set_factory_rooms(&mut self, rooms: &[RoomName]) {
+        self.factory_rooms.clear();
+        self.factory_rooms.extend_from_slice(rooms);
+        self.factory_rooms.sort_unstable_by_key(|r| r.packed_repr());
+        self.factory_rooms.dedup();
+    }
+
     /// The gates room `name` places with under `pcfg`: the config's, with the labs' gate only
-    /// where the room wants labs ([`Self::set_lab_rooms`]).
+    /// where the room wants labs ([`Self::set_lab_rooms`]) and the factory's only where it wants
+    /// a factory ([`Self::set_factory_rooms`]).
     fn gates_for(&self, name: RoomName, pcfg: &PlannerConfig) -> Gates {
-        let wants = self
-            .lab_rooms
-            .binary_search_by_key(&name.packed_repr(), |r| r.packed_repr())
-            .is_ok();
-        Gates::from_config(pcfg).with_labs(wants)
+        let listed = |rooms: &[RoomName]| {
+            rooms
+                .binary_search_by_key(&name.packed_repr(), |r| r.packed_repr())
+                .is_ok()
+        };
+        Gates::from_config(pcfg)
+            .with_labs(listed(&self.lab_rooms))
+            .with_factory(listed(&self.factory_rooms))
     }
 
     /// The name of room `unit`.

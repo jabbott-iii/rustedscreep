@@ -75,9 +75,10 @@ use rustedscreep_consts::{
     RAMPART_DECAY_AMOUNT, RAMPART_DECAY_TIME, RAMPART_HITS, REPAIR_COST, REPAIR_POWER,
     ROAD_DECAY_AMOUNT, ROAD_DECAY_TIME, ROAD_HITS, RoomCoordinate, RoomName,
     SOURCE_ENERGY_CAPACITY, SOURCE_ENERGY_KEEPER_CAPACITY, SOURCE_ENERGY_NEUTRAL_CAPACITY,
-    SPAWN_ENERGY_CAPACITY, SPAWN_ENERGY_START, StructureType, TOMBSTONE_DECAY_PER_PART,
-    TOWER_CAPACITY, Terrain, UPGRADE_CONTROLLER_POWER, WALL_HITS, WALL_HITS_MAX,
-    controller_downgrade, controller_levels, extension_energy_capacity, rampart_hits_max,
+    SPAWN_ENERGY_CAPACITY, SPAWN_ENERGY_START, StructureType, TERMINAL_CAPACITY,
+    TOMBSTONE_DECAY_PER_PART, TOWER_CAPACITY, Terrain, UPGRADE_CONTROLLER_POWER, WALL_HITS,
+    WALL_HITS_MAX, controller_downgrade, controller_levels, extension_energy_capacity,
+    rampart_hits_max,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -1630,6 +1631,9 @@ struct World {
     refused_sites: u32,
     /// Whether the Standard tier runs (`opening work`); off, as below `standard_bucket_min`.
     standard: bool,
+    /// P9.3: while above 0, the terminal store (if any) takes the haulers' energy up to this
+    /// much (`Hauling::set_banks`, as `economy::Factories::banks` would set it).
+    bank_keep: u32,
     /// The processor drops every site the game side accepted (V204's silent checks).
     drop_sites: bool,
     /// Walls built after the start (as structures: movement learns them on a rescan).
@@ -1768,6 +1772,7 @@ impl World {
             billed: 0,
             refused_sites: 0,
             standard: true,
+            bank_keep: 0,
             drop_sites: false,
             extra_walls: Vec::new(),
             events: Vec::new(),
@@ -2165,6 +2170,23 @@ impl World {
                     &mut commit,
                 )
                 .expect("mining");
+        }
+        if self.bank_keep > 0 {
+            let st = &self.snap.structures;
+            let energy = self
+                .stores
+                .iter()
+                .find(|s| s.kind == StructureType::Terminal)
+                .map_or(0, |s| s.energy);
+            let banks: Vec<_> = st
+                .handles()
+                .iter()
+                .zip(st.kinds())
+                .zip(st.positions())
+                .filter(|((_, k), _)| **k == StructureType::Terminal)
+                .map(|((&h, _), &p)| (self.room, h, p, self.bank_keep.saturating_sub(energy)))
+                .collect();
+            self.hauling.set_banks(&banks);
         }
         for unit in 0..self.hauling.room_count() {
             let room = self.hauling.room_name(unit).expect("room");
@@ -6677,6 +6699,59 @@ fn towers_are_filled_once_spawns_and_extensions_are_full() {
         tower(&w) + min > TOWER_CAPACITY,
         "within tower_refill_min of full"
     );
+}
+
+/// P9.3 (ADR-046's "the haulers fill the terminal"): a terminal the factory opens takes the
+/// haulers' energy only once every spawn and extension is full, and stops within a hauler's load
+/// of the mark; with no bank set, it takes none.
+///
+/// Uses: `SPAWN_ENERGY_CAPACITY`, `TERMINAL_CAPACITY`, `CARRY_CAPACITY`, `MAX_CREEP_SIZE` (a
+/// hauler's load is at most a body's CARRY parts).
+#[test]
+fn a_banked_terminal_is_filled_after_the_spawns_up_to_its_mark() {
+    for keep in [0, 1_000] {
+        let mut w = World::new(4, SPAWN_ENERGY_CAPACITY);
+        w.bank_keep = keep;
+        let key = w.key();
+        w.stores.push(SimStore {
+            key,
+            kind: StructureType::Terminal,
+            at: tile(27, 22),
+            energy: 0,
+            capacity: TERMINAL_CAPACITY,
+            cooldown: 0,
+        });
+        let terminal = |w: &World| {
+            w.stores
+                .iter()
+                .find(|s| s.kind == StructureType::Terminal)
+                .map_or(0, |s| s.energy)
+        };
+        let (mut early, mut fills) = (0, 0);
+        for _ in 0..4000 {
+            let spawn_room: u32 = w
+                .stores
+                .iter()
+                .filter(|s| s.spawn_energy())
+                .map(|s| s.capacity - s.energy)
+                .sum();
+            let before = terminal(&w);
+            w.step();
+            if terminal(&w) > before {
+                fills += 1;
+                early += u32::from(spawn_room > 0);
+            }
+        }
+        if keep == 0 {
+            assert_eq!(fills, 0, "no bank, no energy in the terminal");
+            continue;
+        }
+        assert!(fills > 0, "the terminal is filled");
+        assert_eq!(early, 0, "never while a spawn or extension has room");
+        let most_load = MAX_CREEP_SIZE * CARRY_CAPACITY;
+        assert!(terminal(&w) >= keep, "{}", terminal(&w));
+        assert!(terminal(&w) < keep + most_load, "{}", terminal(&w));
+    }
 }
 
 #[test]

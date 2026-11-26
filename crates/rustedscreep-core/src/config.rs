@@ -683,8 +683,7 @@ pub struct PlannerConfig {
     /// Places the ramparts (when ramparts are built is P7's, ADR-007; on since P7.3, ADR-032, whose
     /// workers keep them at [`UpkeepConfig::rampart_permille`] of their level's hits).
     pub ramparts: bool,
-    /// Places the factory, the power spawn, and the nuker (nothing uses them yet; P9's later items
-    /// do).
+    /// Places the power spawn and the nuker (nothing uses them yet; P9's later items and P10 do).
     pub late: bool,
     /// Places the observer (at RCL8, the only level that allows one), which the atlas's observer
     /// loop uses (P8.1, ADR-039). Split from [`Self::late`].
@@ -699,6 +698,13 @@ pub struct PlannerConfig {
     /// (`economy::labs::Labs::wants_labs`; the user's choice, ADR-045: build the labs once
     /// reagents are on hand). Split from [`Self::late`].
     pub labs: bool,
+    /// Places the factory (1 from RCL7, `CONTROLLER_STRUCTURES`), which compresses a room's
+    /// surplus minerals into bars (P9.3, ADR-046), but only in a room that wants it: one where an
+    /// own factory stands, or whose terminal holds a batch of a mineral above
+    /// [`FactoryConfig::mineral_keep`] with its bars under [`FactoryConfig::bar_max`]
+    /// (`economy::factory::Factories::wants_factory`; the user's choice, ADR-046: build the
+    /// factory once it has work). Split from [`Self::late`].
+    pub factory: bool,
     /// The most own construction sites a room may hold before the placement waits: one site a
     /// tick goes out, first the economy's containers and links on the plan's tiles (ADR-023 to
     /// ADR-025's timing), then the plan's items by type (spawns, extensions, ... roads). Unit:
@@ -729,6 +735,7 @@ pub const PLANNER_MMO: PlannerConfig = PlannerConfig {
     observer: true,
     minerals: true,
     labs: true,
+    factory: true,
     max_sites: 10,
     verify_ticks: 500,
     hub_clearance: 3,
@@ -1190,6 +1197,61 @@ pub const LABS_MMO: LabsConfig = LabsConfig {
     read_ticks: 100,
 };
 
+/// The factory (ROADMAP P9.3, ADR-046): in each owned room with an own factory and an own
+/// terminal, a factory hauler loads the factory from the terminal with a batch of the first
+/// mineral the room holds above [`Self::mineral_keep`] and the energy for it, the factory
+/// compresses it into its bar at most once a pacing interval, and the bars go back to the
+/// terminal (`economy::factory`; the user's choices: bars from the surplus, the source haulers
+/// fill the terminal with energy, a factory hauler, the factory built once it has work).
+/// `docs/TUNING.md` gives each one's rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FactoryConfig {
+    /// Picks the mineral to compress, requests the factory hauler, opens the terminal to the
+    /// haulers' energy and orders `produce`. Off, nothing is produced or requested, a room is read
+    /// only while its factory hauler carries something (which it then takes to the terminal), and
+    /// no room wants a factory built ([`PlannerConfig::factory`]).
+    pub enabled: bool,
+    /// The most of each mineral a room keeps unpressed: the factory compresses a mineral only
+    /// while the terminal, the factory and the hauler hold at least a batch's worth more than
+    /// this (the user's choice, ADR-046: bars from the surplus), so the labs (P9.2) and terminal
+    /// balancing (P9.4) keep that much at hand. Unit: units of the mineral.
+    pub mineral_keep: u32,
+    /// The factory stops compressing a mineral once the room holds this many of its bar (in the
+    /// terminal, the factory and the hauler), so bars cannot fill the terminal while nothing
+    /// sells them (P9.5). Unit: units of the bar.
+    pub bar_max: u32,
+    /// While its factory compresses, the room's source haulers deliver energy to the terminal
+    /// after the spawns, extensions and towers until it holds this much (the user's choice,
+    /// ADR-046: the haulers fill the terminal). Unit: energy.
+    pub energy_keep: u32,
+    /// The most energy the factory spends in a creep life (`CREEP_LIFE_TIME`): it produces at
+    /// most once every `CREEP_LIFE_TIME × a batch's energy / energy_per_life` ticks (never sooner
+    /// than the recipe's cooldown), and while it compresses, the upgraders' budget leaves this
+    /// much out (`economy::Upgrading::set_factory`). Unit: energy per creep life.
+    pub energy_per_life: u32,
+    /// The most CARRY parts of the factory hauler; below it the room's energy capacity sets the
+    /// count. The body has a MOVE part for every `MOVE_POWER / MOVE_COST_ROAD` CARRY parts, so it
+    /// walks roads loaded at a tile a tick. Unit: CARRY parts.
+    pub hauler_carry: u32,
+    /// A room with an own factory (or an own terminal at a level that allows one) is read again
+    /// after this many ticks (its terminal's and factory's stocks, the factory's cooldown) when
+    /// nothing is due sooner: it is read every tick the Standard tier runs while its factory
+    /// hauler has work, and on the tick the next batch is due. It is also how long a room's
+    /// factory waits after a refused `produce`. Unit: ticks.
+    pub read_ticks: u32,
+}
+
+/// Factory values for the official MMO.
+pub const FACTORY_MMO: FactoryConfig = FactoryConfig {
+    enabled: true,
+    mineral_keep: 3 * LAB_MINERAL_CAPACITY,
+    bar_max: 20_000,
+    energy_keep: 1_000,
+    energy_per_life: 3_000,
+    hauler_carry: 10,
+    read_ticks: 100,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1217,6 +1279,7 @@ pub struct Config {
     pub upkeep: UpkeepConfig,
     pub minerals: MineralsConfig,
     pub labs: LabsConfig,
+    pub factory: FactoryConfig,
 }
 
 /// A server profile: a name and its values.
@@ -1253,6 +1316,7 @@ pub const MMO: Profile = Profile {
         upkeep: UPKEEP_MMO,
         minerals: MINERALS_MMO,
         labs: LABS_MMO,
+        factory: FACTORY_MMO,
     },
 };
 
@@ -1413,7 +1477,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 192;
+pub const FIELD_COUNT: usize = 200;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1697,6 +1761,7 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     flag!(planner, "PlannerConfig", observer, true),
     flag!(planner, "PlannerConfig", minerals, true),
     flag!(planner, "PlannerConfig", labs, true),
+    flag!(planner, "PlannerConfig", factory, true),
     number!(
         planner,
         "PlannerConfig",
@@ -1950,6 +2015,48 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         true
     ),
     number!(labs, "LabsConfig", read_ticks, 1, 10_000, true),
+    flag!(factory, "FactoryConfig", enabled, true),
+    number!(
+        factory,
+        "FactoryConfig",
+        mineral_keep,
+        0,
+        TERMINAL_CAPACITY,
+        true
+    ),
+    number!(
+        factory,
+        "FactoryConfig",
+        bar_max,
+        0,
+        TERMINAL_CAPACITY,
+        true
+    ),
+    number!(
+        factory,
+        "FactoryConfig",
+        energy_keep,
+        0,
+        TERMINAL_CAPACITY,
+        true
+    ),
+    number!(
+        factory,
+        "FactoryConfig",
+        energy_per_life,
+        1,
+        1_000_000,
+        true
+    ),
+    number!(
+        factory,
+        "FactoryConfig",
+        hauler_carry,
+        1,
+        MAX_CREEP_SIZE - 1,
+        true
+    ),
+    number!(factory, "FactoryConfig", read_ticks, 1, 10_000, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -2235,6 +2342,7 @@ mod tests {
             upkeep: _,
             minerals: _,
             labs: _,
+            factory: _,
         } = MMO.config;
         let SpawnConfig {
             hold_ticks: _,
@@ -2295,6 +2403,7 @@ mod tests {
             observer: _,
             minerals: _,
             labs: _,
+            factory: _,
             max_sites: _,
             verify_ticks: _,
             hub_clearance: _,
@@ -2404,7 +2513,16 @@ mod tests {
             hauler_carry: _,
             read_ticks: _,
         } = LABS_MMO;
-        let expected: [(&str, &[&str]); 23] = [
+        let FactoryConfig {
+            enabled: _,
+            mineral_keep: _,
+            bar_max: _,
+            energy_keep: _,
+            energy_per_life: _,
+            hauler_carry: _,
+            read_ticks: _,
+        } = FACTORY_MMO;
+        let expected: [(&str, &[&str]); 24] = [
             (
                 "loader",
                 &[
@@ -2556,6 +2674,7 @@ mod tests {
                     "observer",
                     "minerals",
                     "labs",
+                    "factory",
                     "max_sites",
                     "verify_ticks",
                     "hub_clearance",
@@ -2680,6 +2799,18 @@ mod tests {
                     "goal_xuh2o",
                     "goal_xgh2o",
                     "batch_min",
+                    "hauler_carry",
+                    "read_ticks",
+                ],
+            ),
+            (
+                "factory",
+                &[
+                    "enabled",
+                    "mineral_keep",
+                    "bar_max",
+                    "energy_keep",
+                    "energy_per_life",
                     "hauler_carry",
                     "read_ticks",
                 ],

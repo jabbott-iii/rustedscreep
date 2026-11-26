@@ -63,7 +63,7 @@ use rustedscreep_core::scheduler::{
 };
 use rustedscreep_core::snapshot::{ObjectKey, ObjectKind, Snapshot, StructureHandle};
 use rustedscreep_core::spawning::{Body, EnergyBudget, Spawner};
-use screeps::{Part, RoomName, StructureType};
+use screeps::{Part, Position, RoomName, StructureType};
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
 use crate::planner::PlannerGlue;
@@ -535,6 +535,18 @@ impl OpeningGlue {
     /// `Labs::wants_labs`).
     pub fn set_lab_rooms(&mut self, rooms: &[RoomName]) {
         self.placement.set_lab_rooms(rooms);
+    }
+
+    /// Sets the rooms whose plan's factory the placement places this tick (P9.3, ADR-046,
+    /// `Factories::wants_factory`).
+    pub fn set_factory_rooms(&mut self, rooms: &[RoomName]) {
+        self.placement.set_factory_rooms(rooms);
+    }
+
+    /// Sets the terminals the haulers deliver energy to this tick (P9.3, ADR-046,
+    /// `Factories::banks`), before the hauling job.
+    pub fn set_banks(&mut self, banks: &[(RoomName, StructureHandle, Position, u32)]) {
+        self.hauling.set_banks(banks);
     }
 
     /// The placement (P4.3's console summary reads its census and totals).

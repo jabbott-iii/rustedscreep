@@ -26,12 +26,13 @@ pub use intern::{Handle, Interner, ObjectKey};
 pub use room_name::parse_room_name;
 pub use tables::{
     BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepClass, CreepHandle, CreepRow,
-    CreepStore, Creeps, INTEL_SOURCES, IntelRead, LAB_RESOURCES, LabRead, LabSites, LabState,
-    LabTerminal, Links, MineralContainer, MineralRead, MineralSite, MineralSites, MineralTerminal,
-    ObjectClass, ObjectHandle, ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation,
-    RoomEnergy, RoomObjects, RoomStatus, Rooms, SIGN_TOWERS, SafeModeState, SignRead, SignSeen,
-    Spawns, StructureClass, StructureHandle, StructureStatic, Structures, Towers,
-    known_structure_type, lab_resource, position_from_packed,
+    CreepStore, Creeps, FACTORY_MINERALS, FACTORY_RESOURCES, FactoryRead, FactorySites,
+    FactoryState, FactoryStock, FactoryTerminal, INTEL_SOURCES, IntelRead, LAB_RESOURCES, LabRead,
+    LabSites, LabState, LabTerminal, Links, MineralContainer, MineralRead, MineralSite,
+    MineralSites, MineralTerminal, ObjectClass, ObjectHandle, ObjectKind, ObjectRow, ObjectStatic,
+    RemoteRead, Reservation, RoomEnergy, RoomObjects, RoomStatus, Rooms, SIGN_TOWERS,
+    SafeModeState, SignRead, SignSeen, Spawns, StructureClass, StructureHandle, StructureStatic,
+    Structures, Towers, factory_resource, known_structure_type, lab_resource, position_from_packed,
 };
 pub use tick::TickContext;
 
@@ -193,6 +194,8 @@ pub struct Snapshot {
     pub minerals: MineralSites,
     /// The owned rooms' lab reads (P9.2, ADR-045).
     pub labs: LabSites,
+    /// The owned rooms' factory reads (P9.3, ADR-046).
+    pub factory: FactorySites,
     pub skipped: SkipCounts,
 }
 
@@ -209,6 +212,7 @@ impl Snapshot {
         self.objects.begin();
         self.minerals.begin();
         self.labs.begin();
+        self.factory.begin();
         self.skipped = SkipCounts::default();
     }
 

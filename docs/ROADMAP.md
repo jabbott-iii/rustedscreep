@@ -210,7 +210,7 @@ Modules:
 ## P9 Late game (SPEC §3.8)
 - [x] Minerals (ADR-044: each owned room with an own extractor on its mineral, a container next to it and an own terminal mines the mineral into the terminal under `minerals.stock_max`, with one mineral miner and the mineral haulers its rate needs; `planner.minerals` places the terminal, the extractor and the mineral container from RCL6, split from `planner.late`).
 - [x] Lab reactions and boost production (ADR-045: a target list of seven compounds with stock goals, `labs.goal_*`, worked at the deepest step of the first short target's chain the terminal holds both reagents of; `planner.labs` places a room's labs only once it wants them, a lab standing or a target's next step on hand; one lab hauler a room; compounds only, boosting left to P10's lab preparation).
-- [ ] Factory.
+- [x] Factory (ADR-046: each owned room with an own factory and terminal compresses the minerals it holds above `factory.mineral_keep` into their bars, under `factory.bar_max`, at most one batch a pace that keeps its energy within `factory.energy_per_life` a creep life; the source haulers fill the terminal with the energy up to `factory.energy_keep` where its sources are hauled; one factory hauler a room; `planner.factory` places a room's factory only once it has work, split from `planner.late`).
 - [ ] Terminal balancing (moving resources between the rooms' terminals).
 - [ ] Market with sanity limits (price bands, volume caps, credit floor).
 - [ ] Power processing (registering the power resource to the account in a power spawn, to develop power creeps).

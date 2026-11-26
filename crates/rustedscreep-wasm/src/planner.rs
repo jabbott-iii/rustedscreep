@@ -206,7 +206,7 @@ impl PlannerGlue {
         let _ = write!(
             text,
             " (replace {}, storage {}, towers {}, ramparts {}, late {}, observer {}, minerals {}, \
-             labs {}, max sites {});",
+             labs {}, factory {}, max sites {});",
             cfg.replace,
             cfg.storage,
             cfg.towers,
@@ -215,6 +215,7 @@ impl PlannerGlue {
             cfg.observer,
             cfg.minerals,
             cfg.labs,
+            cfg.factory,
             cfg.max_sites
         );
         match self.core.load_state() {

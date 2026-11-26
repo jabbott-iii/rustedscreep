@@ -26,10 +26,14 @@
 //!   its extractor, the container next to its mineral, and its terminal.
 //! - [`Labs`]: lab reactions (P9.2, ADR-045): each room's lab roles, its job (one step of a
 //!   target compound's chain), its reactions, and its lab hauler.
+//! - [`Factories`]: the factory (P9.3, ADR-046): each room's job (the surplus mineral it
+//!   compresses into its bar), its batches, its terminal's energy from the haulers, and its
+//!   factory hauler.
 //! - [`Remotes`]: remote mining's manager and creeps (P6.2, ADR-029): each home's candidate rooms,
 //!   what the bot saw of them, their ways and prices, the rooms it mines, and the scouts,
 //!   reservers, remote miners and remote haulers.
 
+mod factory;
 mod hauling;
 mod labs;
 mod minerals;
@@ -42,6 +46,12 @@ pub mod sizing;
 mod upgrading;
 mod watchdog;
 
+pub use factory::{
+    Factories, FactoryEvent, FactoryRoom, FactoryStats, Member as FactoryMember,
+    PRIORITY_FACTORY_HAULER, ProduceOrder, Recipe as FactoryRecipe, Stop as FactoryStop,
+    Task as FactoryTask, Why as FactoryWhy, life_energy as factory_life_energy,
+    pace as factory_pace, pick as factory_pick, recipes as factory_recipes,
+};
 pub use hauling::{
     HaulInput, HaulPlan, HaulSource, HaulStats, HaulTask, HaulView, Hauling, PRIORITY_HAULER,
 };
@@ -85,6 +95,8 @@ pub use upgrading::{
 };
 pub use watchdog::{Event, Observation, Watchdog};
 
+#[cfg(test)]
+mod factory_tests;
 #[cfg(test)]
 mod labs_tests;
 #[cfg(test)]

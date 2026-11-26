@@ -5,8 +5,9 @@
 //! - What is placed ([`Gates`]): the plan's spawns and extensions always; the storage and the hub
 //!   link, the towers, the ramparts and walls, the mineral structures (terminal, extractor and
 //!   mineral container, P9.1, ADR-044), the observer, the labs (P9.2, ADR-045: only in a room
-//!   that wants them, [`Gates::with_labs`]), and the late structures (factory, power spawn,
-//!   nuker) only when their gate is on (the user's choice, 2026-11-18: only what the bot uses); a
+//!   that wants them, [`Gates::with_labs`]), the factory (P9.3, ADR-046: likewise,
+//!   [`Gates::with_factory`]), and the late structures (power spawn, nuker) only when their gate
+//!   is on (the user's choice, 2026-11-18: only what the bot uses); a
 //!   road from the earliest level a structure it serves is placed
 //!   ([`Gates::due_level`], `layout::RoadNeed`), so the mineral's road waits with the extractor. The mining tiles' containers, the controller container and
 //!   the controller and source links come from `economy::mining`, which keeps ADR-023 to
@@ -61,6 +62,7 @@ pub struct Gates {
     pub observer: bool,
     pub minerals: bool,
     pub labs: bool,
+    pub factory: bool,
 }
 
 impl Gates {
@@ -73,6 +75,7 @@ impl Gates {
             observer: cfg.observer,
             minerals: cfg.minerals,
             labs: cfg.labs,
+            factory: cfg.factory,
         }
     }
 
@@ -82,6 +85,16 @@ impl Gates {
     pub const fn with_labs(self, wants: bool) -> Self {
         Self {
             labs: self.labs && wants,
+            ..self
+        }
+    }
+
+    /// These gates in a room that wants a factory or not (`wants`,
+    /// `economy::factory::Factories::wants_factory`): the factory's gate stays on only while the
+    /// room wants one (ADR-046, the user's choice: build the factory once it has work).
+    pub const fn with_factory(self, wants: bool) -> Self {
+        Self {
+            factory: self.factory && wants,
             ..self
         }
     }
@@ -97,6 +110,7 @@ impl Gates {
             Gate::Observer => self.observer,
             Gate::Minerals => self.minerals,
             Gate::Labs => self.labs,
+            Gate::Factory => self.factory,
         }
     }
 
@@ -1028,6 +1042,7 @@ mod tests {
                 observer: true,
                 minerals: true,
                 labs: true,
+                factory: true,
             },
         ] {
             a.gates = gates;
@@ -1234,7 +1249,7 @@ mod tests {
         earliest_level(kind, 0).expect("allowed at some level")
     }
 
-    /// Gates from seven bits: storage, towers, ramparts, late, observer, minerals, labs.
+    /// Gates from eight bits: storage, towers, ramparts, late, observer, minerals, labs, factory.
     fn gates(bits: u8) -> Gates {
         Gates {
             storage: bits & 1 != 0,
@@ -1244,11 +1259,12 @@ mod tests {
             observer: bits & 16 != 0,
             minerals: bits & 32 != 0,
             labs: bits & 64 != 0,
+            factory: bits & 128 != 0,
         }
     }
 
     /// Every gate on.
-    const ALL_ON: u8 = 0b111_1111;
+    const ALL_ON: u8 = 0b1111_1111;
 
     /// The bit of `kind` in [`Ask::full`].
     fn full_bit(kind: StructureType) -> u32 {
@@ -1355,7 +1371,7 @@ mod tests {
     }
 
     /// C14: the economy's containers and links (the mining tiles', the controller's and the
-    /// sources') never come out of [`next`], under any of the 128 gate combinations at any level;
+    /// sources') never come out of [`next`], under any of the 256 gate combinations at any level;
     /// the hub link only with the storage gate on, the mineral container only with the minerals
     /// gate on (P9.1, ADR-044), each from its level.
     ///
@@ -1452,13 +1468,14 @@ mod tests {
         }
     }
 
-    /// C14: under the MMO profile's gates no storage or late structure (factory, power spawn,
-    /// nuker) is due at any level, so none is counted or offered; the tower, the rampart, the
-    /// wall, the observer, the mineral structures (terminal, extractor and mineral container), and
-    /// in a room that wants them the labs are due from the first level that allows each (P7.2
-    /// turned the towers' gate on, P7.3 the ramparts' and with it the walls', ADR-026, ADR-032,
-    /// P8.1 the observer's, ADR-039, P9.1 the minerals', ADR-044, and P9.2 the labs', ADR-045,
-    /// through [`Gates::with_labs`]; the mineral container from the extractor's level), and the
+    /// C14: under the MMO profile's gates no storage or late structure (power spawn, nuker) is
+    /// due at any level, so none is counted or offered; the tower, the rampart, the wall, the
+    /// observer, the mineral structures (terminal, extractor and mineral container), and in a room
+    /// that wants them the labs and the factory are due from the first level that allows each
+    /// (P7.2 turned the towers' gate on, P7.3 the ramparts' and with it the walls', ADR-026,
+    /// ADR-032, P8.1 the observer's, ADR-039, P9.1 the minerals', ADR-044, P9.2 the labs',
+    /// ADR-045, through [`Gates::with_labs`], and P9.3 the factory's, ADR-046, through
+    /// [`Gates::with_factory`]; the mineral container from the extractor's level), and the
     /// one of them first in the planner's kind order is offered; with every gate on, each is due
     /// at the top level.
     ///
@@ -1504,14 +1521,14 @@ mod tests {
         let mut s = Scratch::default();
         for (level, wants) in (1..=MAX_LEVEL).flat_map(|l| [(l, true), (l, false)]) {
             let mut a = ask(&l, &t, level);
-            a.gates = Gates::from_config(&PLANNER_MMO).with_labs(wants);
+            a.gates = Gates::from_config(&PLANNER_MMO)
+                .with_labs(wants)
+                .with_factory(wants);
             let (n, c) = next(&a, &g, &mut s);
             let extractor = first(StructureType::Extractor);
-            let lab = if wants {
-                first(StructureType::Lab)
-            } else {
-                u8::MAX
-            };
+            let wanted = |k: StructureType| if wants { first(k) } else { u8::MAX };
+            let lab = wanted(StructureType::Lab);
+            let factory = wanted(StructureType::Factory);
             let due: Vec<StructureType> = [
                 (StructureType::Tower, first(StructureType::Tower)),
                 (StructureType::Rampart, first(StructureType::Rampart)),
@@ -1521,6 +1538,7 @@ mod tests {
                 (StructureType::Extractor, extractor),
                 (StructureType::Container, extractor),
                 (StructureType::Lab, lab),
+                (StructureType::Factory, factory),
             ]
             .into_iter()
             .filter(|&(_, from)| level >= from)
@@ -1529,7 +1547,7 @@ mod tests {
             assert_eq!(
                 c.due as usize,
                 due.len(),
-                "level {level}, labs {wants}: {c:?}"
+                "level {level}, labs and factory {wants}: {c:?}"
             );
             match due.iter().copied().min_by_key(|&k| kind_rank(k)) {
                 Some(want) => assert!(
