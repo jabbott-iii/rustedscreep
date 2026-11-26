@@ -96,8 +96,8 @@ const ACT_JOB: &str = "spawn act";
 /// Whether the console spawns `role`: a worker only. A miner's body comes from its source
 /// (`economy::mining`, P3.1), a hauler's from its source's yield and trip (`economy::hauling`,
 /// P3.3), an upgrader's from the energy that reaches the controller (`economy::upgrading`, P3.4),
-/// a remote role's needs its remote room, which the console does not name (P6.2), and the signer's
-/// comes from its trip (ADR-030).
+/// a remote role's needs its remote room, which the console does not name (P6.2), the signer's
+/// comes from its trip (ADR-030), and the mineral creeps' from their room's mineral plan (P9.1).
 fn console_role(role: Role) -> bool {
     match role {
         Role::Worker => true,
@@ -112,7 +112,9 @@ fn console_role(role: Role) -> bool {
         | Role::Defender
         | Role::RemoteDefender
         | Role::Explorer
-        | Role::Claimer => false,
+        | Role::Claimer
+        | Role::MineralMiner
+        | Role::MineralHauler => false,
     }
 }
 
@@ -182,7 +184,9 @@ impl SpawnGlue {
                 | Role::Defender
                 | Role::RemoteDefender
                 | Role::Explorer
-                | Role::Claimer => return None,
+                | Role::Claimer
+                | Role::MineralMiner
+                | Role::MineralHauler => return None,
             };
             self.spawner.request(SpawnRequest {
                 home: c.home,

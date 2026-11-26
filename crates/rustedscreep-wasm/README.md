@@ -74,6 +74,7 @@ game's console, for example `rustedscreep.scheduler()` for `schedulerSummary`:
 | `signSummary` | `rustedscreep.sign()` | The signer's record, its trip, and the next signer's plan |
 | `scoutSummary` | `rustedscreep.scout()` | The atlas of rooms near the homes, the explorer and its trip, and the observers' looks |
 | `claimsSummary` | `rustedscreep.claims()` | The claim candidates, why rooms were left out, the plan running, and the best room with its terms |
+| `mineralsSummary` | `rustedscreep.minerals()` | Each room's mineral mining: why it mines or not, its last read, its plan, its creeps, and its counters since boot (P9.1, ADR-044) |
 | `persistSummary`, `persistTest` | `rustedscreep.persist()`, `rustedscreep.persistTest(bytes)` | The segments in use; a write and read-back test |
 | `configSummary`, `configSet`, `configUnset`, `configReset` | `rustedscreep.config()` and the same names | The config in force; set, remove, or clear overrides |
 | `constsSummary` | `rustedscreep.consts()` | The constants self-check: this build's constants against the server's |

@@ -103,17 +103,17 @@ use rustedscreep_core::expansion::Scouting;
 use rustedscreep_core::signing::SIGN_TEXT;
 use rustedscreep_core::snapshot::{
     BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepRow, CreepStore, IntelRead,
-    MineralRead, ObjectKey, ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation,
-    RoomEnergy, RoomStatus, SafeModeState, SignRead, SignSeen, SkipCounts, SkipLog, SkipReason,
-    SkipReport, Snapshot, StructureHandle, StructureStatic, TickContext, known_structure_type,
-    parse_room_name, position_from_packed,
+    MineralContainer, MineralRead, MineralSite, MineralTerminal, ObjectKey, ObjectKind, ObjectRow,
+    ObjectStatic, RemoteRead, Reservation, RoomEnergy, RoomStatus, SafeModeState, SignRead,
+    SignSeen, SkipCounts, SkipLog, SkipReason, SkipReport, Snapshot, StructureHandle,
+    StructureStatic, TickContext, known_structure_type, parse_room_name, position_from_packed,
 };
 use rustedscreep_core::spawning::{CreepName, Identity, Role};
 use screeps::{
-    ConstructionSite, Creep, FindConstant, HasId, MaybeHasId, OwnedStructureProperties, Part,
-    Position, RawObjectId, Resource, ResourceType, Room, RoomName, RoomObject, SYSTEM_USERNAME,
-    Source, Store, Structure, StructureController, StructureLink, StructureSpawn, StructureType,
-    find, game,
+    ConstructionSite, Creep, FindConstant, HasId, MaybeHasId, Mineral, OwnedStructureProperties,
+    Part, Position, RawObjectId, Resource, ResourceType, Room, RoomName, RoomObject,
+    SYSTEM_USERNAME, Source, Store, Structure, StructureController, StructureExtractor,
+    StructureLink, StructureSpawn, StructureType, find, game,
 };
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
@@ -282,6 +282,9 @@ pub struct JsWorld {
     /// Scratch: the owned rooms whose core structures' `hits` this tick reads, sorted (P7.4): a
     /// hostile creep there, `defense.safe_mode` on, and the room not in its safe mode.
     core_rooms: Vec<RoomName>,
+    /// The owned rooms whose mineral the next snapshot reads, sorted (P9.1, ADR-044,
+    /// `Minerals::reads`).
+    mineral_rooms: Vec<RoomName>,
 }
 
 impl JsWorld {
@@ -302,6 +305,15 @@ impl JsWorld {
         self.upkeep_ramparts.clear();
         self.upkeep_ramparts.extend_from_slice(ramparts);
         self.upkeep_ramparts.sort_unstable_by_key(|h| h.slot());
+    }
+
+    /// Sets the owned rooms whose mineral, container, extractor and terminal the next snapshot
+    /// reads (P9.1, ADR-044, `Minerals::reads`).
+    pub fn set_mineral_reads(&mut self, rooms: &[RoomName]) {
+        self.mineral_rooms.clear();
+        self.mineral_rooms.extend_from_slice(rooms);
+        self.mineral_rooms.sort_unstable_by_key(|n| n.packed_repr());
+        self.mineral_rooms.dedup();
     }
 
     fn clear(&mut self) {
@@ -633,7 +645,18 @@ fn push_room(
             }
             snapshot.rooms.set_controller_state(row, state);
         }
+        let objects_from = snapshot.objects.len();
         push_objects(snapshot, js, room.unchecked_ref::<Findable>());
+        // P9.1: the mineral of a room the mineral plan asked for, after its containers.
+        if listed(&js.mineral_rooms, name) {
+            push_mineral(
+                snapshot,
+                js,
+                room.unchecked_ref::<Findable>(),
+                name,
+                objects_from,
+            );
+        }
         if upkeep_tick {
             push_roads(snapshot, js, room.unchecked_ref::<Findable>());
             push_walls(snapshot, js, room.unchecked_ref::<Findable>());
@@ -784,6 +807,78 @@ fn push_intel(
         );
     }
     read
+}
+
+/// An owned room's mineral read (P9.1, ADR-044): `FIND_MINERALS` with its `length`, and for the
+/// first its `get`, `id`, `pos` and `__packedPos` (on a new handle), `mineralAmount`,
+/// `ticksToRegeneration` and `mineralType` (V394, V391); then for the first of the room's
+/// containers (pushed just before, from row `objects_from`) next to it, its `store` and
+/// `getUsedCapacity` for the mineral and for everything (V397): about 12 calls. The extractor and
+/// the terminal come with the room's structures ([`push_structure`]).
+fn push_mineral(
+    snapshot: &mut Snapshot,
+    js: &mut JsWorld,
+    finder: &Findable,
+    room: RoomName,
+    objects_from: usize,
+) {
+    let list = finder.find_array(find::MINERALS.find_code());
+    if list.length() == 0 {
+        return;
+    }
+    let object: RoomObject = list.get(0).unchecked_into();
+    let mineral = object.unchecked_ref::<Mineral>();
+    let amount = mineral.mineral_amount();
+    let regen = mineral.ticks_to_regeneration();
+    let kind = object
+        .unchecked_ref::<MineralInfo>()
+        .mineral_type_value()
+        .as_string()
+        .and_then(|t| mineral_kind(&t));
+    let row = ObjectRow {
+        amount,
+        total: regen.unwrap_or(0),
+        hits: 0,
+    };
+    let before = snapshot.objects.len();
+    push_object(snapshot, js, object, |_| Ok(ObjectKind::Mineral), row);
+    let objects = &snapshot.objects;
+    if objects.len() <= before {
+        return;
+    }
+    let (Some(&handle), Some(&at)) = (objects.handles().last(), objects.positions().last()) else {
+        return;
+    };
+    let near = |p: &Position| {
+        p.room_name() == at.room_name()
+            && p.x().u8().abs_diff(at.x().u8()) <= 1
+            && p.y().u8().abs_diff(at.y().u8()) <= 1
+    };
+    let container = (objects_from..before)
+        .find(|&r| {
+            objects.kinds().get(r) == Some(&ObjectKind::Container)
+                && objects.positions().get(r).is_some_and(near)
+        })
+        .and_then(|r| {
+            let store = js.objects.get(r)?.unchecked_ref::<Stored>().store_of();
+            Some(MineralContainer {
+                handle: *objects.handles().get(r)?,
+                at: *objects.positions().get(r)?,
+                stock: kind.map_or(0, |k| store.get_used_capacity(Some(k))),
+                used: store.get_used_capacity(None),
+            })
+        });
+    snapshot.minerals.push(MineralSite {
+        room,
+        handle,
+        at,
+        kind,
+        amount,
+        regen,
+        extractor: None,
+        container,
+        terminal: None,
+    });
 }
 
 /// A mineral's type from its `mineralType` text (V364): the seven a room can hold, `None` for any
@@ -1189,17 +1284,28 @@ fn push_creep(snapshot: &mut Snapshot, js: &mut JsWorld, creep: Creep, my: bool)
                     .map(|id| id.role);
                 let remote_defender = role == Some(Role::RemoteDefender);
                 let defender = role == Some(Role::Defender) || remote_defender;
-                let no_store = defender || role == Some(Role::Claimer);
+                // P9.1: nor the mineral miner's (no CARRY part either).
+                let no_store =
+                    defender || role == Some(Role::Claimer) || role == Some(Role::MineralMiner);
                 // P2.4: `store`, `getUsedCapacity` and `getCapacity` for energy; a creep with no
                 // active CARRY part has a capacity of null, read as 0 (V196, V197).
                 if !no_store {
                     let store = creep.store();
                     let energy = ResourceType::Energy;
+                    let held = store.get_used_capacity(Some(energy));
+                    // P9.1: a mineral hauler's whole load too (`getUsedCapacity()`, V397); it
+                    // carries nothing but its room's mineral.
+                    let other = if role == Some(Role::MineralHauler) {
+                        store.get_used_capacity(None).saturating_sub(held)
+                    } else {
+                        0
+                    };
                     snapshot.creeps.set_store(
                         row,
                         CreepStore {
-                            energy: store.get_used_capacity(Some(energy)),
+                            energy: held,
                             capacity: store.get_capacity(Some(energy)),
+                            other,
                         },
                     );
                 }
@@ -1345,6 +1451,31 @@ fn push_structure(
                 }
                 let row = u32::try_from(row).unwrap_or(u32::MAX);
                 snapshot.towers.push(handle, row, energy);
+            }
+            // P9.1: in a room read for its mineral, the extractor on it (its `cooldown`, V396)
+            // and the terminal (its `store`, the mineral's `getUsedCapacity` and the free room).
+            if matches!(
+                kind,
+                Some(StructureType::Extractor | StructureType::Terminal)
+            ) && let Some(&at) = snapshot.structures.positions().get(row)
+                && let Some(site) = snapshot.minerals.get(at.room_name()).copied()
+            {
+                if kind == Some(StructureType::Extractor) {
+                    if site.at == at {
+                        let cooldown = structure.unchecked_ref::<StructureExtractor>().cooldown();
+                        snapshot.minerals.set_extractor(at, handle, cooldown);
+                    }
+                } else {
+                    let store = structure.unchecked_ref::<Stored>().store_of();
+                    let stock = site.kind.map_or(0, |k| store.get_used_capacity(Some(k)));
+                    let free = u32::try_from(store.get_free_capacity(None)).unwrap_or(0);
+                    snapshot.minerals.set_terminal(MineralTerminal {
+                        handle,
+                        at,
+                        stock,
+                        free,
+                    });
+                }
             }
             let structures = &snapshot.structures;
             if kind == Some(StructureType::Link) {

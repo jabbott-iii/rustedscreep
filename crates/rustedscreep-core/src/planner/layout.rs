@@ -63,15 +63,17 @@ pub enum Gate {
     Towers,
     /// Ramparts and walls.
     Ramparts,
-    /// The terminal, the extractor and the mineral container, labs, the factory, the power spawn,
-    /// and the nuker.
+    /// Labs, the factory, the power spawn, and the nuker.
     Late,
     /// The observer (P8.1, ADR-039: split from [`Gate::Late`], since the atlas uses it).
     Observer,
+    /// The terminal, the extractor and the mineral container (P9.1, ADR-044: split from
+    /// [`Gate::Late`], since the mineral miner and its hauler use them).
+    Minerals,
 }
 
 /// How many [`Gate`]s there are.
-pub const GATES: usize = 6;
+pub const GATES: usize = 7;
 
 impl Gate {
     /// Every gate, in index order.
@@ -82,6 +84,7 @@ impl Gate {
         Self::Ramparts,
         Self::Late,
         Self::Observer,
+        Self::Minerals,
     ];
 
     /// The gate of the plan's `kind` on `tile` (a container or a link is the economy's but for the
@@ -89,7 +92,7 @@ impl Gate {
     pub fn of(kind: StructureType, tile: Tile, roles: &Roles) -> Self {
         match kind {
             StructureType::Spawn | StructureType::Extension | StructureType::Road => Self::Base,
-            StructureType::Container if roles.mineral_container == Some(tile) => Self::Late,
+            StructureType::Container if roles.mineral_container == Some(tile) => Self::Minerals,
             StructureType::Container => Self::Base,
             StructureType::Link if roles.hub_link == Some(tile) => Self::Storage,
             StructureType::Link => Self::Base,
@@ -97,6 +100,7 @@ impl Gate {
             StructureType::Tower => Self::Towers,
             StructureType::Rampart | StructureType::Wall => Self::Ramparts,
             StructureType::Observer => Self::Observer,
+            StructureType::Terminal | StructureType::Extractor => Self::Minerals,
             _ => Self::Late,
         }
     }

@@ -21,9 +21,10 @@ pub mod overrides;
 use core::fmt;
 
 use rustedscreep_consts::{
-    CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, LINK_CAPACITY, MAX_CONSTRUCTION_SITES,
-    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, OBSERVER_RANGE,
-    RAMPART_DECAY_AMOUNT, RAMPART_DECAY_TIME, RAMPART_HITS_MAX_RCL2, ROOM_SIZE, TOWER_CAPACITY,
+    CONTAINER_CAPACITY, CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, LINK_CAPACITY,
+    MAX_CONSTRUCTION_SITES, MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP,
+    OBSERVER_RANGE, RAMPART_DECAY_AMOUNT, RAMPART_DECAY_TIME, RAMPART_HITS_MAX_RCL2, ROOM_SIZE,
+    TERMINAL_CAPACITY, TOWER_CAPACITY,
 };
 
 /// How the loader recovers after a trap or an aborted tick (ADR-003).
@@ -681,12 +682,16 @@ pub struct PlannerConfig {
     /// Places the ramparts (when ramparts are built is P7's, ADR-007; on since P7.3, ADR-032, whose
     /// workers keep them at [`UpkeepConfig::rampart_permille`] of their level's hits).
     pub ramparts: bool,
-    /// Places the terminal, the extractor and its container, the labs, the factory, the power spawn,
-    /// and the nuker (nothing uses them before P9).
+    /// Places the labs, the factory, the power spawn, and the nuker (nothing uses them yet; P9's
+    /// later items do).
     pub late: bool,
     /// Places the observer (at RCL8, the only level that allows one), which the atlas's observer
     /// loop uses (P8.1, ADR-039). Split from [`Self::late`].
     pub observer: bool,
+    /// Places the terminal, the extractor and the mineral container (from RCL6, the level that
+    /// allows the first two, V393), which mineral mining uses (P9.1, ADR-044: the terminal is
+    /// where the minerals go). Split from [`Self::late`].
+    pub minerals: bool,
     /// The most own construction sites a room may hold before the placement waits: one site a
     /// tick goes out, first the economy's containers and links on the plan's tiles (ADR-023 to
     /// ADR-025's timing), then the plan's items by type (spawns, extensions, ... roads). Unit:
@@ -715,6 +720,7 @@ pub const PLANNER_MMO: PlannerConfig = PlannerConfig {
     ramparts: true,
     late: false,
     observer: true,
+    minerals: true,
     max_sites: 10,
     verify_ticks: 500,
     hub_clearance: 3,
@@ -1073,6 +1079,43 @@ pub const UPKEEP_MMO: UpkeepConfig = UpkeepConfig {
     rampart_refill: 20 * RAMPART_DECAY_AMOUNT,
 };
 
+/// Mineral mining (ROADMAP P9.1, ADR-044): in each owned room with an own extractor on its mineral,
+/// a container next to the mineral and an own terminal, one mineral miner stands on the container
+/// and harvests, and mineral haulers carry the mineral from the container to the terminal
+/// (`economy::minerals`). `docs/TUNING.md` gives each one's rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MineralsConfig {
+    /// Requests the mineral miner and haulers of a room that can mine. Off, none is requested, the
+    /// miner harvests no more, and a room is read only while a hauler has the mineral to carry
+    /// (in the container or in its store), which it then delivers.
+    pub enabled: bool,
+    /// A room stops mining once its terminal holds this much of the room's mineral, and starts
+    /// again below it (the user's choice, ADR-044: mine under a stock cap). Unit: units of the
+    /// mineral.
+    pub stock_max: u32,
+    /// A room also stops mining while its terminal has less free room than this (the terminal's
+    /// one pool holds every resource, V401), so the container's load still fits. Unit: units.
+    pub free_min: u32,
+    /// The most WORK parts a mineral miner gets; below it the room's energy capacity sets the
+    /// count. Unit: WORK parts.
+    pub max_work: u32,
+    /// A room with an extractor is read again after this many ticks (its mineral, container,
+    /// extractor and terminal), or sooner when its mineral's regeneration is due. A room with a
+    /// mineral creep out of the spawn that can act (the room mines, its container holds some of
+    /// the mineral, or a hauler carries some) is read every tick the Standard tier runs. Unit:
+    /// ticks.
+    pub read_ticks: u32,
+}
+
+/// Mineral values for the official MMO.
+pub const MINERALS_MMO: MineralsConfig = MineralsConfig {
+    enabled: true,
+    stock_max: 100_000,
+    free_min: CONTAINER_CAPACITY,
+    max_work: 24,
+    read_ticks: 100,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1098,6 +1141,7 @@ pub struct Config {
     pub claim: ClaimConfig,
     pub defense: DefenseConfig,
     pub upkeep: UpkeepConfig,
+    pub minerals: MineralsConfig,
 }
 
 /// A server profile: a name and its values.
@@ -1132,6 +1176,7 @@ pub const MMO: Profile = Profile {
         claim: CLAIM_MMO,
         defense: DEFENSE_MMO,
         upkeep: UPKEEP_MMO,
+        minerals: MINERALS_MMO,
     },
 };
 
@@ -1292,7 +1337,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 174;
+pub const FIELD_COUNT: usize = 180;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1574,6 +1619,7 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     flag!(planner, "PlannerConfig", ramparts, true),
     flag!(planner, "PlannerConfig", late, true),
     flag!(planner, "PlannerConfig", observer, true),
+    flag!(planner, "PlannerConfig", minerals, true),
     number!(
         planner,
         "PlannerConfig",
@@ -1776,6 +1822,32 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         RAMPART_HITS_MAX_RCL2,
         true
     ),
+    flag!(minerals, "MineralsConfig", enabled, true),
+    number!(
+        minerals,
+        "MineralsConfig",
+        stock_max,
+        0,
+        TERMINAL_CAPACITY,
+        true
+    ),
+    number!(
+        minerals,
+        "MineralsConfig",
+        free_min,
+        0,
+        TERMINAL_CAPACITY,
+        true
+    ),
+    number!(
+        minerals,
+        "MineralsConfig",
+        max_work,
+        1,
+        MAX_CREEP_SIZE - 1,
+        true
+    ),
+    number!(minerals, "MineralsConfig", read_ticks, 1, 10_000, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -2059,6 +2131,7 @@ mod tests {
             claim: _,
             defense: _,
             upkeep: _,
+            minerals: _,
         } = MMO.config;
         let SpawnConfig {
             hold_ticks: _,
@@ -2117,6 +2190,7 @@ mod tests {
             ramparts: _,
             late: _,
             observer: _,
+            minerals: _,
             max_sites: _,
             verify_ticks: _,
             hub_clearance: _,
@@ -2206,7 +2280,14 @@ mod tests {
             rampart_floor: _,
             rampart_refill: _,
         } = UPKEEP_MMO;
-        let expected: [(&str, &[&str]); 21] = [
+        let MineralsConfig {
+            enabled: _,
+            stock_max: _,
+            free_min: _,
+            max_work: _,
+            read_ticks: _,
+        } = MINERALS_MMO;
+        let expected: [(&str, &[&str]); 22] = [
             (
                 "loader",
                 &[
@@ -2356,6 +2437,7 @@ mod tests {
                     "ramparts",
                     "late",
                     "observer",
+                    "minerals",
                     "max_sites",
                     "verify_ticks",
                     "hub_clearance",
@@ -2463,6 +2545,10 @@ mod tests {
                     "rampart_floor",
                     "rampart_refill",
                 ],
+            ),
+            (
+                "minerals",
+                &["enabled", "stock_max", "free_min", "max_work", "read_ticks"],
             ),
         ];
         let mut total = 0;

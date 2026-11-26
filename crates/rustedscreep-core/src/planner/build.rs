@@ -3,11 +3,11 @@
 //! site, a destroy of an own structure that stands in the plan's way, or nothing.
 //!
 //! - What is placed ([`Gates`]): the plan's spawns and extensions always; the storage and the hub
-//!   link, the towers, the ramparts and walls, and the late structures (terminal, extractor and
-//!   mineral container, labs, factory, power spawn, nuker, observer) only when their gate is on
-//!   (the user's choice, 2026-11-18: only what the bot uses); a road from the earliest level a
-//!   structure it serves is placed ([`Gates::due_level`], `layout::RoadNeed`), so the mineral's
-//!   road waits with the extractor. The mining tiles' containers, the controller container and
+//!   link, the towers, the ramparts and walls, the mineral structures (terminal, extractor and
+//!   mineral container, P9.1, ADR-044), the observer, and the late structures (labs, factory,
+//!   power spawn, nuker) only when their gate is on (the user's choice, 2026-11-18: only what the
+//!   bot uses); a road from the earliest level a structure it serves is placed
+//!   ([`Gates::due_level`], `layout::RoadNeed`), so the mineral's road waits with the extractor. The mining tiles' containers, the controller container and
 //!   the controller and source links come from `economy::mining`, which keeps ADR-023 to
 //!   ADR-025's timing; [`role_tile`] maps each to the plan's tile for its role.
 //! - The order: by type in [`KINDS`]'s order (spawns and extensions first, roads late), then the
@@ -58,6 +58,7 @@ pub struct Gates {
     pub ramparts: bool,
     pub late: bool,
     pub observer: bool,
+    pub minerals: bool,
 }
 
 impl Gates {
@@ -68,6 +69,7 @@ impl Gates {
             ramparts: cfg.ramparts,
             late: cfg.late,
             observer: cfg.observer,
+            minerals: cfg.minerals,
         }
     }
 
@@ -80,6 +82,7 @@ impl Gates {
             Gate::Ramparts => self.ramparts,
             Gate::Late => self.late,
             Gate::Observer => self.observer,
+            Gate::Minerals => self.minerals,
         }
     }
 
@@ -1009,6 +1012,7 @@ mod tests {
                 ramparts: true,
                 late: true,
                 observer: true,
+                minerals: true,
             },
         ] {
             a.gates = gates;
@@ -1215,7 +1219,7 @@ mod tests {
         earliest_level(kind, 0).expect("allowed at some level")
     }
 
-    /// Gates from five bits: storage, towers, ramparts, late, observer.
+    /// Gates from six bits: storage, towers, ramparts, late, observer, minerals.
     fn gates(bits: u8) -> Gates {
         Gates {
             storage: bits & 1 != 0,
@@ -1223,11 +1227,12 @@ mod tests {
             ramparts: bits & 4 != 0,
             late: bits & 8 != 0,
             observer: bits & 16 != 0,
+            minerals: bits & 32 != 0,
         }
     }
 
     /// Every gate on.
-    const ALL_ON: u8 = 0b1_1111;
+    const ALL_ON: u8 = 0b11_1111;
 
     /// The bit of `kind` in [`Ask::full`].
     fn full_bit(kind: StructureType) -> u32 {
@@ -1334,9 +1339,9 @@ mod tests {
     }
 
     /// C14: the economy's containers and links (the mining tiles', the controller's and the
-    /// sources') never come out of [`next`], under any of the 16 gate combinations at any level;
-    /// the hub link only with the storage gate on, the mineral container only with the late gate
-    /// on, each from its level.
+    /// sources') never come out of [`next`], under any of the 64 gate combinations at any level;
+    /// the hub link only with the storage gate on, the mineral container only with the minerals
+    /// gate on (P9.1, ADR-044), each from its level.
     ///
     /// Uses: `CONTROLLER_STRUCTURES` (through `earliest_level`: each container and link at a level
     /// that allows it, the mineral container with the extractor), `MAX_LEVEL`.
@@ -1399,7 +1404,7 @@ mod tests {
                 a.gates = g;
                 // In key order: containers before links.
                 let mut want = Vec::new();
-                if g.late && level >= mineral_level {
+                if g.minerals && level >= mineral_level {
                     want.push(Next::Site {
                         kind: StructureType::Container,
                         tile: mineral_container,
@@ -1431,12 +1436,14 @@ mod tests {
         }
     }
 
-    /// C14: under the MMO profile's gates no storage or late structure (terminal, extractor and
-    /// mineral container, lab, factory, power spawn, nuker) is due at any level, so none is counted
-    /// or offered; the tower, the rampart, the wall and the observer are due from the first level
-    /// that allows each (P7.2 turned the towers' gate on, P7.3 the ramparts' and with it the
-    /// walls', ADR-026, ADR-032, and P8.1 the observer's, ADR-039), and the one of them first in
-    /// the planner's kind order is offered; with every gate on, each is due at the top level.
+    /// C14: under the MMO profile's gates no storage or late structure (lab, factory, power
+    /// spawn, nuker) is due at any level, so none is counted or offered; the tower, the rampart,
+    /// the wall, the observer, and the mineral structures (terminal, extractor and mineral
+    /// container) are due from the first level that allows each (P7.2 turned the towers' gate on,
+    /// P7.3 the ramparts' and with it the walls', ADR-026, ADR-032, P8.1 the observer's, ADR-039,
+    /// and P9.1 the minerals', ADR-044; the mineral container from the extractor's level), and the
+    /// one of them first in the planner's kind order is offered; with every gate on, each is due
+    /// at the top level.
     ///
     /// Uses: `PLANNER_MMO` (its gates), `CONTROLLER_STRUCTURES` (through `earliest_level`: each
     /// at the first level that allows it), `MAX_LEVEL`.
@@ -1482,14 +1489,19 @@ mod tests {
             let mut a = ask(&l, &t, level);
             a.gates = Gates::from_config(&PLANNER_MMO);
             let (n, c) = next(&a, &g, &mut s);
+            let extractor = first(StructureType::Extractor);
             let due: Vec<StructureType> = [
-                StructureType::Tower,
-                StructureType::Rampart,
-                StructureType::Wall,
-                StructureType::Observer,
+                (StructureType::Tower, first(StructureType::Tower)),
+                (StructureType::Rampart, first(StructureType::Rampart)),
+                (StructureType::Wall, first(StructureType::Wall)),
+                (StructureType::Observer, first(StructureType::Observer)),
+                (StructureType::Terminal, first(StructureType::Terminal)),
+                (StructureType::Extractor, extractor),
+                (StructureType::Container, extractor),
             ]
             .into_iter()
-            .filter(|&k| level >= first(k))
+            .filter(|&(_, from)| level >= from)
+            .map(|(k, _)| k)
             .collect();
             assert_eq!(c.due as usize, due.len(), "level {level}: {c:?}");
             match due.iter().copied().min_by_key(|&k| kind_rank(k)) {
@@ -2114,10 +2126,12 @@ mod tests {
 
     /// C13: a road is due from the least level of what it serves whose gate is on
     /// ([`Gates::due_level`], `Layout::needs`): one serving only a late structure is due with the
-    /// late gate on and never under the MMO profile's gates; one serving the base at a later level
-    /// and a late structure at an earlier one is due from the base's level with the late gate
-    /// off and from the late one's with it on; one with no recorded need is due from its item's
-    /// level. [`next`] offers exactly the due ones, at every level.
+    /// late gate on and never under the MMO profile's gates; one serving only the mineral
+    /// container is due from the extractor's level under both (the minerals gate is on, P9.1,
+    /// ADR-044); one serving the base at a later level and a late structure at an earlier one is
+    /// due from the base's level with the late gate off and from the late one's with it on; one
+    /// with no recorded need is due from its item's level. [`next`] offers exactly the due ones,
+    /// at every level.
     ///
     /// Uses: `PLANNER_MMO` (its gates), `CONTROLLER_STRUCTURES` (through `earliest_level`: the
     /// extractor's, the first lab's, the third spawn's and the first spawn's levels), `MAX_LEVEL`.
@@ -2126,6 +2140,10 @@ mod tests {
         let t = open();
         let mmo = Gates::from_config(&PLANNER_MMO);
         assert!(!mmo.late, "the MMO profile places no late structures");
+        assert!(
+            mmo.minerals,
+            "the MMO profile places the mineral structures"
+        );
         let all = gates(ALL_ON);
         let mineral = first(StructureType::Extractor);
         let lab = first(StructureType::Lab);
@@ -2135,22 +2153,26 @@ mod tests {
         let mineral_road = tile(20, 20);
         let shared_road = tile(21, 22);
         let core_road = tile(22, 24);
+        let lab_road = tile(23, 26);
         let mut l = layout(vec![
             item_on(StructureType::Road, mineral_road, mineral),
             item_on(StructureType::Road, shared_road, lab.min(third_spawn)),
             item_on(StructureType::Road, core_road, core),
+            item_on(StructureType::Road, lab_road, lab),
         ]);
         l.needs = vec![
-            need(mineral_road, &[(Gate::Late, mineral)]),
+            need(mineral_road, &[(Gate::Minerals, mineral)]),
             need(shared_road, &[(Gate::Base, third_spawn), (Gate::Late, lab)]),
+            need(lab_road, &[(Gate::Late, lab)]),
         ];
         l.needs.sort_by_key(|n| n.tile.index());
         assert!(l.road_need(core_road).is_none());
         // (road, due level under the MMO gates, due level with every gate on)
         let expect = [
-            (mineral_road, None, Some(mineral)),
+            (mineral_road, Some(mineral), Some(mineral)),
             (shared_road, Some(third_spawn), Some(lab)),
             (core_road, Some(core), Some(core)),
+            (lab_road, None, Some(lab)),
         ];
         let road = |at: Tile| {
             *l.items

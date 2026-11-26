@@ -22,11 +22,14 @@
 //! - [`remote_profit`]: remote mining's profit model (P6.1): what a room the bot mines without
 //!   owning it earns and costs per creep life, in energy and in CPU, with or without a reserver
 //!   and roads, and the plan to run it by ([`best_plan`]).
+//! - [`Minerals`]: mineral mining (P9.1, ADR-044): each room's mineral miner and haulers, from
+//!   its extractor, the container next to its mineral, and its terminal.
 //! - [`Remotes`]: remote mining's manager and creeps (P6.2, ADR-029): each home's candidate rooms,
 //!   what the bot saw of them, their ways and prices, the rooms it mines, and the scouts,
 //!   reservers, remote miners and remote haulers.
 
 mod hauling;
+mod minerals;
 mod mining;
 mod opening;
 pub mod placement;
@@ -38,6 +41,13 @@ mod watchdog;
 
 pub use hauling::{
     HaulInput, HaulPlan, HaulSource, HaulStats, HaulTask, HaulView, Hauling, PRIORITY_HAULER,
+};
+pub use minerals::{
+    HARVEST_PERIOD, Member as MineralMember, MineralEvent, MineralPlan, MineralRoom, MineralStats,
+    Minerals, PRIORITY_MINERAL_HAULER, PRIORITY_MINERAL_MINER, Seen as MineralSeen,
+    Why as MineralWhy, gate as mineral_gate, hauler_body as mineral_hauler_body,
+    haulers_wanted as mineral_haulers_wanted, life_yield as mineral_life_yield,
+    miner_body as mineral_miner_body, rate_capacity as mineral_rate, why as mineral_why,
 };
 pub use mining::{
     CONTROLLER_LINK_RANGE, ContainerNeed, LIFE_CYCLES, LINK_MARGIN, LinkNeed, LinkOrder,
@@ -66,6 +76,8 @@ pub use upgrading::{
 };
 pub use watchdog::{Event, Observation, Watchdog};
 
+#[cfg(test)]
+mod minerals_tests;
 #[cfg(test)]
 mod remote_tests;
 // Its two-room world is also the remote defenders' (P7.6, `defense::remote`).

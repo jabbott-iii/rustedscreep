@@ -104,6 +104,7 @@ the console to see the build, the loader's phase, and any incidents.
 | `rustedscreep.sign()` | The controller signer's record and its current trip |
 | `rustedscreep.scout()` | What the bot knows of the rooms near its homes, the explorer, and the observers' looks |
 | `rustedscreep.claims()` | The rooms the bot could claim next, best first, with each one's score and base plan |
+| `rustedscreep.minerals()` | Each owned room's mineral mining: whether it mines (or why not), its mineral, container and terminal as last read, its miner's and haulers' plan, and its counters |
 | `rustedscreep.movement()` | Movement's rooms, grids, flow fields, and traffic |
 | `rustedscreep.consts()` | The constants self-check: this build's game constants against the server's |
 | `rustedscreep.persist()` | The RawMemory segments it uses |

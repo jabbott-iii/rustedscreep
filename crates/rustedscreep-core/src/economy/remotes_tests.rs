@@ -373,6 +373,7 @@ impl World {
                 CreepStore {
                     energy: c.energy,
                     capacity: c.capacity,
+                    other: 0,
                 },
             );
             self.snap.creeps.set_death(row, c.death);

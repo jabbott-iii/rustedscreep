@@ -836,7 +836,7 @@ impl Run {
         if let Some(mc) = b.roles.mineral_container {
             let extractor = earliest_level(StructureType::Extractor, 0)
                 .ok_or(PlanError::NoRoom("extractor level"))?;
-            roads::road(b, hub, mc, 0, extractor, Gate::Late, s)?;
+            roads::road(b, hub, mc, 0, extractor, Gate::Minerals, s)?;
         }
         if let Some(t) = input.spawn
             && self.core.is_some_and(|c| c.spawn != t)

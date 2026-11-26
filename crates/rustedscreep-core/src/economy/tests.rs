@@ -1903,6 +1903,7 @@ impl World {
                     CreepStore {
                         energy: c.energy,
                         capacity: c.capacity(),
+                        other: 0,
                     },
                 );
                 // Its ticksToLive (P5.2), read only until known, as the snapshot does: shown from

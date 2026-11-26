@@ -40,6 +40,7 @@ mod config;
 mod consts_check;
 mod defense;
 mod logging;
+mod minerals;
 mod movement;
 mod opening;
 mod persist;
@@ -86,6 +87,8 @@ struct State {
     scout: scout::ScoutGlue,
     /// Claim scoring (P8.2, ADR-041): the ranking of the rooms to claim and their plan checks.
     claim: claim::ClaimGlue,
+    /// Mineral mining (P9.1, ADR-044): each room's mineral miner and haulers.
+    minerals: minerals::MineralsGlue,
     /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1), the towers
     /// (P7.2), the safe-mode triggers (P7.4), the defenders (P7.5) and the remote defenders (P7.6).
     defense: defense::DefenseGlue,
@@ -145,6 +148,7 @@ pub fn game_loop() {
                     sign,
                     scout,
                     claim,
+                    minerals,
                     defense,
                     persist,
                     consts,
@@ -176,6 +180,7 @@ pub fn game_loop() {
                 spawn.begin(snapshot, &cfg.spawn, |room| opening.worker_body(room));
                 opening.begin(snapshot, &mut movement.core);
                 remote.begin(snapshot);
+                minerals.begin(snapshot, &cfg.minerals);
                 sign.begin(snapshot, &cfg.sign);
                 scout.begin(snapshot, &cfg.scout);
                 claim.begin(snapshot, &cfg.claim, sched.last_tick());
@@ -262,6 +267,22 @@ pub fn game_loop() {
                     &mut act.buffer,
                     &cfg.movement,
                 );
+                // Critical: mineral mining's plans and requests (P9.1, ADR-044; the requests only
+                // while the Standard tier runs), before the spawn plan, and its creeps' bodies for
+                // the upgraders' budget, before the upgrading job.
+                {
+                    let (_, upgrading) = opening.haul_parts();
+                    minerals.plan(
+                        &mut tick,
+                        snapshot,
+                        &mut movement.core,
+                        spawn.spawner_mut(),
+                        upgrading,
+                        &cfg.minerals,
+                        &cfg.hauling,
+                        &cfg.movement,
+                    );
+                }
                 // Critical: the static miners (P3.1), the haulers (P3.3), the upgraders' plan
                 // (P3.4), the opening's workers and their spawn requests (P2.4), then the spawn
                 // plan, after the Critical jobs that request creeps (P2.3).
@@ -315,6 +336,14 @@ pub fn game_loop() {
                     &mut movement.core,
                     &mut act.buffer,
                     &cfg.remote,
+                    &cfg.movement,
+                );
+                // Standard: the mineral miners' and haulers' work (P9.1).
+                minerals.work(
+                    &mut tick,
+                    snapshot,
+                    &mut movement.core,
+                    &mut act.buffer,
                     &cfg.movement,
                 );
                 // Standard: the claimer's walk and claim (P8.3).
@@ -404,7 +433,10 @@ pub fn game_loop() {
                 // After every job: the traffic manager turns the tick's move requests into moves.
                 movement.resolve(&mut tick, snapshot, &mut act.buffer, &cfg.movement);
                 tick.finish();
+                // P9.1: the rooms the next snapshot reads for their minerals.
+                js.set_mineral_reads(minerals.reads(&cfg.minerals));
                 opening.log_events();
+                minerals.log_events();
                 remote.log_events(snapshot, js);
                 sign.log_events(&cfg.sign);
                 scout.log_events(&cfg.scout);
@@ -664,6 +696,21 @@ pub fn claims_summary() -> String {
             Err(_) => String::from("rustedscreep claims: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep claims: state unavailable"))
+}
+
+/// Exported to JS as `mineralsSummary`, for the `rustedscreep.minerals()` console command: one line
+/// with each room's mining state, its last read, its plan, its creeps and its counters (P9.1,
+/// ADR-044).
+#[wasm_bindgen(js_name = "mineralsSummary")]
+pub fn minerals_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state
+                .minerals
+                .summary(&state.snapshot, &state.config.get().minerals),
+            Err(_) => String::from("rustedscreep minerals: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep minerals: state unavailable"))
 }
 
 /// Exported to JS as `remoteSummary`, for the `rustedscreep.remote()` console command: one line with

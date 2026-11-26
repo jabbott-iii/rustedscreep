@@ -2071,7 +2071,9 @@ impl Remotes {
             | Role::Defender
             | Role::RemoteDefender
             | Role::Explorer
-            | Role::Claimer => {}
+            | Role::Claimer
+            | Role::MineralMiner
+            | Role::MineralHauler => {}
         }
         Ok(())
     }

@@ -208,7 +208,7 @@ Modules:
   mined room during P8's live run.
 
 ## P9 Late game (SPEC §3.8)
-- [ ] Minerals.
+- [x] Minerals (ADR-044: each owned room with an own extractor on its mineral, a container next to it and an own terminal mines the mineral into the terminal under `minerals.stock_max`, with one mineral miner and the mineral haulers its rate needs; `planner.minerals` places the terminal, the extractor and the mineral container from RCL6, split from `planner.late`).
 - [ ] Lab reactions and boost production.
 - [ ] Factory.
 - [ ] Terminal balancing (moving resources between the rooms' terminals).

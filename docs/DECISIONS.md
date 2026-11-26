@@ -1067,3 +1067,49 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
   - E7N57 may never reach a second room. If its neighbors keep their towers and no route gets through E8N57, expansion from E7N57 stays shut, and the carried item rides from gate to gate. The way out (where the account plays) is the user's, outside the bot's code.
   - Each 50000-tick retry costs one explorer (50 energy) and up to about 300 route searches, at most one a tick in the Optional tier.
 - Evidence: STATUS's log for 2026-11-25 (the deploy, and `rustedscreep.scout()` and `rustedscreep.claims()` on shard3), ADR-031, ADR-039, ADR-042, V234, V239, V285, V378.
+
+## ADR-044 Mineral mining: where the minerals go, when a room mines, and who carries: Accepted (2026-11-25; implemented 2026-11-26)
+- Context: ROADMAP P9.1 and SPEC §3.8 ask for minerals: each owned room's mineral mined and kept, for labs (P9.2), the factory (P9.3), terminal balancing (P9.4) and the market (P9.5).
+  - **The live home.** E7N57 is at room controller level (RCL) 5. Its storage is not built: `planner.storage` is off (the user's choice, 2026-11-18). `CONTROLLER_STRUCTURES` allows the extractor (the structure a creep needs on a mineral to harvest it) and the terminal only from RCL6 (V393), so nothing can be mined there yet.
+  - **The planner.** It already plans the extractor, the mineral container and the terminal, but behind `planner.late`, with the labs, the factory, the power spawn and the nuker (off: nothing used them).
+  - **Engine facts (V385 to V402).** A harvest needs an own, active extractor on the mineral's tile and the extractor's `cooldown` at 0 (V385, V386). It yields `HARVEST_MINERAL_POWER` (1) a WORK part (V387) and sets the cooldown to `EXTRACTOR_COOLDOWN` (5), which the engine counts down from the next tick, so one mineral gives a harvest every 6 ticks (V388, V389, inferred from the engine's order). What a creep's store cannot hold goes into a container on its tile first (V387, V193). An emptied mineral refills to `MINERAL_DENSITY` for its density `MINERAL_REGEN_TIME` (50000) ticks later (V390, V391). A container, storage or terminal is one pool for every resource (V401), and a creep can hold energy and a mineral together (V402).
+- Options asked (2026-11-25, with the facts above):
+  - The sink: (a) the terminal, with the terminal, the extractor and the mineral container split from `planner.late` into a gate of their own; (b) the storage (`planner.storage` on; 30000 energy, RCL4, `STORAGE_CAPACITY` 1000000); (c) both, the storage first.
+  - When a room mines: (d) while the sink holds less than a stock cap (`minerals.stock_max`), below every economy and defense role; (e) only once labs or the market ask for the mineral (P9.2, P9.5).
+  - Who carries: (f) a dedicated mineral hauler; (g) the energy haulers, which would take a mineral load when the container fills.
+- Decision: (a), (d) and (f), the user's choices ("Terminal", "Under a stock cap", "Mineral hauler").
+- What it does (`rustedscreep_core::economy::minerals`, glue in `rustedscreep-wasm` `minerals.rs` and `snapshot.rs` `push_mineral`):
+  - **The gate.** `planner.minerals` (on) places the terminal (100000 energy), the extractor (5000), the mineral container (5000) and the roads that serve only them, from RCL6 (`planner::layout::Gate::Minerals`). `planner.late` keeps the labs, the factory, the power spawn and the nuker (off).
+  - **When a room mines** (`minerals::why`): `minerals.enabled`, a level that allows the extractor and the terminal, an own extractor on the mineral, a container next to it, an own terminal, a mineral type the build knows, a mineral amount above 0, the terminal holding less than `minerals.stock_max` (100000) of the mineral and at least `minerals.free_min` (2000, `CONTAINER_CAPACITY`) free, and a plan.
+  - **The plan.** It is built again when its key changes (movement's grid version, the room's capacity, the spawn, container and terminal tiles, `minerals.max_work`, `hauling.margin_pct`), with two flow fields: the miner's walk from the spawn and the haulers' trip from the container to the terminal.
+  - **The miner** (`Role::MineralMiner`, name code `e`, priority 65). It has only WORK and MOVE parts. Its body is the one of 1 to `minerals.max_work` (24) WORK parts, with the MOVE parts `sizing::miner_body_work` solves, that harvests the most over its life (`minerals::miner_body`). It stands on the container and calls `harvest` when the extractor's cooldown reads 0 and the container can take a whole harvest, so nothing piles on the ground. One a room, with no pre-spawn replacement.
+  - **The haulers** (`Role::MineralHauler`, code `t`, priority 66). They have CARRY and MOVE parts, sized by the source haulers' solver at the miner's rate (`minerals::rate_capacity`). They are requested only once the miner lives (spawning counts), or for a container holding a full load. An empty hauler withdraws the mineral when the container holds a full load for it, or anything while the miner is not harvesting. A loaded one transfers it all to the terminal.
+  - **The reads.** The snapshot reads a room's mineral (`mineralAmount`, `ticksToRegeneration`, `mineralType`), the container next to it (its stock of the mineral and everything it holds), the extractor's `cooldown` and the terminal's stock and free room: about 14 JS calls. It reads them every tick the Standard tier runs while a mineral creep of the room out of the spawn can act (the room mines, its container holds some of the mineral, or a hauler carries some), else every `minerals.read_ticks` (100) ticks or when the regeneration is due.
+  - **The tiers.** The plans and requests run in a Critical job (`minerals`) before the opening's, requesting only on ticks the Standard tier runs. The creeps' work runs in Standard (`minerals work`).
+  - **The upgraders' budget.** While a room mines, its mineral creeps' bodies count in the upgraders' upkeep (`Upgrading::set_minerals`), so the upgraders are sized to what is left.
+  - **The console and log.** `rustedscreep.minerals()` shows the rooms; `rustedscreep minerals: <room> mines its <type> (<amount> left)` and `... stopped mining: <why>` log a room's start and stop.
+- Added in the implementation, not asked:
+  - The haulers wait for the miner. The sandbox showed a hauler, at the higher priority, ordered first and waiting at an empty container while the miner waited for the spawn.
+  - The overflow rule follows V183 and V193 (a container on the miner's tile takes the overflow), not the verifier's first reading of V387, which said the overflow reaches the ground.
+  - From the hot-path review (2026-11-26, no high finding), applied:
+    - The reads follow creeps that can act, not any creep: a spawning miner, or an idle one after a stop with nothing to carry, no longer holds a room to a read every tick.
+    - No room is read every tick on a tick without the Standard tier, since no creep acts then.
+    - A room dropped from the module (its extractor gone) sets its upkeep to 0, which before stayed in the upgraders' budget.
+    - The upkeep list is cleared each tick at `begin`, not at unit 0, which a resumed job may never reach.
+    - The plan's flow fields are built only for a room that passes the checks before the plan (`minerals::gate`) or whose container holds the mineral.
+    - The miner's WORK count is read from the plan at the harvest, not copied before the plan's build, so the first tick after a reset cannot harvest past the container.
+  - Carried from the review, not applied:
+    - (medium) A mining room is read every tick (about 14 calls), though the miner can harvest only once every 6 ticks; reads could be predicted from the cooldown and the creeps' distances. Measure with the `profiler` build first.
+    - (low) The container's `store` getter is read twice on a read tick.
+    - (low) `mineralType` is read and copied on every read, though it never changes.
+    - (low) A mineral hauler's energy is read only to be subtracted.
+    - (low) There is no hysteresis at `minerals.stock_max`: once P9.2 to P9.5 drain the terminal, each crossing flips the upkeep and rebuilds the upgraders' plan. A band is a tuning choice for the user.
+- Consequences:
+  - At RCL6 a home builds 110000 energy of mineral structures before it mines, besides its level's extensions. The terminal is also what P9.4 and P9.5 need.
+  - Minerals pile up in the terminal up to the cap until P9.2 to P9.5 use them. The energy spent is about 0.5 energy a mineral unit (`MineralsConfig::max_work`'s TUNING row), and only while the cap is not reached.
+  - Nothing is persisted. A reset rebuilds the rooms on their next reads, every room being due on its first tick.
+- Risks:
+  - The 6-tick harvest period is inferred from the engine's order (V389), not measured. With a 5-tick period the miner would only skip a tick it could have harvested, never call on cooldown, since it reads the cooldown each tick.
+  - E7N57 cannot test it live before RCL6. The native tests and the sandbox sim carry it until then.
+  - `minerals.stock_max` and `minerals.max_work` are starting values. P9.2 and P9.5 revisit the cap.
+- Evidence: V385 to V402; `economy/minerals_tests.rs` (16 tests); `planner/build.rs` and `tests/planner_build.rs` (the gate); `js/tools/mineral-sim.mjs` (check row 27).

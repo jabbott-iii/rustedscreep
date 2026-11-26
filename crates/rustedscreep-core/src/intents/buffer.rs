@@ -141,7 +141,7 @@ pub enum CreepIntent {
         resource: ResourceType,
         amount: Option<u32>,
     },
-    /// `harvest(source)` (P2.4).
+    /// `harvest(source)` (P2.4), or `harvest(mineral)` (P9.1, ADR-044).
     Harvest {
         target: ObjectHandle,
     },
@@ -724,7 +724,7 @@ const fn accepts(intent: &CreepIntent, kind: StructureType) -> bool {
 /// [`Rejected::WrongTarget`]).
 const fn accepts_object(intent: &CreepIntent, kind: ObjectKind) -> bool {
     match intent {
-        CreepIntent::Harvest { .. } => matches!(kind, ObjectKind::Source),
+        CreepIntent::Harvest { .. } => matches!(kind, ObjectKind::Source | ObjectKind::Mineral),
         CreepIntent::Build { .. } => matches!(kind, ObjectKind::Site(_)),
         CreepIntent::Pickup { .. } => {
             matches!(kind, ObjectKind::Energy | ObjectKind::OtherResource)

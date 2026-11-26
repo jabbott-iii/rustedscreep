@@ -26,11 +26,11 @@ pub use intern::{Handle, Interner, ObjectKey};
 pub use room_name::parse_room_name;
 pub use tables::{
     BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepClass, CreepHandle, CreepRow,
-    CreepStore, Creeps, INTEL_SOURCES, IntelRead, Links, MineralRead, ObjectClass, ObjectHandle,
-    ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation, RoomEnergy, RoomObjects,
-    RoomStatus, Rooms, SIGN_TOWERS, SafeModeState, SignRead, SignSeen, Spawns, StructureClass,
-    StructureHandle, StructureStatic, Structures, Towers, known_structure_type,
-    position_from_packed,
+    CreepStore, Creeps, INTEL_SOURCES, IntelRead, Links, MineralContainer, MineralRead,
+    MineralSite, MineralSites, MineralTerminal, ObjectClass, ObjectHandle, ObjectKind, ObjectRow,
+    ObjectStatic, RemoteRead, Reservation, RoomEnergy, RoomObjects, RoomStatus, Rooms, SIGN_TOWERS,
+    SafeModeState, SignRead, SignSeen, Spawns, StructureClass, StructureHandle, StructureStatic,
+    Structures, Towers, known_structure_type, position_from_packed,
 };
 pub use tick::TickContext;
 
@@ -188,6 +188,8 @@ pub struct Snapshot {
     pub towers: Towers,
     /// Sources, own sites, piles, tombstones, ruins and containers in owned rooms (P2.4).
     pub objects: RoomObjects,
+    /// The owned rooms' mineral reads (P9.1, ADR-044).
+    pub minerals: MineralSites,
     pub skipped: SkipCounts,
 }
 
@@ -202,6 +204,7 @@ impl Snapshot {
         self.links.begin();
         self.towers.begin();
         self.objects.begin();
+        self.minerals.begin();
         self.skipped = SkipCounts::default();
     }
 

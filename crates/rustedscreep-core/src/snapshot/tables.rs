@@ -442,14 +442,26 @@ pub struct CreepRow {
 pub struct CreepStore {
     /// Energy in the store. Unit: energy.
     pub energy: u32,
-    /// The store's capacity for energy, as `store.getCapacity(RESOURCE_ENERGY)` gives it. Unit: energy.
+    /// The store's capacity for energy, as `store.getCapacity(RESOURCE_ENERGY)` gives it: a
+    /// creep's one pool, shared by every resource it holds (V402). Unit: units.
     pub capacity: u32,
+    /// Everything else in the store (`store.getUsedCapacity()` less the energy), read only for
+    /// mineral haulers (P9.1, ADR-044), which carry nothing but their room's mineral; 0 for every
+    /// other creep. Unit: units.
+    pub other: u32,
 }
 
 impl CreepStore {
     /// Room left for energy (0 when the store holds more than its capacity).
     pub const fn free(self) -> u32 {
         self.capacity.saturating_sub(self.energy)
+    }
+
+    /// Room left for anything: the capacity less the energy and everything else (V402).
+    pub const fn free_all(self) -> u32 {
+        self.capacity
+            .saturating_sub(self.energy)
+            .saturating_sub(self.other)
     }
 }
 
@@ -1214,6 +1226,10 @@ pub enum ObjectKind {
     /// `upkeep.read_ticks` and when a worker is about to repair it: `hits` its hits and `total` its
     /// `hitsMax` (`WALL_HITS_MAX` from RCL2, V310).
     Wall,
+    /// An owned room's mineral (P9.1, ADR-044), read on the ticks [`MineralSites`] says: `amount`
+    /// is its `mineralAmount`, `total` its `ticksToRegeneration` (0 while it holds an amount,
+    /// V391).
+    Mineral,
 }
 
 impl ObjectKind {
@@ -1351,6 +1367,121 @@ impl RoomObjects {
     /// Live handles.
     pub fn live(&self) -> usize {
         self.ids.live()
+    }
+}
+
+/// A container next to an owned room's mineral, as a mineral read gives it (P9.1, ADR-044).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MineralContainer {
+    /// Its row's handle in [`RoomObjects`] (an [`ObjectKind::Container`]).
+    pub handle: ObjectHandle,
+    pub at: Position,
+    /// The room's mineral in its store (`store.getUsedCapacity(type)`). Unit: units.
+    pub stock: u32,
+    /// Everything in its store (`store.getUsedCapacity()`): one pool of `CONTAINER_CAPACITY`
+    /// for every resource type (V401). Unit: units.
+    pub used: u32,
+}
+
+/// An owned room's own terminal, as a mineral read gives it (P9.1, ADR-044).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MineralTerminal {
+    pub handle: StructureHandle,
+    pub at: Position,
+    /// The room's mineral in its store (`store.getUsedCapacity(type)`). Unit: units.
+    pub stock: u32,
+    /// Its free room for anything (`store.getFreeCapacity()`; one pool, V401). Unit: units.
+    pub free: u32,
+}
+
+/// One owned room's mineral read (P9.1, ADR-044): the mineral, and what mining it needs around
+/// it. The snapshot reads it only in the rooms the mineral plan asks for (an own extractor, and a
+/// mineral creep there or a read due), and the extractor and terminal only while the room's row
+/// exists, since own structures come after the rooms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MineralSite {
+    pub room: RoomName,
+    /// The mineral's row handle in [`RoomObjects`] (an [`ObjectKind::Mineral`]).
+    pub handle: ObjectHandle,
+    pub at: Position,
+    /// Its `mineralType`; `None` for a type this build does not list.
+    pub kind: Option<ResourceType>,
+    /// `mineralAmount`. Unit: units.
+    pub amount: u32,
+    /// `ticksToRegeneration`: `None` while it holds an amount (V391). Unit: ticks.
+    pub regen: Option<u32>,
+    /// The own extractor on its tile and its `cooldown` (V396). Unit of the cooldown: ticks.
+    pub extractor: Option<(StructureHandle, u32)>,
+    /// The first container next to it, if one stands.
+    pub container: Option<MineralContainer>,
+    /// The room's own terminal, if one stands.
+    pub terminal: Option<MineralTerminal>,
+}
+
+/// The owned rooms' mineral reads this tick (P9.1), one row a read room, in the order the rooms
+/// were read.
+#[derive(Default)]
+pub struct MineralSites {
+    rows: Vec<MineralSite>,
+}
+
+impl MineralSites {
+    pub(super) fn begin(&mut self) {
+        self.rows.clear();
+    }
+
+    /// Adds a room's read (its extractor and terminal come later, [`Self::set_extractor`] and
+    /// [`Self::set_terminal`]). A second read of the same room is ignored.
+    pub fn push(&mut self, site: MineralSite) {
+        if self.get(site.room).is_none() {
+            self.rows.push(site);
+        }
+    }
+
+    /// Records an own extractor standing at `at`: it is its room's row's extractor when it stands
+    /// on that row's mineral. Returns whether it was taken.
+    pub fn set_extractor(&mut self, at: Position, handle: StructureHandle, cooldown: u32) -> bool {
+        match self.rows.iter_mut().find(|r| r.at == at) {
+            Some(r) => {
+                r.extractor = Some((handle, cooldown));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Records the own terminal of `terminal.at`'s room, if that room has a row.
+    pub fn set_terminal(&mut self, terminal: MineralTerminal) -> bool {
+        let room = terminal.at.room_name();
+        match self.rows.iter_mut().find(|r| r.room == room) {
+            Some(r) => {
+                r.terminal = Some(terminal);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `room`'s read this tick, if it was read.
+    pub fn get(&self, room: RoomName) -> Option<&MineralSite> {
+        self.rows.iter().find(|r| r.room == room)
+    }
+
+    /// The mineral type of `room`'s read this tick, if it was read and the type is known.
+    pub fn kind(&self, room: RoomName) -> Option<ResourceType> {
+        self.get(room).and_then(|r| r.kind)
+    }
+
+    pub fn rows(&self) -> &[MineralSite] {
+        &self.rows
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
     }
 }
 

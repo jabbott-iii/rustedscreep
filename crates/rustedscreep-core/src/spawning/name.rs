@@ -68,11 +68,18 @@ pub enum Role {
     /// best room (`expansion::Claims::best`), whose name its own carries, and claims the
     /// controller. At most one for the bot.
     Claimer,
+    /// A mineral miner (P9.1, ADR-044): WORK and MOVE parts; it stands on the container next to
+    /// its room's mineral and harvests it whenever the extractor is ready, so each harvest
+    /// overflows into the container. At most one a room.
+    MineralMiner,
+    /// A mineral hauler (P9.1, ADR-044): CARRY and MOVE parts; it carries its room's mineral from
+    /// the container next to the mineral to the room's terminal.
+    MineralHauler,
 }
 
 impl Role {
     /// Every role, in a fixed order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::Worker,
         Self::Miner,
         Self::Hauler,
@@ -86,6 +93,8 @@ impl Role {
         Self::RemoteDefender,
         Self::Explorer,
         Self::Claimer,
+        Self::MineralMiner,
+        Self::MineralHauler,
     ];
 
     /// The first byte of the role's creep names. Never change or reuse one (see the module docs).
@@ -104,6 +113,8 @@ impl Role {
             Self::RemoteDefender => b'p',
             Self::Explorer => b'x',
             Self::Claimer => b'k',
+            Self::MineralMiner => b'e',
+            Self::MineralHauler => b't',
         }
     }
 
@@ -139,6 +150,8 @@ impl Role {
             Self::RemoteDefender => "remote defender",
             Self::Explorer => "explorer",
             Self::Claimer => "claimer",
+            Self::MineralMiner => "mineral miner",
+            Self::MineralHauler => "mineral hauler",
         }
     }
 
@@ -530,7 +543,8 @@ mod tests {
         assert_eq!(
             Role::ALL.map(Role::code),
             [
-                b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c', b'g', b'd', b'p', b'x', b'k'
+                b'w', b'm', b'h', b'u', b's', b'r', b'n', b'c', b'g', b'd', b'p', b'x', b'k', b'e',
+                b't'
             ],
             "never change or reuse a code"
         );

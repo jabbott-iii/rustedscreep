@@ -1240,7 +1240,7 @@ impl<'a> Run<'a> {
                 .iter()
                 .find(|i| i.kind == StructureType::Extractor)
                 .map_or(first, |i| i.level);
-            roads::road(&mut self.board, hub, c, 0, level, Gate::Late, s)?;
+            roads::road(&mut self.board, hub, c, 0, level, Gate::Minerals, s)?;
         }
         if self.lone
             && let Some(t) = self.input.spawn
