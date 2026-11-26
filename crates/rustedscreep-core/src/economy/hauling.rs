@@ -462,14 +462,22 @@ impl Hauling {
 
     /// Sets the terminals the haulers deliver energy to this tick once a room's spawns,
     /// extensions and towers are full (P9.3, ADR-046's "the haulers fill the terminal",
-    /// `economy::Factories::banks`): room, terminal, its place, and how much more energy it takes
-    /// (the transfers carry no amount, so the last load may pass it). Call before the `hauling`
-    /// job; none set, no hauler delivers to a terminal.
+    /// `economy::Factories::banks`; P9.4, ADR-047, a send's fee, `economy::Terminals::banks`):
+    /// room, terminal, its place, and how much more energy it takes (the transfers carry no
+    /// amount, so the last load may pass it). A room named twice keeps the larger amount. Call
+    /// before the `hauling` job; none set, no hauler delivers to a terminal.
     pub fn set_banks(&mut self, banks: &[(RoomName, StructureHandle, Position, u32)]) {
         self.banks.clear();
         self.banks.extend(banks.iter().copied().filter(|b| b.3 > 0));
-        self.banks.sort_unstable_by_key(|b| b.0.packed_repr());
+        self.banks
+            .sort_unstable_by_key(|b| (b.0.packed_repr(), core::cmp::Reverse(b.3)));
         self.banks.dedup_by_key(|b| b.0.packed_repr());
+    }
+
+    /// The banks [`Self::set_banks`] kept, for the tests.
+    #[cfg(test)]
+    pub(crate) fn banks(&self) -> &[(RoomName, StructureHandle, Position, u32)] {
+        &self.banks
     }
 
     /// What the opening reads of `room`'s haulers this tick ([`HaulView`]); nothing before the

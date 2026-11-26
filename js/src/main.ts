@@ -12,7 +12,7 @@ import {
   profilerSummary as wasmProfilerSummary, remoteSummary as wasmRemoteSummary, signSummary as wasmSignSummary,
   queueSay as wasmQueueSay, schedulerSummary as wasmSchedulerSummary, scoutSummary as wasmScoutSummary,
   snapshotSummary as wasmSnapshotSummary,
-  spawn as wasmSpawn, spawnerSummary as wasmSpawnerSummary, trapTest as wasmTrapTest,
+  spawn as wasmSpawn, spawnerSummary as wasmSpawnerSummary, terminalsSummary as wasmTerminalsSummary, trapTest as wasmTrapTest,
 } from '../pkg/rustedscreep_wasm.js';
 import { type BuildInfo, type Env, type Glue, Loader, type LoaderConfig, type LoaderMemory, sanitizeLoaderMemory } from './loader.js';
 
@@ -120,6 +120,7 @@ const glue: Glue = {
   mineralsSummary: wasmMineralsSummary,
   labsSummary: wasmLabsSummary,
   factorySummary: wasmFactorySummary,
+  terminalsSummary: wasmTerminalsSummary,
 };
 
 const loader = new Loader(env, glue, CONFIG, BUILD);
@@ -155,7 +156,7 @@ function routeConsole(): void {
 // `rustedscreep.moveTo()` cancels), `rustedscreep.spawner()` or `rustedscreep.spawn("W1N1", "worker")`
 // (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`, `rustedscreep.planner()`, `rustedscreep.remote()`,
 // `rustedscreep.sign()`, `rustedscreep.scout()`, `rustedscreep.claims()`, `rustedscreep.minerals()`,
-// `rustedscreep.labs()`, `rustedscreep.factory()`.
+// `rustedscreep.labs()`, `rustedscreep.factory()`, `rustedscreep.terminals()`.
 g.rustedscreep = {
   trapTest: (n: unknown = 1) => loader.scheduleTraps(Number(n)),
   status: () => loader.status(),
@@ -185,6 +186,7 @@ g.rustedscreep = {
   minerals: () => loader.minerals(),
   labs: () => loader.labs(),
   factory: () => loader.factory(),
+  terminals: () => loader.terminals(),
 };
 
 export function loop(): void {

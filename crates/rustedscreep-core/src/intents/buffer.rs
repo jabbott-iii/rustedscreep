@@ -633,6 +633,15 @@ impl IntentBuffer {
         self.stats.planned = u32::try_from(self.planned.len()).unwrap_or(u32::MAX);
     }
 
+    /// Whether a creep's `withdraw` from the structure `target` was queued this tick, a replaced
+    /// one included (P9.4, ADR-047: a terminal's send waits a tick while a creep takes from it,
+    /// `economy::Terminals::run`).
+    pub fn withdraws_from(&self, target: StructureHandle) -> bool {
+        self.entries
+            .iter()
+            .any(|e| matches!(e.intent, CreepIntent::Withdraw { target: t, .. } if t == target))
+    }
+
     /// The planned intents, once [`Self::resolve`] ran (none before): by row, then blockers first.
     pub fn planned(&self) -> impl ExactSizeIterator<Item = &Issue> {
         self.planned.iter()

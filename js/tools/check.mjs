@@ -98,6 +98,7 @@ const ROWS = [
   ['27 Minerals (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'mineral-sim.mjs')], true],
   ['28 Labs (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'lab-sim.mjs')], true],
   ['29 Factory (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'factory-sim.mjs')], true],
+  ['30 Terminal balancing (sandbox, plain build)', 'node', [join(ROOT, 'js', 'tools', 'terminal-sim.mjs')], true],
 ];
 
 function main() {

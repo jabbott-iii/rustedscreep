@@ -29,6 +29,8 @@
 //! - [`Factories`]: the factory (P9.3, ADR-046): each room's job (the surplus mineral it
 //!   compresses into its bar), its batches, its terminal's energy from the haulers, and its
 //!   factory hauler.
+//! - [`Terminals`]: terminal balancing (P9.4, ADR-047): the owned rooms' terminals send each
+//!   other the base minerals up to a keep, paying the fees from energy the haulers bring.
 //! - [`Remotes`]: remote mining's manager and creeps (P6.2, ADR-029): each home's candidate rooms,
 //!   what the bot saw of them, their ways and prices, the rooms it mines, and the scouts,
 //!   reservers, remote miners and remote haulers.
@@ -43,6 +45,7 @@ pub mod placement;
 mod remote;
 mod remotes;
 pub mod sizing;
+mod terminals;
 mod upgrading;
 mod watchdog;
 
@@ -89,6 +92,12 @@ pub use opening::{
     Fix, Opening, PRIORITY_LOW, PRIORITY_NORMAL, PRIORITY_RECOVERY, Plan, RoomStats, SourcePlan,
     Task, below_pct, below_share, needs_repair, rampart_goal, worker_capacity,
 };
+pub use terminals::{
+    Giving as TerminalGiving, PlanScratch as TerminalPlanScratch, Send as TerminalSend, SendOrder,
+    TerminalRoom, TerminalStats, Terminals, Wait as TerminalWait,
+    affordable as terminal_affordable, fee as terminal_fee, plan as terminal_plan,
+    range as terminal_range,
+};
 pub use upgrading::{
     Crew, PRIORITY_UPGRADER, UpgradePlan, UpgradeStats, UpgradeTask, UpgradeView, Upgrading, Ways,
     delivered, delivering, upkeep,
@@ -106,5 +115,7 @@ mod remote_tests;
 // Its two-room world is also the remote defenders' (P7.6, `defense::remote`).
 #[cfg(test)]
 pub(crate) mod remotes_tests;
+#[cfg(test)]
+mod terminals_tests;
 #[cfg(test)]
 mod tests;

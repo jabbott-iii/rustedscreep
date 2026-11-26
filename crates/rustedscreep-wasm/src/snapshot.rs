@@ -102,20 +102,21 @@ use rustedscreep_core::defense::safe_mode::is_core;
 use rustedscreep_core::expansion::Scouting;
 use rustedscreep_core::signing::SIGN_TEXT;
 use rustedscreep_core::snapshot::{
-    BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepRow, CreepStore,
-    FACTORY_RESOURCES, FactoryState, FactoryStock, FactoryTerminal, IntelRead, LabState,
-    LabTerminal, MineralContainer, MineralRead, MineralSite, MineralTerminal, ObjectKey,
-    ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation, RoomEnergy, RoomStatus,
-    SafeModeState, SignRead, SignSeen, SkipCounts, SkipLog, SkipReason, SkipReport, Snapshot,
-    StructureHandle, StructureStatic, TickContext, factory_resource, known_structure_type,
-    lab_resource, parse_room_name, position_from_packed,
+    BALANCED_RESOURCES, BalancedStock, BodyPartRead, BodyRead, Combat, Controller, ControllerState,
+    CreepRow, CreepStore, FACTORY_RESOURCES, FactoryState, FactoryStock, FactoryTerminal,
+    IntelRead, LabState, LabTerminal, MineralContainer, MineralRead, MineralSite, MineralTerminal,
+    ObjectKey, ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation, RoomEnergy,
+    RoomStatus, SafeModeState, SignRead, SignSeen, SkipCounts, SkipLog, SkipReason, SkipReport,
+    Snapshot, StructureHandle, StructureStatic, TerminalRead, TickContext, factory_resource,
+    known_structure_type, lab_resource, parse_room_name, position_from_packed,
 };
 use rustedscreep_core::spawning::{CreepName, Identity, Role};
 use screeps::{
     ConstructionSite, Creep, FindConstant, HasId, MaybeHasId, Mineral, OwnedStructureProperties,
     Part, Position, RawObjectId, Resource, ResourceType, Room, RoomName, RoomObject,
     SYSTEM_USERNAME, Source, Store, Structure, StructureController, StructureExtractor,
-    StructureFactory, StructureLab, StructureLink, StructureSpawn, StructureType, find, game,
+    StructureFactory, StructureLab, StructureLink, StructureSpawn, StructureTerminal,
+    StructureType, find, game,
 };
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
@@ -296,6 +297,12 @@ pub struct JsWorld {
     /// The owned rooms whose terminal's energy alone the next snapshot reads, sorted (P9.3, the
     /// bank reads, `Factories::bank_reads`).
     bank_rooms: Vec<RoomName>,
+    /// The owned rooms whose terminal the next snapshot reads for balancing, sorted (P9.4,
+    /// ADR-047, `Terminals::reads`).
+    terminal_rooms: Vec<RoomName>,
+    /// The owned rooms whose terminal's energy alone the next snapshot reads for a send's fee,
+    /// sorted (P9.4, `Terminals::reads`).
+    terminal_energy_rooms: Vec<RoomName>,
 }
 
 impl JsWorld {
@@ -348,6 +355,21 @@ impl JsWorld {
         self.bank_rooms.extend_from_slice(banks);
         self.bank_rooms.sort_unstable_by_key(|n| n.packed_repr());
         self.bank_rooms.dedup();
+    }
+
+    /// Sets the owned rooms whose terminal the next snapshot reads for balancing (P9.4, ADR-047,
+    /// `Terminals::reads`), and those whose terminal's energy alone it reads.
+    pub fn set_terminal_reads(&mut self, rooms: &[RoomName], energy: &[RoomName]) {
+        self.terminal_rooms.clear();
+        self.terminal_rooms.extend_from_slice(rooms);
+        self.terminal_rooms
+            .sort_unstable_by_key(|n| n.packed_repr());
+        self.terminal_rooms.dedup();
+        self.terminal_energy_rooms.clear();
+        self.terminal_energy_rooms.extend_from_slice(energy);
+        self.terminal_energy_rooms
+            .sort_unstable_by_key(|n| n.packed_repr());
+        self.terminal_energy_rooms.dedup();
     }
 
     fn clear(&mut self) {
@@ -1000,6 +1022,33 @@ fn read_factory(
         energy,
         stock,
     });
+}
+
+/// An own terminal in a room read for balancing (P9.4, ADR-047), past the `store`, free room and
+/// energy the caller reads: each base mineral's amount (`getUsedCapacity(type)`, V397: undefined
+/// reads as 0; taken from the labs' stock pass instead when the room was read for its labs this
+/// tick) and `cooldown` (V441, V443): 8 calls, or 1 after a lab read. Returns the stock and the
+/// cooldown.
+fn read_balance(
+    snapshot: &Snapshot,
+    structure: &Structure,
+    store: &Store,
+    room: RoomName,
+) -> (BalancedStock, u32) {
+    let lab = snapshot
+        .labs
+        .get(room)
+        .filter(|l| l.terminal.is_some())
+        .copied();
+    let mut stock: BalancedStock = [0; BALANCED_RESOURCES.len()];
+    for (slot, &kind) in stock.iter_mut().zip(BALANCED_RESOURCES.iter()) {
+        *slot = match lab {
+            Some(l) => l.stock_of(kind),
+            None => store.get_used_capacity(Some(kind)),
+        };
+    }
+    let cooldown = structure.unchecked_ref::<StructureTerminal>().cooldown();
+    (stock, cooldown)
 }
 
 /// An own lab in a room read for its labs (P9.2, ADR-045): `mineralType` as a plain value (V413;
@@ -1658,6 +1707,8 @@ fn push_structure(
             // P9.3: in a room read for its factory, the terminal's stock of every factory
             // resource and its energy (the same pass over its store's keys), and the factory
             // ([`read_factory`]); in a room with a bank read, the terminal's energy alone.
+            // P9.4: in a room read for balancing, the terminal's cooldown, free room, energy and
+            // base minerals ([`read_balance`]); in a room read for a send's fee, its energy alone.
             // Only these four kinds look up their room's mineral, lab and factory reads.
             let lab_kinds = matches!(
                 kind,
@@ -1675,6 +1726,9 @@ fn push_structure(
             let labs = at.is_some_and(|at| snapshot.labs.wants(at.room_name()));
             let factory = at.is_some_and(|at| snapshot.factory.wants(at.room_name()));
             let banked = !factory && at.is_some_and(|at| listed(&js.bank_rooms, at.room_name()));
+            let balanced = at.is_some_and(|at| listed(&js.terminal_rooms, at.room_name()));
+            let fee_read =
+                !balanced && at.is_some_and(|at| listed(&js.terminal_energy_rooms, at.room_name()));
             if kind == Some(StructureType::Extractor)
                 && let (Some(at), Some(site)) = (at, site)
                 && site.at == at
@@ -1683,12 +1737,12 @@ fn push_structure(
                 snapshot.minerals.set_extractor(at, handle, cooldown);
             }
             if kind == Some(StructureType::Terminal)
-                && (site.is_some() || labs || factory || banked)
+                && (site.is_some() || labs || factory || banked || balanced || fee_read)
                 && let Some(at) = at
             {
                 let store = structure.unchecked_ref::<Stored>().store_of();
                 // A bank read alone needs only the energy (the hot-path review, 2026-11-26).
-                let free = if site.is_some() || labs || factory {
+                let free = if site.is_some() || labs || factory || balanced {
                     u32::try_from(store.get_free_capacity(None)).unwrap_or(0)
                 } else {
                     0
@@ -1702,9 +1756,14 @@ fn push_structure(
                         free,
                     });
                 }
+                // The energy, once read this tick (the factory's stock pass or its bank read).
+                let mut energy_seen = None;
                 if labs || factory {
                     let energy =
                         read_terminal_stock(snapshot, &store, at.room_name(), labs, factory);
+                    if factory {
+                        energy_seen = Some(energy);
+                    }
                     if labs {
                         snapshot.labs.set_terminal(LabTerminal { handle, at, free });
                     }
@@ -1720,6 +1779,29 @@ fn push_structure(
                 if banked {
                     let energy = store.get_used_capacity(Some(ResourceType::Energy));
                     snapshot.factory.set_bank(at.room_name(), energy);
+                    energy_seen = Some(energy);
+                }
+                if balanced || fee_read {
+                    let energy = energy_seen
+                        .unwrap_or_else(|| store.get_used_capacity(Some(ResourceType::Energy)));
+                    if balanced {
+                        let room = at.room_name();
+                        let (stock, cooldown) = read_balance(snapshot, &structure, &store, room);
+                        if let Ok(row) = u32::try_from(row) {
+                            snapshot.terminals.push(TerminalRead {
+                                room,
+                                handle,
+                                row,
+                                at,
+                                cooldown,
+                                free,
+                                energy,
+                                stock,
+                            });
+                        }
+                    } else {
+                        snapshot.terminals.set_energy(at.room_name(), energy);
+                    }
                 }
             }
             if kind == Some(StructureType::Factory)

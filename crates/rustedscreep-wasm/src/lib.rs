@@ -55,6 +55,7 @@ mod scout;
 mod sign;
 mod snapshot;
 mod spawn;
+mod terminals;
 
 use std::cell::RefCell;
 
@@ -95,6 +96,8 @@ struct State {
     labs: labs::LabsGlue,
     /// The factory (P9.3, ADR-046): each room's job, batches, terminal bank and factory hauler.
     factory: factory::FactoryGlue,
+    /// Terminal balancing (P9.4, ADR-047): the base minerals sent between the rooms' terminals.
+    terminals: terminals::TerminalsGlue,
     /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1), the towers
     /// (P7.2), the safe-mode triggers (P7.4), the defenders (P7.5) and the remote defenders (P7.6).
     defense: defense::DefenseGlue,
@@ -157,6 +160,7 @@ pub fn game_loop() {
                     minerals,
                     labs,
                     factory,
+                    terminals,
                     defense,
                     persist,
                     consts,
@@ -191,6 +195,7 @@ pub fn game_loop() {
                 minerals.begin(snapshot, &cfg.minerals);
                 labs.begin(snapshot, &cfg.labs);
                 factory.begin(snapshot);
+                terminals.begin(snapshot, &cfg.terminals);
                 sign.begin(snapshot, &cfg.sign);
                 scout.begin(snapshot, &cfg.scout);
                 claim.begin(snapshot, &cfg.claim, sched.last_tick());
@@ -321,7 +326,14 @@ pub fn game_loop() {
                         &cfg.factory,
                     );
                 }
-                opening.set_banks(factory.banks());
+                // The banks for the haulers, before the hauling job: the factory's, and the
+                // terminals' whose send waits for its fee (P9.4, ADR-047).
+                {
+                    let standard = tick.allows(Tier::Standard);
+                    let (hauling, _) = opening.haul_parts();
+                    let banks = terminals.banks(hauling, factory.banks(), standard, &cfg.terminals);
+                    opening.set_banks(banks);
+                }
                 // Critical: the static miners (P3.1), the haulers (P3.3), the upgraders' plan
                 // (P3.4), the opening's workers and their spawn requests (P2.4), then the spawn
                 // plan, after the Critical jobs that request creeps (P2.3).
@@ -403,6 +415,8 @@ pub fn game_loop() {
                     &cfg.factory,
                     &cfg.movement,
                 );
+                // Standard: terminal balancing's plan and the waiting fees (P9.4).
+                terminals.work(&mut tick, &act.buffer, &cfg.terminals);
                 // Standard: the claimer's walk and claim (P8.3).
                 claim.work_claimer(
                     &mut tick,
@@ -501,6 +515,8 @@ pub fn game_loop() {
                 // P9.3: the rooms the next snapshot reads for their factory, or for their
                 // terminal's energy alone.
                 factory.set_reads(js, &cfg.factory);
+                // P9.4: the terminals the next snapshot reads for balancing, or for a fee.
+                terminals.set_reads(js, &cfg.terminals);
                 opening.log_events();
                 minerals.log_events();
                 labs.log_events();
@@ -581,6 +597,15 @@ pub fn game_loop() {
                     sched,
                     &cfg.scheduler,
                     &cfg.factory,
+                );
+                // The terminals' sends (P9.4, ADR-047).
+                terminals.issue(
+                    snapshot,
+                    js,
+                    act.log_mut(),
+                    sched,
+                    &cfg.scheduler,
+                    &cfg.terminals,
                 );
                 act::issue(act, snapshot, js, sched, &cfg.scheduler);
                 movement.after_act(snapshot, act.refused_moves(), &cfg.movement);
@@ -827,6 +852,21 @@ pub fn factory_summary() -> String {
             Err(_) => String::from("rustedscreep factory: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep factory: state unavailable"))
+}
+
+/// Exported to JS as `terminalsSummary`, for the `rustedscreep.terminals()` console command: one
+/// line with the settings and the next plan, then each member's last read, the send it waits to
+/// make and its counters (P9.4, ADR-047).
+#[wasm_bindgen(js_name = "terminalsSummary")]
+pub fn terminals_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state
+                .terminals
+                .summary(&state.snapshot, &state.config.get().terminals),
+            Err(_) => String::from("rustedscreep terminals: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep terminals: state unavailable"))
 }
 
 /// Exported to JS as `remoteSummary`, for the `rustedscreep.remote()` console command: one line with

@@ -1867,6 +1867,107 @@ impl FactorySites {
     }
 }
 
+/// The resources terminal balancing moves (P9.4, ADR-047, the user's choice: the base minerals):
+/// the 7 minerals a room's mineral can be (`MINERAL_DENSITY`'s types; each has no
+/// `REACTIONS` entry of its own, so `ResourceType::reaction_components` is `None`), the first 7 of
+/// [`LAB_RESOURCES`]. A terminal read's stock is kept by index in this list
+/// ([`balanced_resource`]).
+pub const BALANCED_RESOURCES: [ResourceType; 7] = {
+    use ResourceType as R;
+    [
+        R::Hydrogen,
+        R::Oxygen,
+        R::Utrium,
+        R::Lemergium,
+        R::Keanium,
+        R::Zynthium,
+        R::Catalyst,
+    ]
+};
+
+/// A terminal read's stock of each of [`BALANCED_RESOURCES`], by index. Unit: units.
+pub type BalancedStock = [u32; BALANCED_RESOURCES.len()];
+
+/// `kind`'s index in [`BALANCED_RESOURCES`]; `None` for a resource terminal balancing does not
+/// move.
+pub fn balanced_resource(kind: ResourceType) -> Option<usize> {
+    BALANCED_RESOURCES.iter().position(|&r| r == kind)
+}
+
+/// One owned room's own terminal, as a balancing read gives it (P9.4, ADR-047): what the plan
+/// needs to send from it or to it this tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalRead {
+    pub room: RoomName,
+    pub handle: StructureHandle,
+    /// Its row in this tick's structures (its JS object, for `send`).
+    pub row: u32,
+    pub at: Position,
+    /// `cooldown` (V441): ticks until it can send again. Unit: ticks.
+    pub cooldown: u32,
+    /// Its free room for anything (`store.getFreeCapacity()`; one pool of `TERMINAL_CAPACITY`,
+    /// V401, V430). Unit: units.
+    pub free: u32,
+    /// Its energy (`store.energy`), which pays a send's fee (V435). Unit: energy.
+    pub energy: u32,
+    /// Its stock of each of [`BALANCED_RESOURCES`], by index. Unit: units.
+    pub stock: BalancedStock,
+}
+
+/// The owned rooms' terminal-balancing reads this tick (P9.4), one row a terminal read in full, in
+/// the order the rooms were read, and the energy of the terminals read for their energy alone
+/// (a terminal waiting for its send's fee, [`Self::energy`]).
+#[derive(Default)]
+pub struct TerminalSites {
+    rows: Vec<TerminalRead>,
+    energies: Vec<(RoomName, u32)>,
+}
+
+impl TerminalSites {
+    pub(super) fn begin(&mut self) {
+        self.rows.clear();
+        self.energies.clear();
+    }
+
+    /// Records a terminal's full read (a second one of the same room replaces the first).
+    pub fn push(&mut self, read: TerminalRead) {
+        match self.rows.iter_mut().find(|r| r.room == read.room) {
+            Some(r) => *r = read,
+            None => self.rows.push(read),
+        }
+    }
+
+    /// Records `room`'s terminal energy from an energy read (a second one replaces the first).
+    pub fn set_energy(&mut self, room: RoomName, energy: u32) {
+        match self.energies.iter_mut().find(|e| e.0 == room) {
+            Some(e) => e.1 = energy,
+            None => self.energies.push((room, energy)),
+        }
+    }
+
+    /// `room`'s full read this tick, if it had one.
+    pub fn get(&self, room: RoomName) -> Option<&TerminalRead> {
+        self.rows.iter().find(|r| r.room == room)
+    }
+
+    /// `room`'s terminal energy from this tick's energy read, if it had one.
+    pub fn energy(&self, room: RoomName) -> Option<u32> {
+        self.energies.iter().find(|e| e.0 == room).map(|e| e.1)
+    }
+
+    pub fn rows(&self) -> &[TerminalRead] {
+        &self.rows
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

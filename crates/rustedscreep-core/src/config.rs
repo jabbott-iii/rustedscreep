@@ -1252,6 +1252,51 @@ pub const FACTORY_MMO: FactoryConfig = FactoryConfig {
     read_ticks: 100,
 };
 
+/// Terminal balancing (ROADMAP P9.4, ADR-047): the owned rooms' own terminals send each other the
+/// base minerals, so that every terminal holds up to [`Self::mineral_keep`] of each of them from
+/// the terminals that hold more (`economy::terminals`; the user's choices: the base minerals, the
+/// source haulers fill a send's fee).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalsConfig {
+    /// Plans and orders the sends, and opens a terminal waiting for its fee to the source
+    /// haulers. Off, no terminal is read for balancing and nothing is sent.
+    pub enabled: bool,
+    /// How much of each base mineral every terminal is filled up to, and how much a terminal
+    /// keeps of each when it gives (it gives only what it holds above this). A room's labs react
+    /// only from its own terminal (ADR-045), so this puts every base mineral in reach of every
+    /// room's labs. Unit: units of the mineral.
+    pub mineral_keep: u32,
+    /// The least a send moves: a terminal is filled only while it lacks at least this much of a
+    /// mineral, and gives only while it holds at least this much above [`Self::mineral_keep`].
+    /// Each send is an intent (0.2 CPU) and starts a `TERMINAL_COOLDOWN`. Unit: units.
+    pub send_min: u32,
+    /// While a planned send waits for its fee, the giving room's source haulers (where its
+    /// hauling plan wants any) deliver energy to its terminal once the spawns, extensions and
+    /// towers are full, until it holds this much (the user's choice, ADR-047: the haulers fill the
+    /// fee). A send is never planned larger than this much energy pays the fee of. Unit: energy.
+    pub energy_keep: u32,
+    /// The farthest two terminals send to each other: the larger of the two rooms' horizontal and
+    /// vertical distance in rooms, the distance of the fee (`1 - exp(-range / 30)` of the amount,
+    /// V432, V433). Unit: rooms.
+    pub max_range: u32,
+    /// With two or more terminals, every one is read again after this many ticks (its cooldown,
+    /// free room, energy and base minerals) and the sends planned, when nothing is due sooner: the
+    /// plan runs again when the terminals that sent come off their cooldown, and on the tick after
+    /// a waiting terminal holds its fee. It is also how long a terminal waits after a refused
+    /// `send`. Unit: ticks.
+    pub read_ticks: u32,
+}
+
+/// Terminal-balancing values for the official MMO.
+pub const TERMINALS_MMO: TerminalsConfig = TerminalsConfig {
+    enabled: true,
+    mineral_keep: LAB_MINERAL_CAPACITY,
+    send_min: 1_000,
+    energy_keep: 1_000,
+    max_range: 10,
+    read_ticks: 100,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1280,6 +1325,7 @@ pub struct Config {
     pub minerals: MineralsConfig,
     pub labs: LabsConfig,
     pub factory: FactoryConfig,
+    pub terminals: TerminalsConfig,
 }
 
 /// A server profile: a name and its values.
@@ -1317,6 +1363,7 @@ pub const MMO: Profile = Profile {
         minerals: MINERALS_MMO,
         labs: LABS_MMO,
         factory: FACTORY_MMO,
+        terminals: TERMINALS_MMO,
     },
 };
 
@@ -1477,7 +1524,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 200;
+pub const FIELD_COUNT: usize = 206;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -2057,6 +2104,33 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         true
     ),
     number!(factory, "FactoryConfig", read_ticks, 1, 10_000, true),
+    flag!(terminals, "TerminalsConfig", enabled, true),
+    number!(
+        terminals,
+        "TerminalsConfig",
+        mineral_keep,
+        0,
+        TERMINAL_CAPACITY,
+        true
+    ),
+    number!(
+        terminals,
+        "TerminalsConfig",
+        send_min,
+        1,
+        TERMINAL_CAPACITY,
+        true
+    ),
+    number!(
+        terminals,
+        "TerminalsConfig",
+        energy_keep,
+        0,
+        TERMINAL_CAPACITY,
+        true
+    ),
+    number!(terminals, "TerminalsConfig", max_range, 1, 255, true),
+    number!(terminals, "TerminalsConfig", read_ticks, 1, 10_000, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -2343,6 +2417,7 @@ mod tests {
             minerals: _,
             labs: _,
             factory: _,
+            terminals: _,
         } = MMO.config;
         let SpawnConfig {
             hold_ticks: _,
@@ -2522,7 +2597,15 @@ mod tests {
             hauler_carry: _,
             read_ticks: _,
         } = FACTORY_MMO;
-        let expected: [(&str, &[&str]); 24] = [
+        let TerminalsConfig {
+            enabled: _,
+            mineral_keep: _,
+            send_min: _,
+            energy_keep: _,
+            max_range: _,
+            read_ticks: _,
+        } = TERMINALS_MMO;
+        let expected: [(&str, &[&str]); 25] = [
             (
                 "loader",
                 &[
@@ -2812,6 +2895,17 @@ mod tests {
                     "energy_keep",
                     "energy_per_life",
                     "hauler_carry",
+                    "read_ticks",
+                ],
+            ),
+            (
+                "terminals",
+                &[
+                    "enabled",
+                    "mineral_keep",
+                    "send_min",
+                    "energy_keep",
+                    "max_range",
                     "read_ticks",
                 ],
             ),
