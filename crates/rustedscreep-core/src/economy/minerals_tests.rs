@@ -176,6 +176,7 @@ impl World {
                     } else {
                         0
                     },
+                    other_kind: None,
                 },
             );
             self.snap.creeps.set_death(row, self.time + CREEP_LIFE_TIME);

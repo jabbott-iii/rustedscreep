@@ -114,7 +114,8 @@ fn console_role(role: Role) -> bool {
         | Role::Explorer
         | Role::Claimer
         | Role::MineralMiner
-        | Role::MineralHauler => false,
+        | Role::MineralHauler
+        | Role::LabHauler => false,
     }
 }
 
@@ -186,7 +187,8 @@ impl SpawnGlue {
                 | Role::Explorer
                 | Role::Claimer
                 | Role::MineralMiner
-                | Role::MineralHauler => return None,
+                | Role::MineralHauler
+                | Role::LabHauler => return None,
             };
             self.spawner.request(SpawnRequest {
                 home: c.home,

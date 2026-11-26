@@ -446,9 +446,13 @@ pub struct CreepStore {
     /// creep's one pool, shared by every resource it holds (V402). Unit: units.
     pub capacity: u32,
     /// Everything else in the store (`store.getUsedCapacity()` less the energy), read only for
-    /// mineral haulers (P9.1, ADR-044), which carry nothing but their room's mineral; 0 for every
-    /// other creep. Unit: units.
+    /// mineral haulers (P9.1, ADR-044), which carry nothing but their room's mineral, and lab
+    /// haulers (P9.2, ADR-045); 0 for every other creep. Unit: units.
     pub other: u32,
+    /// The type of [`Self::other`], read only for a lab hauler that holds some (the first key of
+    /// its store other than energy; the hauler never takes a second type): `None` for every other
+    /// creep, or for a type no lab handles ([`LAB_RESOURCES`]).
+    pub other_kind: Option<ResourceType>,
 }
 
 impl CreepStore {
@@ -1473,6 +1477,198 @@ impl MineralSites {
     }
 
     pub fn rows(&self) -> &[MineralSite] {
+        &self.rows
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+/// Every resource a lab handles (P9.2, ADR-045): the 7 base minerals, then the 34 compounds
+/// `REACTIONS` makes (V131, V409; `ResourceType::reaction_components` is `Some` for each compound
+/// and `None` for the base minerals), in the order of `REACTION_TIME`'s listing. A lab read's
+/// terminal stock is kept by index in this list ([`lab_resource`]).
+pub const LAB_RESOURCES: [ResourceType; 41] = {
+    use ResourceType as R;
+    [
+        R::Hydrogen,
+        R::Oxygen,
+        R::Utrium,
+        R::Lemergium,
+        R::Keanium,
+        R::Zynthium,
+        R::Catalyst,
+        R::Hydroxide,
+        R::ZynthiumKeanite,
+        R::UtriumLemergite,
+        R::Ghodium,
+        R::UtriumHydride,
+        R::UtriumAcid,
+        R::CatalyzedUtriumAcid,
+        R::UtriumOxide,
+        R::UtriumAlkalide,
+        R::CatalyzedUtriumAlkalide,
+        R::KeaniumHydride,
+        R::KeaniumAcid,
+        R::CatalyzedKeaniumAcid,
+        R::KeaniumOxide,
+        R::KeaniumAlkalide,
+        R::CatalyzedKeaniumAlkalide,
+        R::LemergiumHydride,
+        R::LemergiumAcid,
+        R::CatalyzedLemergiumAcid,
+        R::LemergiumOxide,
+        R::LemergiumAlkalide,
+        R::CatalyzedLemergiumAlkalide,
+        R::ZynthiumHydride,
+        R::ZynthiumAcid,
+        R::CatalyzedZynthiumAcid,
+        R::ZynthiumOxide,
+        R::ZynthiumAlkalide,
+        R::CatalyzedZynthiumAlkalide,
+        R::GhodiumHydride,
+        R::GhodiumAcid,
+        R::CatalyzedGhodiumAcid,
+        R::GhodiumOxide,
+        R::GhodiumAlkalide,
+        R::CatalyzedGhodiumAlkalide,
+    ]
+};
+
+/// `kind`'s index in [`LAB_RESOURCES`]; `None` for a resource no lab handles (energy, power,
+/// commodities, ...).
+pub fn lab_resource(kind: ResourceType) -> Option<usize> {
+    LAB_RESOURCES.iter().position(|&r| r == kind)
+}
+
+/// One own lab in a room read for its labs (P9.2, ADR-045).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LabState {
+    pub handle: StructureHandle,
+    /// Its row in this tick's structures (its JS object, for `runReaction`).
+    pub row: u32,
+    pub at: Position,
+    /// `mineralType` (V413): `None` while it holds no mineral, or holds a type no lab handles
+    /// ([`LAB_RESOURCES`]).
+    pub kind: Option<ResourceType>,
+    /// Its stock of [`Self::kind`] (`store[mineralType]`); 0 with none. Unit: units.
+    pub amount: u32,
+    /// `cooldown` (V406): ticks until it can react again. Unit: ticks.
+    pub cooldown: u32,
+}
+
+/// An owned room's own terminal, as a lab read gives it (P9.2, ADR-045).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LabTerminal {
+    pub handle: StructureHandle,
+    pub at: Position,
+    /// Its free room for anything (`store.getFreeCapacity()`; one pool, V401). Unit: units.
+    pub free: u32,
+}
+
+/// One owned room's lab read (P9.2, ADR-045): its own terminal with its stock of every lab
+/// resource, and its own labs ([`LabSites::labs`]). The snapshot reads it only in the rooms the
+/// lab plan asks for, and the terminal and labs only while the room's row exists, since own
+/// structures come after the rooms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LabRead {
+    pub room: RoomName,
+    pub terminal: Option<LabTerminal>,
+    /// The terminal's stock of each of [`LAB_RESOURCES`], by index (0 for none or no terminal).
+    /// Unit: units.
+    pub stock: [u32; LAB_RESOURCES.len()],
+}
+
+impl LabRead {
+    /// The terminal's stock of `kind`: 0 for a resource no lab handles.
+    pub fn stock_of(&self, kind: ResourceType) -> u32 {
+        lab_resource(kind)
+            .and_then(|i| self.stock.get(i).copied())
+            .unwrap_or(0)
+    }
+}
+
+/// The owned rooms' lab reads this tick (P9.2), one row a read room in the order the rooms were
+/// read, and their labs in the order the structures were read.
+#[derive(Default)]
+pub struct LabSites {
+    rows: Vec<LabRead>,
+    labs: Vec<LabState>,
+}
+
+impl LabSites {
+    pub(super) fn begin(&mut self) {
+        self.rows.clear();
+        self.labs.clear();
+    }
+
+    /// Adds `room`'s read, with no terminal and no lab yet ([`Self::set_terminal`],
+    /// [`Self::push_lab`]). A second read of the same room is ignored.
+    pub fn push(&mut self, room: RoomName) {
+        if self.get(room).is_none() {
+            self.rows.push(LabRead {
+                room,
+                terminal: None,
+                stock: [0; LAB_RESOURCES.len()],
+            });
+        }
+    }
+
+    /// Whether `room` has a read row this tick (its structures are read for it).
+    pub fn wants(&self, room: RoomName) -> bool {
+        self.get(room).is_some()
+    }
+
+    /// Records the own terminal of `terminal.at`'s room, if that room has a row. Returns whether
+    /// it was taken.
+    pub fn set_terminal(&mut self, terminal: LabTerminal) -> bool {
+        let room = terminal.at.room_name();
+        match self.rows.iter_mut().find(|r| r.room == room) {
+            Some(r) => {
+                r.terminal = Some(terminal);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Records the terminal of `room` holding `amount` of `kind` (ignored for a resource no lab
+    /// handles, or a room with no row).
+    pub fn set_stock(&mut self, room: RoomName, kind: ResourceType, amount: u32) {
+        if let Some(i) = lab_resource(kind)
+            && let Some(r) = self.rows.iter_mut().find(|r| r.room == room)
+            && let Some(s) = r.stock.get_mut(i)
+        {
+            *s = amount;
+        }
+    }
+
+    /// Records an own lab, if its room has a row. Returns whether it was taken.
+    pub fn push_lab(&mut self, lab: LabState) -> bool {
+        if self.wants(lab.at.room_name()) {
+            self.labs.push(lab);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `room`'s read this tick, if it was read.
+    pub fn get(&self, room: RoomName) -> Option<&LabRead> {
+        self.rows.iter().find(|r| r.room == room)
+    }
+
+    /// `room`'s own labs this tick, in the order they were read (none when it was not read).
+    pub fn labs(&self, room: RoomName) -> impl Iterator<Item = &LabState> {
+        self.labs.iter().filter(move |l| l.at.room_name() == room)
+    }
+
+    pub fn rows(&self) -> &[LabRead] {
         &self.rows
     }
 

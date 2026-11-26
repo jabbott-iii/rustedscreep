@@ -14,7 +14,8 @@
 //! counted per creep life ([`yield_per_life`]): what those sources yield (a sent source's less the
 //! links' loss, [`link_loss`]), less every other creep the room keeps: the mining plan's miners, the
 //! hauling plan's haulers, the opening's planned workers at its capacity, and the mineral miner
-//! and haulers while the room mines (P9.1, [`Upgrading::set_minerals`]). The rest pays for the
+//! and haulers while the room mines (P9.1, [`Upgrading::set_minerals`]), and its lab hauler while
+//! its labs have work (P9.2, [`Upgrading::set_labs`]). The rest pays for the
 //! upgraders' bodies and what they upgrade ([`upgrader_plan`]): one body, sized and counted so they
 //! spend it all, at most one per post and, at level 8, at most `CONTROLLER_MAX_UPGRADE_PER_TICK`
 //! WORK parts in all (V188). Workers that build take energy from the same stores before the
@@ -276,6 +277,9 @@ struct UpgradeRoom {
     /// The mineral creeps' bodies over a creep life while it mines ([`Upgrading::set_minerals`],
     /// P9.1).
     minerals: u64,
+    /// The lab hauler's body over a creep life while its labs have work ([`Upgrading::set_labs`],
+    /// P9.2).
+    labs: u64,
     stats: UpgradeStats,
 }
 
@@ -361,6 +365,7 @@ impl Upgrading {
                         unreachable: Vec::new(),
                         remote: 0,
                         minerals: 0,
+                        labs: 0,
                         stats: UpgradeStats::default(),
                     },
                 ),
@@ -539,6 +544,20 @@ impl Upgrading {
             && let Some(r) = self.rooms.get_mut(i)
         {
             r.minerals = energy;
+        }
+    }
+
+    /// Sets the energy `room`'s lab hauler costs in a creep life while its labs have work
+    /// (`economy::Labs::upkeeps`, P9.2, ADR-045), left out of the upgraders' budget as
+    /// [`Self::set_minerals`] leaves out the mineral creeps. It holds until set again; a room with
+    /// none set counts 0.
+    pub fn set_labs(&mut self, room: RoomName, energy: u64) {
+        if let Ok(i) = self
+            .rooms
+            .binary_search_by_key(&room.packed_repr(), |r| r.name.packed_repr())
+            && let Some(r) = self.rooms.get_mut(i)
+        {
+            r.labs = energy;
         }
     }
 
@@ -1032,7 +1051,9 @@ impl Upgrading {
         // haulers (ADR-029's "home sinks"), so it counts while that container stands.
         let remote = if ways.container { r.remote } else { 0 };
         let delivered = delivered(mine, haul, &self.sources, ways).saturating_add(remote);
-        let upkeep = upkeep(mine, haul, workers).saturating_add(r.minerals);
+        let upkeep = upkeep(mine, haul, workers)
+            .saturating_add(r.minerals)
+            .saturating_add(r.labs);
         let Some((grid, version)) = movement.room_grid(name, mcfg, commit) else {
             return;
         };

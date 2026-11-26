@@ -1904,6 +1904,7 @@ impl World {
                         energy: c.energy,
                         capacity: c.capacity(),
                         other: 0,
+                        other_kind: None,
                     },
                 );
                 // Its ticksToLive (P5.2), read only until known, as the snapshot does: shown from

@@ -21,10 +21,11 @@ pub mod overrides;
 use core::fmt;
 
 use rustedscreep_consts::{
-    CONTAINER_CAPACITY, CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, CREEP_SPAWN_TIME, LINK_CAPACITY,
-    MAX_CONSTRUCTION_SITES, MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP,
-    OBSERVER_RANGE, RAMPART_DECAY_AMOUNT, RAMPART_DECAY_TIME, RAMPART_HITS_MAX_RCL2, ROOM_SIZE,
-    TERMINAL_CAPACITY, TOWER_CAPACITY,
+    CARRY_CAPACITY, CONTAINER_CAPACITY, CPU_TICK_LIMIT_MAX, CREEP_LIFE_TIME, CREEP_SPAWN_TIME,
+    LAB_MINERAL_CAPACITY, LAB_REACTION_AMOUNT, LINK_CAPACITY, MAX_CONSTRUCTION_SITES,
+    MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, OBSERVER_RANGE,
+    RAMPART_DECAY_AMOUNT, RAMPART_DECAY_TIME, RAMPART_HITS_MAX_RCL2, ROOM_SIZE, TERMINAL_CAPACITY,
+    TOWER_CAPACITY,
 };
 
 /// How the loader recovers after a trap or an aborted tick (ADR-003).
@@ -682,8 +683,8 @@ pub struct PlannerConfig {
     /// Places the ramparts (when ramparts are built is P7's, ADR-007; on since P7.3, ADR-032, whose
     /// workers keep them at [`UpkeepConfig::rampart_permille`] of their level's hits).
     pub ramparts: bool,
-    /// Places the labs, the factory, the power spawn, and the nuker (nothing uses them yet; P9's
-    /// later items do).
+    /// Places the factory, the power spawn, and the nuker (nothing uses them yet; P9's later items
+    /// do).
     pub late: bool,
     /// Places the observer (at RCL8, the only level that allows one), which the atlas's observer
     /// loop uses (P8.1, ADR-039). Split from [`Self::late`].
@@ -692,6 +693,12 @@ pub struct PlannerConfig {
     /// allows the first two, V393), which mineral mining uses (P9.1, ADR-044: the terminal is
     /// where the minerals go). Split from [`Self::late`].
     pub minerals: bool,
+    /// Places the labs (3 at RCL6, 6 at RCL7, 10 at RCL8, `CONTROLLER_STRUCTURES`), which lab
+    /// reactions use (P9.2, ADR-045), but only in a room that wants them: one where an own lab
+    /// stands, or whose terminal holds the two reagents of a target's next step
+    /// (`economy::labs::Labs::wants_labs`; the user's choice, ADR-045: build the labs once
+    /// reagents are on hand). Split from [`Self::late`].
+    pub labs: bool,
     /// The most own construction sites a room may hold before the placement waits: one site a
     /// tick goes out, first the economy's containers and links on the plan's tiles (ADR-023 to
     /// ADR-025's timing), then the plan's items by type (spawns, extensions, ... roads). Unit:
@@ -721,6 +728,7 @@ pub const PLANNER_MMO: PlannerConfig = PlannerConfig {
     late: false,
     observer: true,
     minerals: true,
+    labs: true,
     max_sites: 10,
     verify_ticks: 500,
     hub_clearance: 3,
@@ -1116,6 +1124,72 @@ pub const MINERALS_MMO: MineralsConfig = MineralsConfig {
     read_ticks: 100,
 };
 
+/// Lab reactions (ROADMAP P9.2, ADR-045): in each owned room with an own terminal and at least
+/// three own labs, two source labs hold a reaction's reagents and the other labs within
+/// `LAB_REACTION_RANGE` of both make its product, for the first target compound whose terminal
+/// stock is below its goal, at the deepest step of its chain whose two reagents the terminal holds
+/// (`economy::labs`; the user's choices: a target list with stock goals, a lab hauler, compounds
+/// only, no boosting). `docs/TUNING.md` gives each one's rationale and safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LabsConfig {
+    /// Picks new jobs, requests the lab hauler and runs the reactions. Off, no job starts and no
+    /// reaction runs, a room is read only while its lab hauler carries something (which it then
+    /// takes to the terminal), and no room wants labs built ([`PlannerConfig::labs`]).
+    pub enabled: bool,
+    /// The stock goal of the first target, XGHO2 (catalyzed ghodium alkalide, TOUGH parts take
+    /// 30% of the damage, the siege breaker's armor, SPEC §4b): a job for it or its chain starts
+    /// while the terminal holds at least [`Self::batch_min`] less than this. 0 takes it off the
+    /// list. Unit: units of the compound.
+    pub goal_xgho2: u32,
+    /// The second target's goal, XZH2O (catalyzed zynthium acid, dismantle ×4, the breaker's WORK
+    /// parts). As [`Self::goal_xgho2`]. Unit: units.
+    pub goal_xzh2o: u32,
+    /// The third target's goal, XZHO2 (catalyzed zynthium alkalide, fatigue from MOVE ×4, the
+    /// breaker's MOVE parts). As [`Self::goal_xgho2`]. Unit: units.
+    pub goal_xzho2: u32,
+    /// The fourth target's goal, XLHO2 (catalyzed lemergium alkalide, heal ×4, squad healers).
+    /// As [`Self::goal_xgho2`]. Unit: units.
+    pub goal_xlho2: u32,
+    /// The fifth target's goal, XKHO2 (catalyzed keanium alkalide, ranged attack ×4, ranged
+    /// defenders and squads). As [`Self::goal_xgho2`]. Unit: units.
+    pub goal_xkho2: u32,
+    /// The sixth target's goal, XUH2O (catalyzed utrium acid, attack ×4, melee attackers). As
+    /// [`Self::goal_xgho2`]. Unit: units.
+    pub goal_xuh2o: u32,
+    /// The seventh target's goal, XGH2O (catalyzed ghodium acid, upgrade ×2, upgraders). As
+    /// [`Self::goal_xgho2`]. Unit: units.
+    pub goal_xgh2o: u32,
+    /// The least a job makes: a step starts only when it can make this much (or the target's whole
+    /// shortfall, when that is less) from what the terminal holds, so the hauler's trips and the
+    /// final emptying are spread over enough units. It is also how much of both reagents a room's
+    /// terminal must hold before the room wants its labs built. Unit: units.
+    pub batch_min: u32,
+    /// The most CARRY parts of the lab hauler; below it the room's energy capacity sets the count.
+    /// The body has a MOVE part for every `MOVE_POWER / MOVE_COST_ROAD` CARRY parts, so it walks
+    /// roads loaded at a tile a tick. Unit: CARRY parts.
+    pub hauler_carry: u32,
+    /// A room with an own terminal is read again after this many ticks (its terminal's stock, its
+    /// labs' minerals and cooldowns) when nothing is due sooner: it is read every tick the
+    /// Standard tier runs while its lab hauler has work, and on the tick an output lab's reaction
+    /// is due. It is also how long a room's reactions wait after a refused one. Unit: ticks.
+    pub read_ticks: u32,
+}
+
+/// Lab values for the official MMO.
+pub const LABS_MMO: LabsConfig = LabsConfig {
+    enabled: true,
+    goal_xgho2: LAB_MINERAL_CAPACITY,
+    goal_xzh2o: LAB_MINERAL_CAPACITY,
+    goal_xzho2: LAB_MINERAL_CAPACITY,
+    goal_xlho2: LAB_MINERAL_CAPACITY,
+    goal_xkho2: LAB_MINERAL_CAPACITY,
+    goal_xuh2o: LAB_MINERAL_CAPACITY,
+    goal_xgh2o: LAB_MINERAL_CAPACITY,
+    batch_min: 10 * CARRY_CAPACITY,
+    hauler_carry: 10,
+    read_ticks: 100,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1142,6 +1216,7 @@ pub struct Config {
     pub defense: DefenseConfig,
     pub upkeep: UpkeepConfig,
     pub minerals: MineralsConfig,
+    pub labs: LabsConfig,
 }
 
 /// A server profile: a name and its values.
@@ -1177,6 +1252,7 @@ pub const MMO: Profile = Profile {
         defense: DEFENSE_MMO,
         upkeep: UPKEEP_MMO,
         minerals: MINERALS_MMO,
+        labs: LABS_MMO,
     },
 };
 
@@ -1337,7 +1413,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 180;
+pub const FIELD_COUNT: usize = 192;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1620,6 +1696,7 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     flag!(planner, "PlannerConfig", late, true),
     flag!(planner, "PlannerConfig", observer, true),
     flag!(planner, "PlannerConfig", minerals, true),
+    flag!(planner, "PlannerConfig", labs, true),
     number!(
         planner,
         "PlannerConfig",
@@ -1848,6 +1925,31 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
         true
     ),
     number!(minerals, "MineralsConfig", read_ticks, 1, 10_000, true),
+    flag!(labs, "LabsConfig", enabled, true),
+    number!(labs, "LabsConfig", goal_xgho2, 0, TERMINAL_CAPACITY, true),
+    number!(labs, "LabsConfig", goal_xzh2o, 0, TERMINAL_CAPACITY, true),
+    number!(labs, "LabsConfig", goal_xzho2, 0, TERMINAL_CAPACITY, true),
+    number!(labs, "LabsConfig", goal_xlho2, 0, TERMINAL_CAPACITY, true),
+    number!(labs, "LabsConfig", goal_xkho2, 0, TERMINAL_CAPACITY, true),
+    number!(labs, "LabsConfig", goal_xuh2o, 0, TERMINAL_CAPACITY, true),
+    number!(labs, "LabsConfig", goal_xgh2o, 0, TERMINAL_CAPACITY, true),
+    number!(
+        labs,
+        "LabsConfig",
+        batch_min,
+        LAB_REACTION_AMOUNT,
+        LAB_MINERAL_CAPACITY,
+        true
+    ),
+    number!(
+        labs,
+        "LabsConfig",
+        hauler_carry,
+        1,
+        MAX_CREEP_SIZE - 1,
+        true
+    ),
+    number!(labs, "LabsConfig", read_ticks, 1, 10_000, true),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -2132,6 +2234,7 @@ mod tests {
             defense: _,
             upkeep: _,
             minerals: _,
+            labs: _,
         } = MMO.config;
         let SpawnConfig {
             hold_ticks: _,
@@ -2191,6 +2294,7 @@ mod tests {
             late: _,
             observer: _,
             minerals: _,
+            labs: _,
             max_sites: _,
             verify_ticks: _,
             hub_clearance: _,
@@ -2287,7 +2391,20 @@ mod tests {
             max_work: _,
             read_ticks: _,
         } = MINERALS_MMO;
-        let expected: [(&str, &[&str]); 22] = [
+        let LabsConfig {
+            enabled: _,
+            goal_xgho2: _,
+            goal_xzh2o: _,
+            goal_xzho2: _,
+            goal_xlho2: _,
+            goal_xkho2: _,
+            goal_xuh2o: _,
+            goal_xgh2o: _,
+            batch_min: _,
+            hauler_carry: _,
+            read_ticks: _,
+        } = LABS_MMO;
+        let expected: [(&str, &[&str]); 23] = [
             (
                 "loader",
                 &[
@@ -2438,6 +2555,7 @@ mod tests {
                     "late",
                     "observer",
                     "minerals",
+                    "labs",
                     "max_sites",
                     "verify_ticks",
                     "hub_clearance",
@@ -2549,6 +2667,22 @@ mod tests {
             (
                 "minerals",
                 &["enabled", "stock_max", "free_min", "max_work", "read_ticks"],
+            ),
+            (
+                "labs",
+                &[
+                    "enabled",
+                    "goal_xgho2",
+                    "goal_xzh2o",
+                    "goal_xzho2",
+                    "goal_xlho2",
+                    "goal_xkho2",
+                    "goal_xuh2o",
+                    "goal_xgh2o",
+                    "batch_min",
+                    "hauler_carry",
+                    "read_ticks",
+                ],
             ),
         ];
         let mut total = 0;

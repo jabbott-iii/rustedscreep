@@ -1061,12 +1061,12 @@ impl Run {
             }
             for &r in &roads {
                 if self.board.has_road(r) {
-                    self.board.lower_road(r, level, Gate::Late);
-                } else if !self.board.place_road(r, level, Gate::Late) {
+                    self.board.lower_road(r, level, Gate::Labs);
+                } else if !self.board.place_road(r, level, Gate::Labs) {
                     return Err(PlanError::NoRoom("lab road"));
                 }
             }
-            roads::road(&mut self.board, hub, entry, 0, level, Gate::Late, s)?;
+            roads::road(&mut self.board, hub, entry, 0, level, Gate::Labs, s)?;
             return Ok(());
         }
         Err(PlanError::NoRoom("labs"))

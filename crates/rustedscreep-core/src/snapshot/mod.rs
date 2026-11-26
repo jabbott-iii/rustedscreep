@@ -26,11 +26,12 @@ pub use intern::{Handle, Interner, ObjectKey};
 pub use room_name::parse_room_name;
 pub use tables::{
     BodyPartRead, BodyRead, Combat, Controller, ControllerState, CreepClass, CreepHandle, CreepRow,
-    CreepStore, Creeps, INTEL_SOURCES, IntelRead, Links, MineralContainer, MineralRead,
-    MineralSite, MineralSites, MineralTerminal, ObjectClass, ObjectHandle, ObjectKind, ObjectRow,
-    ObjectStatic, RemoteRead, Reservation, RoomEnergy, RoomObjects, RoomStatus, Rooms, SIGN_TOWERS,
-    SafeModeState, SignRead, SignSeen, Spawns, StructureClass, StructureHandle, StructureStatic,
-    Structures, Towers, known_structure_type, position_from_packed,
+    CreepStore, Creeps, INTEL_SOURCES, IntelRead, LAB_RESOURCES, LabRead, LabSites, LabState,
+    LabTerminal, Links, MineralContainer, MineralRead, MineralSite, MineralSites, MineralTerminal,
+    ObjectClass, ObjectHandle, ObjectKind, ObjectRow, ObjectStatic, RemoteRead, Reservation,
+    RoomEnergy, RoomObjects, RoomStatus, Rooms, SIGN_TOWERS, SafeModeState, SignRead, SignSeen,
+    Spawns, StructureClass, StructureHandle, StructureStatic, Structures, Towers,
+    known_structure_type, lab_resource, position_from_packed,
 };
 pub use tick::TickContext;
 
@@ -190,6 +191,8 @@ pub struct Snapshot {
     pub objects: RoomObjects,
     /// The owned rooms' mineral reads (P9.1, ADR-044).
     pub minerals: MineralSites,
+    /// The owned rooms' lab reads (P9.2, ADR-045).
+    pub labs: LabSites,
     pub skipped: SkipCounts,
 }
 
@@ -205,6 +208,7 @@ impl Snapshot {
         self.towers.begin();
         self.objects.begin();
         self.minerals.begin();
+        self.labs.begin();
         self.skipped = SkipCounts::default();
     }
 

@@ -374,6 +374,7 @@ impl World {
                     energy: c.energy,
                     capacity: c.capacity,
                     other: 0,
+                    other_kind: None,
                 },
             );
             self.snap.creeps.set_death(row, c.death);

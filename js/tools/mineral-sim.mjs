@@ -9,8 +9,10 @@
 // capacity by the harness (no extensions stand; `energyAvailable` and `energyCapacityAvailable` are CAPACITY).
 // The run starts with the overrides of CONFIG_LINES in segment 97 (the runtime config's record): the planner, the
 // interim extension, container and link sites, remote mining, the signer, scouting and claim scoring off, so nothing
-// else asks for the spawn or places sites; `minerals.read_ticks` READ_TICKS and `minerals.stock_max` STOCK_MAX. The
-// record loads on the global's second loop, so the first read runs with the profile's values.
+// else asks for the spawn or places sites; `minerals.read_ticks` READ_TICKS and `minerals.stock_max` STOCK_MAX; and lab
+// reactions off (P9.2: they would read the terminal on their own `labs.read_ticks` cadence). The record loads on the
+// global's second loop, so the first read runs with the profile's values (the labs' first read falls on the minerals'
+// first read loop).
 // The terminal holds MMO_STOCK_MAX of the mineral at first (the profile's cap, above STOCK_MAX), so the room does not
 // mine under either value; at offset EMPTY_AT the harness empties it, and the next due read starts the mining; the run
 // ends LINGER loops after the room stopped at the cap and the last load is delivered.
@@ -101,6 +103,7 @@ const CONFIG_LINES = [
   'claim.enabled=false',
   `minerals.stock_max=${STOCK_MAX}`,
   `minerals.read_ticks=${READ_TICKS}`,
+  'labs.enabled=false',
 ];
 const START_LINE = `rustedscreep minerals: ${ROOM} mines its H (${AMOUNT} left)`;
 const STOP_LINE = `rustedscreep minerals: ${ROOM} stopped mining: terminal stocked`;

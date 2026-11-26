@@ -258,6 +258,9 @@ pub struct Placement {
     ground: Ground,
     reach: build::Scratch,
     tiles: Vec<Tile>,
+    /// The rooms whose labs' gate is on this tick (P9.2, ADR-045: the rooms that want labs,
+    /// `economy::labs::Labs::wants_labs`), sorted by packed name ([`Self::set_lab_rooms`]).
+    lab_rooms: Vec<RoomName>,
     field: FlowField,
     dial: Dial,
     occupied: Vec<(Tile, bool)>,
@@ -319,6 +322,26 @@ impl Placement {
         u32::try_from(self.rooms.len()).unwrap_or(u32::MAX)
     }
 
+    /// Sets the rooms that want labs this tick (P9.2, ADR-045): in every other room the plan's
+    /// labs, and the roads only they need, are not placed ([`build::Gates::with_labs`]). Call
+    /// before the job; none set, no room places labs.
+    pub fn set_lab_rooms(&mut self, rooms: &[RoomName]) {
+        self.lab_rooms.clear();
+        self.lab_rooms.extend_from_slice(rooms);
+        self.lab_rooms.sort_unstable_by_key(|r| r.packed_repr());
+        self.lab_rooms.dedup();
+    }
+
+    /// The gates room `name` places with under `pcfg`: the config's, with the labs' gate only
+    /// where the room wants labs ([`Self::set_lab_rooms`]).
+    fn gates_for(&self, name: RoomName, pcfg: &PlannerConfig) -> Gates {
+        let wants = self
+            .lab_rooms
+            .binary_search_by_key(&name.packed_repr(), |r| r.packed_repr())
+            .is_ok();
+        Gates::from_config(pcfg).with_labs(wants)
+    }
+
     /// The name of room `unit`.
     pub fn room_name(&self, unit: u32) -> Option<RoomName> {
         self.rooms.get(usize::try_from(unit).ok()?).map(|r| r.name)
@@ -348,6 +371,9 @@ impl Placement {
     ) -> Result<(), Fault> {
         let now = self.time;
         let ri = usize::try_from(unit).map_err(|_| Fault::new("unit out of range", unit))?;
+        let gates = self
+            .room_name(unit)
+            .map_or(Gates::from_config(pcfg), |n| self.gates_for(n, pcfg));
         let r = self
             .rooms
             .get_mut(ri)
@@ -389,14 +415,8 @@ impl Placement {
                     // and that is due at the level (a tile planned for a switched-off type, or for
                     // a road only those need, holds nothing).
                     if let PlanView::Ready(plan) = plan
-                        && let Some(kind) = due_replacement(
-                            plan,
-                            p.tile,
-                            Gates::from_config(pcfg),
-                            level,
-                            containers,
-                            links,
-                        )
+                        && let Some(kind) =
+                            due_replacement(plan, p.tile, gates, level, containers, links)
                     {
                         r.replacing = Some(Replacing {
                             tile: p.tile,
@@ -633,6 +653,7 @@ impl Placement {
         commit: &mut Commit,
     ) -> Result<(), Fault> {
         let now = self.time;
+        let gates = self.gates_for(name, pcfg);
         let (structures, sites, containers_now, hostile) = room_scan(snap, name, &mut self.tiles);
         let objects = sites.saturating_add(containers_now);
         // A site gone or a structure gone (built or destroyed) shows on the roads and the obstacles
@@ -697,7 +718,7 @@ impl Placement {
             needs: containers.len().saturating_add(links.len()),
             replacing: r.replacing.is_some(),
             full,
-            gates: Gates::from_config(pcfg),
+            gates,
             replace: pcfg.replace,
             max_sites: pcfg.max_sites,
         };
@@ -787,7 +808,7 @@ impl Placement {
                 terrain: &facts.terrain,
                 anchor: plan.anchor,
                 level,
-                gates: Gates::from_config(pcfg),
+                gates,
                 replace: pcfg.replace && r.destroy_lost < LOST_MAX,
                 max_sites: pcfg.max_sites,
                 holding: r.replacing.is_some(),

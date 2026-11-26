@@ -531,6 +531,12 @@ impl OpeningGlue {
         });
     }
 
+    /// Sets the rooms whose plan's labs the placement places this tick (P9.2, ADR-045,
+    /// `Labs::wants_labs`).
+    pub fn set_lab_rooms(&mut self, rooms: &[RoomName]) {
+        self.placement.set_lab_rooms(rooms);
+    }
+
     /// The placement (P4.3's console summary reads its census and totals).
     pub fn placement(&self) -> &Placement {
         &self.placement

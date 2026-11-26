@@ -24,11 +24,14 @@
 //!   and roads, and the plan to run it by ([`best_plan`]).
 //! - [`Minerals`]: mineral mining (P9.1, ADR-044): each room's mineral miner and haulers, from
 //!   its extractor, the container next to its mineral, and its terminal.
+//! - [`Labs`]: lab reactions (P9.2, ADR-045): each room's lab roles, its job (one step of a
+//!   target compound's chain), its reactions, and its lab hauler.
 //! - [`Remotes`]: remote mining's manager and creeps (P6.2, ADR-029): each home's candidate rooms,
 //!   what the bot saw of them, their ways and prices, the rooms it mines, and the scouts,
 //!   reservers, remote miners and remote haulers.
 
 mod hauling;
+mod labs;
 mod minerals;
 mod mining;
 mod opening;
@@ -41,6 +44,12 @@ mod watchdog;
 
 pub use hauling::{
     HaulInput, HaulPlan, HaulSource, HaulStats, HaulTask, HaulView, Hauling, PRIORITY_HAULER,
+};
+pub use labs::{
+    Job as LabJob, LabEvent, LabRoom, LabStats, Labs, Member as LabMember, PRIORITY_LAB_HAULER,
+    Phase as LabPhase, ReactionOrder, Step as LabStep, TARGETS as LAB_TARGETS, Task as LabTask,
+    Why as LabWhy, goals as lab_goals, hauler_body as lab_hauler_body, pick as lab_pick,
+    product_of as lab_product, source_pair as lab_source_pair,
 };
 pub use minerals::{
     HARVEST_PERIOD, Member as MineralMember, MineralEvent, MineralPlan, MineralRoom, MineralStats,
@@ -76,6 +85,8 @@ pub use upgrading::{
 };
 pub use watchdog::{Event, Observation, Watchdog};
 
+#[cfg(test)]
+mod labs_tests;
 #[cfg(test)]
 mod minerals_tests;
 #[cfg(test)]

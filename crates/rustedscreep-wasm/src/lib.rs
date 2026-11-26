@@ -39,6 +39,7 @@ mod claim;
 mod config;
 mod consts_check;
 mod defense;
+mod labs;
 mod logging;
 mod minerals;
 mod movement;
@@ -89,6 +90,8 @@ struct State {
     claim: claim::ClaimGlue,
     /// Mineral mining (P9.1, ADR-044): each room's mineral miner and haulers.
     minerals: minerals::MineralsGlue,
+    /// Lab reactions (P9.2, ADR-045): each room's lab roles, job, reactions and lab hauler.
+    labs: labs::LabsGlue,
     /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1), the towers
     /// (P7.2), the safe-mode triggers (P7.4), the defenders (P7.5) and the remote defenders (P7.6).
     defense: defense::DefenseGlue,
@@ -149,6 +152,7 @@ pub fn game_loop() {
                     scout,
                     claim,
                     minerals,
+                    labs,
                     defense,
                     persist,
                     consts,
@@ -181,6 +185,7 @@ pub fn game_loop() {
                 opening.begin(snapshot, &mut movement.core);
                 remote.begin(snapshot);
                 minerals.begin(snapshot, &cfg.minerals);
+                labs.begin(snapshot, &cfg.labs);
                 sign.begin(snapshot, &cfg.sign);
                 scout.begin(snapshot, &cfg.scout);
                 claim.begin(snapshot, &cfg.claim, sched.last_tick());
@@ -283,6 +288,19 @@ pub fn game_loop() {
                         &cfg.movement,
                     );
                 }
+                // Critical: lab reactions' jobs and the lab hauler's request (P9.2, ADR-045; the
+                // request only while the Standard tier runs), before the spawn plan, and its body
+                // for the upgraders' budget, before the upgrading job.
+                {
+                    let (_, upgrading) = opening.haul_parts();
+                    labs.plan(
+                        &mut tick,
+                        snapshot,
+                        spawn.spawner_mut(),
+                        upgrading,
+                        &cfg.labs,
+                    );
+                }
                 // Critical: the static miners (P3.1), the haulers (P3.3), the upgraders' plan
                 // (P3.4), the opening's workers and their spawn requests (P2.4), then the spawn
                 // plan, after the Critical jobs that request creeps (P2.3).
@@ -346,6 +364,15 @@ pub fn game_loop() {
                     &mut act.buffer,
                     &cfg.movement,
                 );
+                // Standard: the reactions and the lab hauler's work (P9.2).
+                labs.work(
+                    &mut tick,
+                    snapshot,
+                    &mut movement.core,
+                    &mut act.buffer,
+                    &cfg.labs,
+                    &cfg.movement,
+                );
                 // Standard: the claimer's walk and claim (P8.3).
                 claim.work_claimer(
                     &mut tick,
@@ -371,6 +398,8 @@ pub fn game_loop() {
                 if planner.take_dirty() {
                     persist.planner_changed();
                 }
+                // P9.2 (ADR-045): the plan's labs only in the rooms that want them.
+                opening.set_lab_rooms(labs.wants_labs());
                 opening.place(
                     &mut tick,
                     snapshot,
@@ -435,8 +464,11 @@ pub fn game_loop() {
                 tick.finish();
                 // P9.1: the rooms the next snapshot reads for their minerals.
                 js.set_mineral_reads(minerals.reads(&cfg.minerals));
+                // P9.2: the rooms the next snapshot reads for their labs.
+                js.set_lab_reads(labs.reads(&cfg.labs));
                 opening.log_events();
                 minerals.log_events();
+                labs.log_events();
                 remote.log_events(snapshot, js);
                 sign.log_events(&cfg.sign);
                 scout.log_events(&cfg.scout);
@@ -495,6 +527,15 @@ pub fn game_loop() {
                     sched,
                     &cfg.scheduler,
                     &cfg.links,
+                );
+                // The lab reactions (P9.2, ADR-045).
+                labs.issue(
+                    snapshot,
+                    js,
+                    act.log_mut(),
+                    sched,
+                    &cfg.scheduler,
+                    &cfg.labs,
                 );
                 act::issue(act, snapshot, js, sched, &cfg.scheduler);
                 movement.after_act(snapshot, act.refused_moves(), &cfg.movement);
@@ -711,6 +752,21 @@ pub fn minerals_summary() -> String {
             Err(_) => String::from("rustedscreep minerals: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep minerals: state unavailable"))
+}
+
+/// Exported to JS as `labsSummary`, for the `rustedscreep.labs()` console command: one line with
+/// the targets and their goals, then each room's lab state, its last read, its roles, its job, its
+/// hauler and its counters (P9.2, ADR-045).
+#[wasm_bindgen(js_name = "labsSummary")]
+pub fn labs_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state
+                .labs
+                .summary(&state.snapshot, &state.config.get().labs),
+            Err(_) => String::from("rustedscreep labs: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep labs: state unavailable"))
 }
 
 /// Exported to JS as `remoteSummary`, for the `rustedscreep.remote()` console command: one line with

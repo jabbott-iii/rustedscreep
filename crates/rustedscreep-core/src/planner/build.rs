@@ -4,9 +4,10 @@
 //!
 //! - What is placed ([`Gates`]): the plan's spawns and extensions always; the storage and the hub
 //!   link, the towers, the ramparts and walls, the mineral structures (terminal, extractor and
-//!   mineral container, P9.1, ADR-044), the observer, and the late structures (labs, factory,
-//!   power spawn, nuker) only when their gate is on (the user's choice, 2026-11-18: only what the
-//!   bot uses); a road from the earliest level a structure it serves is placed
+//!   mineral container, P9.1, ADR-044), the observer, the labs (P9.2, ADR-045: only in a room
+//!   that wants them, [`Gates::with_labs`]), and the late structures (factory, power spawn,
+//!   nuker) only when their gate is on (the user's choice, 2026-11-18: only what the bot uses); a
+//!   road from the earliest level a structure it serves is placed
 //!   ([`Gates::due_level`], `layout::RoadNeed`), so the mineral's road waits with the extractor. The mining tiles' containers, the controller container and
 //!   the controller and source links come from `economy::mining`, which keeps ADR-023 to
 //!   ADR-025's timing; [`role_tile`] maps each to the plan's tile for its role.
@@ -59,6 +60,7 @@ pub struct Gates {
     pub late: bool,
     pub observer: bool,
     pub minerals: bool,
+    pub labs: bool,
 }
 
 impl Gates {
@@ -70,6 +72,17 @@ impl Gates {
             late: cfg.late,
             observer: cfg.observer,
             minerals: cfg.minerals,
+            labs: cfg.labs,
+        }
+    }
+
+    /// These gates in a room that wants labs or not (`wants`, `economy::labs::Labs::wants_labs`):
+    /// the labs' gate stays on only while the room wants them (ADR-045, the user's choice: build
+    /// the labs once reagents are on hand).
+    pub const fn with_labs(self, wants: bool) -> Self {
+        Self {
+            labs: self.labs && wants,
+            ..self
         }
     }
 
@@ -83,6 +96,7 @@ impl Gates {
             Gate::Late => self.late,
             Gate::Observer => self.observer,
             Gate::Minerals => self.minerals,
+            Gate::Labs => self.labs,
         }
     }
 
@@ -1013,6 +1027,7 @@ mod tests {
                 late: true,
                 observer: true,
                 minerals: true,
+                labs: true,
             },
         ] {
             a.gates = gates;
@@ -1219,7 +1234,7 @@ mod tests {
         earliest_level(kind, 0).expect("allowed at some level")
     }
 
-    /// Gates from six bits: storage, towers, ramparts, late, observer, minerals.
+    /// Gates from seven bits: storage, towers, ramparts, late, observer, minerals, labs.
     fn gates(bits: u8) -> Gates {
         Gates {
             storage: bits & 1 != 0,
@@ -1228,11 +1243,12 @@ mod tests {
             late: bits & 8 != 0,
             observer: bits & 16 != 0,
             minerals: bits & 32 != 0,
+            labs: bits & 64 != 0,
         }
     }
 
     /// Every gate on.
-    const ALL_ON: u8 = 0b11_1111;
+    const ALL_ON: u8 = 0b111_1111;
 
     /// The bit of `kind` in [`Ask::full`].
     fn full_bit(kind: StructureType) -> u32 {
@@ -1339,7 +1355,7 @@ mod tests {
     }
 
     /// C14: the economy's containers and links (the mining tiles', the controller's and the
-    /// sources') never come out of [`next`], under any of the 64 gate combinations at any level;
+    /// sources') never come out of [`next`], under any of the 128 gate combinations at any level;
     /// the hub link only with the storage gate on, the mineral container only with the minerals
     /// gate on (P9.1, ADR-044), each from its level.
     ///
@@ -1436,12 +1452,13 @@ mod tests {
         }
     }
 
-    /// C14: under the MMO profile's gates no storage or late structure (lab, factory, power
-    /// spawn, nuker) is due at any level, so none is counted or offered; the tower, the rampart,
-    /// the wall, the observer, and the mineral structures (terminal, extractor and mineral
-    /// container) are due from the first level that allows each (P7.2 turned the towers' gate on,
-    /// P7.3 the ramparts' and with it the walls', ADR-026, ADR-032, P8.1 the observer's, ADR-039,
-    /// and P9.1 the minerals', ADR-044; the mineral container from the extractor's level), and the
+    /// C14: under the MMO profile's gates no storage or late structure (factory, power spawn,
+    /// nuker) is due at any level, so none is counted or offered; the tower, the rampart, the
+    /// wall, the observer, the mineral structures (terminal, extractor and mineral container), and
+    /// in a room that wants them the labs are due from the first level that allows each (P7.2
+    /// turned the towers' gate on, P7.3 the ramparts' and with it the walls', ADR-026, ADR-032,
+    /// P8.1 the observer's, ADR-039, P9.1 the minerals', ADR-044, and P9.2 the labs', ADR-045,
+    /// through [`Gates::with_labs`]; the mineral container from the extractor's level), and the
     /// one of them first in the planner's kind order is offered; with every gate on, each is due
     /// at the top level.
     ///
@@ -1485,11 +1502,16 @@ mod tests {
         }
         let g = World::spawned().ground();
         let mut s = Scratch::default();
-        for level in 1..=MAX_LEVEL {
+        for (level, wants) in (1..=MAX_LEVEL).flat_map(|l| [(l, true), (l, false)]) {
             let mut a = ask(&l, &t, level);
-            a.gates = Gates::from_config(&PLANNER_MMO);
+            a.gates = Gates::from_config(&PLANNER_MMO).with_labs(wants);
             let (n, c) = next(&a, &g, &mut s);
             let extractor = first(StructureType::Extractor);
+            let lab = if wants {
+                first(StructureType::Lab)
+            } else {
+                u8::MAX
+            };
             let due: Vec<StructureType> = [
                 (StructureType::Tower, first(StructureType::Tower)),
                 (StructureType::Rampart, first(StructureType::Rampart)),
@@ -1498,12 +1520,17 @@ mod tests {
                 (StructureType::Terminal, first(StructureType::Terminal)),
                 (StructureType::Extractor, extractor),
                 (StructureType::Container, extractor),
+                (StructureType::Lab, lab),
             ]
             .into_iter()
             .filter(|&(_, from)| level >= from)
             .map(|(k, _)| k)
             .collect();
-            assert_eq!(c.due as usize, due.len(), "level {level}: {c:?}");
+            assert_eq!(
+                c.due as usize,
+                due.len(),
+                "level {level}, labs {wants}: {c:?}"
+            );
             match due.iter().copied().min_by_key(|&k| kind_rank(k)) {
                 Some(want) => assert!(
                     matches!(n, Next::Site { kind, .. } if kind == want),
@@ -2130,8 +2157,10 @@ mod tests {
     /// container is due from the extractor's level under both (the minerals gate is on, P9.1,
     /// ADR-044); one serving the base at a later level and a late structure at an earlier one is
     /// due from the base's level with the late gate off and from the late one's with it on; one
-    /// with no recorded need is due from its item's level. [`next`] offers exactly the due ones,
-    /// at every level.
+    /// with no recorded need is due from its item's level; one serving only the labs is due from
+    /// the first lab's level under the MMO gates in a room that wants labs and never in one that
+    /// does not (P9.2, ADR-045, [`Gates::with_labs`]). [`next`] offers exactly the due ones, at
+    /// every level.
     ///
     /// Uses: `PLANNER_MMO` (its gates), `CONTROLLER_STRUCTURES` (through `earliest_level`: the
     /// extractor's, the first lab's, the third spawn's and the first spawn's levels), `MAX_LEVEL`.
@@ -2144,6 +2173,11 @@ mod tests {
             mmo.minerals,
             "the MMO profile places the mineral structures"
         );
+        assert!(
+            mmo.labs,
+            "the MMO profile places the labs where they are wanted"
+        );
+        let no_labs = mmo.with_labs(false);
         let all = gates(ALL_ON);
         let mineral = first(StructureType::Extractor);
         let lab = first(StructureType::Lab);
@@ -2154,25 +2188,30 @@ mod tests {
         let shared_road = tile(21, 22);
         let core_road = tile(22, 24);
         let lab_road = tile(23, 26);
+        let labs_road = tile(24, 28);
         let mut l = layout(vec![
             item_on(StructureType::Road, mineral_road, mineral),
             item_on(StructureType::Road, shared_road, lab.min(third_spawn)),
             item_on(StructureType::Road, core_road, core),
             item_on(StructureType::Road, lab_road, lab),
+            item_on(StructureType::Road, labs_road, lab),
         ]);
         l.needs = vec![
             need(mineral_road, &[(Gate::Minerals, mineral)]),
             need(shared_road, &[(Gate::Base, third_spawn), (Gate::Late, lab)]),
             need(lab_road, &[(Gate::Late, lab)]),
+            need(labs_road, &[(Gate::Labs, lab)]),
         ];
         l.needs.sort_by_key(|n| n.tile.index());
         assert!(l.road_need(core_road).is_none());
-        // (road, due level under the MMO gates, due level with every gate on)
+        // (road, due level under the MMO gates, with every gate on, and under the MMO gates in a
+        // room that wants no labs)
         let expect = [
-            (mineral_road, Some(mineral), Some(mineral)),
-            (shared_road, Some(third_spawn), Some(lab)),
-            (core_road, Some(core), Some(core)),
-            (lab_road, None, Some(lab)),
+            (mineral_road, Some(mineral), Some(mineral), Some(mineral)),
+            (shared_road, Some(third_spawn), Some(lab), Some(third_spawn)),
+            (core_road, Some(core), Some(core), Some(core)),
+            (lab_road, None, Some(lab), None),
+            (labs_road, Some(lab), Some(lab), None),
         ];
         let road = |at: Tile| {
             *l.items
@@ -2180,7 +2219,7 @@ mod tests {
                 .find(|i| i.tile == at)
                 .expect("a planned road")
         };
-        for &(at, off, on) in &expect {
+        for &(at, off, on, labs_off) in &expect {
             assert_eq!(
                 mmo.due_level(&l, &road(at)),
                 off,
@@ -2191,15 +2230,24 @@ mod tests {
                 on,
                 "{at:?} with every gate on"
             );
+            assert_eq!(
+                no_labs.due_level(&l, &road(at)),
+                labs_off,
+                "{at:?} in a room that wants no labs"
+            );
         }
-        for (g, late) in [(mmo, false), (all, true)] {
+        for (g, column) in [(mmo, 0), (all, 1), (no_labs, 2)] {
             for level in 1..=MAX_LEVEL {
                 let mut want: Vec<Tile> = expect
                     .iter()
-                    .filter(|&&(_, off, on)| {
-                        (if late { on } else { off }).is_some_and(|d| d <= level)
+                    .filter(|&&(_, off, on, labs_off)| {
+                        [off, on, labs_off]
+                            .get(column)
+                            .copied()
+                            .flatten()
+                            .is_some_and(|d| d <= level)
                     })
-                    .map(|&(at, _, _)| at)
+                    .map(|&(at, _, _, _)| at)
                     .collect();
                 want.sort_by_key(|w| w.index());
                 let mut a = ask(&l, &t, level);

@@ -2073,7 +2073,8 @@ impl Remotes {
             | Role::Explorer
             | Role::Claimer
             | Role::MineralMiner
-            | Role::MineralHauler => {}
+            | Role::MineralHauler
+            | Role::LabHauler => {}
         }
         Ok(())
     }

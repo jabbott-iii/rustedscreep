@@ -6,7 +6,7 @@ import { textCodecSource } from './text-polyfill.js';
 import {
   __wbg_reset_state, actSummary as wasmActSummary, configReset as wasmConfigReset, configSet as wasmConfigSet,
   claimsSummary as wasmClaimsSummary, configSummary as wasmConfigSummary, configUnset as wasmConfigUnset, constsSummary as wasmConstsSummary, initSync,
-  loop as wasmLoop, mineralsSummary as wasmMineralsSummary, moveTo as wasmMoveTo, movementSummary as wasmMovementSummary,
+  labsSummary as wasmLabsSummary, loop as wasmLoop, mineralsSummary as wasmMineralsSummary, moveTo as wasmMoveTo, movementSummary as wasmMovementSummary,
   openingSummary as wasmOpeningSummary,
   persistSummary as wasmPersistSummary, persistTest as wasmPersistTest, plannerSummary as wasmPlannerSummary,
   profilerSummary as wasmProfilerSummary, remoteSummary as wasmRemoteSummary, signSummary as wasmSignSummary,
@@ -118,6 +118,7 @@ const glue: Glue = {
   scoutSummary: wasmScoutSummary,
   claimsSummary: wasmClaimsSummary,
   mineralsSummary: wasmMineralsSummary,
+  labsSummary: wasmLabsSummary,
 };
 
 const loader = new Loader(env, glue, CONFIG, BUILD);
@@ -152,7 +153,8 @@ function routeConsole(): void {
 // `rustedscreep.moveTo("W1N1", 25, 25, 1)` (from another room: `rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1")`;
 // `rustedscreep.moveTo()` cancels), `rustedscreep.spawner()` or `rustedscreep.spawn("W1N1", "worker")`
 // (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`, `rustedscreep.planner()`, `rustedscreep.remote()`,
-// `rustedscreep.sign()`, `rustedscreep.scout()`, `rustedscreep.claims()`, `rustedscreep.minerals()`.
+// `rustedscreep.sign()`, `rustedscreep.scout()`, `rustedscreep.claims()`, `rustedscreep.minerals()`,
+// `rustedscreep.labs()`.
 g.rustedscreep = {
   trapTest: (n: unknown = 1) => loader.scheduleTraps(Number(n)),
   status: () => loader.status(),
@@ -180,6 +182,7 @@ g.rustedscreep = {
   scout: () => loader.scout(),
   claims: () => loader.claims(),
   minerals: () => loader.minerals(),
+  labs: () => loader.labs(),
 };
 
 export function loop(): void {
