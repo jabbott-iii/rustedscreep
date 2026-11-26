@@ -1,6 +1,7 @@
-//! Tests of the claimer and the first spawn site (P8.3, ADR-042, `expansion::claimer`). Expected
-//! values derive from the constants (`MOVE_COST_SWAMP`, `MOVE_POWER`, `BODYPART_COST`,
-//! `CREEP_CLAIM_LIFE_TIME`), `placement::APPEAR_TICKS`, and the claim config.
+//! Tests of the claimer and the first spawn site (P8.3, ADR-042, `expansion::claimer`), and of the
+//! claim's CPU check (P8.4). Expected values derive from the constants (`MOVE_COST_SWAMP`,
+//! `MOVE_POWER`, `BODYPART_COST`, `CREEP_CLAIM_LIFE_TIME`), `placement::APPEAR_TICKS`, and the
+//! claim config.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,13 +12,15 @@ use rustedscreep_consts::{
 };
 
 use super::*;
-use crate::config::{CLAIM_MMO, ClaimConfig, MOVEMENT_MMO, SCOUT_MMO, SPAWN_MMO, ScoutConfig};
+use crate::config::{
+    CLAIM_MMO, ClaimConfig, MOVEMENT_MMO, SCHEDULER_MMO, SCOUT_MMO, SPAWN_MMO, ScoutConfig,
+};
 use crate::economy::placement::APPEAR_TICKS;
 use crate::intents::{CreepIntent, IntentBuffer};
 use crate::movement::{
     Movement, RouteOutcome, RouteQuery, RouteRooms, RouteSearch, ShoveCaps, Tile,
 };
-use crate::scheduler::Commit;
+use crate::scheduler::{Budget, Commit, TickRecord, TickStats};
 use crate::snapshot::{
     Controller, CreepRow, ObjectKey, ObjectKind, ObjectRow, ObjectStatic, RoomEnergy, Snapshot,
     StructureStatic, TickContext,
@@ -146,6 +149,24 @@ struct World {
     router: Rc<RefCell<Router>>,
     cfg: ClaimConfig,
     help_range: u32,
+    /// The base load each tick's record gives the claim's CPU mean (P8.4), and `Game.cpu.limit`.
+    base: f64,
+    cpu_limit: u32,
+}
+
+/// The scheduler's record of a tick that spent `spent`, `optional` of it in Optional jobs (P8.4).
+fn record(time: u32, spent: f64, optional: f64) -> TickRecord {
+    let ctx = TickContext::from_raw(time, 20, 500.0, 10_000);
+    TickRecord {
+        time,
+        loop_index: 1,
+        budget: Budget::compute(&ctx, &SCHEDULER_MMO, 1),
+        stats: TickStats::default(),
+        spent,
+        committed: 0.0,
+        optional,
+        clock_broken: false,
+    }
 }
 
 /// The atlas's neutral read of `name` at `seen`, with its controller at [`CONTROLLER`].
@@ -186,7 +207,7 @@ impl World {
             terms: Terms::default(),
             plan: Some(fit()),
         }]);
-        Self {
+        let mut w = Self {
             time,
             homes: vec![(room(HOME), 5)],
             claimed: Vec::new(),
@@ -203,6 +224,20 @@ impl World {
             router,
             cfg: CLAIM_MMO,
             help_range: SPAWN_MMO.help_range,
+            base: 2.0,
+            cpu_limit: 20,
+        };
+        w.warm();
+        w
+    }
+
+    /// Fills the claim's CPU mean with `claim.cpu_mean_loops` loops of `self.base`, the last one
+    /// the tick before `self.time`.
+    fn warm(&mut self) {
+        let n = self.cfg.cpu_mean_loops;
+        for i in 0..n {
+            let t = self.time - n + i;
+            self.claiming.observe(&record(t, self.base, 0.0), &self.cfg);
         }
     }
 
@@ -220,8 +255,12 @@ impl World {
     }
 
     fn take_snapshot(&mut self) {
-        self.snap
-            .begin(TickContext::from_raw(self.time, 20, 500.0, 10_000));
+        self.snap.begin(TickContext::from_raw(
+            self.time,
+            self.cpu_limit,
+            500.0,
+            10_000,
+        ));
         for (row, c) in self.claimers.iter().enumerate() {
             let r = CreepRow {
                 pos: c.at,
@@ -260,7 +299,9 @@ impl World {
                     })
                 })
                 .expect("spawn");
-            self.snap.spawns.push(h, 0, false);
+            // The homes' spawns are the first structures pushed, so each one's row is its index.
+            let row = u32::try_from(i).expect("row");
+            self.snap.spawns.push(h, row, false);
         }
         for (i, &(r, level, site)) in self.claimed.iter().enumerate() {
             self.snap.rooms.push(r, Controller::Mine { level });
@@ -321,6 +362,8 @@ impl World {
         self.buffer.begin(&self.snap);
         self.spawner.begin(&self.snap, &SPAWN_MMO);
         self.claiming.begin(&self.snap, &self.cfg);
+        let last = record(self.time - 1, self.base, 0.0);
+        self.claiming.observe(&last, &self.cfg);
     }
 
     /// The Critical request, the Standard work and the Optional site pick, as the glue runs them.
@@ -463,6 +506,152 @@ fn a_claimer_is_ordered_once_the_gcl_allows_another_room() {
             PRIORITY_CLAIMER
         )]
     );
+}
+
+// ---- The CPU limit (P8.4) ----
+
+/// The most base load a claim allows with `owned` rooms: `claim.cpu_pct` of the limit, times
+/// `owned / (owned + 1)` (`Claiming::cpu_check`).
+fn most_base(w: &World, owned: u32) -> f64 {
+    f64::from(w.cpu_limit) * f64::from(w.cfg.cpu_pct) / 100.0 * f64::from(owned)
+        / (f64::from(owned) + 1.0)
+}
+
+/// A new global orders no claimer, and reads no GCL, until the CPU mean holds
+/// `claim.cpu_mean_loops` loops; then it does.
+#[test]
+fn a_claim_waits_for_the_cpu_mean() {
+    let mut w = World::new();
+    w.claiming = Claiming::default();
+    let n = w.cfg.cpu_mean_loops;
+    // Each `begin` folds in the tick before, so after loop `i` the mean holds `i` loops.
+    for i in 1..n {
+        w.begin();
+        w.claiming.set_gcl(5);
+        assert_eq!(
+            w.claiming.cpu_check(&w.cfg),
+            CpuCheck::Warming { loops: i },
+            "loop {i}"
+        );
+        assert!(!w.claiming.gcl_due(&w.claims, &w.cfg, w.help_range));
+        assert!(!w.claiming.wants_request(&w.claims, &w.cfg, w.help_range));
+        w.work();
+        assert!(w.requests().is_empty(), "loop {i}");
+        w.time += 1;
+    }
+    w.begin();
+    assert!(w.claiming.cpu_check(&w.cfg).allows());
+    w.work();
+    assert_eq!(w.requests().len(), 1);
+}
+
+/// The claim goes while the base load times one more room over the owned rooms is at most
+/// `claim.cpu_pct` of `Game.cpu.limit`, and waits, with no GCL read, once it is above; Optional
+/// work on top of the base load does not count.
+#[test]
+fn a_claim_waits_while_one_more_room_would_pass_the_cpu_share() {
+    for owned in [1u32, 2] {
+        let run = |extra: f64, optional: f64| {
+            let mut w = World::new();
+            if owned == 2 {
+                w.homes.push((room("E2N3"), 5));
+            }
+            let limit = most_base(&w, owned);
+            w.claiming = Claiming::default();
+            for i in 0..w.cfg.cpu_mean_loops {
+                let t = w.time - w.cfg.cpu_mean_loops + i;
+                let rec = record(t, limit + extra + optional, optional);
+                w.claiming.observe(&rec, &w.cfg);
+            }
+            w.base = limit + extra;
+            w.begin();
+            let check = w.claiming.cpu_check(&w.cfg);
+            let due = w.claiming.gcl_due(&w.claims, &w.cfg, w.help_range);
+            w.claiming.set_gcl(5);
+            w.work();
+            (check, due, w.requests().len())
+        };
+        let cap = f64::from(20u32) * f64::from(CLAIM_MMO.cpu_pct) / 100.0;
+        let (check, due, n) = run(0.0, 0.0);
+        let CpuCheck::Ready {
+            projected, cap: c, ..
+        } = check
+        else {
+            panic!("ready: {check:?}");
+        };
+        assert!(
+            (c - cap).abs() < 1e-9 && (projected - cap).abs() < 1e-9,
+            "{check:?}"
+        );
+        assert!(
+            check.allows() && due && n == 1,
+            "{owned} owned at the cap: {check:?}"
+        );
+        // Optional work far above the limit leaves the base load, and the claim, as they were.
+        let (check, due, n) = run(0.0, 3.0 * cap);
+        assert!(
+            check.allows() && due && n == 1,
+            "{owned} owned with Optional work"
+        );
+        let (check, due, n) = run(0.01, 0.0);
+        assert!(!check.allows(), "{owned} owned above the cap: {check:?}");
+        assert!(
+            !due && n == 0,
+            "{owned} owned above the cap: no GCL read, no claimer"
+        );
+    }
+}
+
+/// A room below `claim.min_home_level` (still growing) is counted at the grown rooms' cost: with one
+/// grown home and one young room, the projection is the mean times 3, not 3 / 2, so a load the
+/// latter would allow waits until the young room reaches the level.
+#[test]
+fn a_young_room_is_counted_at_the_grown_rooms_cost() {
+    let young = u8::try_from(CLAIM_MMO.min_home_level - 1).expect("level");
+    let grown = u8::try_from(CLAIM_MMO.min_home_level).expect("level");
+    let run = |level: u8| {
+        let mut w = World::new();
+        w.homes.push((room("E1N2"), level));
+        let cap = f64::from(w.cpu_limit) * f64::from(w.cfg.cpu_pct) / 100.0;
+        // Below the cap at 3 / 2 of the mean (0.6 of it), above it at 3 times (1.2 of it).
+        w.base = 0.4 * cap;
+        w.claiming = Claiming::default();
+        w.warm();
+        w.begin();
+        w.claiming.set_gcl(5);
+        w.work();
+        (w.claiming.cpu_check(&w.cfg), w.requests().len(), w.base)
+    };
+    let (check, n, base) = run(young);
+    let CpuCheck::Ready { projected, .. } = check else {
+        panic!("ready: {check:?}");
+    };
+    assert!((projected - base * 3.0).abs() < 1e-9, "{check:?}");
+    assert!(!check.allows() && n == 0, "a young room: {check:?}");
+    let (check, n, base) = run(grown);
+    let CpuCheck::Ready { projected, .. } = check else {
+        panic!("ready: {check:?}");
+    };
+    assert!((projected - base * 3.0 / 2.0).abs() < 1e-9, "{check:?}");
+    assert!(check.allows() && n == 1, "both grown: {check:?}");
+}
+
+/// A `Game.cpu.limit` of 0 (an unlimited user on a private server reads 0, V37) allows no claim,
+/// whatever the load.
+#[test]
+fn a_zero_cpu_limit_allows_no_claim() {
+    let mut w = World::new();
+    w.cpu_limit = 0;
+    w.begin();
+    w.claiming.set_gcl(5);
+    w.work();
+    let check = w.claiming.cpu_check(&w.cfg);
+    assert!(
+        matches!(check, CpuCheck::Ready { cap, .. } if cap == 0.0),
+        "{check:?}"
+    );
+    assert!(!check.allows());
+    assert!(w.requests().is_empty());
 }
 
 #[test]

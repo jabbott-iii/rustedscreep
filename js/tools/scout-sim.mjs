@@ -22,9 +22,10 @@
 // Runs A and B start with the overrides `sign.enabled=false` (no signer, whose creep would give vision too),
 // `scout.max_distance=1`, `scout.save_ticks=5` and `claim.enabled=false` (claim scoring would read W2N1's terrain;
 // run C checks it) in segment 97 (the runtime config's record; scouting stays on), which the bot loads on its second
-// loop; it then requests segment 94 (the atlas), which loads on the loop after. Run C starts with the same overrides
-// but the last. The snapshot reads a due room only once the atlas has loaded and the tick before ran the Optional
-// tier.
+// loop; it then requests segment 94 (the atlas), which loads on the loop after. Runs C and D start with the same
+// overrides but the last, and with `claim.cpu_mean_loops=3` (P8.4: the claim's CPU mean is full from the global's fifth
+// loop, so the claim is not held for the MMO default's 1500 loops). The snapshot reads a due room only
+// once the atlas has loaded and the tick before ran the Optional tier.
 // Run A (explorer and record): the spawn holds SPAWN_ENERGY_CAPACITY. The explorer's tour this gives (expansion/mod.rs
 // `nearest_due`, by world tiles from where it stands to each room's center, then by packed name): out of the spawn on
 // (25, 24), W1N2's center is 49 tiles away and the other two 50, so W1N2 first, whose route the glue refuses before
@@ -166,8 +167,17 @@ const SAVE_TICKS = 5;
 /** ScoutConfig's MMO default (crates/rustedscreep-core/src/config.rs SCOUT_MMO). */
 const REFRESH_TICKS = 50000;
 const CONFIG_LINES = ['sign.enabled=false', 'scout.max_distance=1', `scout.save_ticks=${SAVE_TICKS}`, 'claim.enabled=false'];
+/** Runs C and D: the claim's CPU mean (P8.4) over C_CPU_LOOPS loops, so it is full before the best line. The claim
+ * allows at most ClaimConfig's MMO `cpu_pct` (80) of the sandbox's Game.cpu.limit (20); the sandbox's clock is real
+ * elapsed time, about 0.3 to 0.5 ms a loop here (2026-11-25), so the cap of 16 leaves a margin of about 30 for 1 owned
+ * room, and 3 loops average out one slow loop. */
+const C_CPU_LOOPS = 3;
+const C_CPU_CAP = (20 * 80 / 100).toFixed(2);
 /** Run C's overrides: claim scoring stays on. */
-const C_CONFIG_LINES = CONFIG_LINES.filter((l) => !l.startsWith('claim.'));
+const C_CONFIG_LINES = [...CONFIG_LINES.filter((l) => !l.startsWith('claim.')), `claim.cpu_mean_loops=${C_CPU_LOOPS}`];
+/** The claims summary's CPU fragment (crates/rustedscreep-wasm/src/claim.rs `claimer_summary`): the mean, the load with
+ * one more room, and the cap. */
+const CPU_PART = new RegExp(`; CPU (\\d+\\.\\d\\d) a tick, (\\d+\\.\\d\\d) with another room \\(at most ${C_CPU_CAP.replace('.', '\\.')}\\)`);
 /** The runtime config's log line for the record above (crates/rustedscreep-wasm/src/config.rs `loaded`). */
 const CONFIG_LINE = `rustedscreep config: ${CONFIG_LINES.length} override(s) from segment ${CONFIG_SEGMENT} (written at tick 0): ${CONFIG_LINES.join(' ')}`;
 /** The explorer's body (expansion `request`) and its cost. */
@@ -867,6 +877,23 @@ function advance(state, offset) {
   state.observedNext = state.observeIntent;
 }
 
+/**
+ * P8.4's CPU fragment of a claims summary: present once, the load with one more room `factor` times the mean
+ * (`Claiming::cpu_check`: (owned + 1) over the rooms at `claim.min_home_level` or more), each shown to two decimals.
+ */
+function checkCpu(problems, summary, factor) {
+  const m = CPU_PART.exec(summary ?? '');
+  if (!m || (summary.match(/; CPU /g) ?? []).length !== 1) {
+    problems.push(`the claims summary ${JSON.stringify(summary)} has no single CPU fragment matching ${CPU_PART}`);
+    return;
+  }
+  const [mean, projected] = [Number(m[1]), Number(m[2])];
+  // Both are rounded to 0.005: the projection's error is its own plus `factor` times the mean's.
+  if (Math.abs(projected - mean * factor) > 0.005 * (1 + factor) + 1e-9) {
+    problems.push(`the CPU fragment ${JSON.stringify(m[0])}: ${projected} with another room, expected ${mean} × ${factor}`);
+  }
+}
+
 /** A sim of `state`'s world, with the console's commands from `command(offset, lines)`. */
 function runWorld(state, dir, ticks, command) {
   state.creeps.push({
@@ -1337,8 +1364,11 @@ const milli = (text) => Math.round(Number(text) * 1000);
  *     repair of N ramparts' decay a tick (`RAMPART_DECAY_AMOUNT` every `RAMPART_DECAY_TIME` - 1 ticks, V304, at
  *     `REPAIR_COST`, over `CREEP_LIFE_TIME`), V their sum, and (X, Y) a tile of W2N1 that is neither a wall nor an edge;
  * 14. `rustedscreep.claims()` C_SETTLE loops later is exactly `rustedscreep claims: 1 candidates (1 planned); left out:
- *     reserved 1, sources 1; best W2N1 at V e/t; scores 3, plans 1 (1 fit), steps K, terrain reads 1 (0 failed) | 1.
- *     <the best line's text after "best ">`, K above 0 (a score on each of the three reads' loops, none before);
+ *     reserved 1, sources 1; best W2N1 at V e/t; scores 3, plans 1 (1 fit), steps K, terrain reads 1 (0 failed); GCL 1
+ *     for 1 owned; CPU M a tick, P with another room (at most 16.00); no claimer; claimers 0, claims 0, failed 0, spawn
+ *     sites 0 (0 refused), route searches 0, GCL reads 1 | 1. <the best line's text after "best ">`, K above 0 (a score
+ *     on each of the three reads' loops, none before), P twice M to the rounding (P8.4's CPU check, `checkCpu`), and
+ *     one `Game.gcl.level` read;
  * 15. check 11's rules, with the claims line the only other line allowed and the terrain call above.
  */
 export function claimsRun(dir) {
@@ -1405,11 +1435,14 @@ export function claimsRun(dir) {
   const shown = (best[0] ?? '').replace('rustedscreep claims: best ', '');
   const head = `rustedscreep claims: 1 candidates (1 planned); left out: reserved 1, sources 1; best ${WEST} at ${value} e/t; `
     + 'scores 3, plans 1 (1 fit), steps ';
-  // The claimer's part (P8.3): W1N1 is at RCL8, so the GCL is read once, and level 1 allows no second room.
-  const tail = `, terrain reads 1 (0 failed); GCL 1 for 1 owned; no claimer; claimers 0, claims 0, failed 0, spawn sites 0 `
-    + `(0 refused), route searches 0, GCL reads 1 | 1. ${shown}`;
-  const steps = summary?.startsWith(head) && summary.endsWith(tail) ? Number(summary.slice(head.length, summary.length - tail.length)) : NaN;
-  if (!(steps > 0)) problems.push(`the claims summary ${JSON.stringify(summary)}, expected ${JSON.stringify(`${head}K${tail}`)} with K above 0`);
+  // The claimer's part (P8.3): W1N1 is at RCL8, so the GCL is read once, and level 1 allows no second room. P8.4's
+  // CPU fragment (CPU_PART) stands between the GCL and the claimer, with one more room twice the mean for 1 owned.
+  const tail = `, terrain reads 1 (0 failed); GCL 1 for 1 owned; CPU M; no claimer; claimers 0, claims 0, failed 0, `
+    + `spawn sites 0 (0 refused), route searches 0, GCL reads 1 | 1. ${shown}`;
+  checkCpu(problems, summary, 2);
+  const plain = summary?.replace(CPU_PART, '; CPU M');
+  const steps = plain?.startsWith(head) && plain.endsWith(tail) ? Number(plain.slice(head.length, plain.length - tail.length)) : NaN;
+  if (!(steps > 0)) problems.push(`the claims summary ${JSON.stringify(summary)}, expected ${JSON.stringify(`${head}K${tail}`)} with K above 0 and M as ${CPU_PART}`);
   if (state.gclReads.length !== 1) problems.push(`Game.gcl.level read at ${JSON.stringify(state.gclReads)}, expected once`);
 
   if (problems.length) throw new Error(`scout-sim (run C, claims):\n  ${problems.slice(0, 25).join('\n  ')}`);
@@ -1431,8 +1464,9 @@ export function claimsRun(dir) {
  *     next loop and no other site call in W2N1;
  * 19. after the claim, a spawnCreep call for a pioneer (a name matching PIONEER_NAME, two arguments, OK) from W1N1's
  *     spawn, its body WORK, CARRY and MOVE parts costing at most D_CAPACITY (the processor drops it: nothing builds);
- * 20. `rustedscreep.claims()` D_SETTLE loops after it ends with `; GCL 2 for 2 owned; no claimer; claimers 1, claims 1,
- *     failed 0, spawn sites 1 (0 refused), route searches 1, GCL reads 1`;
+ * 20. `rustedscreep.claims()` D_SETTLE loops after it ends with `; GCL 2 for 2 owned; CPU M a tick, P with another room
+ *     (at most 16.00); no claimer; claimers 1, claims 1, failed 0, spawn sites 1 (0 refused), route searches 1, GCL
+ *     reads 1`, P three times M to the rounding (W2N1 at level 1 counts at W1N1's cost);
  * 21. check 11's rules, with the claimer's move, claimController and suicide calls and the one W2N1 site allowed, the
  *     claimer's and pioneers' orders the only spawnCreep calls, and the claim lines above the only other lines.
  */
@@ -1534,10 +1568,15 @@ export function claimerRun(dir) {
       + `one after the claim with WORK, CARRY and MOVE parts at most ${D_CAPACITY} energy, OK`);
   }
 
-  // 20. The console summary.
+  // 20. The console summary, with P8.4's CPU fragment (CPU_PART) for 2 owned rooms, W2N1 at level 1 below
+  // `claim.min_home_level` (4), so the load is W1N1's alone and one more room makes three times it.
   const [summary] = commandResults(world, CLAIMS);
-  const tail = `; GCL ${D_GCL} for 2 owned; no claimer; claimers 1, claims 1, failed 0, spawn sites 1 (0 refused), route searches 1, GCL reads 1`;
-  if (!summary?.endsWith(tail)) problems.push(`the claims summary ${JSON.stringify(summary)}, expected it to end ${JSON.stringify(tail)}`);
+  const tail = `; GCL ${D_GCL} for 2 owned; CPU M; no claimer; claimers 1, claims 1, failed 0, spawn sites 1 (0 refused), `
+    + 'route searches 1, GCL reads 1';
+  checkCpu(problems, summary, 3);
+  if (!summary?.replace(CPU_PART, '; CPU M').endsWith(tail)) {
+    problems.push(`the claims summary ${JSON.stringify(summary)}, expected it to end ${JSON.stringify(tail)} with M as ${CPU_PART}`);
+  }
 
   if (problems.length) throw new Error(`scout-sim (run D, claimer):\n  ${problems.slice(0, 25).join('\n  ')}`);
   return {

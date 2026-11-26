@@ -173,6 +173,8 @@ pub struct TickCpu<'a, C: Clock> {
     clock_broken: bool,
     /// The highest tier a job call has used this tick.
     highest: Option<Tier>,
+    /// CPU spent inside Optional job calls this tick (see [`TickRecord::optional`]).
+    optional: f64,
     stats: TickStats,
 }
 
@@ -196,6 +198,7 @@ impl<'a, C: Clock> TickCpu<'a, C> {
             commit: Commit::default(),
             clock_broken: false,
             highest: None,
+            optional: 0.0,
             stats: TickStats::default(),
         }
     }
@@ -366,7 +369,9 @@ impl<'a, C: Clock> TickCpu<'a, C> {
         let mut ran = 0u32;
         let mut faults = 0u32;
         let mut first = true;
+        let bad_before = self.stats.bad_samples;
         let mut spent = self.sample();
+        let opened = spent;
         let stop = loop {
             let left = cap - spent;
             if left.is_nan() || left <= 0.0 {
@@ -436,6 +441,18 @@ impl<'a, C: Clock> TickCpu<'a, C> {
         if let Some(n) = count {
             state.next = wrap(start, ran.min(n), n);
         }
+        // `spent` is the call's last reading here: the Optional work's CPU, with what it committed,
+        // from the readings the slicer took anyway (no clock read of its own). A bad reading in the
+        // call (it keeps the last good one, so `opened` may be from before the call) leaves the
+        // call in the base load, the side that holds a claim back.
+        let used = spent - opened;
+        if job.tier == Tier::Optional
+            && self.stats.bad_samples == bad_before
+            && used.is_finite()
+            && used > 0.0
+        {
+            self.optional += used;
+        }
         self.stats.units = self.stats.units.saturating_add(ran);
         self.stats.faults = self.stats.faults.saturating_add(faults);
         if stop == Stop::Budget {
@@ -454,6 +471,7 @@ impl<C: Clock> Drop for TickCpu<'_, C> {
             stats: self.stats,
             spent: self.spent(),
             committed: self.commit.cpu,
+            optional: self.optional,
             clock_broken: self.clock_broken,
         });
     }
@@ -1013,6 +1031,96 @@ mod tests {
         assert!((rec.committed - committed).abs() < 1e-9);
         assert!((rec.spent - (3.0 + committed)).abs() < 1e-9);
         assert_eq!((rec.stats.budget_stops, rec.stats.out_of_order), (0, 0));
+    }
+
+    /// Uses: INTENT_CPU_COST. The record splits the tick's CPU: the Optional job calls' CPU, with
+    /// what their units committed, is `optional`, and `base()` is the rest; the split takes no clock
+    /// reading of its own. A broken clock makes the base infinite.
+    #[test]
+    fn the_tick_record_splits_off_the_optional_work() {
+        let mut sched = Scheduler::default();
+        let clock = FakeClock::default();
+        let (mut crit, mut opt) = (JobState::default(), JobState::default());
+        let mut tick = sched.begin(&full_tick(1), &SCHEDULER_MMO, clock.clone());
+        assert!(!tick.allows(Tier::Optional));
+        clock.now.set(2.0);
+        tick.run_units(&CRIT, &mut crit, 2, |_, commit| {
+            clock.spend(0.5);
+            commit.intents(1);
+            Ok(())
+        });
+        drop(tick);
+        // The first loop of a global runs no Optional work: all of it is base.
+        let rec = *sched.last_tick().expect("recorded");
+        assert_eq!(rec.optional, 0.0);
+        assert!((rec.base() - rec.spent).abs() < 1e-9);
+
+        let first_reads = clock.reads.get();
+        let mut tick = sched.begin(&full_tick(2), &SCHEDULER_MMO, clock.clone());
+        assert!(tick.allows(Tier::Optional));
+        clock.now.set(2.0);
+        tick.run_units(&CRIT, &mut crit, 2, |_, commit| {
+            clock.spend(0.5);
+            commit.intents(1);
+            Ok(())
+        });
+        let reads = clock.reads.get();
+        tick.run_steps(&OPT, &mut opt, |i, commit| {
+            clock.spend(1.25);
+            commit.intents(2);
+            Ok(if i == 2 { Step::Done } else { Step::More })
+        });
+        let opt_reads = clock.reads.get() - reads;
+        // A Critical job after the Optional one counts as base too.
+        tick.run_units(&CRIT, &mut crit, 1, |_, _| {
+            clock.spend(0.75);
+            Ok(())
+        });
+        let samples = clock.reads.get() - first_reads;
+        drop(tick);
+        let rec = *sched.last_tick().expect("recorded");
+        let optional = 3.0 * (1.25 + 2.0 * INTENT_CPU_COST);
+        let base = 2.0 + 2.0 * (0.5 + INTENT_CPU_COST) + 0.75;
+        assert!((rec.optional - optional).abs() < 1e-9, "{}", rec.optional);
+        assert!((rec.base() - base).abs() < 1e-9, "{}", rec.base());
+        assert!((rec.spent - (base + optional)).abs() < 1e-9);
+        // The Optional call took only the slicer's own readings: one to start, one per batch.
+        let batches = 1 + 2u32.div_ceil(SCHEDULER_MMO.max_units_per_sample);
+        assert_eq!(opt_reads, 1 + batches);
+        assert_eq!(rec.stats.samples, samples);
+
+        let broken = TickRecord {
+            clock_broken: true,
+            ..rec
+        };
+        assert_eq!(broken.base(), f64::INFINITY);
+    }
+
+    /// An Optional call whose opening reading is bad (it keeps the last good one, from before the
+    /// work in between) stays in the base load instead of taking that work into `optional`.
+    #[test]
+    fn a_bad_reading_leaves_the_optional_call_in_the_base_load() {
+        let mut sched = Scheduler::default();
+        let clock = FakeClock::default();
+        let (mut crit, mut opt) = (JobState::default(), JobState::default());
+        sched
+            .begin(&full_tick(1), &SCHEDULER_MMO, clock.clone())
+            .finish();
+        let mut tick = sched.begin(&full_tick(2), &SCHEDULER_MMO, clock.clone());
+        clock.now.set(1.0);
+        tick.run_units(&CRIT, &mut crit, 1, |_, _| Ok(()));
+        // Base work the clock has not seen yet when the Optional call opens on a NaN reading.
+        clock.spend(4.0);
+        clock.script.borrow_mut().push(f64::NAN);
+        tick.run_steps(&OPT, &mut opt, |_, _| {
+            clock.spend(0.5);
+            Ok(Step::Done)
+        });
+        drop(tick);
+        let rec = *sched.last_tick().expect("recorded");
+        assert_eq!((rec.stats.bad_samples, rec.clock_broken), (1, false));
+        assert_eq!(rec.optional, 0.0);
+        assert!((rec.base() - 5.5).abs() < 1e-9, "{}", rec.base());
     }
 
     /// `isolate` records a failing unit like a sliced one and reports success or failure.

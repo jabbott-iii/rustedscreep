@@ -1,7 +1,8 @@
 //! Expansion (ROADMAP P8, SPEC §3.7). P8.1 (ADR-039) is scouting: the atlas of the rooms near the
 //! homes, the explorer that walks into them, and the observers that look at them. P8.2 (ADR-041,
 //! [`claim`]) ranks the rooms to claim, and P8.3 (ADR-042, [`claimer`]) sends the claimer and places
-//! a claimed room's first spawn site.
+//! a claimed room's first spawn site. P8.4 holds the claimer back while the global control level
+//! (GCL) or the CPU limit leaves no room for another room ([`Claiming::cpu_check`]).
 //!
 //! # The atlas
 //!
@@ -60,8 +61,8 @@ pub use atlas::{
 };
 pub use claim::{Candidate, ClaimEvent, ClaimHome, ClaimStats, Claims, Fit, Skip, Terms};
 pub use claimer::{
-    CLAIMER_MOVES, ClaimerEvent, ClaimerState, ClaimerStats, Claiming, Failure, PRIORITY_CLAIMER,
-    REREAD_WAIT, SitePick, claimer_body,
+    CLAIMER_MOVES, ClaimerEvent, ClaimerState, ClaimerStats, Claiming, CpuCheck, Failure,
+    PRIORITY_CLAIMER, REREAD_WAIT, SitePick, claimer_body,
 };
 
 use rustedscreep_consts::{

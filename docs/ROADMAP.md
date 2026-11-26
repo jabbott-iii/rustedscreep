@@ -194,7 +194,7 @@ Modules:
 - [x] Scouting and observers (structures that give vision of a distant room; ADR-039: one explorer creep, the atlas of rooms within 10 of a home in segment 94, the observers at RCL8 with their own planner gate).
 - [x] Claim scoring (ADR-041: the atlas's rooms ranked in milli-energy a tick, the top 3 checked with the base planner before one is chosen, live in the Optional tier with `rustedscreep.claims()`, one-source rooms scored like any other).
 - [x] Claimers and pioneers (creeps sent to build up a newly claimed room; ADR-042: one claimer at a time while the GCL allows another room, the pioneers the claimed room's own opening workers spawned by the nearest full spawn room within `spawn.help_range`, claims within that range, the first spawn site at the plan's level-1 spawn).
-- [ ] GCL (global control level, which caps how many rooms the bot may own) and CPU limits respected.
+- [x] GCL (global control level, which caps how many rooms the bot may own) and CPU limits respected (the GCL check is ADR-042's: fewer owned rooms than `Game.gcl.level`; P8.4 adds the CPU check: the base load, each loop's CPU less its Optional work, averaged over `claim.cpu_mean_loops` loops and projected to one more room at a grown room's cost, at most `claim.cpu_pct` of `Game.cpu.limit`).
 
 **Gate:**
 - [ ] Scoring tests pass.

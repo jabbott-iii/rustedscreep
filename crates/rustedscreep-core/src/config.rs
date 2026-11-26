@@ -928,6 +928,14 @@ pub struct ClaimConfig {
     /// A room whose claim failed (no route, a claimer lost on the way, a refused call) is not
     /// claimed again for this long. Unit: ticks.
     pub retry_ticks: u32,
+    /// The CPU limit's share one more room may bring the bot to (P8.4,
+    /// `expansion::Claiming::cpu_check`): a claimer is ordered only while the base load's mean
+    /// (`scheduler::CpuLoad`, each loop's CPU less its Optional work's), times one more room over
+    /// the owned rooms, is at most this share of `Game.cpu.limit`. Unit: percent.
+    pub cpu_pct: u32,
+    /// The loops the base load's mean covers; a global orders no claimer before its mean holds this
+    /// many. Unit: loops.
+    pub cpu_mean_loops: u32,
 }
 
 /// Claim scoring values for the official MMO.
@@ -944,6 +952,8 @@ pub const CLAIM_MMO: ClaimConfig = ClaimConfig {
     claimers: true,
     min_home_level: 4,
     retry_ticks: 5_000,
+    cpu_pct: 80,
+    cpu_mean_loops: CREEP_LIFE_TIME,
 };
 
 /// Defense (ROADMAP P7, `defense::Threats`). `docs/TUNING.md` gives each one's rationale and safe
@@ -1282,7 +1292,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 172;
+pub const FIELD_COUNT: usize = 174;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -1701,6 +1711,8 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     flag!(claim, "ClaimConfig", claimers, true),
     number!(claim, "ClaimConfig", min_home_level, 1, 8, true),
     number!(claim, "ClaimConfig", retry_ticks, 100, 100_000, true),
+    number!(claim, "ClaimConfig", cpu_pct, 10, 100, true),
+    number!(claim, "ClaimConfig", cpu_mean_loops, 1, 100_000, true),
     number!(
         defense,
         "DefenseConfig",
@@ -2166,6 +2178,8 @@ mod tests {
             claimers: _,
             min_home_level: _,
             retry_ticks: _,
+            cpu_pct: _,
+            cpu_mean_loops: _,
         } = CLAIM_MMO;
         let DefenseConfig {
             threat_end_ticks: _,
@@ -2415,6 +2429,8 @@ mod tests {
                     "claimers",
                     "min_home_level",
                     "retry_ticks",
+                    "cpu_pct",
+                    "cpu_mean_loops",
                 ],
             ),
             (

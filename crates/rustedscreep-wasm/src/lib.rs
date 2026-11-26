@@ -178,7 +178,7 @@ pub fn game_loop() {
                 remote.begin(snapshot);
                 sign.begin(snapshot, &cfg.sign);
                 scout.begin(snapshot, &cfg.scout);
-                claim.begin(snapshot, &cfg.claim);
+                claim.begin(snapshot, &cfg.claim, sched.last_tick());
                 // A claim the game refused (P8.3): the claimed room's atlas entry is read again.
                 for &room in claim.expired() {
                     scout.expire(room, &cfg.scout);

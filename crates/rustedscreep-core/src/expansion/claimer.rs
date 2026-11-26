@@ -18,6 +18,37 @@
 //! - The candidate's home has a spawn and a controller at `claim.min_home_level` or more, and a
 //!   spawn room lies within `spawn.help_range` of the candidate, so its pioneers have a room to
 //!   come from (the user's "Claim within help range").
+//! - The CPU limit leaves room for one more room (P8.4, [`Claiming::cpu_check`]). This check comes
+//!   before the GCL read, so a claim the CPU holds back reads no GCL.
+//!
+//! # Why the CPU limit is checked, and how
+//!
+//! Every room the bot owns adds its creeps' intents and its share of the snapshot and decide step
+//! to each tick, for as long as it is owned, while `Game.cpu.limit` stays the same (20 on the free
+//! tier, whatever the GCL, V35). A tick above the limit takes the difference from the bucket (V37),
+//! and once the bucket runs low the scheduler stops the Standard tier (hauling, upgrading,
+//! building) in every room. So a claim that pushes the bot's steady load past the limit costs more
+//! than the room gains.
+//!
+//! The steady load is the base load ([`crate::scheduler::TickRecord::base`]: each loop's CPU less
+//! its Optional work, which only spends the bucket's surplus), averaged over
+//! `claim.cpu_mean_loops` loops ([`crate::scheduler::CpuLoad`], one creep life by default, so a
+//! spawn cycle averages out). One more room is assumed to cost what a grown room costs, a grown
+//! room being one at `claim.min_home_level` or more:
+//! - With every owned room grown, that is the mean times `(owned + 1) / owned`.
+//! - A room below that level (the last room claimed, still building up) costs less today than it
+//!   will, so the projection lays the whole load on the grown rooms and counts every owned room at
+//!   their cost: `mean / grown × (owned + 1)`. For one grown home at 6 CPU and a young room at 2,
+//!   that is 8 / 1 × 3 = 24, not 8 × 3 / 2 = 12, so a third claim waits until the young room has
+//!   grown and shows its real cost.
+//!
+//! Both count the fixed cost of a loop (the loader and the snapshot's setup, about 0.2 CPU live,
+//! STATUS Measurements) once more than they should, which errs toward holding the claim. A claimer
+//! is ordered only while the projection is at most `claim.cpu_pct` of `Game.cpu.limit`; the rest is
+//! left for what the base load leaves out ([`crate::scheduler::TickRecord::base`]: the work after
+//! the tick's last clock reading, the act step's own cost, persistence writes), the Optional work,
+//! and global resets. A global orders no claimer before its mean holds `claim.cpu_mean_loops`
+//! loops (the mean is heap state, so a reset starts it again).
 //!
 //! The order goes to the candidate's home at [`PRIORITY_CLAIMER`]: one CLAIM part and
 //! [`CLAIMER_MOVES`] MOVE parts ([`claimer_body`]), so it walks a tile a tick on any terrain. Its
@@ -66,7 +97,7 @@ use crate::config::{ClaimConfig, MovementConfig, ScoutConfig};
 use crate::economy::placement::APPEAR_TICKS;
 use crate::intents::{CreepIntent, IntentBuffer};
 use crate::movement::{MoveError, MoveTo, Movement, RouteOutcome, Tile};
-use crate::scheduler::{Commit, Fault, Tier};
+use crate::scheduler::{Commit, CpuLoad, Fault, TickRecord, Tier};
 use crate::signing::at;
 use crate::snapshot::{Controller, CreepHandle, ObjectKind, Snapshot};
 use crate::spawning::{Body, BodySpec, EnergyBudget, Role, SpawnRequest, Spawner, room_distance};
@@ -177,6 +208,24 @@ impl SitePick {
     pub const KIND: StructureType = StructureType::Spawn;
 }
 
+/// What the CPU limit says about one more room ([`Claiming::cpu_check`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CpuCheck {
+    /// The base load's mean holds `loops`, fewer than `claim.cpu_mean_loops`: no claim yet.
+    Warming { loops: u32 },
+    /// The mean (unit: CPU a tick), the load it projects with one more room, and the most
+    /// `claim.cpu_pct` allows (both CPU a tick).
+    Ready { mean: f64, projected: f64, cap: f64 },
+}
+
+impl CpuCheck {
+    /// Whether a claim may go: the projected load is at most the cap, and the cap is above 0 (a
+    /// `Game.cpu.limit` of 0, an unlimited user on a private server, allows none).
+    pub fn allows(self) -> bool {
+        matches!(self, Self::Ready { projected, cap, .. } if cap > 0.0 && projected <= cap)
+    }
+}
+
 /// Counters since the global started, for the console.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ClaimerStats {
@@ -221,6 +270,10 @@ pub struct Claiming {
     no_site: Vec<RoomName>,
     events: Vec<ClaimerEvent>,
     stats: ClaimerStats,
+    /// The base load's mean (P8.4).
+    load: CpuLoad,
+    /// `Game.cpu.limit` this tick.
+    cpu_limit: u32,
     /// Scratch for the route search.
     avoid: Vec<RoomName>,
     path: Vec<Position>,
@@ -274,6 +327,7 @@ impl Claiming {
     /// own claimers; a claim that succeeded, was refused, or lost its claimer.
     pub fn begin(&mut self, snap: &Snapshot, cfg: &ClaimConfig) {
         self.time = snap.tick.time;
+        self.cpu_limit = snap.tick.cpu_limit;
         self.events.clear();
         self.extras.clear();
         self.expire.clear();
@@ -451,6 +505,41 @@ impl Claiming {
         self.fail(gone.target, Failure::Lost, cfg);
     }
 
+    /// Folds the last finished tick into the base load's mean (P8.4). Call once a tick, with the
+    /// scheduler's record of the tick before.
+    pub fn observe(&mut self, rec: &TickRecord, cfg: &ClaimConfig) {
+        self.load.add(rec, cfg.cpu_mean_loops);
+    }
+
+    /// Whether the CPU limit leaves room for one more room (module docs): the base load's mean over
+    /// the grown rooms (those at `claim.min_home_level` or more, at least one) times one more than
+    /// the owned rooms, against `claim.cpu_pct` of `Game.cpu.limit`.
+    ///
+    /// Uses no game constant. `Game.cpu.limit` is what the bucket gains each tick (V35, V37), so a
+    /// load above it drains the bucket.
+    pub fn cpu_check(&self, cfg: &ClaimConfig) -> CpuCheck {
+        let Some(mean) = self.load.mean(cfg.cpu_mean_loops) else {
+            return CpuCheck::Warming {
+                loops: self.load.loops(),
+            };
+        };
+        let count = |n: usize| f64::from(u32::try_from(n).unwrap_or(u32::MAX).max(1));
+        let owned = count(self.owned.len());
+        let grown = count(
+            self.owned
+                .iter()
+                .filter(|o| u32::from(o.level) >= cfg.min_home_level)
+                .count(),
+        );
+        let projected = mean / grown * (owned + 1.0);
+        let cap = f64::from(self.cpu_limit) * f64::from(cfg.cpu_pct) / 100.0;
+        CpuCheck::Ready {
+            mean,
+            projected,
+            cap,
+        }
+    }
+
     /// The candidate a claimer would be ordered for, checking all but the GCL (module docs): its
     /// home and room.
     fn candidate(
@@ -478,7 +567,7 @@ impl Claiming {
             .owned
             .iter()
             .any(|o| o.spawn && room_distance(o.room, best.room) <= help_range);
-        served.then_some((best.home, best.room))
+        (served && self.cpu_check(cfg).allows()).then_some((best.home, best.room))
     }
 
     /// Whether the glue should read `Game.gcl.level` now: a claimer would be ordered but for the

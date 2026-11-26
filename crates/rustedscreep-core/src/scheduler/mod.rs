@@ -45,11 +45,13 @@
 
 mod budget;
 mod fault;
+mod load;
 mod slice;
 mod wheel;
 
 pub use budget::{Budget, Cap, Off, Tier};
 pub use fault::{Fault, FaultLog, FaultRecord, SUPPRESSED_JOBS, Suppressed};
+pub use load::CpuLoad;
 pub use slice::{Clock, Commit, Job, JobState, Report, Step, Stop, TickCpu, TickStats};
 pub use wheel::{RING, SleepWheel};
 
@@ -68,7 +70,32 @@ pub struct TickRecord {
     pub spent: f64,
     /// CPU committed for the act layer. Unit: CPU.
     pub committed: f64,
+    /// CPU spent inside the tick's Optional job calls: from the first to the last clock reading of
+    /// each call, with the CPU its units committed. Optional work spends the bucket's surplus
+    /// ([`Budget::compute`]), so it grows and shrinks with the bucket; [`Self::base`] leaves it out.
+    /// Unit: CPU.
+    pub optional: f64,
     pub clock_broken: bool,
+}
+
+impl TickRecord {
+    /// The tick's base load: its CPU less its Optional work's ([`Self::optional`]), the CPU the
+    /// Critical and Standard work and the fixed costs (the loader, the snapshot) took. Infinity if
+    /// the clock broke. Unit: CPU.
+    ///
+    /// Like [`Self::spent`] it ends at the tick's last clock reading, so it leaves out the traffic
+    /// manager's own work after that reading and everything after the decide step: the act step's
+    /// cost beyond `INTENT_CPU_COST` an intent, the log, and persistence writes. Some Optional cost
+    /// lands in it: the intents of the moves the traffic manager resolves for creeps Optional work
+    /// runs (the explorer, the signer), the snapshot's reads of rooms they or an observer see, and an
+    /// Optional call that had a bad clock reading.
+    pub fn base(&self) -> f64 {
+        if self.clock_broken || !self.spent.is_finite() {
+            f64::INFINITY
+        } else {
+            (self.spent - self.optional).max(0.0)
+        }
+    }
 }
 
 /// The scheduler's state for one global.

@@ -16,6 +16,8 @@
 //! - `claimer` (Critical, before the spawn plan, only on a tick that runs the Optional tier): the
 //!   claimer's request; `Game.gcl.level` is read in it (3 reads through `Reflect`) only when every
 //!   other check passes and the level was not read this global or `claim.score_ticks` ago.
+//! - P8.4's CPU check takes the scheduler's record of the tick before at the start of each tick
+//!   (`Claiming::observe`, no JS call) and `Game.cpu.limit` from the snapshot.
 //! - `claimer work` (Standard): the claimer's route search (heavy, once a global), its move, its
 //!   `claimController` call next to the controller, and its `suicide` once done.
 //! - In the Optional tier, after the `claims` job: the owned rooms with no spawn and no spawn site
@@ -32,13 +34,13 @@ use rustedscreep_core::config::{
 };
 use rustedscreep_core::expansion::claim::SHOWN;
 use rustedscreep_core::expansion::{
-    Candidate, ClaimEvent, ClaimHome, ClaimerEvent, Claiming, Claims, Scouting, SitePick,
+    Candidate, ClaimEvent, ClaimHome, ClaimerEvent, Claiming, Claims, CpuCheck, Scouting, SitePick,
 };
 use rustedscreep_core::intents::{ActLog, IntentBuffer, Outcome, error_name};
 use rustedscreep_core::movement::Movement;
 use rustedscreep_core::planner::flood::Params;
 use rustedscreep_core::scheduler::{
-    Clock, Fault, FaultRecord, Job, JobState, Scheduler, Step, TickCpu, Tier,
+    Clock, Fault, FaultRecord, Job, JobState, Scheduler, Step, TickCpu, TickRecord, Tier,
 };
 use rustedscreep_core::snapshot::{RoomStatus, Snapshot};
 use rustedscreep_core::spawning::Spawner;
@@ -115,10 +117,14 @@ fn energy(v: i64) -> String {
 }
 
 impl ClaimGlue {
-    /// Starts the tick: no events yet; the owned rooms and the claimer from the snapshot.
-    pub fn begin(&mut self, snapshot: &Snapshot, cfg: &ClaimConfig) {
+    /// Starts the tick: no events yet; the owned rooms and the claimer from the snapshot, and the
+    /// scheduler's record of the tick before (`last`) into the CPU mean (P8.4).
+    pub fn begin(&mut self, snapshot: &Snapshot, cfg: &ClaimConfig, last: Option<&TickRecord>) {
         self.core.begin();
         self.claiming.begin(snapshot, cfg);
+        if let Some(rec) = last {
+            self.claiming.observe(rec, cfg);
+        }
     }
 
     /// The rooms whose atlas entry is marked stale this tick (a refused claim).
@@ -477,6 +483,27 @@ impl ClaimGlue {
             }
             None => {
                 let _ = write!(text, "; GCL not read, {owned} owned");
+            }
+        }
+        // P8.4: the base load's mean and what one more room would bring it to.
+        match c.cpu_check(cfg) {
+            CpuCheck::Warming { loops } => {
+                let _ = write!(
+                    text,
+                    "; CPU mean over {loops} of {} loops",
+                    cfg.cpu_mean_loops
+                );
+            }
+            check @ CpuCheck::Ready {
+                mean,
+                projected,
+                cap,
+            } => {
+                let _ = write!(
+                    text,
+                    "; CPU {mean:.2} a tick, {projected:.2} with another room ({} {cap:.2})",
+                    if check.allows() { "at most" } else { "above" }
+                );
             }
         }
         match c.claimer() {
