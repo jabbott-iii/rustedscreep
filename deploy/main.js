@@ -226,6 +226,28 @@ function actSummary() {
 }
 
 /**
+ * Exported to JS as `claimsSummary`, for the `rustedscreep.claims()` console command: one line with
+ * the candidates' counts, why rooms were left out, the plan running, the best room, and the first
+ * candidates with their terms (P8.2, ADR-041).
+ * @returns {string}
+ */
+function claimsSummary() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        let ret;
+        __wbg_call_guard();
+        ret = wasm.claimsSummary();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        __wbg_call_guard();
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * Exported to JS as `configReset`, for `rustedscreep.configReset()`: removes every override.
  * @returns {string}
  */
@@ -605,6 +627,28 @@ function schedulerSummary() {
 }
 
 /**
+ * Exported to JS as `scoutSummary`, for the `rustedscreep.scout()` console command: one line with
+ * the atlas, the rooms due, the explorer and its trip, this tick's observer looks and the counts
+ * since the global started (P8.1, ADR-039).
+ * @returns {string}
+ */
+function scoutSummary() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        let ret;
+        __wbg_call_guard();
+        ret = wasm.scoutSummary();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        __wbg_call_guard();
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * Exported to JS as `signSummary`, for the `rustedscreep.sign()` console command: one line with
  * the signer's record, its trip, the next signer's plan and its counts (ADR-030).
  * @returns {string}
@@ -782,6 +826,10 @@ function __wbg_get_imports() {
             const ret = arg0.build(arg1);
             return ret;
         }, arguments); },
+        __wbg_claimController_c2fb18ec5950abed: function() { return handleError(function (arg0, arg1) {
+            const ret = arg0.claimController(arg1);
+            return ret;
+        }, arguments); },
         __wbg_controller_fb0c168695740499: function(arg0) {
             const ret = arg0.controller;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
@@ -806,6 +854,10 @@ function __wbg_get_imports() {
             const ret = Reflect.deleteProperty(arg0, arg1);
             return ret;
         }, arguments); },
+        __wbg_density_value_09e962c57fe84da6: function(arg0) {
+            const ret = arg0.density;
+            return ret;
+        },
         __wbg_destroy_c79477a7058f2e5c: function() { return handleError(function (arg0) {
             const ret = arg0.destroy();
             return ret;
@@ -986,6 +1038,10 @@ function __wbg_get_imports() {
             const ret = arg0.level;
             return ret;
         },
+        __wbg_level_value_1731743d50924248: function(arg0) {
+            const ret = arg0.level;
+            return ret;
+        },
         __wbg_limit_1050789f9e9aa13c: function() {
             const ret = Game.cpu.limit;
             return ret;
@@ -998,6 +1054,10 @@ function __wbg_get_imports() {
         },
         __wbg_max_rooms_664b8b593d1663b5: function(arg0, arg1) {
             arg0.maxRooms = arg1;
+        },
+        __wbg_mineral_type_value_b2a53d82b31d6f85: function(arg0) {
+            const ret = arg0.mineralType;
+            return ret;
         },
         __wbg_move_a08b29fe96a5d874: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.move(arg1);
@@ -1037,6 +1097,10 @@ function __wbg_get_imports() {
         },
         __wbg_notify_b0fdf1c28cd8b667: function() { return handleError(function (arg0, arg1) {
             Game.notify(getStringFromWasm0(arg0, arg1));
+        }, arguments); },
+        __wbg_observeRoom_aa7114f61b900a69: function() { return handleError(function (arg0, arg1) {
+            const ret = arg0.observeRoom(arg1);
+            return ret;
         }, arguments); },
         __wbg_ops_ea9b5651a796f698: function(arg0) {
             const ret = arg0.ops;
@@ -1328,7 +1392,7 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("string")], shim_idx: 19, ret: Externref, inner_ret: Some(Externref) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("string")], shim_idx: 20, ret: Externref, inner_ret: Some(Externref) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_66fc74bf8055cade___convert__closures_____invoke___wasm_bindgen_66fc74bf8055cade___JsValue__wasm_bindgen_66fc74bf8055cade___JsValue__true_);
             return ret;
         },
@@ -1687,6 +1751,239 @@ function crc32Hex(bytes) {
     return ((c ^ 0xffffffff) >>> 0).toString(16).padStart(8, '0');
 }
 
+// Raw DEFLATE (RFC 1951) to bytes, for the wasm text modules the GitHub link delivers (ADR-040): the build compresses
+// the wasm with Node's zlib (raw, level 9) before the base64, so the upload fits the MMO's 2 MB code cap (V76, V370),
+// and the MMO's runtime has no decompression of its own (V373). Plain JS, after zlib's puff: one lookup table per
+// Huffman code, built per block, indexed by the next `bits` input bits (DEFLATE packs codes from the least
+// significant bit, so each table entry is filled at the code's bit-reversed index and every index it prefixes).
+// Strict: an invalid block type, a stored block whose length check fails, an over-subscribed code or one with no
+// end-of-block code, input bits that match no code, a length or distance symbol out of range, a distance before the
+// output's start, output past or short of `size`, and a stream that reads past its end each throw a TypeError. The
+// loader's CRC-32 then covers the content.
+const MAXBITS = 15;
+/** Length symbols 257 to 285: each length's base and its extra bits. */
+const LENGTH_BASE = Uint16Array.of(3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258);
+const LENGTH_EXTRA = Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0);
+/** Distance symbols 0 to 29: each distance's base and its extra bits. */
+const DIST_BASE = Uint16Array.of(1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577);
+const DIST_EXTRA = Uint8Array.of(0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13);
+/** The order in which a dynamic block lists its code-length code's lengths. */
+const ORDER = Uint8Array.of(16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);
+/** Zero bytes a stream may be read ahead past its end while its last code is looked up; more is a cut stream. */
+const LOOKAHEAD = 4;
+let fixed;
+function fail(what) {
+    throw new TypeError(`not a raw DEFLATE stream: ${what}`);
+}
+/** The canonical Huffman code (RFC 1951 section 3.2.2) of the first `n` of `lengths` (0: the symbol is unused). */
+function build(lengths, n) {
+    const count = new Uint16Array(MAXBITS + 1);
+    let max = 0;
+    for (let s = 0; s < n; s++) {
+        const l = lengths[s];
+        count[l] = count[l] + 1;
+        if (l > max)
+            max = l;
+    }
+    count[0] = 0;
+    let left = 1;
+    for (let b = 1; b <= MAXBITS; b++) {
+        left = (left << 1) - count[b];
+        if (left < 0)
+            fail('an over-subscribed code');
+    }
+    // An incomplete code is legal (RFC 1951 allows one distance code); its unused windows stay -1.
+    const bits = Math.max(max, 1);
+    const size = 1 << bits;
+    const table = new Int32Array(size).fill(-1);
+    const next = new Uint16Array(MAXBITS + 1);
+    let code = 0;
+    for (let b = 1; b <= MAXBITS; b++) {
+        code = (code + count[b - 1]) << 1;
+        next[b] = code;
+    }
+    for (let s = 0; s < n; s++) {
+        const l = lengths[s];
+        if (l === 0)
+            continue;
+        let c = next[l];
+        next[l] = c + 1;
+        let reversed = 0;
+        for (let i = 0; i < l; i++) {
+            reversed = (reversed << 1) | (c & 1);
+            c >>>= 1;
+        }
+        const entry = (s << 4) | l;
+        for (let j = reversed; j < size; j += 1 << l)
+            table[j] = entry;
+    }
+    return { table, bits };
+}
+/** The fixed codes of a type-1 block (RFC 1951 section 3.2.6), built once. */
+function fixedCodes() {
+    if (fixed)
+        return fixed;
+    const lit = new Uint8Array(288);
+    lit.fill(8, 0, 144);
+    lit.fill(9, 144, 256);
+    lit.fill(7, 256, 280);
+    lit.fill(8, 280, 288);
+    fixed = { lit: build(lit, 288), dist: build(new Uint8Array(30).fill(5), 30) };
+    return fixed;
+}
+/**
+ * The `size` bytes that the raw DEFLATE stream `input` inflates to (ADR-040). Throws a TypeError for a stream that is
+ * malformed, cut short, or that inflates to any other length.
+ */
+function inflateRaw(input, size) {
+    if (!Number.isInteger(size) || size < 0)
+        throw new RangeError(`cannot inflate to ${size} bytes`);
+    const out = new Uint8Array(size);
+    const end = input.length;
+    let op = 0;
+    let ip = 0;
+    let bitbuf = 0;
+    let bitcnt = 0;
+    /** Makes at least `n` bits available, reading zero bytes past the end for a lookahead only. */
+    const need = (n) => {
+        while (bitcnt < n) {
+            if (ip >= end + LOOKAHEAD)
+                fail('it ends early');
+            bitbuf |= (ip < end ? input[ip] : 0) << bitcnt;
+            ip++;
+            bitcnt += 8;
+        }
+    };
+    const bits = (n) => {
+        need(n);
+        const v = bitbuf & ((1 << n) - 1);
+        bitbuf >>>= n;
+        bitcnt -= n;
+        return v;
+    };
+    const decode = (c) => {
+        need(c.bits);
+        const e = c.table[bitbuf & ((1 << c.bits) - 1)];
+        if (e < 0)
+            fail('bits that match no code');
+        const l = e & 15;
+        bitbuf >>>= l;
+        bitcnt -= l;
+        return e >> 4;
+    };
+    for (;;) {
+        const last = bits(1);
+        const type = bits(2);
+        if (type === 0) {
+            // A stored block starts at the next byte: drop the partial byte, and give back the whole bytes read ahead.
+            ip -= bitcnt >> 3;
+            bitbuf = 0;
+            bitcnt = 0;
+            if (ip + 4 > end)
+                fail('a stored block ends early');
+            const len = input[ip] | (input[ip + 1] << 8);
+            const nlen = input[ip + 2] | (input[ip + 3] << 8);
+            ip += 4;
+            if (len !== (~nlen & 0xffff))
+                fail('a stored block whose length check fails');
+            if (ip + len > end)
+                fail('a stored block ends early');
+            if (op + len > size)
+                fail(`it inflates past ${size} bytes`);
+            out.set(input.subarray(ip, ip + len), op);
+            ip += len;
+            op += len;
+        }
+        else if (type === 3) {
+            fail('a block of type 3');
+        }
+        else {
+            let lit;
+            let dist;
+            if (type === 1) {
+                ({ lit, dist } = fixedCodes());
+            }
+            else {
+                const nlen = bits(5) + 257;
+                const ndist = bits(5) + 1;
+                const ncode = bits(4) + 4;
+                if (nlen > 286 || ndist > 30)
+                    fail('a dynamic block with too many codes');
+                const clen = new Uint8Array(19);
+                for (let i = 0; i < ncode; i++)
+                    clen[ORDER[i]] = bits(3);
+                const lencode = build(clen, 19);
+                const total = nlen + ndist;
+                const lengths = new Uint8Array(total);
+                for (let i = 0; i < total;) {
+                    const sym = decode(lencode);
+                    if (sym < 16) {
+                        lengths[i++] = sym;
+                        continue;
+                    }
+                    let repeat;
+                    let value = 0;
+                    if (sym === 16) {
+                        if (i === 0)
+                            fail('a repeat with no length before it');
+                        value = lengths[i - 1];
+                        repeat = 3 + bits(2);
+                    }
+                    else if (sym === 17) {
+                        repeat = 3 + bits(3);
+                    }
+                    else {
+                        repeat = 11 + bits(7);
+                    }
+                    if (i + repeat > total)
+                        fail('code lengths that run past their count');
+                    lengths.fill(value, i, i + repeat);
+                    i += repeat;
+                }
+                if (lengths[256] === 0)
+                    fail('a dynamic block with no end-of-block code');
+                lit = build(lengths.subarray(0, nlen), nlen);
+                dist = build(lengths.subarray(nlen), ndist);
+            }
+            for (;;) {
+                const sym = decode(lit);
+                if (sym < 256) {
+                    if (op >= size)
+                        fail(`it inflates past ${size} bytes`);
+                    out[op++] = sym;
+                    continue;
+                }
+                if (sym === 256)
+                    break;
+                const k = sym - 257;
+                if (k >= 29)
+                    fail('a length symbol out of range');
+                const len = LENGTH_BASE[k] + bits(LENGTH_EXTRA[k]);
+                const d = decode(dist);
+                if (d >= 30)
+                    fail('a distance symbol out of range');
+                const back = DIST_BASE[d] + bits(DIST_EXTRA[d]);
+                if (back > op)
+                    fail('a distance before the start of the output');
+                if (op + len > size)
+                    fail(`it inflates past ${size} bytes`);
+                for (let i = 0; i < len; i++) {
+                    out[op] = out[op - back];
+                    op++;
+                }
+            }
+        }
+        if (last)
+            break;
+    }
+    // Every bit used must be the stream's own: the lookahead's zero bytes may only be left unread.
+    if (ip * 8 - bitcnt > end * 8)
+        fail('it ends early');
+    if (op !== size)
+        fail(`it inflates to ${op} bytes, not ${size}`);
+    return out;
+}
+
 // The loader's boot, run and recovery state machine (ADR-003). Every Screeps global it needs comes in
 // through `Env` and the wasm through `Glue`, so js/test/loader.test.mjs can drive it natively; main.ts
 // wires it to the real runtime. No game logic lives here.
@@ -1765,9 +2062,11 @@ function partModuleName(k) {
  * its recorded length, only the last may end in '=', and the parts are decoded into one buffer, so a missing,
  * empty, cut or misplaced part throws a TypeError that names it before anything is decoded or compiled (an empty
  * part 0 with toBytes's text, `returned Object, not bytes`, since a non-string part 0 is read as a binary module).
- * A part of the recorded length with other content decodes, and the CRC-32 check reports it (ADR-015).
+ * A part of the recorded length with other content decodes, and the CRC-32 check reports it (ADR-015). With
+ * `inflatedBytes` above 0 the decoded text is a raw DEFLATE stream (ADR-040), inflated to exactly that many bytes; a
+ * stream that does not inflate throws a TypeError, and the boot line's tag adds the stream's length.
  */
-function loadWasm(requireModule, wasmParts) {
+function loadWasm(requireModule, wasmParts, inflatedBytes = 0) {
     // A part that is missing, or cut short (a SyntaxError that does not name its module), is named, part 0 too.
     let first;
     try {
@@ -1825,7 +2124,17 @@ function loadWasm(requireModule, wasmParts) {
             throw notBase64(k, e);
         }
     }
-    return { bytes, tag: `String(base64, ${chars} chars${count > 1 ? ` in ${count} parts` : ''})` };
+    const parts = `${chars} chars${count > 1 ? ` in ${count} parts` : ''}`;
+    if (!(inflatedBytes > 0))
+        return { bytes, tag: `String(base64, ${parts})` };
+    let wasm;
+    try {
+        wasm = inflateRaw(bytes, inflatedBytes);
+    }
+    catch (e) {
+        throw new TypeError(`the wasm text modules' ${bytes.length}-byte DEFLATE stream does not inflate to ${inflatedBytes} bytes (${message(e)})`);
+    }
+    return { bytes: wasm, tag: `String(base64, ${parts}, deflate ${bytes.length} B)` };
 }
 function message(e) {
     return e instanceof Error ? `${e.name}: ${e.message}` : String(e);
@@ -1924,8 +2233,9 @@ class Loader {
         let bytes;
         let tag;
         try {
-            // The boot line shows which delivery ran: a binary module's type, or the text modules' base64 (ADR-015, ADR-028).
-            ({ bytes, tag } = loadWasm((name) => this.env.requireModule(name), this.build.wasmParts));
+            // The boot line shows which delivery ran: a binary module's type, or the text modules' base64 (ADR-015, ADR-028)
+            // and, for a DEFLATE stream, its length (ADR-040; the inflate falls in `load+crc`).
+            ({ bytes, tag } = loadWasm((name) => this.env.requireModule(name), this.build.wasmParts, this.build.inflatedBytes));
         }
         catch (e) {
             this.incident('load', message(e));
@@ -2269,6 +2579,14 @@ class Loader {
     sign() {
         return this.summary('signSummary', 'sign summary');
     }
+    /** Console command `rustedscreep.scout()`: the wasm's scouting summary (atlas, explorer, looks; ADR-039). */
+    scout() {
+        return this.summary('scoutSummary', 'scout summary');
+    }
+    /** Console command `rustedscreep.claims()`: the wasm's claim-scoring summary (ranking, plans, best; ADR-041). */
+    claims() {
+        return this.summary('claimsSummary', 'claims summary');
+    }
     /**
      * Console command `rustedscreep.spawn(room, role)`: a spawn of `room` spawns one creep of `role` (worker when
      * omitted) sized to the room's capacity, once the room holds its cost; `rustedscreep.spawn()` cancels. Only
@@ -2324,7 +2642,7 @@ class Loader {
 // recovers from traps and aborted ticks (ADR-003). The state machine is in loader.ts; this file wires it
 // to the Screeps runtime. No game logic. The polyfill import must stay first: once strings cross the
 // boundary, the glue constructs TextDecoder and TextEncoder while it loads (V90).
-const BUILD = ({"id":"d8db073590e8-7ba99bbd","wasmCrc32":"7ba99bbd","features":[],"wasmParts":[622444,622444,622440]});
+const BUILD = ({"id":"cb78d29fe127-dirty-51708c84","wasmCrc32":"51708c84","features":[],"wasmParts":[750036],"inflatedBytes":1549904});
 const CONFIG = ({"bootBucketMin":480,"bootSplitTicks":true,"recoveryMode":"halt","backoffWindowTicks":1000,"backoffIncidents":3,"backoffBaseTicks":100,"backoffMaxTicks":3200,"notifyGroupMinutes":60,"trapTestMax":20});
 /** The open-source driver keeps the first 500 characters of a notification; the docs say 1000 (V96). */
 const NOTIFY_MAX = 500;
@@ -2414,6 +2732,8 @@ const glue = {
     plannerSummary: plannerSummary,
     remoteSummary: remoteSummary,
     signSummary: signSummary,
+    scoutSummary: scoutSummary,
+    claimsSummary: claimsSummary,
 };
 const loader = new Loader(env, glue, CONFIG, BUILD);
 const routedError = (...args) => {
@@ -2446,7 +2766,7 @@ function routeConsole() {
 // `rustedscreep.moveTo("W1N1", 25, 25, 1)` (from another room: `rustedscreep.moveTo("W2N1", 25, 25, 1, "W1N1")`;
 // `rustedscreep.moveTo()` cancels), `rustedscreep.spawner()` or `rustedscreep.spawn("W1N1", "worker")`
 // (`rustedscreep.spawn()` cancels), `rustedscreep.opening()`, `rustedscreep.planner()`, `rustedscreep.remote()`,
-// `rustedscreep.sign()`.
+// `rustedscreep.sign()`, `rustedscreep.scout()`, `rustedscreep.claims()`.
 g.rustedscreep = {
     trapTest: (n = 1) => loader.scheduleTraps(Number(n)),
     status: () => loader.status(),
@@ -2470,6 +2790,8 @@ g.rustedscreep = {
     planner: () => loader.planner(),
     remote: () => loader.remote(),
     sign: () => loader.sign(),
+    scout: () => loader.scout(),
+    claims: () => loader.claims(),
 };
 function loop() {
     try {
