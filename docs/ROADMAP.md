@@ -196,13 +196,15 @@ Modules:
 - [x] Claimers and pioneers (creeps sent to build up a newly claimed room; ADR-042: one claimer at a time while the GCL allows another room, the pioneers the claimed room's own opening workers spawned by the nearest full spawn room within `spawn.help_range`, claims within that range, the first spawn site at the plan's level-1 spawn).
 - [x] GCL (global control level, which caps how many rooms the bot may own) and CPU limits respected (the GCL check is ADR-042's: fewer owned rooms than `Game.gcl.level`; P8.4 adds the CPU check: the base load, each loop's CPU less its Optional work, averaged over `claim.cpu_mean_loops` loops and projected to one more room at a grown room's cost, at most `claim.cpu_pct` of `Game.cpu.limit`).
 
-**Gate:**
-- [ ] Scoring tests pass.
-- [ ] Once GCL allows a second room (VERIFICATION_LOG R28, the GCL-to-room-count rule, still unverified), a live run claims and bootstraps it without lowering the home room's RCL
-  progress below the threshold in TUNING.
-- [ ] P6's carried reading (ADR-031): net energy per CPU from a live run that mines a remote room is recorded, or the record shows that no home had a remote room it could mine
+**Gate:** passed 2026-11-25 (its live claim carried by ADR-043).
+- [x] Scoring tests pass.
+- [x] Once GCL allows a second room, a live run claims and bootstraps it without lowering the home room's RCL progress below the threshold in TUNING.
+  ADR-043 (the live claim waits for a room E7N57 can reach) amended this item: no route leaves E7N57 while its three neighbors stay owned by other
+  players and two of them hold towers, and the GCL on shard3 is not read yet, so the first live claim's lines, with the home's progress against the
+  threshold (set before then), are recorded when the GCL, the CPU check, and a route allow one, with P9's gate as the backstop.
+- [x] P6's carried reading (ADR-031): net energy per CPU from a live run that mines a remote room is recorded, or the record shows that no home had a remote room it could mine
   during P8's live run.
-- [ ] P7's carried event (ADR-038): a live defense event is logged with the bot's response, or the user's record shows that no dangerous hostile entered an owned or
+- [x] P7's carried event (ADR-038): a live defense event is logged with the bot's response, or the user's record shows that no dangerous hostile entered an owned or
   mined room during P8's live run.
 
 ## P9 Late game (SPEC §3.8)
@@ -219,6 +221,9 @@ Modules:
 - [ ] Per-feature tests pass.
 - [ ] Market sanity-limit tests pass.
 - [ ] Live runs never generate pixels below the configured bucket.
+- [ ] P8's carried claim (ADR-043): a live claim's lines are recorded (TEST_PLAN §8, "Claimers and pioneers"), with the home room's RCL progress at or above
+  TUNING's threshold, or `rustedscreep.claims()` and `rustedscreep.scout()` during P9's live run show that no claim was possible (no reachable candidate,
+  the GCL, or the CPU check).
 
 ## P10 Offense core (SPEC §4a, §4c budgets)
 - [ ] Offense energy and CPU budgets enforced first.
