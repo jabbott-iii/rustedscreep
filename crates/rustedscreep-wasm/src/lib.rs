@@ -42,6 +42,7 @@ mod defense;
 mod factory;
 mod labs;
 mod logging;
+mod market;
 mod minerals;
 mod movement;
 mod opening;
@@ -98,6 +99,7 @@ struct State {
     factory: factory::FactoryGlue,
     /// Terminal balancing (P9.4, ADR-047): the base minerals sent between the rooms' terminals.
     terminals: terminals::TerminalsGlue,
+    market: market::Market,
     /// Defense (P7): the threat assessment of hostile creeps in owned rooms (P7.1), the towers
     /// (P7.2), the safe-mode triggers (P7.4), the defenders (P7.5) and the remote defenders (P7.6).
     defense: defense::DefenseGlue,
@@ -161,6 +163,7 @@ pub fn game_loop() {
                     labs,
                     factory,
                     terminals,
+                    market,
                     defense,
                     persist,
                     consts,
@@ -507,6 +510,15 @@ pub fn game_loop() {
                 act_test.queue(&mut act.buffer, snapshot, tick.commit());
                 // After every job: the traffic manager turns the tick's move requests into moves.
                 movement.resolve(&mut tick, snapshot, &mut act.buffer, &cfg.movement);
+                // Market work uses Optional CPU left after traffic resolution.
+                market.work(
+                    &mut tick,
+                    snapshot,
+                    js,
+                    &act.buffer,
+                    terminals.has_sends(),
+                    &cfg,
+                );
                 tick.finish();
                 // P9.1: the rooms the next snapshot reads for their minerals.
                 js.set_mineral_reads(minerals.reads(&cfg.minerals));
@@ -607,6 +619,7 @@ pub fn game_loop() {
                     &cfg.scheduler,
                     &cfg.terminals,
                 );
+                market.issue(snapshot.tick.time, act.log_mut(), sched, &cfg.scheduler);
                 act::issue(act, snapshot, js, sched, &cfg.scheduler);
                 movement.after_act(snapshot, act.refused_moves(), &cfg.movement);
                 probe.act();
@@ -867,6 +880,17 @@ pub fn terminals_summary() -> String {
             Err(_) => String::from("rustedscreep terminals: state busy"),
         })
         .unwrap_or_else(|_| String::from("rustedscreep terminals: state unavailable"))
+}
+
+/// The Optional market job's counters for the `rustedscreep.market()` console command.
+#[wasm_bindgen(js_name = "marketSummary")]
+pub fn market_summary() -> String {
+    STATE
+        .try_with(|cell| match cell.try_borrow() {
+            Ok(state) => state.market.summary(&state.config.get().market),
+            Err(_) => String::from("rustedscreep market: state busy"),
+        })
+        .unwrap_or_else(|_| String::from("rustedscreep market: state unavailable"))
 }
 
 /// Exported to JS as `remoteSummary`, for the `rustedscreep.remote()` console command: one line with

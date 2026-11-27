@@ -109,6 +109,7 @@ export interface Glue {
   factorySummary?: () => string;
   /** One line about terminal balancing: its settings, the next plan, per terminal its read, waiting send and counters (P9.4, ADR-047). */
   terminalsSummary?: () => string;
+  marketSummary?: () => string;
 }
 
 /** Loader state kept in Memory, so it survives a halt. Read at boot and written only on incidents. */
@@ -761,6 +762,11 @@ export class Loader {
     return this.summary('factorySummary', 'factory summary');
   }
 
+  /** Console command `rustedscreep.market()`: market scans and deal outcomes. */
+  market(): string {
+    return this.summary('marketSummary', 'market summary');
+  }
+
   /** Console command `rustedscreep.terminals()`: the wasm's terminal-balancing summary (settings, terminals, sends; ADR-047). */
   terminals(): string {
     return this.summary('terminalsSummary', 'terminals summary');
@@ -787,7 +793,7 @@ export class Loader {
       | 'snapshotSummary' | 'schedulerSummary' | 'actSummary' | 'profilerSummary' | 'persistSummary' | 'configSummary'
       | 'constsSummary' | 'movementSummary' | 'spawnerSummary' | 'openingSummary' | 'plannerSummary'
       | 'remoteSummary' | 'signSummary' | 'scoutSummary' | 'claimsSummary' | 'mineralsSummary'
-      | 'labsSummary' | 'factorySummary' | 'terminalsSummary',
+      | 'labsSummary' | 'factorySummary' | 'terminalsSummary' | 'marketSummary',
     noun: string,
   ): string {
     const call = this.glue[name];

@@ -55,6 +55,7 @@ pub mod defense;
 pub mod economy;
 pub mod expansion;
 pub mod intents;
+pub mod market;
 pub mod movement;
 pub mod persist;
 pub mod planner;

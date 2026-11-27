@@ -116,6 +116,11 @@ impl TerminalsGlue {
         self.standard = report.ran > 0;
     }
 
+    /// Whether terminal balancing has credits-free transfers queued for this tick.
+    pub fn has_sends(&self) -> bool {
+        !self.core.orders().is_empty()
+    }
+
     /// Gives the next snapshot the terminals it reads in full, and those it reads for their
     /// energy alone.
     pub fn set_reads(&mut self, js: &mut JsWorld, cfg: &TerminalsConfig) {

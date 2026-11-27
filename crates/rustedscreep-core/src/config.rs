@@ -25,7 +25,7 @@ use rustedscreep_consts::{
     LAB_MINERAL_CAPACITY, LAB_REACTION_AMOUNT, LINK_CAPACITY, MAX_CONSTRUCTION_SITES,
     MAX_CREEP_SIZE, MOVE_COST_PLAIN, MOVE_COST_ROAD, MOVE_COST_SWAMP, OBSERVER_RANGE,
     RAMPART_DECAY_AMOUNT, RAMPART_DECAY_TIME, RAMPART_HITS_MAX_RCL2, ROOM_SIZE, TERMINAL_CAPACITY,
-    TOWER_CAPACITY,
+    TERMINAL_COOLDOWN, TOWER_CAPACITY,
 };
 
 /// How the loader recovers after a trap or an aborted tick (ADR-003).
@@ -1297,6 +1297,48 @@ pub const TERMINALS_MMO: TerminalsConfig = TerminalsConfig {
     read_ticks: 100,
 };
 
+/// Market policy (P9.5). The optional job deals on public orders for base minerals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarketConfig {
+    /// Enable autonomous deals on external base mineral orders.
+    pub enabled: bool,
+    /// Ticks between market slots. The schedule comes from the game tick.
+    pub scan_ticks: u32,
+    /// Maximum quotes inspected from one filtered book per slot.
+    pub scan_orders: u32,
+    /// Minimum number of units in a deal.
+    pub min_amount: u32,
+    /// Maximum number of units in a deal and per market slot.
+    pub max_amount: u32,
+    /// Highest purchase price in thousandths of a credit per unit. Zero disables buying.
+    pub buy_max_milli: u32,
+    /// Lowest sale price in thousandths of a credit per unit. Zero disables selling.
+    pub sell_min_milli: u32,
+    /// Whole credits an automated purchase must leave in the account.
+    pub credit_floor: u32,
+    /// Energy that must remain in the local terminal after the fee.
+    pub energy_keep: u32,
+    /// Maximum terminal stock to fill toward when buying each base mineral.
+    pub buy_target: u32,
+    /// Minimum local stock after selling a base mineral.
+    pub sell_keep: u32,
+}
+
+/// The MMO's market settings. Enable explicitly after setting acceptable prices.
+pub const MARKET_MMO: MarketConfig = MarketConfig {
+    enabled: false,
+    scan_ticks: 100,
+    scan_orders: 64,
+    min_amount: 100,
+    max_amount: 1_000,
+    buy_max_milli: 2_000,
+    sell_min_milli: 100,
+    credit_floor: 1_000,
+    energy_keep: 1_000,
+    buy_target: LAB_MINERAL_CAPACITY,
+    sell_keep: 30_000,
+};
+
 /// Every subsystem's thresholds: one server profile's values, or those values with the runtime
 /// overrides applied ([`overrides::Store::config`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1326,6 +1368,7 @@ pub struct Config {
     pub labs: LabsConfig,
     pub factory: FactoryConfig,
     pub terminals: TerminalsConfig,
+    pub market: MarketConfig,
 }
 
 /// A server profile: a name and its values.
@@ -1364,6 +1407,7 @@ pub const MMO: Profile = Profile {
         labs: LABS_MMO,
         factory: FACTORY_MMO,
         terminals: TERMINALS_MMO,
+        market: MARKET_MMO,
     },
 };
 
@@ -1524,7 +1568,7 @@ macro_rules! flag {
 }
 
 /// Fields in [`FIELDS`].
-pub const FIELD_COUNT: usize = 206;
+pub const FIELD_COUNT: usize = 217;
 
 /// Every config field, in TUNING.md's order, with its safe range: the code constants that runtime
 /// overrides are clamped to and that TUNING.md's safe-range column must start with. Where a range
@@ -2131,6 +2175,59 @@ pub static FIELDS: [Field; FIELD_COUNT] = [
     ),
     number!(terminals, "TerminalsConfig", max_range, 1, 255, true),
     number!(terminals, "TerminalsConfig", read_ticks, 1, 10_000, true),
+    flag!(market, "MarketConfig", enabled, true),
+    number!(
+        market,
+        "MarketConfig",
+        scan_ticks,
+        TERMINAL_COOLDOWN,
+        10_000,
+        true
+    ),
+    number!(market, "MarketConfig", scan_orders, 1, 256, true),
+    number!(
+        market,
+        "MarketConfig",
+        min_amount,
+        1,
+        TERMINAL_CAPACITY,
+        true
+    ),
+    number!(
+        market,
+        "MarketConfig",
+        max_amount,
+        1,
+        TERMINAL_CAPACITY,
+        true
+    ),
+    number!(market, "MarketConfig", buy_max_milli, 0, 1_000_000, true),
+    number!(market, "MarketConfig", sell_min_milli, 0, 1_000_000, true),
+    number!(market, "MarketConfig", credit_floor, 0, 1_000_000_000, true),
+    number!(
+        market,
+        "MarketConfig",
+        energy_keep,
+        0,
+        TERMINAL_CAPACITY,
+        true
+    ),
+    number!(
+        market,
+        "MarketConfig",
+        buy_target,
+        0,
+        TERMINAL_CAPACITY,
+        true
+    ),
+    number!(
+        market,
+        "MarketConfig",
+        sell_keep,
+        0,
+        TERMINAL_CAPACITY,
+        true
+    ),
 ];
 
 /// The field with runtime key `key`, and its index in [`FIELDS`].
@@ -2418,6 +2515,7 @@ mod tests {
             labs: _,
             factory: _,
             terminals: _,
+            market: _,
         } = MMO.config;
         let SpawnConfig {
             hold_ticks: _,
@@ -2605,7 +2703,20 @@ mod tests {
             max_range: _,
             read_ticks: _,
         } = TERMINALS_MMO;
-        let expected: [(&str, &[&str]); 25] = [
+        let MarketConfig {
+            enabled: _,
+            scan_ticks: _,
+            scan_orders: _,
+            min_amount: _,
+            max_amount: _,
+            buy_max_milli: _,
+            sell_min_milli: _,
+            credit_floor: _,
+            energy_keep: _,
+            buy_target: _,
+            sell_keep: _,
+        } = MARKET_MMO;
+        let expected: [(&str, &[&str]); 26] = [
             (
                 "loader",
                 &[
@@ -2907,6 +3018,22 @@ mod tests {
                     "energy_keep",
                     "max_range",
                     "read_ticks",
+                ],
+            ),
+            (
+                "market",
+                &[
+                    "enabled",
+                    "scan_ticks",
+                    "scan_orders",
+                    "min_amount",
+                    "max_amount",
+                    "buy_max_milli",
+                    "sell_min_milli",
+                    "credit_floor",
+                    "energy_keep",
+                    "buy_target",
+                    "sell_keep",
                 ],
             ),
         ];

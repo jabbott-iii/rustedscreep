@@ -65,7 +65,7 @@ const RUN = 120;
 const SUMMARY = 'rustedscreep.terminals()';
 const KEEPER = { name: 'Keeper', x: 40, y: 40 };
 /** The overrides, in the config's field order (config::FIELDS). */
-const CONFIG_LINES = [
+export const CONFIG_LINES = [
   'opening.place_extensions=false',
   'mining.place_containers=false',
   'links.place_links=false',
@@ -123,10 +123,10 @@ const RAW = (() => {
   return raw;
 })();
 
-function makeWorld() {
+export function makeWorld(rooms = ROOMS) {
   let n = 10;
   return {
-    rooms: ROOMS.map((r) => ({
+    rooms: rooms.map((r) => ({
       ...r,
       terminal: { id: id(n++), x: 30, y: 24, store: { ...r.store }, cooldownTime: 0 },
       controller: { id: id(n++), x: 40, y: 10 },
@@ -160,7 +160,7 @@ function keeperObject(state, pos, r) {
   return self;
 }
 
-function sceneFor(state, offset) {
+export function sceneFor(state, offset) {
   state.intents.clear();
   const reads = (state.reads[offset] = {});
   const rooms = {};

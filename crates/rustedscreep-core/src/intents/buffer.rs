@@ -642,6 +642,19 @@ impl IntentBuffer {
             .any(|e| matches!(e.intent, CreepIntent::Withdraw { target: t, .. } if t == target))
     }
 
+    /// Whether a queued resource intent can change a terminal before a market deal settles.
+    /// A purchase needs both stock and free space. A sale only needs its initial stock and energy.
+    pub fn changes_market_stock(&self, terminal: StructureHandle, buying: bool) -> bool {
+        self.entries.iter().any(|entry| match entry.intent {
+            CreepIntent::Withdraw { target, .. } => target == terminal,
+            CreepIntent::Transfer {
+                target: Target::Structure(target),
+                ..
+            } => buying && target == terminal,
+            _ => false,
+        })
+    }
+
     /// The planned intents, once [`Self::resolve`] ran (none before): by row, then blockers first.
     pub fn planned(&self) -> impl ExactSizeIterator<Item = &Issue> {
         self.planned.iter()
@@ -923,6 +936,28 @@ mod tests {
             objects,
             gone_object,
         }
+    }
+
+    #[test]
+    fn market_stock_checks_creep_deposits_for_purchases() {
+        let w = world();
+        let mut buf = IntentBuffer::default();
+        let mut commit = Commit::default();
+        buf.begin(&w.snap);
+        buf.push(
+            &w.snap,
+            w.a,
+            energy(Target::Structure(w.spawn), None),
+            &mut commit,
+        )
+        .expect("nearby deposit");
+        assert!(buf.changes_market_stock(w.spawn, true));
+        assert!(!buf.changes_market_stock(w.spawn, false));
+        assert!(!buf.changes_market_stock(w.nuker, true));
+        buf.push(&w.snap, w.a, withdraw(w.spawn, None), &mut commit)
+            .expect("nearby withdrawal");
+        assert!(buf.changes_market_stock(w.spawn, true));
+        assert!(buf.changes_market_stock(w.spawn, false));
     }
 
     fn energy(target: Target, amount: Option<u32>) -> CreepIntent {

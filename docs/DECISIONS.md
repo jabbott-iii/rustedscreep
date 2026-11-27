@@ -1253,3 +1253,35 @@ Claude proposes ADRs and the user accepts them. Numbers are never reused.
   - The cooldown's tick offset is inferred (V441). The module reads the cooldown before each plan and waits for it, so a longer period costs one plan a tick later.
   - `terminals.mineral_keep`, `send_min`, `energy_keep` and `max_range` are starting values; P9.5's market revisits them.
 - Evidence: V430 to V446; `economy/terminals_tests.rs` (22 tests); `js/tools/terminal-sim.mjs` (check row 30); the hot-path review (2026-11-26).
+
+## ADR-048 Market deals within price, volume and credit limits (2026-11-26)
+
+- **Context.** P9.5 adds market access for the seven base minerals that supply lab reactions.
+  E7N57 needs an own active terminal to trade. Published deal and order rules are in V447–V454.
+- **Policy.** The MMO profile leaves trading off until enabled through `market.enabled`. When on,
+  the bot buys toward a per-mineral stock target and sells above a surplus mark, subject to higher
+  reserves from terminal balancing, the factory and the market buy target. Deals use public orders. Listing fees,
+  standing orders and account resources are outside this policy. The bot pauses while its own
+  standing orders exist, since fills initiated by another player could spend credits or draw
+  stock in the same tick.
+- **Limits.** One deal per time slot on the configured tick grid, with the resource and side
+  rotating. Integer milli-credit prices and a balance rounded down size the request against
+  the price band, available and remaining order volume, stock or capacity, the lot limits and
+  the credit floor. The initiating terminal must be off cooldown and able to pay the fee from
+  energy above its reserve. Internal sends take priority and the bot skips any terminal where
+  a creep has queued a withdrawal. Purchases also skip terminals with queued deposits. The market
+  uses the terminal's existing energy.
+- **CPU.** Optional jobs run after traffic resolution and scan on due slots and read one ready terminal candidate per owned room.
+  When the terminal-balancing snapshot already read it, the job reuses that read. A single
+  game query returns the current book for the mineral and side. The bot inspects a rotating,
+  bounded slice of it in scheduler units, estimates fees in Rust and checks the selected
+  quote with the game's wrapped fee calculation. The tick schedule survives a reset without
+  a persisted record. The orders and JS objects live only through the current tick. The game
+  query materializes the filtered book in one call, so the scheduler can bound subsequent quote
+  inspection but cannot interrupt the call itself.
+- **Trade-offs.** A bounded scan and a single local terminal can miss better quotes. An unwrapped
+  estimate can rule out long routes near the world seam. The fixed cadence prevents retries
+  in the same slot after a refusal. A queued deal can fill partially or be dropped if the
+  other party's order changes before settlement. The credit floor applies to the bot's own
+  request against the observed balance. Other shards or manual actions can change the account
+  balance independently.

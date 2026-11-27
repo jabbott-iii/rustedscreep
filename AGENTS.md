@@ -8,7 +8,11 @@ global control level (GCL) and room controller level (RCL), energy throughput, d
 - Authoritative requirements: `docs/SPEC.md`. Do not edit it. Record deviations in `docs/DECISIONS.md`, the architecture decision records (ADRs).
 - Where we are: `docs/STATUS.md`, which is injected at session start and after compaction (when Codex summarizes the conversation). The phase plan and exit gates (the checks, with evidence, that close a phase) are in `docs/ROADMAP.md` (the core track for the MMO, the official persistent server: phases P0–P12). Two optional tracks build on it and never block it: `docs/ROADMAP_PRIVATE.md` (private-server phases PS#) and `docs/ROADMAP_SEASONAL.md` (Seasonal-server phases SE#, after P12, the last core phase) (ADR-010, which split the roadmap into these three tracks).
 - Multi-step procedures live in skills: `/kickoff`, `/verify`, `/module`, `/phase-gate`, `/check`,
-  `/cpu-audit`, `/combat-verify`, `/deploy`, `/commit-msg`. Area-specific rules live in `.Codex/rules/` and load by path.
+  `/cpu-audit`, `/combat-verify`, `/deploy`, `/commit-msg`. Repository skills live in `.agents/skills/`. Before editing files, read each rule in
+  `.codex/rules/` whose root-relative `paths` match the files involved. Apply all matching rules.
+  The rules cover pure Rust (`core-logic.md`), combat and intents (`combat.md`), the wasm boundary
+  (`wasm-bot.md`), the JS loader and tools (`js-loader.md`), project documents (`docs.md`), and writing
+  in Markdown and Rust (`writing.md`).
 
 ## Working agreement (always applies)
 - Work as a senior engineer and pair programmer. Explain significant decisions in a sentence or two and name risks and assumptions. Leave the user's decisions to the user.

@@ -1,0 +1,53 @@
+---
+paths:
+  - "crates/rustedscreep-wasm/**"
+---
+
+# WASM boundary crate (`rustedscreep-wasm`)
+
+## Snapshot (JS → Rust), once per tick
+- Make one pass over owned rooms, creeps (the player's units), structures, and visible hostiles. Read each JS property once. Every
+  getter, such as `creep.pos()` or `store()`, is a JS crossing (a call from Rust out to JS, which costs CPU), so cache the result in
+  the snapshot struct (the tick's copy of game state in Rust).
+- Convert to `rustedscreep-core` types immediately. Intern object IDs to `u32` handles. Game objects go stale next tick (game turn), so
+  keep JS handles only for the current tick and re-resolve by ID when needed.
+- Never call `find`/`look*` inside loops. Use one bulk call per room per tick, or cached static data (terrain, sources,
+  minerals, controller position) that is invalidated by events.
+
+## Act (Rust → intents), one batch
+- Issue intents (the game actions creeps and structures order each tick) from the intent buffer produced by `rustedscreep-core`.
+  Before issuing, drop no-ops: moving while fatigued (a creep with fatigue cannot move), repairing full hits (hit points),
+  transferring into a full store, or re-issuing an identical order to an idle structure.
+- Enforce the engine intent-priority table (which intents on the same creep block which) encoded in `rustedscreep_core::intents`,
+  and never emit a combination that blocks itself.
+- One movement intent per creep. Prefer `move(direction)` computed from Rust paths and flow fields (each tile's path cost to a
+  target, from which a creep reads its next step) over `moveTo`, which pathfinds in JS. Use `PathFinder.search` only for
+  inter-room routes, with Rust-built cost matrices and cached results.
+- Count intents per tick in the profiler. The intent count is the main CPU cost to minimize.
+
+## Memory and persistence
+- Never touch `Memory` (`screeps::memory`, the game's persistent JSON object) in the tick path. The wrapper JSON-parses on first
+  access each tick. The two exceptions (architecture decision records ADR-018, ADR-019) live in `spawn.rs`: after an accepted
+  `spawnCreep` (which already parsed it), delete that name's `Memory.creeps` entry; after a `spawnCreep` that threw on a null
+  `Memory`, reset the raw string to `{}`.
+- Persist only what must survive a reset (a global reset: a fresh JS global, with all heap state lost), in RawMemory segments
+  (the game's 100 persistent strings, ids 0 to 99). Each segment carries a versioned header (magic, format version, length,
+  checksum). Write only when dirty. Request segments ahead of use: a `setActiveSegments` request applies on the next tick (V41).
+- A decode failure or version mismatch triggers a rebuild from game state, logged once. Never panic.
+- Encode role, home room, and serial in creep names so identity survives resets without Memory.
+
+## Errors, logging, resets
+- Process each room, creep, and task in its own `Result` boundary. A failure is logged with a rate limit and skipped. The tick continues.
+- Same no-panic clippy denies as `rustedscreep-core`, at the crate root for non-test code.
+- Logging goes through `log` macros and the minimal logger in `logging.rs` (ADR-014 replaced `fern`), with the level from config. Guard expensive formatting with `log::log_enabled!`.
+- On a global reset, initialize in small steps across ticks: Critical tier (the work that runs every tick) first, caches rebuilt
+  lazily by tier. The first tick after a reset must not run Optional work (the lowest CPU tier).
+
+## Profiler and features
+- The `profiler` feature compiles in sparse `Game.cpu.getUsed()` sampling per subsystem. Results go to a RawMemory stats segment
+  that the console reads (`RawMemory.segments[99]`, TEST_PLAN §8). Without the feature, the profiler compiles out to nothing.
+- Features: `mmo` and `sim` (map them to the `screeps-game-api` features of the same name, after verifying the names for the pinned
+  version), `profiler`, `visuals`, and `trap-test` (a debug export that forces a trap, a WebAssembly runtime abort, on demand,
+  used only to test loader recovery).
+  When `sim` maps to the crate's `sim`, the crate parses the room name `sim` (packed 0), so `rustedscreep_core::snapshot::parse_room_name`
+  must accept it too (VERIFICATION_LOG V114).

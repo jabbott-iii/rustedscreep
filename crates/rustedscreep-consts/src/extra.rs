@@ -49,3 +49,10 @@ pub const CREEP_NAME_MAX_LENGTH: usize = 100;
 /// (<https://github.com/screeps/engine/blob/a90d26fc9eb943147799e65d0bf9d4d0d79a2722/src/processor/intents/spawns/create-creep.js#L71>),
 /// VERIFICATION_LOG V282. Last verified: 2026-11-22.
 pub const BODYPART_HITS: u32 = 100;
+
+/// Engine money units per displayed market credit (V447, V450).
+///
+/// Source: screeps/engine a90d26f, `src/game/market.js` L21–24 and L196–200.
+/// <https://github.com/screeps/engine/blob/a90d26fc9eb943147799e65d0bf9d4d0d79a2722/src/game/market.js#L196-L200>
+/// Last verified: 2026-11-26.
+pub const MARKET_CREDIT_SCALE: u32 = 1_000;

@@ -521,6 +521,15 @@ first loop. Recovery is in section 6. `js/tools/` holds the build
 size, check, smoke (the bundle in a Screeps-like sandbox, run at the end of every build), and setup-binaryen. Generated files go to the git-ignored `js/pkg/`,
 `js/build/`, and `dist/`.
 
+### Market (P9.5)
+
+The Optional market job reads current terminal stock and a filtered public order book on a
+scheduled slot. Pure Rust sizes deals against stock, terminal energy, price, credit and volume
+limits. The scheduler caps inspection of the returned book, and the act step issues at most
+one order after the game confirms the transfer fee. A terminal send or an open standing order
+can take priority over the market. The game tick determines the scan schedule and quote rotation.
+Only the current tick holds market data and JS objects. See ADR-048 and V447–V454.
+
 ## 3. Cache and invalidation table
 _P1 onward._
 
